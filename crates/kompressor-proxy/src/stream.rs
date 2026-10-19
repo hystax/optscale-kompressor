@@ -1042,7 +1042,7 @@ fn filter_our_chat_calls(frame: &SseFrame, ours: &mut Vec<String>) -> ChatFilter
     }
 }
 
-/// Record the item id a frame of ours belongs to, so its later parts can be
+/// Record the item id or block index a frame of ours belongs to, so its later parts can be
 /// recognised.
 ///
 /// Responses names the tool only on `output_item.added`/`done`; the argument
@@ -1051,6 +1051,12 @@ fn filter_our_chat_calls(frame: &SseFrame, ours: &mut Vec<String>) -> ChatFilter
 /// after hand-over is unrecognisable and reaches a client that never saw the
 /// call it belongs to.
 fn note_our_item(family: ApiFamily, frame: &SseFrame, ours: &mut Vec<String>) {
+    if family == ApiFamily::AnthropicMessages {
+        // The opening block may be buffered while its deltas arrive after
+        // hand-over. Preserve its index before dropping that opening frame.
+        belongs_to_our_call(family, frame, ours);
+        return;
+    }
     if family != ApiFamily::OpenAiResponses {
         return;
     }
@@ -1076,8 +1082,8 @@ fn note_our_item(family: ApiFamily, frame: &SseFrame, ours: &mut Vec<String>) {
 /// the argument deltas, which reference the item by id rather than by name —
 /// hence the running set.
 ///
-/// Responses only. Chat reports a turn's calls inside the same delta frames as
-/// its text, so there is no whole frame to drop there and `scrub` handles it.
+/// Responses and Anthropic. Chat reports calls alongside text in the same
+/// delta frames, so `filter_our_chat_calls` filters their entries instead.
 fn belongs_to_our_call(family: ApiFamily, frame: &SseFrame, ours: &mut Vec<String>) -> bool {
     let Some(value) = frame.json() else {
         return false;
