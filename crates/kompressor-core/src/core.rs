@@ -155,6 +155,7 @@ impl AppCore {
         };
         let mut stats = compress_messages(messages, options, &req, &mut refs);
         let engine_ms = started.elapsed().as_secs_f64() * 1000.0;
+        note_oversized_refusals(&mut stats, &refs, request.request_id);
 
         if !self.retain_fragments(identity, &refs, request.request_id, options)
             && let Some(original) = original
@@ -231,6 +232,7 @@ impl AppCore {
             }
         }
 
+        note_oversized_refusals(&mut stats, &refs, request.request_id);
         let retained = self.retain_fragments(identity, &refs, request.request_id, options);
         if !retained && options.mode == Mode::Recoverable {
             discard_compression_stats(&mut stats);
@@ -534,6 +536,34 @@ impl AppCore {
     }
 }
 
+/// Record fragments the engine refused to retain, so a 0.00% that came from
+/// `max_ref_bytes` is distinguishable from one that came from having nothing to
+/// compress.
+///
+/// Both read the same in a stats report otherwise, and `--explain` is the only
+/// place that currently tells them apart — which is no help to an operator
+/// looking at a dashboard. A refusal the compressor handled by keeping its
+/// content retracts itself and never reaches here; what is left is a marker
+/// that could not be honoured, which is why the payload came back whole.
+fn note_oversized_refusals(stats: &mut CompressStats, refs: &RefCollector, request_id: &str) {
+    let refused = refs.oversized_refusals();
+    if refused == 0 {
+        return;
+    }
+    *stats
+        .skipped_by_reason
+        .entry("refs_oversized".to_string())
+        .or_insert(0) += refused as u32;
+    tracing::warn!(
+        request_id,
+        refused,
+        max_ref_bytes = refs.max_ref_bytes(),
+        "declined to compress: an elision was larger than `max_ref_bytes` and could not be \
+         retained, so the payload was returned uncompressed; raise `[engine] max_ref_bytes` \
+         or lower the amount elided"
+    );
+}
+
 fn discard_compression_stats(stats: &mut CompressStats) {
     stats.tokens_out = stats.tokens_in;
     stats.chars_out = stats.chars_in;
@@ -774,6 +804,58 @@ mod tests {
             Surface::Cli,
         );
         assert_eq!(output, input);
+    }
+
+    /// A payload declined for the fragment limit says so in its stats.
+    ///
+    /// Without this, the row is indistinguishable from one the engine simply
+    /// found nothing to compress in: same 0.00%, same empty `by_type`. The
+    /// operator sees a dashboard that reads "nothing to do" when the truth is
+    /// "gave up", and the one surface that told them apart was `--explain`,
+    /// which nobody runs against production traffic.
+    #[test]
+    fn a_payload_declined_for_the_fragment_limit_is_visible_in_stats() {
+        let core = core();
+        let input = log_payload(400);
+        let mut options = core.options_for(&Identity::anonymous(), None);
+        options.max_ref_bytes = 8;
+        let (output, outcome) = core.compress_raw(
+            &Identity::anonymous(),
+            &input,
+            None,
+            &RequestInfo::default(),
+            &options,
+            Surface::Cli,
+        );
+        assert_eq!(output, input, "it still declines");
+        assert!(
+            outcome
+                .stats
+                .skipped_by_reason
+                .contains_key("refs_oversized"),
+            "the reason must be recorded, got {:?}",
+            outcome.stats.skipped_by_reason
+        );
+
+        // …and a payload that simply had nothing to compress does not claim it.
+        let prose = "Some ordinary prose that no compressor claims. ".repeat(30);
+        let options = core.options_for(&Identity::anonymous(), None);
+        let (_, outcome) = core.compress_raw(
+            &Identity::anonymous(),
+            &prose,
+            None,
+            &RequestInfo::default(),
+            &options,
+            Surface::Cli,
+        );
+        assert!(
+            !outcome
+                .stats
+                .skipped_by_reason
+                .contains_key("refs_oversized"),
+            "nothing was refused here, got {:?}",
+            outcome.stats.skipped_by_reason
+        );
     }
 
     #[test]

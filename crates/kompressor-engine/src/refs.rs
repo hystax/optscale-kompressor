@@ -159,6 +159,15 @@ pub struct RefCollector {
     pairs: Vec<(RefId, String)>,
     seen: HashSet<RefId>,
     oversized_attempts: usize,
+    /// Every fragment refused for size, for reporting rather than for control.
+    ///
+    /// Separate from `oversized_attempts`, which is the *veto* signal and is
+    /// deliberately restored by `rollback` and retracted by
+    /// `forgive_oversized` — both of which happen at exactly the moments a
+    /// report would want to know. This one is sticky: it answers "did the
+    /// fragment limit cost this payload anything", whether that cost was the
+    /// whole compression or one fold group that stayed inline.
+    oversized_refusals: usize,
 }
 
 /// A point to roll a collector back to.
@@ -184,6 +193,7 @@ impl RefCollector {
             pairs: Vec::new(),
             seen: HashSet::new(),
             oversized_attempts: 0,
+            oversized_refusals: 0,
         }
     }
 
@@ -195,6 +205,7 @@ impl RefCollector {
             pairs: Vec::new(),
             seen: HashSet::new(),
             oversized_attempts: 0,
+            oversized_refusals: 0,
         }
     }
 
@@ -222,6 +233,7 @@ impl RefCollector {
         }
         if fragment.len() > self.max_ref_bytes {
             self.oversized_attempts += 1;
+            self.oversized_refusals += 1;
             return None;
         }
         let id = ref_for(fragment);
@@ -237,6 +249,36 @@ impl RefCollector {
             pairs: self.pairs.len(),
             oversized: self.oversized_attempts,
         }
+    }
+
+    /// Retract a refusal the caller dealt with itself.
+    ///
+    /// The refusal count exists so the pipeline can veto a candidate that
+    /// elided something it could not retain. A caller that asked, was refused,
+    /// and then *did not elide* — keeping every occurrence, or shipping a
+    /// marker that reconstructs without a fragment — shipped nothing
+    /// unfetchable, so its refusal must not veto the payload. Counting it
+    /// anyway discarded 97.88% of a payload whose log fold had already declined
+    /// the one group it could not keep and folded the other two cleanly.
+    ///
+    /// Saturating: a retraction without a matching refusal is a no-op rather
+    /// than a wrap into a count that would veto everything forever.
+    /// Fragments refused for size, including ones a compressor then handled.
+    pub fn oversized_refusals(&self) -> usize {
+        self.oversized_refusals
+    }
+
+    /// Carry a dropped candidate's refusals across for reporting.
+    ///
+    /// A candidate that is disqualified is never adopted, so without this the
+    /// one refusal that explains why the payload came back whole disappears
+    /// with it.
+    pub fn absorb_oversized_refusals(&mut self, other: &RefCollector) {
+        self.oversized_refusals += other.oversized_refusals;
+    }
+
+    pub fn forgive_oversized(&mut self) {
+        self.oversized_attempts = self.oversized_attempts.saturating_sub(1);
     }
 
     /// Discard everything stashed since `mark`.
@@ -265,6 +307,7 @@ impl RefCollector {
             pairs: Vec::new(),
             seen: HashSet::new(),
             oversized_attempts: 0,
+            oversized_refusals: 0,
         }
     }
 
@@ -274,6 +317,7 @@ impl RefCollector {
     /// the handle its marker already carries.
     pub fn adopt(&mut self, other: RefCollector) {
         self.oversized_attempts += other.oversized_attempts;
+        self.oversized_refusals += other.oversized_refusals;
         for (_, fragment) in other.pairs {
             self.stash(&fragment);
         }
