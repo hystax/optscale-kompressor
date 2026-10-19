@@ -43,6 +43,20 @@ pub struct CompressOutcome {
     pub mode: Mode,
 }
 
+/// A finished compression that has not been published.
+///
+/// Holds the elided fragments and the originals to fall back to, so that
+/// [`AppCore::publish`] can retain, revert and file in one step — or so that a
+/// caller that no longer wants the result can drop it and leave no trace. See
+/// [`AppCore::compress_only`].
+pub struct Computed {
+    pub stats: CompressStats,
+    refs: RefCollector,
+    original: Option<Vec<Message>>,
+    time_ms: i64,
+    engine_ms: f64,
+}
+
 /// Where a compression came from, for attribution.
 #[derive(Clone, Debug, Default)]
 pub struct RequestInfo<'a> {
@@ -153,8 +167,95 @@ impl AppCore {
             fetches,
             cache_hit_per_mille,
         };
-        let mut stats = compress_messages(messages, options, &req, &mut refs);
-        let engine_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let computed = Computed {
+            stats: compress_messages(messages, options, &req, &mut refs),
+            refs,
+            original,
+            time_ms,
+            engine_ms: started.elapsed().as_secs_f64() * 1000.0,
+        };
+        self.publish(identity, messages, computed, request, options, surface)
+    }
+
+    /// Compress without retaining, recording or promoting anything.
+    ///
+    /// The second half is [`AppCore::publish`], and the split exists because a
+    /// caller can decide *after* the work finishes that it will not use the
+    /// result. The proxy races compression against a deadline on a
+    /// `spawn_blocking` task, and a blocking task cannot be cancelled: when
+    /// the deadline won, the abandoned task ran on to completion and stored
+    /// fragments nothing could fetch, filed an optimization event for an
+    /// output that was never forwarded, and moved inline-promotion state that
+    /// rewrote later prompts. Measured once at 16,435 saved tokens recorded
+    /// after the request had already fallen back to its original body.
+    ///
+    /// A cancellation flag consulted inside the work would narrow that window
+    /// rather than close it — the check and the publication cannot be made
+    /// atomic against a deadline that fires between them. Computing here and
+    /// publishing on the caller's side closes it: nothing is published until
+    /// the caller has decided, and a result it abandons is simply dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compress_only(
+        &self,
+        messages: &mut [Message],
+        options: &EngineOptions,
+        frozen_message_count: usize,
+        context: &str,
+        prefix_cache: PrefixCache,
+        keep_inline: &[RefId],
+        fetches: &[(RefId, u32)],
+        cache_hit_per_mille: u32,
+    ) -> Computed {
+        let started = Instant::now();
+        let time_ms = now_ms();
+        let mut refs = options.collector();
+        let original = (options.mode == Mode::Recoverable).then(|| messages.to_vec());
+        let req = RequestOptions {
+            frozen_message_count,
+            context,
+            prefix_cache,
+            keep_inline,
+            fetches,
+            cache_hit_per_mille,
+        };
+        let stats = compress_messages(messages, options, &req, &mut refs);
+        Computed {
+            stats,
+            refs,
+            original,
+            time_ms,
+            engine_ms: started.elapsed().as_secs_f64() * 1000.0,
+        }
+    }
+
+    /// Retain what a compression elided, then file it.
+    ///
+    /// Every side effect of compressing lives here: fragment retention, the
+    /// fallback when retention fails, the protected-role refresh and the
+    /// optimization event. A [`Computed`] that is never passed to this has
+    /// touched nothing outside its own allocations.
+    pub fn publish(
+        &self,
+        identity: &Identity,
+        messages: &mut [Message],
+        computed: Computed,
+        request: &RequestInfo<'_>,
+        options: &EngineOptions,
+        surface: Surface,
+    ) -> CompressOutcome {
+        let Computed {
+            mut stats,
+            refs,
+            original,
+            time_ms,
+            engine_ms,
+        } = computed;
+
+        // Carried over from the call this commit's restructure displaced. It
+        // belongs on this side of the split rather than in `compress_only`:
+        // the note is part of what gets filed, so a computed result the caller
+        // abandons should not produce one. `compress_only` has no
+        // `RequestInfo` to name the request with either.
         note_oversized_refusals(&mut stats, &refs, request.request_id);
 
         if !self.retain_fragments(identity, &refs, request.request_id, options)
@@ -787,6 +888,67 @@ mod tests {
         assert_eq!(output, input);
         assert_eq!(outcome.stats.refs_emitted, 0);
         assert_eq!(outcome.stats.tokens_out, outcome.stats.tokens_in);
+    }
+
+    /// A computed compression that is never published touches nothing.
+    ///
+    /// This is what lets the proxy race compression against a deadline. A
+    /// `spawn_blocking` task cannot be cancelled, so the loser runs to
+    /// completion; the guarantee has to be that its result is inert until
+    /// someone publishes it. Before the split it was not: the abandoned task
+    /// retained fragments, filed savings for an output never forwarded, and
+    /// moved inline-promotion state.
+    #[test]
+    fn a_computed_compression_is_inert_until_it_is_published() {
+        let (sink, captured) = kompressor_stats::writer::capturing_sink(64);
+        let store = Arc::new(MemoryRefStore::new());
+        let core = AppCore::new(Config::default(), store.clone(), sink);
+        let identity = Identity::anonymous();
+        let options = core.options_for(&identity, None);
+        let mut messages = vec![Message::text("user", log_payload(400))];
+
+        let computed = core.compress_only(
+            &mut messages,
+            &options,
+            0,
+            "",
+            PrefixCache::Warm,
+            &[],
+            &[],
+            1000,
+        );
+        assert!(
+            computed.stats.tokens_out < computed.stats.tokens_in,
+            "the work really happened"
+        );
+        assert_eq!(
+            store.stats().expect("store stats").live_refs,
+            0,
+            "no fragment may be retained before publication"
+        );
+        assert!(
+            captured.drain().is_empty(),
+            "no event may be filed before publication"
+        );
+
+        let outcome = core.publish(
+            &identity,
+            &mut messages,
+            computed,
+            &RequestInfo::default(),
+            &options,
+            Surface::Proxy,
+        );
+        assert!(outcome.stats.tokens_out < outcome.stats.tokens_in);
+        assert!(
+            store.stats().expect("store stats").live_refs > 0,
+            "publication retains what was elided"
+        );
+        assert_eq!(
+            captured.drain().len(),
+            1,
+            "publication files exactly one event"
+        );
     }
 
     #[test]
