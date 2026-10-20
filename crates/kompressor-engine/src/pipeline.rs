@@ -374,6 +374,8 @@ fn route<'a>(
         let mut scratch = refs.scratch();
         if let Some((out, subtypes)) = guarded(|| crush_mixed(content, opts, ctx, &mut scratch))
             && chars_len(&out) < chars_len(content)
+            // …and the same disqualification, stated once for both readings.
+            && scratch.oversized_attempts() == 0
         {
             let mut types = Vec::new();
             if let Some((checked, kind)) = accounted(content, out, Kind::Mixed, opts, &mut types) {
@@ -406,6 +408,23 @@ fn route<'a>(
         ctx,
         &mut whole_types,
     );
+    // A reading that could not retain what it elided is not a candidate.
+    //
+    // Its output is short — the elision happened, only the fragment behind it
+    // was refused — so it wins the size comparison below, is adopted, and then
+    // trips the caller's oversized guard, which discards *everything* including
+    // the reading that was shippable. Measured: a 1.1 MB payload whose uniform
+    // body exceeded `max_ref_bytes` returned byte-for-byte at 0.00%, throwing
+    // away a segmented reading that had already removed 21 KB of it.
+    //
+    // This is the arbitration-level twin of the refusal count `Mark` restores
+    // on rollback, and it exists for the same reason: a candidate that cannot
+    // ship must not veto the one that can.
+    let whole = whole.filter(|_| whole_scratch.oversized_attempts() == 0);
+    // The disqualified reading is dropped, so carry across the refusal that
+    // disqualified it; it is the only account of why this payload compressed
+    // less than it could have.
+    refs.absorb_oversized_refusals(&whole_scratch);
 
     match (mixed_candidate, whole) {
         (Some((mixed_out, mixed_kind, mixed_types, mixed_refs)), whole) => {
@@ -834,6 +853,36 @@ mod tests {
         (out, kind, refs, applied)
     }
 
+    /// Three templates folded independently, sized so that exactly one of the
+    /// three fragments is over a 20,000-byte `max_ref_bytes`.
+    ///
+    /// The lines within a group differ, so the fold cannot be reversed from a
+    /// bare `[\u{d7}N]` count and each group needs a handle of its own — which is
+    /// what makes one group refusable while the others are not.
+    fn three_fold_groups() -> String {
+        let mut lines: Vec<String> = Vec::new();
+        for i in 0..900 {
+            lines.push(format!(
+                "worker alpha processed batch {i} in {}ms queue={i}",
+                10 + i % 7
+            ));
+        }
+        for i in 0..90 {
+            lines.push(format!(
+                "cache bravo evicted key k{i} age={i}s size={}",
+                100 + i
+            ));
+        }
+        for i in 0..90 {
+            lines.push(format!(
+                "sync delta pushed shard {i} rev={} bytes={}",
+                1000 + i,
+                i * 13
+            ));
+        }
+        lines.join("\n")
+    }
+
     fn log_payload(lines: usize) -> String {
         (0..lines)
             .map(|i| {
@@ -1030,6 +1079,141 @@ mod tests {
         assert!(!refs.pairs().iter().any(|(id, _)| *id == claimed_id));
         for (id, _) in refs.pairs() {
             assert!(output.contains(&format!("ref:{id}")));
+        }
+    }
+
+    /// One region whose elision cannot be retained must not discard the others.
+    ///
+    /// The whole-message reading of such a payload is *short* — the elision
+    /// happened, only the fragment behind it was refused — so it used to win
+    /// the size arbitration, get adopted, and then trip the oversized guard,
+    /// which returns the payload untouched. Everything another reading had
+    /// legitimately compressed went with it. Measured on a 1.1 MB log: 0.00%,
+    /// discarding 21 KB the segmenter had already removed.
+    ///
+    /// `max_ref_bytes` is set small here so the same arithmetic runs on a
+    /// payload a test can hold.
+    #[test]
+    fn a_region_that_cannot_retain_its_elision_does_not_discard_the_others() {
+        let opts = EngineOptions {
+            max_ref_bytes: 3_000,
+            ..EngineOptions::default()
+        };
+        // Two fenced blocks. The first elides far more than the cap allows and
+        // so can never ship; the second folds well within it.
+        let bulky = (0..200)
+            .map(|i| format!("epoch 1 step {i}/200 loss=1.8520 lr=0.000300 tok/s=5000{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let foldable = (0..40)
+            .map(|i| {
+                format!(
+                    "src/mod.c:{}:5: warning: unused variable `t{i}` [-Wall]",
+                    10 + i
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let content = format!(
+            "Training run:\n\n```\n{bulky}\n```\n\nBuild warnings:\n\n```\n{foldable}\n```\n"
+        );
+
+        let (out, kind, refs, _) = run(&content, &opts);
+
+        assert!(
+            kind.is_some(),
+            "the retainable region must still ship; got the payload back untouched"
+        );
+        assert!(
+            chars_len(&out) < chars_len(&content),
+            "{} -> {}, nothing was removed",
+            chars_len(&content),
+            chars_len(&out)
+        );
+        // The unretainable region keeps its bytes rather than carrying a marker
+        // nothing can honour.
+        assert!(
+            out.contains("epoch 1 step 100/200"),
+            "a line from the region that could not be retained must survive verbatim"
+        );
+        // Every handle that did ship is honoured by the output.
+        for (id, _) in refs.pairs() {
+            assert!(
+                out.contains(&id.to_string()),
+                "stashed fragment {id} is named by no marker"
+            );
+        }
+    }
+    /// Within one reading: a fold group over the cap must not discard the
+    /// groups under it.
+    ///
+    /// `fold_suffix` already declines a group whose fragment cannot be
+    /// retained, keeping every occurrence — nothing unfetchable ships. But the
+    /// refusal was still counted, and the pipeline guard vetoes on the count,
+    /// so a payload whose other groups folded perfectly came back whole.
+    /// Measured with three groups and one over the cap: 0.00% against the
+    /// 13.18% the two retainable groups are worth.
+    #[test]
+    fn a_fold_group_over_the_cap_does_not_discard_the_groups_under_it() {
+        let opts = EngineOptions {
+            max_ref_bytes: 20_000,
+            ..EngineOptions::default()
+        };
+        let content = three_fold_groups();
+        // Forced, because this payload's *detected* type is `listing` and the
+        // sampler mints one fragment rather than one per template. The defect
+        // is in how several fragments from a single reading interact, so the
+        // test drives the reading that produces several.
+        let mut refs = opts.collector();
+        let mut applied = Vec::new();
+        let ctx = Context::for_role("tool");
+        let (out, kind) = compress_content(
+            &content,
+            "tool",
+            &opts,
+            Some(ForcedType::Log),
+            &mut refs,
+            &ctx,
+            &mut applied,
+        );
+
+        assert!(kind.is_some(), "the retainable groups must still fold");
+        assert!(
+            chars_len(&out) < chars_len(&content),
+            "{} -> {}, nothing was removed",
+            chars_len(&content),
+            chars_len(&out)
+        );
+        // The group whose fragment was refused keeps every occurrence: a bare
+        // `[×N]` there would assert a repeat of lines that differ.
+        assert_eq!(
+            out.lines()
+                .filter(|l| l.starts_with("worker alpha"))
+                .count(),
+            900,
+            "every occurrence of the refused group must survive"
+        );
+        // …while the two that fit are folded behind handles.
+        assert!(
+            out.lines()
+                .any(|l| l.contains("cache bravo") && l.contains("[\u{d7}")),
+            "the bravo group must fold, got:\n{out}"
+        );
+        assert!(
+            out.lines()
+                .any(|l| l.contains("sync delta") && l.contains("[\u{d7}")),
+            "the delta group must fold, got:\n{out}"
+        );
+        assert_eq!(
+            refs.pairs().len(),
+            2,
+            "exactly the two retainable fragments"
+        );
+        for (id, _) in refs.pairs() {
+            assert!(
+                out.contains(&id.to_string()),
+                "stashed fragment {id} is named by no marker"
+            );
         }
     }
 }

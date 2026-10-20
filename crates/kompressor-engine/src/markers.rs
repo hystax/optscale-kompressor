@@ -169,7 +169,12 @@ pub fn fold_suffix(
         Some(id) => Some(format!(" [×{count} ref:{id}]")),
         // Identical repeats reconstruct from the count whether or not a
         // fragment could be stored, so the opt-in degrades rather than refuses.
-        None if identical => bare(),
+        None if identical => {
+            // Refused for size, but the count alone reconstructs these lines,
+            // so nothing unfetchable ships and the refusal is retracted.
+            refs.forgive_oversized();
+            bare()
+        }
         // Nothing was stored and the lines were not the same bytes, so a bare
         // `[×N]` here would assert a repeat that did not happen. That is the
         // one thing this must never do. Measured at the default 65,536, a
@@ -189,7 +194,15 @@ pub fn fold_suffix(
         // over `max_ref_bytes`. That is a broken promise rather than a
         // contract, so this declines rather than papering over it, and the
         // caller keeps every occurrence.
-        None => None,
+        //
+        // Having declined, the refusal is retracted: every occurrence is still
+        // in the output, so there is no unfetchable marker for the pipeline's
+        // guard to protect anyone from, and leaving the count raised discards
+        // the groups that folded cleanly alongside this one.
+        None => {
+            refs.forgive_oversized();
+            None
+        }
     }
 }
 
