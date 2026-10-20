@@ -26,12 +26,14 @@
 //!
 //! # What identifies a conversation
 //!
-//! The frozen prefix itself, fingerprinted. Not a session header: those are
-//! client-specific (`x-claude-code-session-id`, `prompt_cache_key`, and
-//! whatever the next client invents), and a proxy that only works for clients
-//! it has heard of is the failure the agent catalogue is written against. The
-//! prefix is also the honest key — it is what the *provider* caches on, so two
-//! requests sharing a fingerprint share a cache entry by construction.
+//! The learned opening of the conversation, fingerprinted inside its resolved
+//! tenant, upstream, API-family and model namespace. Not a session header:
+//! those are client-specific (`x-claude-code-session-id`, `prompt_cache_key`,
+//! and whatever the next client invents), and a proxy that only works for
+//! clients it has heard of is the failure the agent catalogue is written
+//! against. The opening identifies the conversation while the namespace keeps
+//! independent callers and provider/model routes from sharing its optimization
+//! state.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -65,9 +67,10 @@ struct Identity {
 
 /// Conversation identities, learned rather than derived.
 ///
-/// Keyed by `(length, chain hash at that length)`: the exact content of the
-/// first `length` messages. `lengths` refcounts which lengths are registered,
-/// so a lookup probes only those rather than every depth.
+/// Keyed by `(length, chain hash at that length)`: the resolved namespace and
+/// exact content of the first `length` messages. `lengths` refcounts which
+/// lengths are registered, so a lookup probes only those rather than every
+/// depth.
 #[derive(Debug, Default)]
 struct Identities {
     by_prefix: HashMap<(usize, u64), Identity>,
@@ -760,8 +763,24 @@ impl PrefixTracker {
 /// lets [`PrefixTracker::identify`] recognise turn twenty as the conversation
 /// that turn one started. Capped at `IDENTITY_DEPTH`.
 pub fn identity_chain(messages: &[&str]) -> Vec<u64> {
+    identity_chain_in_scope(messages, &[])
+}
+
+/// A stable identity chain for messages inside one tenant and provider/model
+/// namespace. Namespace components are hashed before conversation messages,
+/// with a distinct separator so user-controlled text cannot move a request
+/// into another scope.
+pub fn identity_chain_in_scope(messages: &[&str], scope: &[&str]) -> Vec<u64> {
     let mut out = Vec::with_capacity(messages.len().min(IDENTITY_DEPTH));
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for part in scope {
+        hash ^= 0xFE;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        for byte in part.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
     for part in messages.iter().take(IDENTITY_DEPTH) {
         // The same separator `fingerprint` uses, and for the same reason:
         // `0xFF` cannot occur in a `&str`, so two different message splits
@@ -1113,6 +1132,46 @@ mod tests {
             fingerprint(&["one conversation"]),
             fingerprint(&["another"])
         );
+    }
+
+    #[test]
+    fn identical_openings_in_different_scopes_get_different_identities() {
+        let tracker = PrefixTracker::new(Duration::ZERO);
+        let identify =
+            |scope: &[&str]| tracker.identify(&identity_chain_in_scope(&["same opening"], scope));
+
+        let base = identify(&["tenant-a", "openai", "gpt-5"]);
+        assert_eq!(identify(&["tenant-a", "openai", "gpt-5"]), base);
+        assert_ne!(identify(&["tenant-b", "openai", "gpt-5"]), base);
+        assert_ne!(identify(&["tenant-a", "anthropic", "gpt-5"]), base);
+        assert_ne!(identify(&["tenant-a", "openai", "gpt-4"]), base);
+    }
+
+    #[test]
+    fn retrieval_promotions_do_not_cross_scopes_with_identical_openings() {
+        let tracker = PrefixTracker::new(Duration::ZERO);
+        let identify = |tenant: &str| {
+            tracker
+                .identify(&identity_chain_in_scope(
+                    &["same opening"],
+                    &[tenant, "openai", "gpt-5"],
+                ))
+                .unwrap()
+        };
+        let tenant_a = identify("tenant-a");
+        let tenant_b = identify("tenant-b");
+        let id = kompressor_engine::refs::ref_for("fragment");
+
+        assert_eq!(tracker.floor(tenant_a, 8), 8);
+        assert_eq!(tracker.floor(tenant_b, 2), 2);
+        assert_eq!(tracker.floor(tenant_a, 3), 3);
+        assert_eq!(tracker.floor(tenant_b, 6), 2);
+
+        tracker.record_retrieved(tenant_a, "req-a", &[id]);
+        tracker.record_retrieved(tenant_a, "req-b", &[id]);
+
+        assert_eq!(tracker.retrieved(Some(tenant_a)), vec![id]);
+        assert!(tracker.retrieved(Some(tenant_b)).is_empty());
     }
 
     #[test]

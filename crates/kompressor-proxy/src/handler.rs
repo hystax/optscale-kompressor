@@ -506,8 +506,9 @@ fn record_discard(state: &ProxyState, identity: &Identity, request_id: &str) {
 /// where it should have read `frozen=1`.
 /// The text of a conversation's opening messages, for the identity chain.
 ///
-/// Everything, in order, capped inside [`prefixcache::identity_chain`] — not a
-/// chosen few. Choosing was the bug: an agent harness opens every conversation
+/// Everything, in order, capped inside
+/// [`prefixcache::identity_chain_in_scope`] — not a chosen few. Choosing was
+/// the bug: an agent harness opens every conversation
 /// with the same preamble, so the first message, and then the first message
 /// plus the first `user` message, both named the CLIENT rather than the
 /// conversation. Measured on a 20-task run, 637 requests fell into five keys,
@@ -516,7 +517,9 @@ fn record_discard(state: &ProxyState, identity: &Identity, request_id: &str) {
 /// The whole opening list does discriminate — two tasks differ somewhere in
 /// it — and it stays stable because a later turn APPENDS, so the opening it
 /// was first seen with is still its opening. Resolving that into an identity
-/// is [`PrefixTracker::identify`]'s job.
+/// is [`PrefixTracker::identify`]'s job. The chain is also scoped to the
+/// authenticated tenant, configured upstream, API family and request model so
+/// identical text across those boundaries cannot share tracker state.
 fn conversation_opening(messages: &[Message]) -> Vec<String> {
     messages
         .iter()
@@ -526,9 +529,11 @@ fn conversation_opening(messages: &[Message]) -> Vec<String> {
 
 fn prefix_identity(
     state: &ProxyState,
+    identity: &Identity,
     family: Option<ApiFamily>,
     mode: ProxyMode,
     body: &Bytes,
+    provider: &str,
 ) -> Option<u64> {
     if mode.is_off() {
         return None;
@@ -538,9 +543,15 @@ fn prefix_identity(
     let walk = walker_for(family).walk(&value)?;
     let opening = conversation_opening(&walk.messages);
     let refs: Vec<&str> = opening.iter().map(String::as_str).collect();
+    let scope = [
+        identity.tenant.as_str(),
+        provider,
+        family.as_str(),
+        walk.model.as_deref().unwrap_or(""),
+    ];
     let fingerprint = state
         .prefixes
-        .identify(&prefixcache::identity_chain(&refs))?;
+        .identify(&prefixcache::identity_chain_in_scope(&refs, &scope))?;
     // Recorded whatever the setting says, so that turning `frozen_prefix` on
     // mid-session finds a watermark describing what the client established
     // rather than whatever this turn happens to mark.
@@ -569,7 +580,7 @@ async fn prepare(
     request_id: &str,
     provider: &str,
 ) -> Prepared {
-    let fingerprint = prefix_identity(state, family, mode, &body);
+    let fingerprint = prefix_identity(state, identity, family, mode, &body, provider);
     let mut prepared = prepare_inner(
         state,
         identity,
@@ -2012,6 +2023,54 @@ mod tests {
         let two = identify("add a changelog entry");
         assert!(one.is_some() && two.is_some());
         assert_ne!(one, two, "the task must reach the identity");
+    }
+
+    #[test]
+    fn identical_openings_do_not_share_prefix_state_across_tenants_or_models() {
+        use kompressor_core::Config;
+        use kompressor_engine::Mode;
+        use kompressor_store::memory::MemoryRefStore;
+        use kompressor_store::types::Tenant;
+
+        let core = kompressor_core::AppCore::new(
+            Config::default(),
+            Arc::new(MemoryRefStore::new()),
+            kompressor_stats::writer::null_sink(),
+        );
+        let state = ProxyState::new(Arc::new(core), reqwest::Client::new());
+        let make_identity = |tenant: &str| Identity {
+            tenant: Tenant::new(tenant),
+            mode: None,
+            trusted: false,
+        };
+        let body = |model: &str| {
+            Bytes::from(
+                json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "same opening"}]
+                })
+                .to_string(),
+            )
+        };
+        let get = |identity: &Identity, provider: &str, model: &str| {
+            prefix_identity(
+                &state,
+                identity,
+                Some(ApiFamily::OpenAiChat),
+                ProxyMode::On(Mode::Recoverable),
+                &body(model),
+                provider,
+            )
+        };
+
+        let tenant_a = make_identity("tenant-a");
+        let tenant_b = make_identity("tenant-b");
+        let first = get(&tenant_a, "openai", "gpt-5");
+        assert_eq!(get(&tenant_a, "openai", "gpt-5"), first);
+        assert_ne!(get(&tenant_b, "openai", "gpt-5"), first);
+        assert_ne!(get(&tenant_a, "anthropic", "gpt-5"), first);
+        assert_ne!(get(&tenant_a, "openai", "gpt-4"), first);
+        assert_eq!(state.prefixes.tracked(), 4);
     }
 
     #[test]
