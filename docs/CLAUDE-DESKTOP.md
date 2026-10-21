@@ -1,179 +1,270 @@
 # Claude Desktop integration
 
-Investigation date: 2026-10-20. Inspected Linux Desktop build: **2.42304.2**.
+Use a local TLS adapter to route the unmodified Claude Desktop **Code tab**
+through Kompressor. Desktop retains its normal subscription login and OAuth
+credentials; no separate API key is needed. Normal plan limits and any enabled
+extra usage still apply. This guide covers Linux with systemd user services.
 
-## Subscription mode is different from Claude Code CLI
+Validated 2026-10-21 with Desktop's bundled Claude Code **2.1.295**.
 
-The `claude` entry in `crates/kompressor-cli/src/wrap/agents.rs` launches the
-CLI with `ANTHROPIC_BASE_URL` and `ENABLE_TOOL_SEARCH=true`. The `--attach`
-implementation in `wrap/mod.rs` instead writes project-local
-`.claude/settings.local.json` environment values.
+```text
+Claude Desktop Code → TLS adapter 127.0.0.1:8840
+                    → Kompressor 127.0.0.1:8817/anthropic
+                    → https://api.anthropic.com
+```
 
-Neither is sufficient for the signed-in Desktop Code tab. Desktop sets its
-own API host when constructing the child process environment. It also filters
-`ANTHROPIC_BASE_URL` out of its local environment editor. Anthropic documents
-this precedence explicitly:
+Both processes must run. Kompressor's HTTP reverse proxy does not implement
+an HTTPS CONNECT proxy: **set `HTTPS_PROXY` to port 8840, not 8817**.
+
+## Why Desktop needs an adapter
+
+The CLI can use `kompressor wrap claude` or `ANTHROPIC_BASE_URL`. Signed-in
+Desktop overrides that base URL, including values supplied through settings.
+Desktop's third-party inference configuration instead uses separate gateway
+credentials. The TLS adapter preserves the normal subscription authentication
+path while allowing Kompressor to inspect Messages requests.
+
+References:
 
 - [Desktop-controlled environment variables](https://code.claude.com/docs/en/desktop#environment-variables-desktop-sets-itself)
 - [Desktop gateway configuration](https://code.claude.com/docs/en/llm-gateway-connect#desktop-app)
+- [Proxy and custom CA configuration](https://code.claude.com/docs/en/network-config)
 
-The supported gateway configuration uses separate gateway credentials. It is
-not a setting that redirects the existing subscription session. Remote Control
-also rejects a custom API base URL, so it is not a documented workaround:
+## 1. Configure and start Kompressor
 
-- [Remote Control requirements](https://code.claude.com/docs/en/remote-control)
+Use the following settings in `~/.config/kompressor/config.toml`. Merge them
+into an existing configuration rather than duplicating TOML tables or replacing
+other upstreams. Replace `/home/YOUR_USER` with your absolute home path; do not
+assume TOML expands `~` or `$HOME`.
 
-## Custom Code integration: live-validated on 2.42304.2
+```toml
+[server]
+listen = "127.0.0.1:8817"
 
-The installed `resources/app.asar` contains an environment builder in
-`.vite/build/index.chunk-DOx99pQU.js`, named `pJ` in this build. Its output
-includes:
+[engine]
+mode = "recoverable"
+max_ref_bytes = 1048576
 
-```javascript
-ANTHROPIC_BASE_URL: e.apiHost,
-CLAUDE_CODE_OAUTH_TOKEN: e.oauthToken,
-ANTHROPIC_API_KEY: "",
-ANTHROPIC_AUTH_TOKEN: "",
+[proxy]
+frozen_prefix = "first_seen"
+
+[refs]
+backend = "sqlite"
+path = "/home/YOUR_USER/.local/share/kompressor/refs.db"
+
+[stats]
+enabled = true
+path = "/home/YOUR_USER/.local/share/kompressor/stats.db"
+
+[[proxy.upstreams]]
+name = "anthropic"
+path_prefix = "/anthropic"
+strip_prefix = true
+base_url = "https://api.anthropic.com"
+api_family = "anthropic"
+forward_auth = true
 ```
 
-An offline test evaluated the actual builder with synthetic inputs and a
-candidate override. Only `ANTHROPIC_BASE_URL` changed for local Code sessions;
-OAuth fields were preserved. The override was disabled for Cowork and
-third-party inference sessions. The isolated experiment below then completed
-live requests through it; see "Live validation".
-
-A deployable integration should:
-
-1. Use an isolated app copy or a reproducible package patch. Verify the app
-   version, bundle hash and unique replacement target before patching.
-2. Opt in through a dedicated launcher. Accept only the configured loopback
-   proxy URL; do not change authentication, login or token refresh endpoints.
-3. Change the local Code child process's API base URL after Desktop composes
-   its environment. Preserve its OAuth handling. Keep tool search enabled.
-4. Start a dedicated Kompressor instance before launching Desktop. Keep its
-   statistics and reference stores separate from sweep databases.
-5. Validate with a new Code session: proxy requests must appear, then a
-   multi-turn file-reading test must produce live handles and a successful
-   retrieval. A successful chat response alone does not prove proxy routing.
-6. Test restart, token refresh, proxy failure, and restore of the original app.
-   Refuse an unrecognized app update instead of applying a stale patch.
-
-Kompressor already parses Anthropic Messages and recognizes Desktop's
-`claude-cli/... (external, claude-desktop)` user agent as a subscription client.
-The earlier Claude Code sweep exercises that Messages compression/retrieval
-path, but does not validate the Desktop launcher.
-
-The dedicated proxy needs an `anthropic` mount for `/v1/messages` forwarding
-to `https://api.anthropic.com`, with `forward_auth=true`. Other `/v1` requests
-(including model discovery) and `/api` requests should use passthrough mounts
-to that same upstream. Put the specific Messages mount before `/v1`.
-
-Use `engine.mode="recoverable"` and, if opting into tail compression,
-`proxy.frozen_prefix="first_seen"`. Monitor cache usage as well as compression:
-this is a deliberate change from the conservative `marker` default.
-Use absolute paths for the stats and reference stores.
-
-## Regular Chat requires separate investigation
-
-The installed app explicitly tracks hosted
-`chat_conversations/<id>/completion`, `completion2`, retry variants, and a
-mobile completion service. These are not Anthropic Messages.
-
-`crates/kompressor-wire/src/lib.rs` supports OpenAI Chat Completions, OpenAI
-Responses and Anthropic Messages. There is no hosted Claude Chat adapter.
-Pointing a mount at `claude.ai` or configuring an HTTPS proxy does not create
-one; passthrough traffic is not compressed.
-
-Before implementing a Chat adapter, capture a controlled, non-sensitive
-conversation and determine:
-
-- whether requests contain history or only a conversation reference and new input;
-- which tool results or attachment contents are locally available to compress;
-- whether the hosted service permits an appropriate retrieval tool;
-- how streamed events, retries and stored conversation state interact.
-
-History assembled only on the remote service cannot be rewritten by a local
-request proxy. Compressing just newly submitted material is a different and
-more limited feature. The request payload of regular Chat was **not captured**
-in this investigation; full-history compression is therefore unproven.
-
-An MCP registration can expose Kompressor tools to Chat, but does not intercept
-its inference requests or automatically compress its conversation history.
-
-## Isolated experiment
-
-The version-pinned preparation script copies the installed Linux app, checks
-the target bundle hash, patches only Code's API URL, and rebuilds ASAR offsets
-and SHA-256 integrity metadata. It refuses to overwrite an experiment directory.
+`first_seen` opts into compressing history beyond the initially frozen prefix;
+monitor cache usage as well as compression. Keep prompt caching enabled.
 
 ```bash
-python3 scripts/claude-desktop-experiment/prepare.py /tmp/claude-kompressor-test
-scripts/claude-desktop-experiment/launch.sh /tmp/claude-kompressor-test
+mkdir -p ~/.local/share/kompressor
+kompressor serve --proxy --api --config ~/.config/kompressor/config.toml
 ```
 
-The launcher uses separate XDG configuration, data and cache directories, starts
-Kompressor on `127.0.0.1:8839`, and stops that proxy when the experiment app
-exits. Sign into the separate profile. Existing Desktop windows and Code
-sessions are not rerouted. The patch leaves Chat and Cowork unchanged.
+Leave this running and use another terminal for the remaining steps. If an
+existing Kompressor service already listens on 8817, use that instance instead
+of launching a second one.
 
-`prepare.py` also writes the sweep's retrieval fixture (`fixture/warmup_1.py`,
-`warmup_2.py`, `ledger.py`) with a fresh planted token in `expected-token.txt`.
-Until the isolated profile has signed in, `launch.sh` routes `claude://` login
-callbacks to it through `~/.local/share/applications/kompressor-claude-experiment.desktop`;
-the original handler is restored on the first callback or on exit. The proxy
-logs to `logs/proxy.log` with `kompressor_proxy=debug`, which names the upstream
-mount of every request but not its body.
+## 2. Install the TLS adapter
 
-Start a new local Code session rooted at `fixture/` and paste `prompt.txt`
-(copied from `scripts/claude-desktop-experiment/prompt.txt`) as one message. Its
-shape matters:
-
-- One read per turn. Reading all three files in one turn put them in the first
-  substantial turn, which `frozen_prefix="first_seen"` leaves alone: zero
-  savings, token read in the clear.
-- A harmless turn after `cat ledger.py`. The proxy never compresses the newest
-  tool result, so `ledger.py` is only folded once another turn follows. The
-  sweep uses `rm ledger.py` there; Desktop's Code session declined to delete a
-  file on pasted instructions and answered in the same request, so the prompt
-  uses `wc -l` instead.
-- A fresh session per attempt. A session that already printed the token can
-  answer from its own reply.
-
-Check progress, per-turn savings, cache usage and the reply with:
+With `uv` installed, run:
 
 ```bash
-python3 scripts/claude-desktop-experiment/status.py /tmp/claude-kompressor-test "<final reply>"
+uv tool install mitmproxy==12.2.3
 ```
 
-`status.py` joins `optimization_events` to `proxy_requests` by `request_id`:
-the proxy leaves `proxy_requests.compression_event_id` NULL even on compressed
-Messages requests (observed for streaming and non-streaming), which is a stats
-bug to fix separately.
+From the root of this repository, install the supplied
+[TLS addon](../scripts/claude-desktop/tls_adapter.py):
 
-Inspect `/tmp/claude-kompressor-test/state/stats.db` for actual proxy requests.
-Starting the app or receiving a Claude reply is not a successful pairing unless
-requests appear there. For a compression test, verify live optimization events
-and successful retrievals as well. The app's normal installation is untouched;
-rollback consists of quitting the experiment.
+```bash
+mkdir -p ~/.local/share/kompressor/claude-tls/mitmproxy
+chmod 700 ~/.local/share/kompressor/claude-tls
+chmod 700 ~/.local/share/kompressor/claude-tls/mitmproxy
+cp scripts/claude-desktop/tls_adapter.py ~/.local/share/kompressor/claude-tls/
 
-## Live validation
+cat > ~/.local/share/kompressor/claude-tls/mitmproxy/config.yaml <<'EOF_CONFIG'
+listen_host: 127.0.0.1
+listen_port: 8840
+allow_hosts:
+  - '^api\.anthropic\.com:443$'
+connection_strategy: lazy
+upstream_cert: false
+flow_detail: 0
+termlog_verbosity: warn
+EOF_CONFIG
+```
 
-Run 2026-10-20, Desktop 2.42304.2, model `claude-opus-5-5`, subscription
-sign-in in the isolated profile, `engine.mode="recoverable"`,
-`frozen_prefix="first_seen"`.
+The addon forwards only `POST /v1/messages` on `api.anthropic.com` to
+`http://127.0.0.1:8817/anthropic/v1/messages`, preserving query parameters and
+credentials. It decodes compressed uploads and streams responses without
+buffering. Other API paths go directly upstream; other HTTPS hosts remain
+CONNECT tunnels. It does not log request bodies or credentials.
 
-- Routing: Code requests reached the proxy as `anthropic_messages` (streaming
-  and non-streaming) and passthrough `/v1` and `/api` traffic, all HTTP 200.
-  OAuth was untouched.
-- Compression: each earlier `cat` result was folded once it stopped being the
-  newest; the request answering the question carried all three files folded,
-  15,309 tokens saved.
-- Retrieval: that request made one retrieve round; the injected tool returned
-  the `reconcile_17` fragment (1,118 characters) and the reply was the planted
-  token. `status.py` reported `RETRIEVED` and `ANSWER CORRECT`.
-- Cache: the folded history stayed byte-stable; the retrieving request read
-  123,004 tokens from cache and wrote 1,276.
+## 3. Install and start the adapter service
 
-Not yet tested: app restart, OAuth token refresh, proxy failure mid-session
-(the patched app has no fallback to the direct API host), and behaviour after
-a Desktop update (prepare.py refuses an unrecognized build).
+The following assumes `uv` installed `mitmdump` in `~/.local/bin`. Check with
+`command -v mitmdump` and adjust `ExecStart` if necessary.
+
+```bash
+mkdir -p ~/.config/systemd/user
+
+cat > ~/.config/systemd/user/kompressor-claude-tls.service <<'EOF_SERVICE'
+[Unit]
+Description=Claude TLS adapter for local Kompressor
+After=kompressor.service
+
+[Service]
+ExecStart=%h/.local/bin/mitmdump --set confdir=%h/.local/share/kompressor/claude-tls/mitmproxy -s %h/.local/share/kompressor/claude-tls/tls_adapter.py
+Restart=on-failure
+RestartSec=3
+UMask=0077
+
+[Install]
+WantedBy=default.target
+EOF_SERVICE
+
+systemctl --user daemon-reload
+systemctl --user enable --now kompressor-claude-tls
+systemctl --user status kompressor-claude-tls
+```
+
+`enable --now` starts the adapter immediately and at future logins. To start it
+only for the current login, use `systemctl --user start kompressor-claude-tls`.
+`After=kompressor.service` orders startup if that service is also started; it
+**does not start Kompressor**. A manually launched Kompressor works too.
+
+For foreground operation instead of systemd, first stop any running adapter
+service to free port 8840, then run:
+
+```bash
+~/.local/bin/mitmdump \
+  --set confdir="$HOME/.local/share/kompressor/claude-tls/mitmproxy" \
+  -s "$HOME/.local/share/kompressor/claude-tls/tls_adapter.py"
+```
+
+## 4. Configure Claude and certificate trust
+
+On its first startup, mitmproxy automatically generates a local CA and reuses
+it on later starts. The public certificate is:
+
+```text
+~/.local/share/kompressor/claude-tls/mitmproxy/mitmproxy-ca-cert.pem
+```
+
+Wait for the service to start and confirm that file exists. Use the certificate
+from this adapter instance. The similarly named `mitmproxy-ca.pem` contains the
+CA's private key and must not be distributed.
+
+Back up `~/.claude/settings.json`, then merge these entries into its `env`
+object, preserving other settings. Replace `/home/YOUR_USER` with your absolute
+home path; JSON does not expand shell variables.
+
+```json
+{
+  "env": {
+    "HTTPS_PROXY": "http://127.0.0.1:8840",
+    "NODE_EXTRA_CA_CERTS": "/home/YOUR_USER/.local/share/kompressor/claude-tls/mitmproxy/mitmproxy-ca-cert.pem",
+    "CLAUDE_CODE_TETHER_LIVE": "0"
+  }
+}
+```
+
+Remove any previous `ANTHROPIC_BASE_URL` override from these Desktop settings.
+`NODE_EXTRA_CA_CERTS` is required in this setup because Claude must trust the
+adapter's locally signed certificate. It can be omitted only when that CA is
+already trusted through a certificate store the client uses. Do not disable TLS
+certificate verification.
+
+**Fully quit and reopen Claude Desktop, then start a new local Code session.**
+
+### Why disable Message Threads?
+
+Bundled Claude Code 2.1.295 enables `message-threads-2026-08-12`: it sends a
+`thread` object and only new messages while Anthropic holds the prior history.
+The proxy cannot compress old tool results that never arrive again. Occasional
+full-history requests still compress, making a routing-only test misleading.
+
+`CLAUDE_CODE_TETHER_LIVE=0` disables Message Threads while retaining prompt
+caching. This is an internal, version-specific switch, not a documented stable
+interface. Revalidate after client upgrades.
+
+## Verify and troubleshoot
+
+```bash
+systemctl --user status kompressor-claude-tls
+journalctl --user -u kompressor-claude-tls -n 20 --no-pager
+ss -ltnp '( sport = :8817 or sport = :8840 )'
+```
+
+Both ports should be listening. A no-credential request verifies TLS trust and
+the route without making a paid model call:
+
+```bash
+curl --silent --show-error --max-time 30 --noproxy '' \
+  --proxy http://127.0.0.1:8840 \
+  --cacert "$HOME/.local/share/kompressor/claude-tls/mitmproxy/mitmproxy-ca-cert.pem" \
+  https://api.anthropic.com/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'anthropic-version: 2023-06-01' \
+  --data '{"model":"claude-sonnet-4-6","max_tokens":1,"messages":[{"role":"user","content":"test"}]}' \
+  -w '\nHTTP %{http_code}\n'
+```
+
+An Anthropic authentication error with HTTP **401** is expected here because
+no credential was supplied. This proves connectivity, not subscription login,
+compression, or retrieval. Verify those with a real Code session and Kompressor
+statistics; join `optimization_events` and `proxy_requests` by `request_id`.
+
+| Symptom | Check |
+| --- | --- |
+| Failed connection or repeated reconnects | `HTTPS_PROXY` must use 8840; both adapter and Kompressor must run. |
+| Address already in use | Do not run manual and service instances on the same port. |
+| Certificate verification failure | Check the absolute CA path and that it belongs to the running adapter. |
+| Claude works but old tool results stay full | Check `CLAUDE_CODE_TETHER_LIVE=0`, restart Desktop, and use a fresh session. |
+| Requests still bypass the adapter | Check other environment/settings overrides, lowercase proxy variables, and `NO_PROXY` bypasses. |
+
+For retrieval validation, prepare fresh fixture files before starting the
+session, attach no files, and read `warmup_1.py`, `warmup_2.py`, then `ledger.py`
+in separate tool calls. Follow with `wc -l warmup_1.py` before asking for the
+hidden string in `ledger.py`'s `reconcile_17`. Use a fresh planted string and do
+not reread the file: the model must retrieve its elided body. Full attached
+copies or an answer already present in the conversation invalidate this test.
+
+A controlled test through the TLS adapter using Desktop's bundled 2.1.295
+binary and saved user settings removed **15,303 tokens** on the final request,
+performed **one retrieval round**, and returned the correct fresh string.
+That request recorded 45,803 cache-read tokens summed across retrieval rounds.
+A real GUI session must also be checked after changing settings. OAuth refresh
+and behaviour after future client upgrades are not established by this test.
+
+## Stop or undo the integration
+
+Restore the backed-up Claude settings, or remove the three added environment
+entries while preserving unrelated settings, then restart Desktop. Stop the
+adapter and disable its login startup with:
+
+```bash
+systemctl --user disable --now kompressor-claude-tls
+```
+
+Stopping the adapter while Claude still points to it causes connection failures.
+Kompressor may continue serving other clients independently.
+
+## Regular Chat is separate
+
+This integration covers the Code tab's Anthropic Messages calls. Hosted Claude
+Chat uses different endpoints and has no Kompressor wire adapter. An MCP
+registration can expose retrieval tools to Chat, but does not intercept its
+inference requests or automatically compress server-held conversation history.
