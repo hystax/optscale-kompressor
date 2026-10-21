@@ -30,11 +30,6 @@ Desktop's third-party inference configuration instead uses separate gateway
 credentials. Intercepting preserves the normal subscription authentication
 path while allowing Kompressor to inspect Messages requests.
 
-Earlier versions of this document used mitmproxy and a Python addon for the
-TLS side. That is no longer needed: `[proxy.intercept]` does the same work
-inside the binary. [Migrating from the Python adapter](#migrating-from-the-python-adapter)
-has the steps.
-
 References:
 
 - [Desktop-controlled environment variables](https://code.claude.com/docs/en/desktop#environment-variables-desktop-sets-itself)
@@ -89,14 +84,12 @@ api_family = "passthrough"
 forward_auth = true
 ```
 
-`[proxy.intercept]` is the listener that replaces the external TLS adapter. It
-is off unless `listen` names an address, so an upgrade never starts one by
-surprise.
+`[proxy.intercept]` is the listener that does this. It is off unless `listen`
+names an address, so an upgrade never starts one by surprise.
 
 The mounts are `/v1` and `/api`, not `/anthropic`. An intercepted request keeps
-the path the client sent — the adapter had to rewrite to another port because
-it was forwarding over HTTP to a separate process, and nothing in process needs
-that indirection. `/api` is required as well as `/v1`: a Code session probes
+the path the client sent, and the listener serves it from the same process, so
+there is no rewriting and no second port. `/api` is required as well as `/v1`: a Code session probes
 `/api/hello` and signs in through `/api/oauth/*`, and without a mount for them
 it takes a 404 from the proxy mid-session.
 
@@ -224,13 +217,13 @@ statistics; join `optimization_events` and `proxy_requests` by `request_id`.
 | Symptom | Check |
 | --- | --- |
 | Failed connection or repeated reconnects | `HTTPS_PROXY` must name the `[proxy.intercept] listen` port, and Kompressor must be running. |
-| Address already in use | The old mitmproxy adapter is still bound to 8840. Stop it, or give the listener another port. |
+| Address already in use | Something else holds the `listen` port. Find it with `ss -ltnp \| grep 8840`, or give the listener another port. |
 | `TLS handshake failed` in the log | Two causes, indistinguishable from the server side. Check `alpn` contains `h2` first — Desktop offers only that — then `NODE_EXTRA_CA_CERTS`. The log line reports what was advertised. |
 | Mid-session 404 from the proxy | No `/api` mount; a session probes `/api/hello` and signs in through `/api/oauth/*`. |
 | Anthropic traffic reaching `api.openai.com` or `chatgpt.com` | Two mounts claim `/v1`, or this mount was inserted above a `[proxy.upstreams.subscription]` block and adopted it. |
 | `intercept is listening with no intercept_hosts` | `intercept_hosts` is empty, so every connection is tunnelled. A working listener that compresses nothing. |
 | Claude works but old tool results stay full | Check `CLAUDE_CODE_TETHER_LIVE=0`, restart Desktop, and use a fresh session. |
-| Requests still bypass the adapter | Check other environment/settings overrides, lowercase proxy variables, and `NO_PROXY` bypasses. |
+| Requests still bypass the listener | Check other environment/settings overrides, lowercase proxy variables, and `NO_PROXY` bypasses. |
 
 For retrieval validation, prepare fresh fixture files before starting the
 session, attach no files, and read `warmup_1.py`, `warmup_2.py`, then `ledger.py`
@@ -239,96 +232,15 @@ hidden string in `ledger.py`'s `reconcile_17`. Use a fresh planted string and do
 not reread the file: the model must retrieve its elided body. Full attached
 copies or an answer already present in the conversation invalidate this test.
 
-A controlled test through the TLS adapter using Desktop's bundled 2.1.295
-binary and saved user settings removed **15,303 tokens** on the final request,
-performed **one retrieval round**, and returned the correct fresh string.
-That request recorded 45,803 cache-read tokens summed across retrieval rounds.
-A real GUI session must also be checked after changing settings. OAuth refresh
-and behaviour after future client upgrades are not established by this test.
+What has been verified of this path: a request reaches `api.anthropic.com`
+through the listener over HTTP/2, with a certificate minted for the SNI and
+verified by the client against the generated CA. That is connectivity and
+routing.
 
-## Migrating from the Python adapter
-
-If mitmproxy is already serving this integration, the switch is six steps. The
-`HTTPS_PROXY` and `CLAUDE_CODE_TETHER_LIVE` settings do not change; only the
-thing listening on the port and the CA behind it do.
-
-**1. Stop the adapter and keep it stopped.** It holds port 8840, which the
-listener is about to want.
-
-```bash
-systemctl --user disable --now kompressor-claude-tls
-```
-
-**2. Check the port is actually free.** A manually launched `mitmdump` is not
-covered by the unit above.
-
-```bash
-ss -ltnp | grep 8840 || echo "8840 is free"
-```
-
-**3. Add `[proxy.intercept]` to the configuration** as in step 1, then restart
-Kompressor and confirm it came up intercepting rather than merely listening.
-
-```bash
-systemctl --user restart kompressor
-journalctl --user -u kompressor -n 20 --no-pager | grep -iE 'intercepting|certificate authority'
-```
-
-**4. Point the trust at the new CA.** This is the one settings change. In
-`~/.claude/settings.json`, replace the `NODE_EXTRA_CA_CERTS` value with
-`ca_path/ca.pem`; leave `HTTPS_PROXY` and `CLAUDE_CODE_TETHER_LIVE` alone.
-
-```bash
-grep -o '"NODE_EXTRA_CA_CERTS": "[^"]*"' ~/.claude/settings.json
-```
-
-**5. Prove the route before involving Desktop**, which costs nothing and fails
-faster than a session does. HTTP **401** is the expected answer: it is
-Anthropic rejecting a request with no credential, which means the whole path
-worked.
-
-```bash
-curl --silent --show-error --max-time 30 --noproxy '' \
-  --proxy http://127.0.0.1:8840 \
-  --cacert "$HOME/.local/share/kompressor/ca/ca.pem" \
-  https://api.anthropic.com/v1/messages \
-  -w '\nHTTP %{http_code}\n'
-```
-
-**6. Fully quit and reopen Desktop, then start a new Code session.** A running
-session keeps the environment it was spawned with, so a reopened tab is not
-enough.
-
-Then check that traffic is arriving, by request rather than by summary:
-
-```bash
-sqlite3 ~/.local/share/kompressor/stats.db \
-  'select datetime(time_ms/1000,"unixepoch","localtime"), api_family, upstream, status
-   from proxy_requests order by id desc limit 10;'
-```
-
-### Rolling back
-
-Nothing is destroyed by trying this: the mitmproxy configuration directory and
-its CA stay where they were. To go back, stop Kompressor, restore the previous
-`NODE_EXTRA_CA_CERTS` value, and `systemctl --user enable --now
-kompressor-claude-tls`. Only one of the two may hold the port at a time.
-
-### Removing mitmproxy once it is no longer needed
-
-Leave this until the built-in listener has carried a few real sessions.
-
-```bash
-systemctl --user disable --now kompressor-claude-tls
-rm ~/.config/systemd/user/kompressor-claude-tls.service
-systemctl --user daemon-reload
-uv tool uninstall mitmproxy
-```
-
-The adapter's own CA is still trusted by whatever you installed it in. Remove
-it from that trust store, then delete
-`~/.local/share/kompressor/claude-tls/`, which holds both the addon and the
-adapter's CA private key.
+Compression and retrieval figures through this listener have **not** been
+re-measured; neither has OAuth refresh, nor behaviour after a client upgrade.
+Treat the procedure above as the way to establish them, not as something
+already established.
 
 ## Stop or undo the integration
 
@@ -349,6 +261,6 @@ identifies the right one.
 ## Regular Chat is separate
 
 This integration covers the Code tab's Anthropic Messages calls. Hosted Claude
-Chat uses different endpoints and has no Kompressor wire adapter. An MCP
+Chat uses different endpoints, which this listener does not intercept. An MCP
 registration can expose retrieval tools to Chat, but does not intercept its
 inference requests or automatically compress server-held conversation history.
