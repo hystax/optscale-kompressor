@@ -67,6 +67,7 @@ pub mod bodycodec;
 pub mod failopen;
 mod handler;
 pub mod headers;
+pub mod intercept;
 pub mod mode;
 mod nonstream;
 mod piggyback;
