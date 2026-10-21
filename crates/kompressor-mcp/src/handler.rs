@@ -193,6 +193,8 @@ impl KompressorTools {
         let for_store = identity.clone();
         let request_id = request.request_id.to_string();
         let reference = normalize_handle(&input.reference).to_string();
+        // Kept for the note after the move into the blocking closure.
+        let handle = reference.clone();
         let range = input.range.map(Into::into);
         let retrieved = blocking(move || {
             core.retrieve(
@@ -237,6 +239,21 @@ impl KompressorTools {
         let mut result =
             CallToolResult::structured(serde_json::to_value(&output).map_err(internal)?);
         result.content = vec![ContentBlock::text(text)];
+        // ...and a second block for what the envelope says, when it says
+        // something the model should act on.
+        //
+        // Not every client surfaces `structuredContent`. Claude Desktop's chat
+        // shows the text blocks alone, and a model there reported `found` and
+        // `total_lines` as simply absent — so the one field that carries an
+        // instruction, `truncated`, was invisible precisely where the tool
+        // description tells the model to narrow the range and ask again.
+        //
+        // Kept out of the first block so a fragment stays quotable verbatim,
+        // and omitted entirely when the whole fragment came back, which is the
+        // case that needs no commentary.
+        if let Some(note) = envelope_note(&output, &handle) {
+            result.content.push(ContentBlock::text(note));
+        }
         Ok(result)
     }
 
@@ -445,6 +462,32 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// What the envelope says, for clients that never show the envelope.
+///
+/// `None` when the whole fragment came back intact: the content speaks for
+/// itself and a note would be noise on every retrieval. Something is returned
+/// only when the model is holding part of a fragment, because then "how much is
+/// there" and "was this cut" change what it should do next.
+fn envelope_note(output: &RetrieveOutput, reference: &str) -> Option<String> {
+    if !output.found {
+        // The miss already explains itself in the first block.
+        return None;
+    }
+    if output.truncated {
+        return Some(format!(
+            "[kompressor: TRUNCATED at the size cap. ref:{reference} holds {} lines / {} chars.              Ask again with a narrower range rather than assuming this is all of it.]",
+            output.total_lines, output.total_chars
+        ));
+    }
+    if output.ranged {
+        return Some(format!(
+            "[kompressor: a range of ref:{reference}, which holds {} lines / {} chars in full.]",
+            output.total_lines, output.total_chars
+        ));
+    }
+    None
 }
 
 fn internal(error: serde_json::Error) -> ErrorData {

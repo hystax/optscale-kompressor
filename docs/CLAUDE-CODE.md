@@ -19,6 +19,7 @@ login (`oauth-2025-04-20`), model `claude-opus-5[1m]`, OptScale Kompressor in
 - [Why nothing compresses](#why-nothing-compresses)
 - [Do not disable prompt caching](#do-not-disable-prompt-caching)
 - [Verify it for yourself](#verify-it-for-yourself)
+  - [Do not ask the model](#do-not-ask-the-model)
 - [Reading the outcome field](#reading-the-outcome-field)
 - [What the proxy changes about your request](#what-the-proxy-changes-about-your-request)
 - [When wrapping Claude Code is still worth it](#when-wrapping-claude-code-is-still-worth-it)
@@ -262,6 +263,34 @@ payloads a compression proxy exists for are exactly the ones this client
 disposes of first. What reaches the engine is the traffic already small enough
 that Claude Code did not consider it worth persisting.
 
+#### Where the line is
+
+**30,720 bytes — 30 KiB.** Measured against 2.1.299 by reading files of known
+size in one session and checking which came back wrapped:
+
+| output | result |
+|---|---|
+| 8K, 12K, 16K, 20K, 24K, 28K, 29K, 30,000 bytes | arrives inline |
+| 30,720 bytes (30 KiB), 31K, 32K | `<persisted-output>`, ~2 KB preview |
+
+So the band in which compression can do anything at all through a Bash tool is
+between `min_compress_chars` and that ceiling:
+
+| size | what happens |
+|---|---|
+| under 512 B | below `min_compress_chars`; nothing to do |
+| **512 B – 30 KiB** | **the engine sees it and can compress it** |
+| 30 KiB and over | withheld by the client; the proxy never sees it |
+
+`BASH_MAX_OUTPUT_LENGTH` appears in the binary beside this logic, so the ceiling
+may be raisable, but that is untested here.
+
+The practical consequence is for anyone building a fixture to exercise this: a
+test file of 36 KB produces no compression and no markers, and the session will
+report — accurately — that every line arrived intact. That is the client
+withholding it, not the engine declining it. The sweep's own code fixture takes
+`--compact` for this reason, which brings it to roughly 21 KB.
+
 ## Do not disable prompt caching
 
 `DISABLE_PROMPT_CACHING=1` removes the breakpoints, and compression does start
@@ -286,6 +315,46 @@ Code. The fix, if one ever exists, is client-side: a breakpoint placed before
 the tool-result history rather than after it.
 
 ## Verify it for yourself
+
+### Do not ask the model
+
+The obvious test is to ask the session what it sees: whether bodies arrived as
+markers, which handles it was given, to quote a marker line. Every one of those
+questions returns "no compression happened", in sessions where the engine
+removed fifteen thousand tokens from a single request.
+
+The model is not wrong, and it is not a reliable witness. With
+`retrieve_execution = "server"` — the default — the proxy elides on the way out,
+resolves the handles itself, and the model is handed resolved content. It
+reports what it was given. Measured on one run:
+
+```text
+tokens_in   tokens_out   removed   refs_emitted
+   22,875        7,576    15,299            20
+
+retrieval_events: 3, 8,476 chars returned
+tools the model called: Bash, Bash, Bash, Bash
+```
+
+Twenty bodies elided, three retrievals executed, and from inside the
+conversation nothing visibly happened. A report of "every line is present as
+literal source" is compatible with all of that.
+
+Ask the ledger instead:
+
+```bash
+sqlite3 ~/.local/share/kompressor/stats.db \
+  'select tokens_in, tokens_out, tokens_in - tokens_out as removed, refs_emitted
+   from optimization_events where outcome = "compressed" order by id desc limit 5;'
+```
+
+A model only becomes a witness worth questioning when the handles reach it
+unresolved — `retrieve_execution` set so the client answers, or the MCP surface
+where the model calls `optscale_kompressor_retrieve` itself. Those are the
+configurations the retrieval fixtures are built for, and they are not the
+default.
+
+### What the session says on exit
 
 A wrapped session tells you as it exits, and on Claude Code the expected
 reading is the middle one — traffic arrived, and none of it was eligible:

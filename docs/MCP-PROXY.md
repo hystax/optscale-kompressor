@@ -180,6 +180,16 @@ A fold of *identical* lines — `connection refused [×380]` — carries no hand
 and needs none: the count preserves everything. That is a compressed result, not
 a failed one.
 
+**Ask the database, not the model.** A session asked what it sees will report
+that nothing was compressed even when thousands of tokens were removed, because
+the handles are resolved before the content reaches it. The rows above are the
+evidence; the model's account of its own context is not.
+
+This surface is the exception worth knowing about: a model that calls
+`optscale_kompressor_retrieve` itself *is* a witness, because the tool call
+appears in the transcript. That is the one place asking is meaningful — and what
+to ask is "did you call retrieve", not "do you see markers".
+
 ## When it does not work
 
 | symptom | cause |
