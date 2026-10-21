@@ -13,18 +13,19 @@ kompressor-engine = { path = "../kompressor-engine" }
 kompressor-stats = { path = "../kompressor-stats" }
 kompressor-store = { path = "../kompressor-store" }
 
-rmcp = { version = "3.3.0", features = ["server", "macros", "transport-streamable-http-server", "transport-io"] }
+rmcp = { version = "3.3.0", features = ["server", "client", "macros", "transport-streamable-http-server",  "transport-child-process", "transport-io"] }
 schemars = "1"
 
 axum = { workspace = true }
 http = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
 tower-service = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 parking_lot = { workspace = true }
 anyhow = { workspace = true }
-tracing = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }

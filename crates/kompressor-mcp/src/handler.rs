@@ -91,7 +91,10 @@ impl KompressorTools {
     ///
     /// Read from the connection, never from the call's arguments. A `tenant`
     /// field in a tool's arguments reaches no code at all.
-    fn identity(&self, context: &RequestContext<RoleServer>) -> Result<Identity, ErrorData> {
+    pub(crate) fn identity(
+        &self,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<Identity, ErrorData> {
         match &self.identity {
             IdentitySource::Fixed(identity) => Ok((**identity).clone()),
             IdentitySource::Connection => context
@@ -117,7 +120,7 @@ impl KompressorTools {
     ///
     /// The JSON-RPC id is reused so a row in the statistics database can be
     /// matched back to the exact tool call that produced it.
-    fn request_id(context: &RequestContext<RoleServer>) -> String {
+    pub(crate) fn request_id(context: &RequestContext<RoleServer>) -> String {
         format!("mcp-{}", context.id)
     }
 }

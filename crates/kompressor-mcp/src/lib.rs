@@ -56,6 +56,7 @@ pub mod handler;
 pub mod http;
 pub mod identity;
 pub mod limit;
+pub mod proxy;
 pub mod stdio;
 pub mod wire;
 
@@ -64,4 +65,4 @@ pub use handler::KompressorTools;
 pub use http::mcp_router;
 pub use identity::IdentitySource;
 pub use limit::{Decision, RetrievalLimiter};
-pub use stdio::{serve_pipe, serve_stdio};
+pub use stdio::{serve_pipe, serve_proxy_pipe, serve_stdio};

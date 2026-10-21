@@ -184,8 +184,10 @@ pub enum WireRange {
     /// A 1-based inclusive line window, the way an editor addresses a file.
     Lines {
         /// First line to return, counting from 1.
+        #[schemars(schema_with = "non_negative_integer")]
         start: usize,
         /// Last line to return, included.
+        #[schemars(schema_with = "non_negative_integer")]
         end: usize,
     },
     /// An RFC 6901 pointer into a fragment that is JSON, such as `/3/items`.
@@ -196,8 +198,10 @@ pub enum WireRange {
     /// A character window, half-open and snapped to character boundaries.
     Chars {
         /// First character to return, counting from 0.
+        #[schemars(schema_with = "non_negative_integer")]
         start: usize,
         /// One past the last character to return.
+        #[schemars(schema_with = "non_negative_integer")]
         end: usize,
     },
     /// Lines containing a literal substring, with surrounding context lines.
@@ -206,6 +210,7 @@ pub enum WireRange {
         pattern: String,
         /// How many lines of context to keep on each side of a match.
         #[serde(default = "default_context")]
+        #[schemars(schema_with = "non_negative_integer")]
         context: usize,
     },
 }
@@ -238,6 +243,27 @@ pub struct RetrieveInput {
     pub range: Option<WireRange>,
 }
 
+/// A count, as JSON Schema can actually express one.
+///
+/// `schemars` renders a `usize` as `{"type": "integer", "format": "uint"}`, and
+/// `uint` is not a JSON Schema format. Validators are required to ignore an
+/// unknown format, so nothing breaks — but Claude Code says so out loud, once
+/// per schema, on every session that lists these tools:
+///
+/// ```text
+/// unknown format "uint" ignored in schema at path "#/properties/total_chars"
+/// ```
+///
+/// That is noise in the one place a user is trying to read what went wrong, and
+/// it doubles when the tool reaches a client twice. `minimum: 0` says the same
+/// thing in the vocabulary the specification defines.
+fn non_negative_integer(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "integer",
+        "minimum": 0
+    })
+}
+
 /// The result of `optscale_kompressor_retrieve`.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 pub struct RetrieveOutput {
@@ -251,8 +277,10 @@ pub struct RetrieveOutput {
     /// A range was applied, so `content` is part of the fragment, not all of it.
     pub ranged: bool,
     /// Lines in the whole fragment, not in what was returned.
+    #[schemars(schema_with = "non_negative_integer")]
     pub total_lines: usize,
     /// Characters in the whole fragment, not in what was returned.
+    #[schemars(schema_with = "non_negative_integer")]
     pub total_chars: usize,
     /// The result hit the server's size cap and was cut. Narrow it with a range.
     pub truncated: bool,

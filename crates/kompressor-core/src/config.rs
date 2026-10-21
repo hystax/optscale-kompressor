@@ -187,6 +187,48 @@ impl Default for RefsConfig {
 /// Off unless [`Self::listen`] names an address. A CONNECT proxy that appeared
 /// because somebody upgraded would be an unpleasant surprise, and a listener
 /// holding a signing key more so.
+/// An MCP server this one fronts.
+///
+/// Proxy mode exists for clients that cannot be pointed at the HTTP proxy at
+/// all — Claude Desktop's Chat tab among them. Their inference requests carry
+/// no bulk worth eliding, because the conversation lives on the server; the
+/// bulk they carry is **tool results**, which are machine-facing in exactly the
+/// way tool output in a coding agent is. Fronting the servers that produce
+/// those results compresses them without touching anything a person reads.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpServerConfig {
+    /// Prefixes this server's tool names, so two servers exporting `read_file`
+    /// do not shadow each other.
+    pub name: String,
+    /// Spawned, speaking JSON-RPC on its pipe. Exclusive with [`Self::url`].
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    /// Extra environment for a spawned server. The parent's is inherited.
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Connected to over streamable HTTP. Exclusive with [`Self::command`].
+    pub url: Option<String>,
+    /// Whether results from this server are compressed at all.
+    ///
+    /// False forwards them untouched, which is right for a server whose results
+    /// are already small or structurally fragile: excluding one is better than
+    /// tuning the engine around it.
+    pub compress: bool,
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        McpServerConfig {
+            name: String::new(),
+            command: None,
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            url: None,
+            compress: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct InterceptConfig {
@@ -280,6 +322,8 @@ impl Default for RetrieveConfig {
 pub struct McpConfig {
     pub enabled: bool,
     pub path: String,
+    /// Servers this one fronts. Empty, the default, serves only our own tools.
+    pub servers: Vec<McpServerConfig>,
     /// Empty means any host is accepted, which is right for an internal service.
     pub allowed_hosts: Vec<String>,
     pub max_retrievals_per_minute: u32,
@@ -290,6 +334,7 @@ impl Default for McpConfig {
         McpConfig {
             enabled: true,
             path: "/mcp".to_string(),
+            servers: Vec::new(),
             allowed_hosts: Vec::new(),
             max_retrievals_per_minute: 120,
         }

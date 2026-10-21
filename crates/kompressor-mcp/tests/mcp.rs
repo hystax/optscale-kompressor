@@ -949,3 +949,36 @@ async fn the_ref_store_the_router_is_built_on_is_the_one_the_config_asks_for() {
         "the fragment must land in the store the deployment configured"
     );
 }
+
+/// Every count in a tool schema uses JSON Schema's own vocabulary.
+///
+/// `schemars` renders a `usize` with `"format": "uint"`, which is not a format
+/// the specification defines. Validators ignore it, so nothing breaks — but
+/// Claude Code prints a warning for each one, on every session that lists these
+/// tools, in the place a user reads to find out what went wrong. This keeps the
+/// next `usize` added to a wire type from quietly putting it back.
+#[test]
+fn no_tool_schema_declares_a_format_json_schema_does_not_define() {
+    use schemars::schema_for;
+
+    for (name, schema) in [
+        (
+            "RetrieveInput",
+            schema_for!(kompressor_mcp::wire::RetrieveInput),
+        ),
+        (
+            "RetrieveOutput",
+            schema_for!(kompressor_mcp::wire::RetrieveOutput),
+        ),
+        (
+            "CompressInput",
+            schema_for!(kompressor_mcp::wire::CompressInput),
+        ),
+    ] {
+        let rendered = serde_json::to_string(&schema).expect("schema serialises");
+        assert!(
+            !rendered.contains("\"uint"),
+            "{name} still declares a uint format: use #[schemars(schema_with = \"non_negative_integer\")]"
+        );
+    }
+}

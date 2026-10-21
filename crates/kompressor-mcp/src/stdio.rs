@@ -35,7 +35,39 @@ const ENV_TENANT: &str = "KOMPRESSOR_TENANT";
 /// report it rather than exiting silently.
 pub async fn serve_stdio(core: Arc<AppCore>) -> anyhow::Result<()> {
     let identity = stdio_identity(&core)?;
-    serve_pipe(core, identity, stdio()).await
+    // Proxy mode only when something is configured to be fronted: a runtime
+    // that launched this expecting our four tools gets exactly those, and a
+    // session with no fronted servers does not pay for the machinery.
+    if core.config().mcp.servers.is_empty() || crate::proxy::is_fronted() {
+        serve_pipe(core, identity, stdio()).await
+    } else {
+        serve_proxy_pipe(core, identity, stdio()).await
+    }
+}
+
+/// Serve proxy mode over a pipe: our tools plus every fronted server's.
+///
+/// Split from [`serve_pipe`] rather than folded into it so the no-server case
+/// stays exactly what it was, and so a test can drive this one with a client on
+/// the other end of a duplex.
+pub async fn serve_proxy_pipe<T, E, A>(
+    core: Arc<AppCore>,
+    identity: Identity,
+    transport: T,
+) -> anyhow::Result<()>
+where
+    T: IntoTransport<RoleServer, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let limiter = Arc::new(RetrievalLimiter::new(
+        core.config().mcp.max_retrievals_per_minute,
+    ));
+    let servers = core.config().mcp.servers.clone();
+    let tools = KompressorTools::for_identity(core.clone(), limiter, identity);
+    let proxy = crate::proxy::ProxyTools::connect(tools, core, &servers).await;
+    let service = rmcp::ServiceExt::serve(proxy, transport).await?;
+    service.waiting().await?;
+    Ok(())
 }
 
 /// Serve the tools over any byte pipe, acting for one fixed identity.
