@@ -71,10 +71,13 @@ Why this key and not an environment variable: under a ChatGPT plan, Codex routes
 through its built-in `openai` provider whatever `model_provider` says, and only
 the top-level `openai_base_url` catches that. `OPENAI_BASE_URL` is ignored.
 
-> **Unverified for the Codex desktop app.** Everything in `CODEX.md` was
-> measured against **codex-cli 0.155.1**. Whether the GUI reads the same config
-> file, has its own base-URL setting, or ignores the key entirely is not known
-> here. Step 5 is how you find out.
+> **Unverified for the Codex desktop app.** The measurements behind `CODEX.md`
+> and this page were taken against **codex-cli** — 0.155.1 originally, and
+> 0.163.0-alpha.11.1 for the sweep that produced the current numbers. Whether
+> the GUI reads the same config file, has its own base-URL setting, or ignores
+> the key entirely has not been measured. Step 5 is how you find out, and
+> [WebSocket mode](#websocket-mode) is the other half of the answer: a GUI on a
+> ChatGPT plan uses the same built-in provider, so it opens the same upgrade.
 
 ## 5. Confirm traffic is flowing
 
@@ -99,6 +102,55 @@ system service. The config lives at `~/.config/kompressor/config.toml`, which is
 on the loader's search path, and the store is under your own home directory. The
 Linux package installs its config to `/etc/kompressor/config.toml`, which is
 **not** searched, so the same command there needs the path naming explicitly.
+
+## WebSocket mode
+
+Codex opens `ws://127.0.0.1:8817/v1/responses` before it tries HTTPS. On a
+ChatGPT plan that preference cannot be turned off from any key codex reads, so
+every subscription session — desktop or CLI — arrives as an upgrade request.
+Relaying it is what makes such a session compressible at all.
+
+The relay is **on by default**. Set it anyway:
+
+```toml
+[proxy]
+websocket_relay = true
+```
+
+Writing it out matters more than it looks. Commenting the key out does not
+disable the relay, it only hides which way it is set — a config carrying
+`# relay disabled` above a commented-out `websocket_relay = true` is a config
+whose relay is on. Confirm what is actually in force rather than reading the
+file:
+
+```bash
+kompressor check-config --config ~/.config/kompressor/config.toml | grep websocket_relay
+```
+
+To turn it off — for an operator who would rather have the token numbers than
+the saving — `websocket_relay = false`, or
+`KOMPRESSOR__PROXY__WEBSOCKET_RELAY=false` for one run. That restores the
+refusal, the fallback and the thirteen-second stall along with the accounting.
+
+An **API-key** session needs none of this: `kompressor wrap codex` writes
+`supports_websockets = false` on the provider block it creates, which suppresses
+the attempt entirely. The key exists only on a provider block, so it is
+unavailable to the subscription path, which uses the built-in provider.
+
+### Watching a relayed session
+
+Nothing is written unless asked for. Name a file and the relay records the
+frames it carried:
+
+```bash
+KOMPRESSOR_WS_CAPTURE=~/kompressor-ws-frames.jsonl \
+  kompressor serve --proxy --config ~/.config/kompressor/config.toml
+```
+
+An empty or absent file after a codex session means the traffic went over HTTP,
+not that compression failed. A session whose `optimization_events` show savings
+while its `proxy_requests` show null token counts is the normal signature of a
+relayed turn.
 
 ## Where the config is read from
 
@@ -159,10 +211,16 @@ substituted in. Keep your changes in the config file instead.
 That is what a LaunchAgent is: the proxy serves the agents in your login session
 and reads your config, which a root daemon has no business doing.
 
-**A subscription session pays a WebSocket handshake.** `openai_base_url`
-overrides the built-in provider's URL but cannot disable its WebSocket
-preference, so expect five attempts before it falls back to HTTPS. Not a
-misconfiguration.
+**A subscription session opens a WebSocket, and the relay answers it.**
+`openai_base_url` overrides the built-in provider's URL but cannot disable its
+transport preference, and no top-level key can. Since 0.14.0 the proxy relays
+that upgrade rather than refusing it, so the five attempts and roughly thirteen
+seconds of dead air this section used to describe are gone.
+
+What a relayed session costs is the accounting, not the latency: the relay never
+reads a `response.completed`, so its token counts are filed null and no cost
+report prices it. The saving is real and uncounted. See
+[WebSocket mode](#websocket-mode).
 
 | | |
 |---|---|
