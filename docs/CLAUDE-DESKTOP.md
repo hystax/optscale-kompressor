@@ -24,6 +24,13 @@ uses when it cannot be.
 
 ## Why Desktop needs intercepting
 
+![Claude Desktop without kompressor](charts/desktop-baseline.drawio.png)
+
+The two tabs reach different providers over different protocols with different
+credentials, which is why neither is wrapped the way a CLI is. Both charts here
+are `.drawio.png`: picture and source in one file, re-exported with `-e`.
+
+
 The CLI can use `kompressor wrap claude` or `ANTHROPIC_BASE_URL`. Signed-in
 Desktop overrides that base URL, including values supplied through settings.
 Desktop's third-party inference configuration instead uses separate gateway

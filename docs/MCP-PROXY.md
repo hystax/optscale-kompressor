@@ -25,6 +25,15 @@ compresses the whole request, which is strictly more.
 
 ## What it does
 
+![Compressing the Chat tab](charts/mcp-proxy.drawio.png)
+
+For what this looks like with nothing in front of it, see
+[the baseline](charts/desktop-baseline.drawio.png) — the Chat half of it is the
+argument for this mode.
+
+The chart is a `.drawio.png`: the picture and its source are the same file, so
+opening it in drawio edits both. Re-export with `-e` or the source is lost.
+
 ```text
 Claude Desktop Chat
   └─ kompressor mcp serve            registered as an MCP server
