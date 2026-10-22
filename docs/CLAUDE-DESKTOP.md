@@ -118,12 +118,16 @@ attaches that table to the most recent `[[proxy.upstreams]]`, so a mount
 inserted above one adopts it and forwards subscription traffic to the wrong
 provider.
 
-> **Since 1.1.0 the packaged default already carries these mounts**, along with
-> `frozen_prefix` and `websocket_relay`. On a clean install there is nothing to
-> add here; `[proxy.intercept]` is the only block shipped commented out, because
-> an installed package should not open a CONNECT proxy or generate a certificate
-> authority without being asked. An upgrade never rewrites an existing config, so
-> a machine that already had one keeps it and needs the edits above.
+> **Since 1.1.0 the packaged default already carries all of this** — the mounts,
+> `frozen_prefix`, `websocket_relay` and `[proxy.intercept]` itself. On a clean
+> install there is nothing to add here: the listener comes up on 8840 and the
+> certificate authority is generated on first start. Steps 2 and 3 below are
+> still yours to do, because trusting that CA and pointing Desktop at the proxy
+> are decisions a package cannot make for you.
+>
+> An upgrade never rewrites an existing config, so a machine that already had
+> one keeps it and needs the edits above. dpkg leaves the new default at
+> `/etc/kompressor/config.toml.dpkg-dist` to merge from.
 
 `first_seen` opts into compressing history beyond the initially frozen prefix;
 monitor cache usage as well as compression. Keep prompt caching enabled.

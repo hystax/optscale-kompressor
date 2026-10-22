@@ -58,22 +58,32 @@ frozen_prefix = "first_seen"
 # key out does not disable the relay, it only hides which way it is set.
 websocket_relay = true
 
-# --- Claude Desktop's Code tab (optional) ------------------------------------
+# --- Claude Desktop's Code tab ------------------------------------
 # Desktop overwrites ANTHROPIC_BASE_URL when it spawns a session, so there is no
 # base URL to point at this proxy. It does honour HTTPS_PROXY and a custom CA.
 #
-# Left commented deliberately. Uncommenting opens a CONNECT proxy and generates
-# a local certificate authority on first start; an installed package should not
-# do either without being asked. See docs/CLAUDE-DESKTOP.md.
+# On by default. Two things happen on first start that are worth knowing about
+# before they happen rather than after:
 #
-# [proxy.intercept]
-# listen = "127.0.0.1:8840"
-# intercept_hosts = ["api.anthropic.com"]
-# ca_path = "/var/lib/kompressor/ca"
-# # h2 is required: Desktop's client offers only h2 for api.anthropic.com, and a
-# # listener advertising http/1.1 alone fails the handshake in a way that looks
-# # exactly like an untrusted certificate.
-# alpn = ["h2", "http/1.1"]
+#   * a CONNECT proxy listens on the address below. It terminates TLS only for
+#     the hosts named in `intercept_hosts` and copies every other connection
+#     byte for byte without reading it.
+#   * a local certificate authority is generated under `ca_path` if none is
+#     there. The key is written 0600 and never leaves that directory. Nothing
+#     trusts it until you install it somewhere, and a client that has not been
+#     pointed here is unaffected either way.
+#
+# To turn it off, comment out `listen` — the listener is off unless an address
+# is named. Remove the CA directory as well if you had already trusted it.
+# See docs/CLAUDE-DESKTOP.md.
+[proxy.intercept]
+listen = "127.0.0.1:8840"
+intercept_hosts = ["api.anthropic.com"]
+ca_path = "/var/lib/kompressor/ca"
+# h2 is required: Desktop's client offers only h2 for api.anthropic.com, and a
+# listener advertising http/1.1 alone fails the handshake in a way that looks
+# exactly like an untrusted certificate.
+alpn = ["h2", "http/1.1"]
 
 [[proxy.upstreams]]
 name = "openai"

@@ -125,6 +125,21 @@ pub struct EngineOptions {
     /// values back — keeps its handle either way.
     pub fold_handles_identical_repeats: bool,
 
+    /// Say `similar` in a fold marker whose occurrences differ.
+    ///
+    /// `[×N ref:…]` is documented to a model as "a line that repeated", so over
+    /// lines that merely shared a template it describes the handle as holding
+    /// copies of something already visible — and a model with no reason to
+    /// fetch does not fetch. Measured on eight attachment headings folded to
+    /// one: the seven variants were retained and retrievable, and the task
+    /// still lost the instruction they carried.
+    ///
+    /// On, such a fold reads `[×N similar ref:…]`. The handle, the fragment and
+    /// the compression are identical either way; only what the model is told
+    /// changes. Off restores the older wording, which is what the golden
+    /// vectors were recorded under.
+    pub fold_marks_variants: bool,
+
     /// Compress HTML by folding its repeated lines.
     ///
     /// HTML had no compressor at all: `strategy_for` had no arm for it, so it
@@ -341,6 +356,7 @@ impl Default for EngineOptions {
             enable_gutter_aware_detection: true,
             enable_build_templates: true,
             fold_handles_identical_repeats: false,
+            fold_marks_variants: true,
             enable_html_compressor: true,
             enable_normalised_text_fold: true,
             enable_tabular_ratio: true,
@@ -457,6 +473,7 @@ pub struct EngineOptionsPatch {
     pub enable_gutter_aware_detection: Option<bool>,
     pub enable_build_templates: Option<bool>,
     pub fold_handles_identical_repeats: Option<bool>,
+    pub fold_marks_variants: Option<bool>,
     pub enable_html_compressor: Option<bool>,
     pub enable_normalised_text_fold: Option<bool>,
     pub enable_tabular_ratio: Option<bool>,
@@ -506,6 +523,7 @@ impl EngineOptionsPatch {
             enable_gutter_aware_detection,
             enable_build_templates,
             fold_handles_identical_repeats,
+            fold_marks_variants,
             enable_html_compressor,
             enable_normalised_text_fold,
             enable_tabular_ratio,

@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
-    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -49,10 +49,13 @@ pub enum CaError {
 
 /// A CA that signs leaves on demand.
 pub struct Authority {
-    /// Signs leaves. On a reload this is rebuilt from the stored parameters,
-    /// which gives a *different* certificate with the same name and key —
-    /// fine for signing, wrong to present.
-    certificate: Certificate,
+    /// Signs leaves.
+    ///
+    /// rcgen 0.14 models the signing identity as an `Issuer` — a name, a key
+    /// and the usages — rather than as a certificate. That removes the trap the
+    /// field below was added for: there is no second certificate to accidentally
+    /// present, because signing never produces one.
+    issuer: Issuer<'static, KeyPair>,
     /// The certificate the operator actually trusted, byte for byte.
     ///
     /// Keeping this separate is the whole of the fix for a bug the reload test
@@ -62,7 +65,6 @@ pub struct Authority {
     /// Leaves still verify, because `signed_by` derives the issuer from the
     /// name and signs with the key, and both of those survive the round trip.
     der: CertificateDer<'static>,
-    key: KeyPair,
     pem: String,
     path: PathBuf,
     alpn: Vec<Vec<u8>>,
@@ -115,16 +117,15 @@ impl Authority {
         let cert_path = dir.join("ca.pem");
         let key_path = dir.join("ca.key");
 
-        let (certificate, key, pem, der) = if cert_path.exists() || key_path.exists() {
+        let (issuer, pem, der) = if cert_path.exists() || key_path.exists() {
             Self::load(dir, &cert_path, &key_path)?
         } else {
             Self::create(dir, &cert_path, &key_path)?
         };
 
         Ok(Authority {
-            certificate,
+            issuer,
             der,
-            key,
             pem,
             path: dir.to_path_buf(),
             alpn: alpn.iter().map(|p| p.as_bytes().to_vec()).collect(),
@@ -136,7 +137,7 @@ impl Authority {
         dir: &Path,
         cert_path: &Path,
         key_path: &Path,
-    ) -> Result<(Certificate, KeyPair, String, CertificateDer<'static>), CaError> {
+    ) -> Result<(Issuer<'static, KeyPair>, String, CertificateDer<'static>), CaError> {
         // Half a CA is not a CA. Saying which half is missing saves the
         // operator guessing whether to delete the directory.
         for p in [cert_path, key_path] {
@@ -162,24 +163,21 @@ impl Authority {
             path: key_path.to_path_buf(),
             reason: e.to_string(),
         })?;
-        let params =
-            CertificateParams::from_ca_cert_pem(&cert_pem).map_err(|e| CaError::Invalid {
-                path: cert_path.to_path_buf(),
-                reason: e.to_string(),
-            })?;
-        let certificate = params.self_signed(&key).map_err(|e| CaError::Invalid {
+        // The issuer carries the name, the usages and the key. It is not a
+        // certificate and cannot be mistaken for the one on disk.
+        let issuer = Issuer::from_ca_cert_pem(&cert_pem, key).map_err(|e| CaError::Invalid {
             path: cert_path.to_path_buf(),
             reason: e.to_string(),
         })?;
         let der = der_from_pem(cert_path, &cert_pem)?;
-        Ok((certificate, key, cert_pem, der))
+        Ok((issuer, cert_pem, der))
     }
 
     fn create(
         dir: &Path,
         cert_path: &Path,
         key_path: &Path,
-    ) -> Result<(Certificate, KeyPair, String, CertificateDer<'static>), CaError> {
+    ) -> Result<(Issuer<'static, KeyPair>, String, CertificateDer<'static>), CaError> {
         std::fs::create_dir_all(dir).map_err(|source| CaError::Io {
             path: dir.to_path_buf(),
             source,
@@ -227,7 +225,9 @@ impl Authority {
         );
 
         let der = certificate.der().clone();
-        Ok((certificate, key, pem, der))
+        // Params and key become the issuer; the certificate's bytes are what we
+        // present and are kept separately.
+        Ok((Issuer::new(params, key), pem, der))
     }
 
     /// Where the certificate an operator has to trust can be found.
@@ -282,7 +282,7 @@ impl Authority {
         params.subject_alt_names = vec![san_for(host)];
 
         let leaf = params
-            .signed_by(&key, &self.certificate, &self.key)
+            .signed_by(&key, &self.issuer)
             .map_err(|source| CaError::Mint {
                 host: host.to_string(),
                 source,
@@ -491,14 +491,25 @@ mod tests {
     fn certificates_have_a_believable_validity_window() {
         // rcgen's default is 1975 to 4096. A certificate valid for twenty-one
         // centuries is not one any trust store should be asked to accept.
-        let dir = temp_dir("validity");
-        let ca = Authority::load_or_create(&dir, &["http/1.1".into()], 8).unwrap();
+        // Asserted on the window itself rather than on a built certificate:
+        // rcgen 0.14 models the signing identity as an `Issuer`, which exposes
+        // no parameters to read back. The window is what both the CA and the
+        // leaf paths set, so it is the thing worth pinning — and a real
+        // certificate carrying it is covered end to end by the handshake tests.
         let now = OffsetDateTime::now_utc();
 
-        assert!(ca.certificate.params().not_before <= now);
-        let ca_years = (ca.certificate.params().not_after - now).whole_days() / 365;
+        let (ca_before, ca_after) = validity(CA_DAYS);
+        assert!(ca_before <= now, "a backdated start, for slow clocks");
+        let ca_years = (ca_after - now).whole_days() / 365;
         assert!((2..=4).contains(&ca_years), "CA valid for {ca_years} years");
-        let _ = std::fs::remove_dir_all(&dir);
+
+        let (leaf_before, leaf_after) = validity(LEAF_DAYS);
+        assert!(leaf_before <= now);
+        let leaf_days = (leaf_after - now).whole_days();
+        assert!(
+            (80..=100).contains(&leaf_days),
+            "leaf valid for {leaf_days} days"
+        );
     }
 
     #[test]

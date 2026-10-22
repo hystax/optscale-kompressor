@@ -254,9 +254,11 @@ decrypted request is served by the same router the proxy already runs, so no
 mount or handler changes to support it. Point Desktop at it with `HTTPS_PROXY`
 and `NODE_EXTRA_CA_CERTS` in `~/.claude/settings.json`.
 
-Off unless `listen` names an address: an upgrade never opens a CONNECT proxy or
-generates a CA by surprise, and the packaged default ships the block commented
-out.
+The packaged default enables it, so a clean install listens on 8840 and
+generates its CA on first start. Nothing trusts that CA until you install it,
+and a client that has not been pointed at the proxy is unaffected either way.
+Comment out `listen` to turn the listener off — it is off unless an address is
+named, so an upgrade of a machine that never had it stays that way.
 
 This covers the Code tab. The **Chat tab** reaches `claude.ai` with a web
 session and its own conversation API — nothing a reverse proxy can serve, and
