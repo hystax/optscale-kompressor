@@ -71,7 +71,7 @@ leaf_cache_entries = 64
 
 [[proxy.upstreams]]
 name = "anthropic"
-path_prefix = "/v1"
+path_prefix = "/v1/messages"
 base_url = "https://api.anthropic.com"
 api_family = "anthropic"
 forward_auth = true
@@ -87,11 +87,11 @@ forward_auth = true
 `[proxy.intercept]` is the listener that does this. It is off unless `listen`
 names an address, so an upgrade never starts one by surprise.
 
-The mounts are `/v1` and `/api`, not `/anthropic`. An intercepted request keeps
-the path the client sent, and the listener serves it from the same process, so
-there is no rewriting and no second port. `/api` is required as well as `/v1`: a Code session probes
-`/api/hello` and signs in through `/api/oauth/*`, and without a mount for them
-it takes a 404 from the proxy mid-session.
+The mounts are `/v1/messages` and `/api`, not `/anthropic`. An intercepted
+request keeps the path the client sent, and the listener serves it from the same
+process, so there is no rewriting and no second port. `/api` is required as well:
+a Code session probes `/api/hello` and signs in through `/api/oauth/*`, and
+without a mount for them it takes a 404 from the proxy mid-session.
 
 `alpn` must include `h2`. Desktop's client offers **only** `h2` for
 `api.anthropic.com`; a listener advertising just `http/1.1` answers
@@ -100,13 +100,30 @@ a handshake EOF that looks exactly like an untrusted certificate. It is not
 one — `openssl s_client -alpn h2` against such a listener reports alert 120
 with `Verify return code: 0 (ok)`.
 
-> **If you already mount `openai` at `/v1`**, move it to `/openai` with
-> `strip_prefix = true` first. Two mounts on `/v1` load without complaint and
-> the first one wins, which sends Anthropic traffic to `api.openai.com`.
-> Equally, put this mount **after** any `[proxy.upstreams.subscription]` block:
-> TOML attaches that table to the most recent `[[proxy.upstreams]]`, so a mount
-> inserted above one adopts it and forwards subscription traffic to the wrong
-> provider.
+### Sharing the proxy with Codex
+
+`/v1/messages` rather than `/v1`, because Codex wants `/v1` and cannot be told
+otherwise: `kompressor wrap codex` writes `openai_base_url = ".../v1"` with no
+key to override it. Upstream matching is longest-prefix, so the two coexist —
+`/v1/messages` wins for Claude, `/v1/responses` falls through to OpenAI.
+
+Do **not** reach for the obvious inverse and mount OpenAI on `/v1/responses`.
+`rewrite_prefix` replaces the matched mount prefix, so that mount leaves an
+empty tail and a subscription request arrives at `chatgpt.com` as
+`/backend-api/codex/` — a 404 that reads like a broken login rather than a
+routing mistake. Measured, twice, before the cause was obvious.
+
+Put this mount **after** any `[proxy.upstreams.subscription]` block. TOML
+attaches that table to the most recent `[[proxy.upstreams]]`, so a mount
+inserted above one adopts it and forwards subscription traffic to the wrong
+provider.
+
+> **Since 1.1.0 the packaged default already carries these mounts**, along with
+> `frozen_prefix` and `websocket_relay`. On a clean install there is nothing to
+> add here; `[proxy.intercept]` is the only block shipped commented out, because
+> an installed package should not open a CONNECT proxy or generate a certificate
+> authority without being asked. An upgrade never rewrites an existing config, so
+> a machine that already had one keeps it and needs the edits above.
 
 `first_seen` opts into compressing history beyond the initially frozen prefix;
 monitor cache usage as well as compression. Keep prompt caching enabled.

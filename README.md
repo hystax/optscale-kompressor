@@ -210,9 +210,59 @@ anywhere in the session rather than only while a request is passing through the
 proxy. Nothing durable is written — no `~/.claude.json`, no `~/.claude/settings.json`
 — so there is no `unwrap` step.
 
-An early "compress only what the provider has not cached yet" path exists behind
-`proxy.frozen_prefix = "first_seen"`. It has open issues and is off by default.
-Measurements and the full argument: [docs/CLAUDE-CODE.md](docs/CLAUDE-CODE.md).
+That paragraph describes the **default**, `proxy.frozen_prefix = "marker"`.
+Setting `first_seen` instead compresses only what the provider has not cached
+yet, and on Anthropic traffic it is the difference between nothing and
+**43.6% removed** over a sixteen-payload session — because Claude Code's
+trailing breakpoint pins the whole conversation under the marker rule, so there
+is nothing left for the engine to touch.
+
+It is no longer experimental. Safety is established: excess writes measured 0 on
+10 of 13 runs, every non-zero figure predating the `was_warm` and discard-guard
+fixes, and a 40-turn Opus run held the incremental-cache identity 37 times out of
+37 while removing 33.0% at 96.6% cache reads. It is what the packaged default
+sets for Anthropic clients, and what `docs/CLAUDE-DESKTOP.md` requires.
+
+The engine default stays `marker`, for one remaining reason and it is not churn:
+the **cost** case is unmeasured, and the obvious experiment is invalid —
+`$/MTok out` correlates +0.80 with run length, so two runs of different
+trajectories cannot be compared however carefully they are matched. That wants a
+replay-based A/B over recorded turns. Until then the default is conservative on
+economics rather than on safety. The argument in full:
+[docs/CLAUDE-CODE.md](docs/CLAUDE-CODE.md).
+
+### Claude Desktop — intercepted, because it cannot be pointed
+
+Desktop's **Code tab** is Claude Code, and it cannot be wrapped: the app sets
+`ANTHROPIC_BASE_URL` itself when it spawns a session, over the inherited
+environment and over `~/.claude/settings.json` alike. There is no value to set.
+
+What it does honour is a proxy and a certificate authority, so that is the way
+in:
+
+```toml
+[proxy.intercept]
+listen = "127.0.0.1:8840"
+intercept_hosts = ["api.anthropic.com"]
+ca_path = "/home/you/.local/share/kompressor/ca"
+alpn = ["h2", "http/1.1"]
+```
+
+`CONNECT` on that port, TLS terminated for the allow-listed host with a
+certificate minted locally, everything else tunnelled byte for byte. The
+decrypted request is served by the same router the proxy already runs, so no
+mount or handler changes to support it. Point Desktop at it with `HTTPS_PROXY`
+and `NODE_EXTRA_CA_CERTS` in `~/.claude/settings.json`.
+
+Off unless `listen` names an address: an upgrade never opens a CONNECT proxy or
+generates a CA by surprise, and the packaged default ships the block commented
+out.
+
+This covers the Code tab. The **Chat tab** reaches `claude.ai` with a web
+session and its own conversation API — nothing a reverse proxy can serve, and
+nothing worth serving: its history is held server-side, so a turn carries one
+message and an id. Setup, measurements and the limits:
+[docs/CLAUDE-DESKTOP.md](docs/CLAUDE-DESKTOP.md).
 
 ### Any client, through the proxy
 
