@@ -956,40 +956,58 @@ pub(crate) async fn compress_with_deadline(
     let model = model.map(str::to_string);
     let provider = provider.to_string();
 
+    // Computation only. A `spawn_blocking` task cannot be cancelled, so when
+    // the deadline below wins this one still runs to completion — and until
+    // publication moved out of it, that abandoned task retained fragments
+    // nothing could fetch, filed savings for an output never forwarded, and
+    // promoted handles that rewrote later prompts. Everything it produces now
+    // lives in the `Computed` it returns, which the timeout arm simply drops.
     let work = move || {
         let mut messages = messages;
-        let outcome = core.compress(
-            &identity,
+        let computed = core.compress_only(
             &mut messages,
-            &RequestInfo {
-                request_id: &request_id,
-                api_family: Some(family.as_str()),
-                model: model.as_deref(),
-                provider: Some(provider.as_str()),
-            },
             &options,
             frozen_message_count,
             "",
-            Surface::Proxy,
             prefix_cache,
             &keep_inline,
             &fetches,
             cache_hit_per_mille,
         );
-        // Pinned before anything else can re-decide it. The rewrite this
-        // promotion paid for is spent; weighing it again next turn, against a
-        // bar that will have moved, is how a promoted fragment gets re-elided
-        // and loses the prefix a second time.
-        prefixes.record_inlined(conversation, &outcome.stats.kept_inline_refs);
-        let saved = outcome
-            .stats
-            .tokens_in
-            .saturating_sub(outcome.stats.tokens_out);
-        (messages, saved)
+        (
+            core, identity, options, request_id, model, provider, messages, computed,
+        )
     };
 
     match tokio::time::timeout(timeout, tokio::task::spawn_blocking(work)).await {
-        Ok(Ok(value)) => Some(value),
+        Ok(Ok((core, identity, options, request_id, model, provider, mut messages, computed))) => {
+            // Published only now that the race is decided, so nothing a
+            // timeout discarded can reach the store, the stats or the
+            // promotion state.
+            let outcome = core.publish(
+                &identity,
+                &mut messages,
+                computed,
+                &RequestInfo {
+                    request_id: &request_id,
+                    api_family: Some(family.as_str()),
+                    model: model.as_deref(),
+                    provider: Some(provider.as_str()),
+                },
+                &options,
+                Surface::Proxy,
+            );
+            // Pinned before anything else can re-decide it. The rewrite this
+            // promotion paid for is spent; weighing it again next turn,
+            // against a bar that will have moved, is how a promoted fragment
+            // gets re-elided and loses the prefix a second time.
+            prefixes.record_inlined(conversation, &outcome.stats.kept_inline_refs);
+            let saved = outcome
+                .stats
+                .tokens_in
+                .saturating_sub(outcome.stats.tokens_out);
+            Some((messages, saved))
+        }
         // a panicked engine is a fail-open, not a 500: the invariant is that
         // compression subtracts tokens, never availability
         Ok(Err(error)) => {
