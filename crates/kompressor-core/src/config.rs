@@ -744,10 +744,27 @@ impl Config {
         }
         let xdg = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?
-            .join("kompressor")
-            .join("config.toml");
-        xdg.is_file().then_some(xdg)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+            .map(|base| base.join("kompressor").join("config.toml"));
+        if let Some(xdg) = xdg
+            && xdg.is_file()
+        {
+            return Some(xdg);
+        }
+        None
+    }
+
+    /// Where a Linux package installs the system configuration.
+    ///
+    /// Deliberately **not** part of [`Self::discover`]. Reading it there would
+    /// make `kompressor compress` on a developer machine behave differently
+    /// depending on whether a package happened to be installed — measured as
+    /// six hermetic CLI tests changing their output the moment this file
+    /// existed. Commands that are *about the running service* opt in instead;
+    /// `kompressor stats` is the one that does.
+    pub fn system_path() -> Option<std::path::PathBuf> {
+        let system = PathBuf::from("/etc/kompressor/config.toml");
+        system.is_file().then_some(system)
     }
 
     pub fn load(path: Option<&std::path::Path>) -> Result<Config, ConfigError> {
