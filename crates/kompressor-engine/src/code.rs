@@ -483,6 +483,10 @@ mod imp {
             }
             let indent = " ".repeat(column + 4);
             let fragment = join_lines(&lines[start..end]);
+            if refs.code_is_preserved(&fragment) {
+                last_end = Some(end);
+                continue;
+            }
             let marker = code_marker(&name, end - start, &fragment, refs, "#");
             // A filler keeps the definition a definition: a body of nothing but
             // a comment is a syntax error, and the re-parse below would then
@@ -650,6 +654,9 @@ mod imp {
                 continue;
             }
             let hidden = &block[open + 1..close];
+            if refs.code_is_preserved(hidden) {
+                continue;
+            }
             let count = hidden.matches('\n').count() + 1;
             if count <= opts.code_max_body_lines {
                 continue;
