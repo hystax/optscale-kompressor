@@ -9,7 +9,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "1.2.0"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/hystax/optscale-kompressor"
 
@@ -82,7 +82,7 @@ humantime-serde = "1"
 anyhow = "1"
 thiserror = "2"
 once_cell = "1"
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 [profile.release]
 opt-level = 3

@@ -2,7 +2,7 @@
 
 ![CI](https://github.com/hystax/optscale-kompressor/actions/workflows/ci.yml/badge.svg)
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
-![MSRV 1.90](https://img.shields.io/badge/rust-1.90%2B-orange.svg)
+![MSRV 1.95](https://img.shields.io/badge/rust-1.95%2B-orange.svg)
 
 **Deterministic prompt compression for coding agents, in one Rust binary.**
 
@@ -142,7 +142,7 @@ removed detail stays retrievable.
 Pre-built binaries for Linux (x86_64, arm64) and macOS (arm64, x86_64), with
 checksums, are on the [Releases page](https://github.com/hystax/optscale-kompressor/releases/latest).
 
-With Cargo (Rust 1.90 or newer):
+With Cargo (Rust 1.95 or newer):
 
 ```bash
 cargo install --locked --git https://github.com/hystax/optscale-kompressor kompressor-cli

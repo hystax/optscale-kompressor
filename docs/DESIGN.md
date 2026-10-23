@@ -214,7 +214,7 @@ Makefile          every target, self-documenting via `make`
 | observability | `tracing`, `tracing-subscriber` (json/env-filter), `metrics` + `metrics-exporter-prometheus` | |
 | tests | `wiremock` (upstream mock) | `proptest`, `insta`, `criterion` and `cargo-fuzz` are **not** in the tree. Golden vectors are a hand-rolled snapshot (`fixtures/golden.json.gz`, §18) and the benchmark is `kompressor bench replay` against a recorded baseline, not criterion |
 
-Edition 2021. MSRV is **1.90**, declared in `Cargo.toml` and gated by a CI job that builds on exactly that toolchain — the floor is set by the dependency graph (`tree-sitter-language`), not by anything this workspace writes, and `--no-default-features` does not lower it because cargo resolves `rust-version` across the whole locked graph. `#![forbid(unsafe_code)]` is in nine of the ten crates; `kompressor-cli` is the exception.
+Edition 2024. MSRV is **1.95**, declared in `Cargo.toml` and gated by a CI job that builds on exactly that toolchain — the floor is set by the dependency graph (`parking_lot` 0.13; it was 1.90 for `tree-sitter-language` until that bump), not by anything this workspace writes, and `--no-default-features` does not lower it because cargo resolves `rust-version` across the whole locked graph. `#![forbid(unsafe_code)]` is in nine of the ten crates; `kompressor-cli` is the exception.
 
 ## 4. `kompressor-engine`: types, traits, pipeline
 
@@ -2738,7 +2738,7 @@ that `make check` locally and CI cannot hold different opinions:
 |---|---|
 | `lint` | `make lint` — `cargo fmt --check`, `cargo clippy --all-targets -D warnings` |
 | `test` | `cargo test --workspace`, twice: default features and `--no-default-features` |
-| `msrv` | `cargo check --workspace --all-targets` on 1.90 exactly, so the declared MSRV is a fact rather than a claim |
+| `msrv` | `cargo check --workspace --all-targets` on 1.95 exactly, so the declared MSRV is a fact rather than a claim |
 | `gate` | `make release` then `make bench` (the fixture replay gate: coverage, claimed and billed not regressed, no invariant violated, determinism), `make docs-check`, `make smoke` |
 | `e2e` | `make e2e` — the hermetic Docker suite on an `internal: true` network |
 
