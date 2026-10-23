@@ -2165,6 +2165,17 @@ applied on open), `compress --ephemeral`, and the `bench sample`, `needles`
 and `calibrate-tokens` subcommands (§18.6 describes the metrics). `bench
 replay` and `bench extract` ship.
 
+`bench replay` is the one command that does **not** consult configuration
+discovery. Every other command reads `$KOMPRESSOR_CONFIG`, then
+`./kompressor.toml`, then the XDG path; the replay reads `--config` if given and
+the compiled-in defaults otherwise. It is a gate measured against a committed
+baseline, so it has to measure the engine rather than the machine — a personal
+config carrying `enable_normalised_text_fold = false` otherwise moves the `text`
+bucket by 47 points and `make bench` reports it as a code regression. `--config`
+still works, which is the A/B case the command reads configuration for at all,
+and it applies to `--save` as much as to `--compare`: a baseline recorded under
+someone's local settings would move the gate for everyone.
+
 `compress --explain` prints the detection result, the chosen reading (mixed vs
 whole, redraw arbitration), the per-slot kinds, markers and refs, and the
 accounted-guard decision. It exists because every one of those is otherwise
