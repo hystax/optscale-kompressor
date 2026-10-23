@@ -159,7 +159,9 @@ make release
 
 `make deb`, `make rpm`, `make static` (musl), `make docker` and
 `make macos-pkg-docker` build packages; each says what it needs if a tool is
-missing. [docs/QUICKSTART.md](docs/QUICKSTART.md) covers running it as a service,
+missing. `make deb-static` and `make rpm-static` build the same two packages
+from the musl binary, so they depend on no `libc6`/`glibc` and install on
+distributions older than the machine that built them. [docs/QUICKSTART.md](docs/QUICKSTART.md) covers running it as a service,
 and [docs/MACOS.md](docs/MACOS.md) covers the macOS paths.
 
 ---

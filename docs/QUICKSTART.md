@@ -464,6 +464,40 @@ that installs the binary, `/etc/kompressor/config.toml` (as a conffile, so an
 upgrade will not overwrite your edits), and a unit that runs as an unprivileged
 `kompressor` user with its state in `/var/lib/kompressor`.
 
+**A static package**, for a machine whose libc you do not control.
+`make deb-static` and `make rpm-static` build the same two packages from a
+statically linked musl binary. They install the same files and run the same
+unit; the difference is that neither depends on a libc, so both install on a
+distribution older than the one you built them on.
+
+The ordinary `make deb` and `make rpm` record the *build host's* glibc as a
+minimum — build on a current Ubuntu and the packages refuse to install on
+anything a few years older, which is only ever discovered on the far machine.
+Measured on this build: the glibc `.deb` demands `libc6 (>= 2.39)` and will not
+install on Debian 11, and the glibc `.rpm` demands seven `GLIBC_2.29`-and-later
+symbol versions and will not install on Rocky Linux 8. Both static packages
+install and run on those same two images.
+
+They need the Rust musl target and a musl C compiler (the tree-sitter grammars
+are C):
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+sudo apt install musl-tools
+make deb-static        # target/debian-static/kompressor_<version>-static_<arch>.deb
+make rpm-static        # target/generate-rpm-static/kompressor-<version>-static.<arch>.rpm
+```
+
+The filename is the only place the difference shows. The **package** name and
+version are the same as the glibc build's, deliberately, so `dpkg`/`rpm` treat
+the two as one program and moving between them works in either direction. To
+check which one you have:
+
+```bash
+dpkg-deb -f <file> Depends          # static: just `adduser`
+rpm -qp --requires <file>           # static: no libc.so.6 lines
+```
+
 The config is installed **world-readable** (`0644 root:root`). Nothing in the
 shipped file is a credential — every upstream sets `forward_auth = true`, so the
 caller's own key is forwarded and none is stored — and an operator has to be
