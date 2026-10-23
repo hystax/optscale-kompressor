@@ -942,6 +942,7 @@ impl Config {
             "enable_listing_compressor" => flag!(e.enable_listing_compressor),
             "enable_code_aware" => flag!(e.enable_code_aware),
             "enable_mixed_content" => flag!(e.enable_mixed_content),
+            "enable_config_sections" => flag!(e.enable_config_sections),
             "enable_config_compressor" => flag!(e.enable_config_compressor),
             "enable_nested_routing" => flag!(e.enable_nested_routing),
             "enable_redraw_fold" => flag!(e.enable_redraw_fold),

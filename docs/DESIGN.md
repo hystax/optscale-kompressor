@@ -285,6 +285,7 @@ pub struct EngineOptions {
     pub enable_code_aware: bool,                    // true
     pub enable_mixed_content: bool,                 // true
     pub enable_config_compressor: bool,             // true
+    pub enable_config_sections: bool,               // true
     pub enable_nested_routing: bool,                // true
     pub enable_redraw_fold: bool,                   // true  (arbitrated; needs a collector)
     pub enable_build_templates: bool,               // true  (build output folds by name too, §7.4)
@@ -2040,6 +2041,7 @@ enable_listing_compressor = true
 enable_code_aware = true
 enable_mixed_content = true
 enable_config_compressor = true
+enable_config_sections = true
 enable_nested_routing = true
 enable_redraw_fold = true           # arbitrated transforms
 enable_build_templates = true       # build output may fold by name, §7.4

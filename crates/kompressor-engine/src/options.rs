@@ -77,6 +77,15 @@ pub struct EngineOptions {
     pub enable_code_aware: bool,
     pub enable_mixed_content: bool,
     pub enable_config_compressor: bool,
+    /// Let the segmenter recognise a run of configuration inside a
+    /// heterogeneous body.
+    ///
+    /// Without it the segmenter's vocabulary is diffs, logs, grep hits,
+    /// tables and listings — all line-shaped. Configuration is not, so a
+    /// tool result holding a source file and then a `.cfg` presented as
+    /// one unclassified run, went whole to the detector's single winner,
+    /// and compressed by nothing at all.
+    pub enable_config_sections: bool,
 
     /// Re-detect and route long string values instead of blind-clipping them.
     ///
@@ -351,6 +360,7 @@ impl Default for EngineOptions {
             enable_code_aware: true,
             enable_mixed_content: true,
             enable_config_compressor: true,
+            enable_config_sections: true,
             enable_nested_routing: true,
             enable_redraw_fold: true,
             enable_gutter_aware_detection: true,
@@ -468,6 +478,7 @@ pub struct EngineOptionsPatch {
     pub enable_code_aware: Option<bool>,
     pub enable_mixed_content: Option<bool>,
     pub enable_config_compressor: Option<bool>,
+    pub enable_config_sections: Option<bool>,
     pub enable_nested_routing: Option<bool>,
     pub enable_redraw_fold: Option<bool>,
     pub enable_gutter_aware_detection: Option<bool>,
@@ -518,6 +529,7 @@ impl EngineOptionsPatch {
             enable_code_aware,
             enable_mixed_content,
             enable_config_compressor,
+            enable_config_sections,
             enable_nested_routing,
             enable_redraw_fold,
             enable_gutter_aware_detection,
