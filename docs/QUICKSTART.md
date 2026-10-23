@@ -498,6 +498,21 @@ dpkg-deb -f <file> Depends          # static: just `adduser`
 rpm -qp --requires <file>           # static: no libc.so.6 lines
 ```
 
+**All of them at once**, when you are cutting a release rather than installing
+on one machine:
+
+```bash
+make all
+```
+
+That runs every packaging target the host can run — both binaries, both `.deb`s,
+both `.rpm`s, the container image and the macOS `.pkg` — and collects the results
+into `target/dist` with a `SHA256SUMS` beside them. No host has a C toolchain
+for every target, so each leg is probed first: what cannot be built here is
+listed at the end with the command that would enable it, instead of failing
+somewhere inside a linker. Skips are reported but do not fail the run; `make all
+STRICT=1` makes them fail it, which is what a release build wants.
+
 The config is installed **world-readable** (`0644 root:root`). Nothing in the
 shipped file is a credential — every upstream sets `forward_auth = true`, so the
 caller's own key is forwarded and none is stored — and an operator has to be

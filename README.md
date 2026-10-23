@@ -157,8 +157,13 @@ make release
 ./target/release/kompressor version
 ```
 
-`make deb`, `make rpm`, `make static` (musl), `make docker` and
-`make macos-pkg-docker` build packages; each says what it needs if a tool is
+`make all` builds every binary and package this machine can build and collects
+them, with checksums, into `target/dist`. It probes each one first and prints
+what it skipped and the command that would enable it, rather than failing deep
+inside a linker — no single host has a C toolchain for every target.
+
+The individual targets are `make deb`, `make rpm`, `make static` (musl),
+`make docker` and `make macos-pkg-docker`; each says what it needs if a tool is
 missing. `make deb-static` and `make rpm-static` build the same two packages
 from the musl binary, so they depend on no `libc6`/`glibc` and install on
 distributions older than the machine that built them. [docs/QUICKSTART.md](docs/QUICKSTART.md) covers running it as a service,

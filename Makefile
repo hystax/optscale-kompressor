@@ -189,6 +189,13 @@ diagrams: ## Re-render the charts at a uniform scale (each .drawio.png already h
 
 ##@ Release
 
+# Not the default goal: `.DEFAULT_GOAL := help` above keeps a bare `make`
+# printing the target list, which is what someone arriving at this repo wants.
+# The name is still `all` because that is the one every release script guesses.
+.PHONY: all
+all: ## Every binary and package this machine can build, into target/dist
+	./scripts/build/all.sh
+
 .PHONY: install
 install: release ## Install the binary under PREFIX (default /usr/local)
 	install -Dm755 $(RELEASE_BIN) $(DESTDIR)$(PREFIX)/bin/$(BIN)
