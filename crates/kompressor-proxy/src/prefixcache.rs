@@ -147,7 +147,11 @@ pub struct PrefixTracker {
     /// required. Measured rather than assumed, and process-wide rather than
     /// per-conversation: it is a rate, and the two conversations in a run are
     /// the same workload against the same provider.
-    billed: Mutex<(u64, u64)>,
+    ///
+    /// Cache reads, the whole billed prompt, and the part of it the provider
+    /// billed as a cache *write* — which only Anthropic reports, and which
+    /// prices a rewrite above a plain miss.
+    billed: Mutex<(u64, u64, u64)>,
     seen: Mutex<HashMap<u64, Seen>>,
     /// Openings already seen, so a later turn is recognised as the same
     /// conversation rather than hashed into a new one.
@@ -234,11 +238,15 @@ fn is_a_cache_loss(before: u32, now: u32, prior_rounds: u32, rounds: u32) -> boo
 const RETRIEVED_PER_CONVERSATION: usize = 64;
 /// Most conversations the retrieved map tracks at once.
 const RETRIEVED_CONVERSATIONS: usize = 1024;
+/// Fresh over cached, as the engine's promotion rule assumes it.
+const CACHE_DISCOUNT: u64 = 10;
+/// Anthropic's five-minute cache write, as a multiple of fresh, per mille.
+const CACHE_WRITE_PER_MILLE: u64 = 1250;
 
 impl PrefixTracker {
     pub fn new(ttl: Duration) -> PrefixTracker {
         PrefixTracker {
-            billed: Mutex::new((0, 0)),
+            billed: Mutex::new((0, 0, 0)),
             seen: Mutex::new(HashMap::new()),
             ids: Mutex::new(Identities::default()),
             retrieved: Mutex::new(HashMap::new()),
@@ -288,6 +296,13 @@ impl PrefixTracker {
     }
 
     /// Record what the provider reported for this prefix.
+    ///
+    /// `prompt_tokens` is the *whole* billed prompt, cached part included. On
+    /// OpenAI that is the reported `prompt_tokens`; on Anthropic the reported
+    /// `input_tokens` is only the uncached remainder, and the caller must add
+    /// the cache reads and writes back. Passed raw, it made every Anthropic
+    /// run read as 1000 — 41,116 cached over 8 "prompt" tokens — so the engine
+    /// priced every promotion at the most demanding bar there is.
     pub fn record(
         &self,
         fingerprint: u64,
@@ -500,15 +515,52 @@ impl PrefixTracker {
     /// be, so the engine demands the most before rewriting a prefix. Guessing
     /// the other way would promote on thin evidence, which is the mistake that
     /// cost 46,379 tokens of cache in one turn.
+    ///
+    /// Where the provider bills cache writes, this is the *price-equivalent*
+    /// rate rather than the raw one. The engine's rule prices a rewrite at
+    /// `fresh − cached` per token behind it, which is right for OpenAI. On
+    /// Anthropic the bytes behind a rewrite are written again at 1.25× fresh,
+    /// so the true price is `1.25·fresh − cached` — 11.5 cached tokens, not 9.
+    /// The rate returned is the one under which the engine's formula charges
+    /// exactly that, so the provider's pricing stays here, with the usage that
+    /// reveals it. Measured on afull89 (92.2% reads, 7.3% writes) it reads 947:
+    /// about six demands to repay a break near the head of the prompt, against
+    /// the eight the unmeasured 1000 demanded and the five a raw 921 would.
     pub fn cache_hit_per_mille(&self) -> u32 {
         let Ok(billed) = self.billed.lock() else {
             return 1000;
         };
-        let (read, prompt) = *billed;
+        let (read, prompt, written) = *billed;
         if prompt == 0 {
             return 1000;
         }
-        ((read.saturating_mul(1000) / prompt) as u32).min(1000)
+        let read = read.min(prompt);
+        let written = written.min(prompt - read);
+        if written == 0 {
+            return (read * 1000 / prompt) as u32;
+        }
+        let fresh = prompt - read - written;
+        // What one prompt token costs on this traffic, in thousandths of a
+        // cached one.
+        let blended = (read * 1000
+            + fresh * 1000 * CACHE_DISCOUNT
+            + written * CACHE_WRITE_PER_MILLE * CACHE_DISCOUNT)
+            / prompt;
+        // Scaled so `(discount − 1) / equivalent` equals the true
+        // `(write × discount − 1) / blended`, then inverted from
+        // `equivalent = hit + (1 − hit) × discount`.
+        let equivalent =
+            blended * (CACHE_DISCOUNT - 1) * 1000 / (CACHE_WRITE_PER_MILLE * CACHE_DISCOUNT - 1000);
+        ((CACHE_DISCOUNT * 1000).saturating_sub(equivalent) / (CACHE_DISCOUNT - 1)).min(1000) as u32
+    }
+
+    /// Record the part of a billed prompt the provider charged as a cache
+    /// write. Called beside [`PrefixTracker::record`], for the same usage, and
+    /// only when that call counted it.
+    pub fn record_cache_writes(&self, written: u32) {
+        if let Ok(mut billed) = self.billed.lock() {
+            billed.2 = billed.2.saturating_add(u64::from(written));
+        }
     }
 
     /// Pin fragments the engine has shipped whole, so the decision is not
@@ -844,6 +896,25 @@ mod tests {
         tracker.record(3, None, Some(1_000_000), 0);
         tracker.record(4, Some(500), None, 0);
         assert_eq!(tracker.cache_hit_per_mille(), 480);
+    }
+
+    /// Anthropic's writes make a rewrite dearer than a miss, and the rate says
+    /// so in the only currency the engine reads.
+    #[test]
+    fn billed_cache_writes_raise_the_price_of_a_rewrite() {
+        let tracker = PrefixTracker::new(Duration::from_secs(0));
+        // afull89's totals, per ten thousand: 92.15% reads, 7.27% writes.
+        tracker.record(1, Some(9_215), Some(10_000), 0);
+        assert_eq!(tracker.cache_hit_per_mille(), 921);
+        tracker.record_cache_writes(727);
+        // Between the raw 921 (which under-prices the write) and the 1000 the
+        // uncorrected Anthropic reading pinned every run at.
+        assert_eq!(tracker.cache_hit_per_mille(), 947);
+        // A cold start bills nothing but writes, and must not read as cached.
+        let cold = PrefixTracker::new(Duration::from_secs(0));
+        cold.record(1, Some(0), Some(10_000), 0);
+        cold.record_cache_writes(10_000);
+        assert!(cold.cache_hit_per_mille() < 100);
     }
 
     /// A promotion is taken once, because it is paid for once.

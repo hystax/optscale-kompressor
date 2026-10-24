@@ -1673,7 +1673,10 @@ async fn stream_response(
         let failure = if outcome.client_gone {
             Some("client disconnected before the stream completed".to_string())
         } else if outcome.upstream_error {
-            Some("upstream stream ended early".to_string())
+            outcome
+                .error_detail
+                .clone()
+                .or_else(|| Some("upstream stream ended early".to_string()))
         } else {
             None
         };
@@ -1847,12 +1850,33 @@ impl Recorder {
         // cache reads means the response carried no usage at all, which is not
         // evidence either way and is stored as such.
         if let Some(prefix) = self.prefix {
-            self.prefixes.record(
-                prefix,
-                self.event.cache_read_tokens,
-                self.event.prompt_tokens,
-                rounds,
-            );
+            // Anthropic reports `input_tokens` as the uncached remainder, with
+            // reads and writes beside it; OpenAI's `prompt_tokens` already
+            // includes its cached part. The tracker needs the whole prompt
+            // either way, and the event keeps the provider's own figure.
+            let anthropic = usage.is_some_and(|usage| {
+                usage.get("cache_read_input_tokens").is_some()
+                    || usage.get("cache_creation_input_tokens").is_some()
+            });
+            let written = self.event.cache_write_tokens.unwrap_or(0);
+            let prompt = if anthropic {
+                self.event.prompt_tokens.map(|uncached| {
+                    uncached
+                        .saturating_add(self.event.cache_read_tokens.unwrap_or(0))
+                        .saturating_add(written)
+                })
+            } else {
+                self.event.prompt_tokens
+            };
+            self.prefixes
+                .record(prefix, self.event.cache_read_tokens, prompt, rounds);
+            if anthropic
+                && written > 0
+                && self.event.cache_read_tokens.is_some()
+                && prompt.is_some_and(|prompt| prompt > 0)
+            {
+                self.prefixes.record_cache_writes(written);
+            }
         }
         self.core.stats().send(Event::ProxyRequest(self.event));
     }

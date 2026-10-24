@@ -72,4 +72,6 @@ venv/
 findings.md
 
 #experiments
+
 scripts/claude-desktop-experiment
+docs/investigations/
