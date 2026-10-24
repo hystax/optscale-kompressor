@@ -71,6 +71,13 @@ Why this key and not an environment variable: under a ChatGPT plan, Codex routes
 through its built-in `openai` provider whatever `model_provider` says, and only
 the top-level `openai_base_url` catches that. `OPENAI_BASE_URL` is ignored.
 
+> **codex-cli 0.164.0 and later.** Measured on Windows: with this key in the
+> config file, a ChatGPT login sends an API key in place of its token, and
+> requests fail with `401 … Missing scopes: api.responses.write`. Given on the
+> command line instead, `codex -c 'openai_base_url="…"'`, the token is kept.
+> [`CODEX.md`](CODEX.md) has the alias that does it for every session. Not yet
+> measured against this mount or on macOS.
+
 > **Unverified for the Codex desktop app.** The measurements behind `CODEX.md`
 > and this page were taken against **codex-cli** — 0.155.1 originally, and
 > 0.163.0-alpha.11.1 for the sweep that produced the current numbers. Whether

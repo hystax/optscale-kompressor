@@ -151,6 +151,10 @@ struct ServeCmd {
     /// Serve the LLM reverse proxy.
     #[arg(long)]
     proxy: bool,
+    /// Stop when a `stop` line arrives on standard input. Passed by
+    /// `kompressor wrap`, which holds the other end of the pipe.
+    #[arg(long, hide = true)]
+    stop_on_stdin: bool,
 }
 
 #[derive(Args)]
@@ -463,7 +467,12 @@ fn run(cli: Cli) -> CliResult {
                 .enable_all()
                 .build()
                 .map_err(|e| CliError::runtime("could not start the runtime", e))?;
-            runtime.block_on(serve::run(config, surfaces, args.listen))
+            runtime.block_on(serve::run(
+                config,
+                surfaces,
+                args.listen,
+                args.stop_on_stdin,
+            ))
         }
         Command::Mcp(McpCmd::Serve(args)) => {
             let config =

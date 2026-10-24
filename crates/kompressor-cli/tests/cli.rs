@@ -1170,3 +1170,66 @@ fn the_reported_segfault_buried_in_a_training_log_is_no_longer_hidden() {
         value["saved_pct"]
     );
 }
+
+/// `serve` as `kompressor wrap` starts it: stdin is a pipe the wrap holds.
+fn supervised_serve() -> std::process::Child {
+    std::process::Command::new(env!("CARGO_BIN_EXE_kompressor"))
+        .args([
+            "serve",
+            "--api",
+            "--listen",
+            "127.0.0.1:0",
+            "--stop-on-stdin",
+        ])
+        .env_remove("KOMPRESSOR_CONFIG")
+        .env("XDG_CONFIG_HOME", no_config_dir())
+        .current_dir(scratch_dir())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("serve starts")
+}
+
+/// Poll for exit, since `std` has no wait with a timeout.
+fn exited_within(child: &mut std::process::Child, limit: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < deadline {
+        if child.try_wait().expect("the child can be polled").is_some() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
+/// The stop request a wrap session sends instead of a signal, which is the only
+/// way it can stop its proxy on Windows. Before this, every wrap there left the
+/// proxy running after the agent exited.
+#[test]
+fn a_supervised_proxy_stops_on_the_stop_line() {
+    let mut child = supervised_serve();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "stop").unwrap();
+    let stopped = exited_within(&mut child, std::time::Duration::from_secs(20));
+    if !stopped {
+        let _ = child.kill();
+    }
+    assert!(stopped, "serve ignored the stop line");
+    assert!(
+        child.wait().unwrap().success(),
+        "a requested stop is a clean exit"
+    );
+}
+
+/// The wrap that started a proxy can exit while another session still uses it.
+/// Its end of the pipe closes then, and that must not take the proxy down.
+#[test]
+fn a_supervised_proxy_outlives_its_supervisor() {
+    let mut child = supervised_serve();
+    drop(child.stdin.take());
+    let exited = exited_within(&mut child, std::time::Duration::from_secs(2));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(!exited, "end of input stopped the proxy");
+}

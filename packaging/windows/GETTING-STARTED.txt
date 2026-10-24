@@ -27,7 +27,10 @@ For a client that wrap does not start, such as a desktop app:
 
     kompressor serve --proxy --api
 
-and point the client at http://127.0.0.1:8817. Ctrl-C stops it.
+and point the client at http://127.0.0.1:8817. Ctrl-C stops it. The proxy
+forwards only to the upstreams its configuration names, and the example
+below names none: docs/WINDOWS.md in the repository (link at the end),
+section 2, has one that does.
 
 If kompressor was installed as a system service, that proxy is already
 running and starts with Windows; wrap uses it.
