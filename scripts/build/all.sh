@@ -26,7 +26,8 @@ MAKE="${MAKE:-make}"
 STATIC_TARGET="${STATIC_TARGET:-x86_64-unknown-linux-musl}"
 STRICT="${STRICT:-0}"
 DIST="target/dist"
-VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+# `tr`: a Windows checkout has CRLF in Cargo.toml.
+VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1 | tr -d '\r')"
 
 ok=()
 skipped=()
@@ -133,6 +134,11 @@ leg "container image"             docker      "${musl_reason:-$(want_docker)}"
 # zig is too old for cargo-zigbuild, which every current Debian is.
 leg "macos ${MACOS_ARCH:-universal2} .pkg" macos-pkg-docker "$(want_docker)" \
     "target/macos/*${VERSION}*.pkg"
+# Windows, in a container like macOS. One leg for both files: win-installer
+# also leaves the bare .exe, the same one it packs, signed once.
+leg "windows x86_64 .exe + installer" win-installer "$(want_docker)" \
+    "target/windows/kompressor-${VERSION}-x86_64-windows.exe" \
+    "target/windows/kompressor-${VERSION}-x86_64-setup.exe"
 
 # Checksums over the directory as it ended up, so the file cannot describe an
 # artifact that is not there.
