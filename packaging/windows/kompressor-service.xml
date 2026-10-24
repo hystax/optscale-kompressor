@@ -1,0 +1,20 @@
+<!--
+  WinSW configuration for the Windows service the installer's system mode
+  registers. WinSW (installed as kompressor-service.exe next to kompressor.exe)
+  reads the XML file with its own name, runs `kompressor serve`, restarts it on
+  failure and stops it with Ctrl-C, so serve drains its statistics on the way
+  out. The installer switches the account to NT AUTHORITY\LocalService.
+-->
+<service>
+  <id>kompressor</id>
+  <name>OptScale Kompressor</name>
+  <description>Compressing proxy for coding agents, on http://127.0.0.1:8817.</description>
+  <executable>%BASE%\kompressor.exe</executable>
+  <arguments>serve --proxy --api --config "%ProgramData%\kompressor\config.toml"</arguments>
+  <startmode>Automatic</startmode>
+  <onfailure action="restart" delay="10 sec"/>
+  <resetfailure>1 hour</resetfailure>
+  <stoptimeout>25 sec</stoptimeout>
+  <logpath>%ProgramData%\kompressor\logs</logpath>
+  <log mode="roll"/>
+</service>

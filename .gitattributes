@@ -1,0 +1,10 @@
+# Run in Linux containers from the checkout, where CRLF breaks them; pinned to
+# LF even when Git for Windows checks text out as CRLF.
+*.sh        text eol=lf
+Makefile    text eol=lf
+Dockerfile* text eol=lf
+
+# Shell scripts without the extension, shipped as-is in the .deb and .pkg.
+packaging/debian/postinst           text eol=lf
+packaging/debian/postrm             text eol=lf
+packaging/macos/scripts/postinstall text eol=lf

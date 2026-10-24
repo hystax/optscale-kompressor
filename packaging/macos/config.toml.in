@@ -1,10 +1,9 @@
-# kompressor — user service configuration.
+# kompressor — service configuration.
 #
-# Written by the macOS package postinstall, which substitutes @STATE@ for a real
-# absolute path. The loader does NOT expand `$HOME` or `~`: a path spelled
-# `$HOME/.local/share/...` is taken literally and creates a directory called
-# `$HOME` next to wherever the process happens to be running. Expansion
-# therefore happens at install time, here, and never in the TOML.
+# Written by the installer (the macOS package, or the Windows installer's system
+# mode), which substitutes @STATE@ for a real absolute path. The loader expands
+# nothing in a path: `$HOME`, `~` or `%ProgramData%` is taken literally and
+# creates a directory of that name next to wherever the process is running.
 
 [server]
 listen = "127.0.0.1:8817"
@@ -55,9 +54,9 @@ websocket_relay = true
 #     the hosts named in `intercept_hosts` and copies every other connection
 #     byte for byte without reading it.
 #   * a local certificate authority is generated under `ca_path` if none is
-#     there. The key is written 0600 and never leaves that directory. Nothing
-#     trusts it until you install it somewhere, and a client that has not been
-#     pointed here is unaffected either way.
+#     there. The key is readable only by the service and never leaves that
+#     directory. Nothing trusts it until you install it somewhere, and a client
+#     that has not been pointed here is unaffected either way.
 #
 # To turn it off, comment out `listen` — the listener is off unless an address
 # is named. Remove the CA directory as well if you had already trusted it.
