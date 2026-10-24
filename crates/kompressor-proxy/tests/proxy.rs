@@ -878,6 +878,9 @@ async fn a_streamed_round_counts_each_input_token_once() {
         "event: message_delta\n",
         r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":8,"cache_read_input_tokens":41116,"cache_creation_input_tokens":3600,"output_tokens":214}}"#,
         "\n\n",
+        "event: message_stop\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
     );
     Mock::given(any())
         .respond_with(

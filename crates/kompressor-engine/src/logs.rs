@@ -514,6 +514,7 @@ fn fold_templates(
                     &member[1..],
                     refs,
                     opts.fold_handles_identical_repeats,
+                    opts.fold_marks_variants,
                 )
             } else {
                 None
@@ -860,7 +861,13 @@ mod tests {
             Identity::Values,
         )
         .expect("folds");
-        assert!(recovered.contains("[×3 ref:k_"), "got {recovered:?}");
+        // ...and so the marker says `similar`, not a bare repeat: the three
+        // timestamps differ, and a model told they repeated has no reason to
+        // reach for the only copy of them.
+        assert!(
+            recovered.contains("[×3 similar ref:k_"),
+            "got {recovered:?}"
+        );
         assert_eq!(refs.len(), 1, "one fragment for the 2nd..Nth occurrences");
         assert_eq!(
             refs.pairs()[0].1,

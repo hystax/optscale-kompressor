@@ -7,9 +7,9 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "1.0.4"
+version = "1.3.0"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/hystax/optscale-kompressor"
 
@@ -46,6 +46,13 @@ axum = { version = "0.8", features = ["macros", "ws"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["trace", "limit", "timeout", "request-id", "util"] }
 hyper = "1"
+hyper-util = { version = "0.1", features = ["server", "server-auto", "service", "tokio"] }
+ring = "0.17"
+pem = "4"
+time = { version = "0.3", default-features = false, features = ["std"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring", "x509-parser"] }
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
@@ -55,10 +62,27 @@ futures-util = "0.3"
 # matches reqwest's rustls below: a second TLS stack in one binary is a second
 # set of roots to keep current and a second place a handshake can fail.
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
-# reqwest 0.13 split the old `rustls-tls` feature in two: `rustls` selects the
-# stack, `webpki-roots` the root store it trusts. Naming both keeps the same
-# combination 0.12 bundled under one name — a change of spelling, not of trust.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "http2", "stream", "json"] }
+# Held at 0.12 deliberately, and the reason is not inertia.
+#
+# 0.13 collapsed the rustls features into `rustls` and `rustls-no-provider`,
+# and *both* carry `dep:rustls-platform-verifier` unconditionally — there is no
+# longer a way to use rustls without it. Three things follow, none of them
+# wanted here:
+#
+#   * it links Apple's Security and CoreFoundation frameworks on macOS, which
+#     zig has no stubs for, so `make macos-pkg-docker` cannot link at all.
+#     That is how this was found: the .pkg build broke and the cause was a
+#     transitive dependency nobody had asked for.
+#   * `rustls` also forces `__rustls-aws-lc-rs`, so the binary carries a second
+#     crypto provider beside the `ring` every other crate here uses.
+#   * certificates are then checked against the OS trust store rather than the
+#     webpki roots this line asks for. The 0.13 spelling was introduced with a
+#     comment calling it "a change of spelling, not of trust". It was both.
+#
+# 0.12's `rustls-tls-webpki-roots` is `webpki-roots` + `__rustls-ring`: one
+# provider, one root store, no platform verifier, and it matches
+# tokio-tungstenite's feature of the same name above.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "http2", "stream", "json"] }
 url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
@@ -75,7 +99,7 @@ humantime-serde = "1"
 anyhow = "1"
 thiserror = "2"
 once_cell = "1"
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 [profile.release]
 opt-level = 3

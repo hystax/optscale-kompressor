@@ -15,7 +15,7 @@ cd "$ROOT"
 command -v docker >/dev/null || { echo "docker is not installed" >&2; exit 1; }
 
 BIN="target/$TARGET/release/kompressor"
-[[ -x "$BIN" ]] || ./scripts/build-static.sh "$TARGET"
+[[ -x "$BIN" ]] || ./scripts/build/static.sh "$TARGET"
 
 ctx="$(mktemp -d)"
 trap 'rm -rf "$ctx"' EXIT

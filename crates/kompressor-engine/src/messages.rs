@@ -395,8 +395,9 @@ const CACHE_DISCOUNT: u32 = 10;
 ///
 /// `hit_per_mille` of 1000 recovers the old value of 9 and is the default where
 /// nothing has been observed: it is the most demanding reading, and erring
-/// towards refusing is the cheap mistake. Anthropic bills the rewrite as well,
-/// which puts its true figure above this, so there too the bias is to refuse.
+/// towards refusing is the cheap mistake. Anthropic bills the rewrite as a
+/// cache write, which puts its true figure above this; the proxy folds that
+/// premium into the rate it sends rather than this rule knowing providers.
 fn fetches_to_repay_a_break(behind: u32, whole: u32, hit_per_mille: u32) -> u64 {
     if whole == 0 {
         return 0;
@@ -887,9 +888,11 @@ pub fn compress_messages(
                 .max()
                 .unwrap_or(0);
             if compressed_here && protected > 0 {
-                // What shipping this message whole gives up, every later turn.
-                let forfeited = count_tokens(&original, &role)
-                    .saturating_sub(count_tokens(&messages[index].content, &role));
+                let demanded: Vec<_> = refs.pairs()[inline_mark.pairs..]
+                    .iter()
+                    .filter(|(id, _)| req.keep_inline.contains(id))
+                    .map(|(id, _)| *id)
+                    .collect();
                 // Everything after this message, which a rewrite here makes the
                 // provider read again, and the whole prompt it is a fraction
                 // of. Counted on what the messages hold right now: the ones
@@ -904,6 +907,31 @@ pub fn compress_messages(
                     .iter()
                     .map(|each| count_tokens(&each.content, &each.role))
                     .sum();
+                // Whether the rewrite is repaid, before any representation is
+                // priced. When it is not, no candidate can change the answer,
+                // and building one re-parses a large source message on every
+                // turn of a conversation that keeps fetching from it — 37
+                // refusals of one message in a single afull89 trial.
+                let repaid = keeping_it_inline_is_worth_it(
+                    0,
+                    protected,
+                    break_cost,
+                    whole,
+                    fetches,
+                    req.cache_hit_per_mille,
+                );
+                // Price the representation we would actually ship. A single
+                // fetched function must not be charged for restoring every
+                // unrelated body in a large source file.
+                let mut recovery_refs = refs.scratch();
+                let selective = repaid
+                    .then(|| {
+                        compress_preserving_code(&original, &role, opts, req, &mut recovery_refs)
+                    })
+                    .flatten();
+                let recovery_content = selective.as_ref().map_or(&original, |(content, _)| content);
+                let forfeited = count_tokens(recovery_content, &role)
+                    .saturating_sub(count_tokens(&messages[index].content, &role));
                 if keeping_it_inline_is_worth_it(
                     forfeited,
                     protected,
@@ -912,15 +940,22 @@ pub fn compress_messages(
                     fetches,
                     req.cache_hit_per_mille,
                 ) {
-                    kept_inline_ids.extend(
-                        refs.pairs()[inline_mark.pairs..]
-                            .iter()
-                            .filter(|(id, _)| req.keep_inline.contains(id))
-                            .map(|(id, _)| *id),
+                    tracing::info!(
+                        handles = ?demanded, fetches, forfeited, protected,
+                        break_cost, whole, selective = selective.is_some(),
+                        "keeping demanded fragments inline"
                     );
+                    kept_inline_ids.extend(demanded);
                     refs.rollback(inline_mark);
-                    messages[index].content = original;
-                    compressed_here = false;
+                    compressed_here = if let Some((content, kinds)) = selective {
+                        messages[index].content = content;
+                        applied = kinds;
+                        refs.adopt(recovery_refs);
+                        true
+                    } else {
+                        messages[index].content = original;
+                        false
+                    };
                     kept_inline = true;
                 } else {
                     // Said out loud, because the consequence is that the model
@@ -929,6 +964,11 @@ pub fn compress_messages(
                     // salvage on `warn`: two paid runs narrowed nothing at all
                     // while it was a `debug`.
                     tracing::warn!(
+                        handles = ?demanded,
+                        // `forfeited` is priced on the whole original when the
+                        // rewrite already failed, so it cannot name the reason.
+                        reason = if repaid { "inline_growth" } else { "prefix_rewrite" },
+                        selective = selective.is_some(),
                         forfeited,
                         protected,
                         break_cost,
@@ -972,6 +1012,57 @@ pub fn compress_messages(
     stats.protected_refs = protected_ref_ids.into_iter().collect();
     stats.kept_inline_refs = kept_inline_ids.into_iter().collect();
     stats.finish(opts.mode, refs)
+}
+
+/// Build a recovery candidate with fetched source bodies held inline. Callers
+/// can price it in a scratch collector before accepting the promotion. A
+/// fallback route must not hide a demanded body again; otherwise the caller
+/// must price and retain the original message instead.
+fn compress_preserving_code(
+    original: &MessageContent,
+    role: &str,
+    opts: &EngineOptions,
+    req: &RequestOptions,
+    refs: &mut RefCollector,
+) -> Option<(MessageContent, Vec<Kind>)> {
+    let mut candidate = original.clone();
+    let mut scratch = refs.scratch();
+    scratch.preserve_code(req.keep_inline);
+    let mut applied = Vec::new();
+    let mut changed = false;
+    let mut compress = |text: &mut String| {
+        let ctx = Context::for_role(role);
+        let (out, kind) =
+            compress_content(text, role, opts, None, &mut scratch, &ctx, &mut applied);
+        if let Some(kind) = kind {
+            *text = out.into_owned();
+            applied.push(kind);
+            changed = true;
+        }
+    };
+    match &mut candidate {
+        MessageContent::Text(text) => compress(text),
+        MessageContent::Blocks(slots) => {
+            for slot in slots {
+                let lifted = slot.protection == Protection::WhileCached
+                    && req.prefix_cache == PrefixCache::Cold;
+                if !slot.protected || lifted {
+                    compress(&mut slot.text);
+                }
+            }
+        }
+        MessageContent::Opaque => return None,
+    }
+    if !changed
+        || scratch
+            .pairs()
+            .iter()
+            .any(|(id, _)| req.keep_inline.contains(id))
+    {
+        return None;
+    }
+    refs.adopt(scratch);
+    Some((candidate, applied))
 }
 
 fn texts_of(content: &MessageContent) -> Vec<&str> {
@@ -1590,6 +1681,174 @@ mod skip_reason_tests {
         EngineOptions {
             mode: Mode::Recoverable,
             ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "code-aware")]
+    #[test]
+    fn fetched_shared_bodies_do_not_expose_an_unfetched_body() {
+        // Exercise both source compressors and both message representations.
+        for python in [true, false] {
+            for (blocks, json_envelope, keep_count) in
+                [(false, false), (true, false), (false, true), (true, true)]
+                    .into_iter()
+                    .flat_map(|(blocks, json)| {
+                        [1, 8].into_iter().map(move |count| (blocks, json, count))
+                    })
+            {
+                let source = |variant: &str| -> String {
+                    (0..18)
+                        .map(|function| {
+                            let mut body = String::new();
+                            for step in 0..26 {
+                                let value = if function == 17 && step == 17 {
+                                    format!("\"{variant}\"")
+                                } else {
+                                    (function * 26 + step).to_string()
+                                };
+                                body.push_str(&if python {
+                                    format!("    step_{step} = compute(entries, {value})\n")
+                                } else {
+                                    format!("    const step_{step} = compute(entries, {value});\n")
+                                });
+                            }
+                            if python {
+                                format!("def reconcile_{function:02}(entries):\n{body}\n")
+                            } else {
+                                format!("function reconcile_{function:02}(entries) {{\n{body}}}\n")
+                            }
+                        })
+                        .collect()
+                };
+                let message = |text: &str| {
+                    let wrapped = if json_envelope {
+                        serde_json::json!({"output": text, "exit_code": 0}).to_string()
+                    } else {
+                        text.to_string()
+                    };
+                    let text = wrapped.as_str();
+                    let mut message = msg("tool", text);
+                    if blocks {
+                        let mut protected = TextSlot::new("protected context");
+                        protected.protected = true;
+                        message.content =
+                            MessageContent::Blocks(vec![protected, TextSlot::new(text)]);
+                    }
+                    message
+                };
+                let mut warmup_handles = Vec::new();
+                for variant in ["decoy-one", "decoy-two"] {
+                    let mut messages = vec![message(&source(variant))];
+                    let mut refs = RefCollector::new(1 << 20);
+                    compress_messages(
+                        &mut messages,
+                        &opts(),
+                        &RequestOptions::default(),
+                        &mut refs,
+                    );
+                    assert_eq!(refs.len(), 18);
+                    warmup_handles.push(refs.pairs().iter().map(|(id, _)| *id).collect::<Vec<_>>());
+                }
+                assert_eq!(&warmup_handles[0][..17], &warmup_handles[1][..17]);
+                assert_ne!(warmup_handles[0][17], warmup_handles[1][17]);
+                let keep = &warmup_handles[0][..keep_count];
+                let original = message(&source("unfetched-ledger-secret"));
+                let mut messages = vec![original.clone()];
+                let mut refs = RefCollector::new(1 << 20);
+                let stats = compress_messages(
+                    &mut messages,
+                    &opts(),
+                    &RequestOptions {
+                        keep_inline: keep,
+                        ..Default::default()
+                    },
+                    &mut refs,
+                );
+                let output = messages[0].content.joined_text();
+                assert_eq!(stats.compressed_messages, 1);
+                assert_eq!(stats.kept_inline_refs.len(), keep_count);
+                assert_eq!(refs.len(), 18 - keep_count);
+                assert_eq!(
+                    output.matches("body lines omitted").count(),
+                    18 - keep_count
+                );
+                assert!(output.contains("step_0 = compute(entries, 0)"));
+                assert!(!output.contains("unfetched-ledger-secret"));
+                assert!(refs.pairs().iter().all(|(id, _)| !keep.contains(id)));
+                assert!(
+                    refs.pairs()
+                        .iter()
+                        .any(|(_, text)| text.contains("unfetched-ledger-secret"))
+                );
+                for (id, _) in refs.pairs() {
+                    assert!(output.contains(&id.to_string()), "no orphan references");
+                }
+                if let MessageContent::Blocks(slots) = &messages[0].content {
+                    assert_eq!(slots[0].text, "protected context");
+                    assert!(slots[0].protected);
+                }
+                if keep_count == 1 {
+                    // Selective recovery is cheaper, not exempt from the cache
+                    // rewrite guard. A rejected candidate must not leak refs.
+                    let mut denied = vec![
+                        original.clone(),
+                        msg("system", &"cached tail ".repeat(5000)),
+                    ];
+                    let mut denied_refs = RefCollector::new(1 << 20);
+                    let denied_stats = compress_messages(
+                        &mut denied,
+                        &opts(),
+                        &RequestOptions {
+                            keep_inline: keep,
+                            ..Default::default()
+                        },
+                        &mut denied_refs,
+                    );
+                    assert!(denied_stats.kept_inline_refs.is_empty());
+                    assert_eq!(denied_refs.len(), 18);
+                    assert_eq!(
+                        denied[0]
+                            .content
+                            .joined_text()
+                            .matches("body lines omitted")
+                            .count(),
+                        18
+                    );
+                }
+                // Protection belongs to this retry, not the reusable collector.
+                let mut fresh = vec![original.clone()];
+                let later =
+                    compress_messages(&mut fresh, &opts(), &RequestOptions::default(), &mut refs);
+                assert_eq!(later.compressed_messages, 1);
+                assert_eq!(
+                    fresh[0]
+                        .content
+                        .joined_text()
+                        .matches("body lines omitted")
+                        .count(),
+                    18
+                );
+                // Once every body is fetched, keeping the complete original is
+                // still correct, and must not leave orphan references behind.
+                let all: Vec<_> = refs.pairs().iter().map(|(id, _)| *id).collect();
+                let mut fetched = vec![original.clone()];
+                let mut final_refs = RefCollector::new(1 << 20);
+                let final_stats = compress_messages(
+                    &mut fetched,
+                    &opts(),
+                    &RequestOptions {
+                        keep_inline: &all,
+                        ..Default::default()
+                    },
+                    &mut final_refs,
+                );
+                assert_eq!(fetched[0].content, original.content);
+                assert!(final_refs.is_empty());
+                assert_eq!(
+                    final_stats.skipped_by_reason.get("retrieved_before"),
+                    Some(&1)
+                );
+            }
         }
     }
 

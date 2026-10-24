@@ -115,12 +115,96 @@ if [ "$1" -eq 0 ]; then
 fi
 """
 
+# The static variant, the RPM side of [package.metadata.deb.variants.musl].
+# `make rpm-static`, or by hand after `make static` has filled target/static:
+#
+#   cargo generate-rpm -p crates/kompressor-cli --variant musl \
+#                      -o target/generate-rpm-static
+#
+# `auto-req` is the RPM counterpart of cargo-deb's `$auto`, and is switched off
+# for the same reason: it runs ldd over the payload and turns the result into
+# requires. On the glibc build that is twenty-odd `libc.so.6(GLIBC_x.y)` lines
+# whose highest version is whatever the build host happened to have — the floor
+# this variant exists to remove. On a static binary ldd has nothing to report,
+# so in practice the list comes out empty either way; saying `disabled` makes
+# that an intention rather than a happy accident, and keeps the package honest
+# if the link ever stops being fully static.
+#
+# `requires` is inherited: shadow-utils and systemd are still needed, because
+# the scriptlets still call useradd and systemctl. Static linking removes a
+# libc dependency, not the package's dependency on the system around it.
+[package.metadata.generate-rpm.variants.musl]
+auto-req = "disabled"
+# Repeated in full because the variant overwrites this key rather than merging
+# into it: only the first entry differs from the table above.
+assets = [
+    { source = "../../target/static/kompressor", dest = "/usr/bin/kompressor", mode = "755" },
+    { source = "../../packaging/kompressor.toml", dest = "/etc/kompressor/config.toml", mode = "644", config = "noreplace" },
+    { source = "../../packaging/systemd/kompressor.service", dest = "/usr/lib/systemd/system/kompressor.service", mode = "644" },
+    { source = "../../README.md", dest = "/usr/share/doc/kompressor/README.md", mode = "644", doc = true },
+    { source = "../../docs/QUICKSTART.md", dest = "/usr/share/doc/kompressor/QUICKSTART.md", mode = "644", doc = true },
+    { source = "../../LICENSE", dest = "/usr/share/doc/kompressor/LICENSE", mode = "644", doc = true },
+]
+
 [package.metadata.deb.systemd-units]
 unit-scripts = "../../packaging/systemd"
 unit-name = "kompressor"
 enable = true
 start = true
 restart-after-upgrade = true
+
+# --- The static variant ----------------------------------------------------
+# `make deb-static`, or by hand:
+#
+#   make static                                   # or scripts/build/static.sh
+#   mkdir -p target/static
+#   cp target/x86_64-unknown-linux-musl/release/kompressor target/static/
+#   cargo deb -p kompressor-cli --variant musl \
+#             --target x86_64-unknown-linux-musl --no-build -o target/debian-static
+#
+# The Makefile then renames the result to carry `-static`, because the package
+# name and version below are the same as the glibc build's and the filename is
+# the only thing left that can tell the two apart.
+#
+# The copy is not ceremony. cargo-deb resolves asset paths against this
+# manifest and does not rewrite them for `--target`; it warns about the
+# `../../` form and then packages whatever is at that path, which for the
+# unmodified asset list is the *glibc* binary — a static package containing a
+# dynamic executable, built without an error. Naming a staging path the build
+# fills is the only arrangement where the file in the package is the file the
+# variant is named after, and it keeps the triple out of this manifest so
+# STATIC_TARGET still chooses the architecture.
+#
+# Same package, same files, same unit; the only difference is a binary linked
+# against musl instead of glibc, which means the package carries its libc
+# rather than depending on one. A .deb built on this machine installs on a
+# distribution five years older than it, which the ordinary one does not: the
+# glibc build records the build host's glibc as a floor, and the floor is only
+# ever as old as whoever ran `make deb`.
+#
+# `$auto` is dropped from `depends` on purpose rather than by oversight.
+# cargo-deb derives that list by reading the ELF's dynamic section; on a
+# statically linked binary there is nothing there to read, so at best it
+# contributes nothing and at worst — if the link ever stops being fully static
+# — it quietly puts libc6 back, which is the one thing this variant exists to
+# avoid. Naming `adduser` outright keeps the postinst's `useradd` honest.
+#
+# Everything not named here is inherited from [package.metadata.deb] above,
+# the systemd unit and the conffile included.
+[package.metadata.deb.variants.musl]
+# Without this the package would be named `kompressor-musl`, and `apt upgrade`
+# would treat it as a different program rather than a newer build of this one.
+name = "kompressor"
+depends = "adduser"
+# Repeated in full because cargo-deb replaces the list rather than merging it:
+# only the first line differs from [package.metadata.deb] above.
+assets = [
+    ["../../target/static/kompressor", "usr/bin/", "755"],
+    ["../../packaging/kompressor.toml", "etc/kompressor/config.toml", "644"],
+    ["../../README.md", "usr/share/doc/kompressor/README.md", "644"],
+    ["../../docs/QUICKSTART.md", "usr/share/doc/kompressor/QUICKSTART.md", "644"],
+    ["../../LICENSE", "usr/share/doc/kompressor/LICENSE", "644"],
+]
 
 [[bin]]
 name = "kompressor"

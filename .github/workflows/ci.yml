@@ -126,7 +126,7 @@ jobs:
       - run: cargo test --workspace ${{ matrix.flags }}
 
   msrv:
-    name: msrv (1.90)
+    name: msrv (1.95)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -135,14 +135,15 @@ jobs:
       # never built is a claim, not a fact; this is the only thing that makes it
       # one. Bump both together or not at all.
       #
-      # 1.90 is set by the dependency graph, not by anything this workspace
-      # writes: tree-sitter-language requires it. Note that cargo resolves
-      # `rust-version` across the whole locked graph, so `--no-default-features`
-      # does not lower it even though it deactivates the grammars.
+      # 1.95 is set by the dependency graph, not by anything this workspace
+      # writes: parking_lot 0.13 requires it, and before that 1.90 was
+      # tree-sitter-language's floor. Note that cargo resolves `rust-version`
+      # across the whole locked graph, so `--no-default-features` does not lower
+      # it even though it deactivates the grammars.
       - name: toolchain
         run: |
-          rustup toolchain install 1.90 --profile minimal --no-self-update
-          rustup default 1.90
+          rustup toolchain install 1.95 --profile minimal --no-self-update
+          rustup default 1.95
       - uses: actions/cache@v4
         with:
           path: |

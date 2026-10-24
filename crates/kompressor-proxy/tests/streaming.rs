@@ -72,6 +72,37 @@ const ANTHROPIC_ANSWERS: &str = concat!(
     "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
 );
 
+#[tokio::test]
+async fn anthropic_handover_mid_call_drops_later_deltas_and_stop() {
+    // Force hand-over after the first argument delta. The opening block was
+    // buffered; the remaining delta and stop arrive in passthrough.
+    let harness = Harness::with(|config| config.proxy.stream_intercept_bytes = 1).await;
+    let asks = ANTHROPIC_ASKS.replace(
+        "event: content_block_stop",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\" \"}}\n\nevent: content_block_stop",
+    );
+    Mock::given(any())
+        .respond_with(move |request: &Request| sse(&asks.replace("HANDLE", &handle_in(request))))
+        .mount(&harness.server)
+        .await;
+    let reply = harness
+        .post(
+            "/v1/messages",
+            &streaming(anthropic_body(&log_payload(400))),
+        )
+        .await;
+    let text = reply.text();
+    assert!(
+        !text.contains("content_block_"),
+        "orphaned block event: {text}"
+    );
+    assert!(!text.contains("tool_use"), "{text}");
+    assert!(
+        text.contains("end_turn") && text.contains("message_stop"),
+        "{text}"
+    );
+}
+
 /// Responses splits its `data:` across two lines here, which the spec says to
 /// join with a newline and which a stricter parser would drop.
 const RESPONSES_ASKS: &str = concat!(

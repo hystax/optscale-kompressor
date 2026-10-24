@@ -386,6 +386,8 @@ fn recorded_options(mode: Mode) -> EngineOptions {
         enable_fold_fallback: false,
         // off by default anyway; named so the harness states what it assumes
         enable_preamble_aware_detection: false,
+        // a fold over variants was announced as a plain repeat
+        fold_marks_variants: false,
         // the line-number column was classified along with the content
         enable_line_gutter: false,
         // there was no last-resort clip for over-long lines

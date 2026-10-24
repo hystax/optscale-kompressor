@@ -46,6 +46,7 @@ Standard library only, so it runs anywhere the binary does.
 import argparse
 import datetime as dt
 import glob
+import hashlib
 import json
 import os
 import re
@@ -957,6 +958,8 @@ def cache_losses(rows):
                 continue
             out.append({
                 "conversation": key,
+                "before_request_id": previous.get("request_id"),
+                "request_id": current.get("request_id"),
                 "was": was,
                 "now": now,
                 "lost": was - now,
@@ -995,10 +998,10 @@ CACHE_READ_RATE = 0.1
 SESSION_BREAK = 0.5
 
 
-def billed_tokens(rows, field):
+def billed_tokens(rows, field, provider="openai"):
     """`field` summed with re-sends priced at the cache-read rate.
 
-    The arithmetic is exact rather than per-byte, which it can afford to be:
+    This is a monotonic-history estimate, not a provider billing ledger:
     for one monotonic session, the content new at turn i is re-sent (N - i)
     times, so the weighted total is `unique + (flat - unique) * rate` -- the
     same number a per-byte walk would reach, without needing byte identity the
@@ -1017,9 +1020,21 @@ def billed_tokens(rows, field):
         group = sorted(group, key=lambda r: r.get("time_ms") or 0)
         current = []
         for row in group:
-            prompt = row.get("prompt_tokens") or 0
-            previous = (current[-1].get("prompt_tokens") or 0) if current else 0
-            if current and previous and prompt < previous * SESSION_BREAK:
+            def prompt_size(item):
+                size = item.get("prompt_tokens") or 0
+                if provider == "anthropic":
+                    size += (item.get("cache_read_tokens") or 0) + (item.get("cache_write_tokens") or 0)
+                return size
+
+            prompt = prompt_size(row)
+            previous = prompt_size(current[-1]) if current else 0
+            count = row.get("messages_total")
+            old_count = current[-1].get("messages_total") if current else None
+            # Counts, when present, distinguish a new session from a cache
+            # transition. Anthropic's uncached remainder alone cannot do so.
+            boundary = (count < old_count if count is not None and old_count is not None
+                        else bool(previous and prompt < previous * SESSION_BREAK))
+            if current and boundary:
                 sessions.append(current)
                 current = []
             current.append(row)
@@ -1027,7 +1042,8 @@ def billed_tokens(rows, field):
             sessions.append(current)
     weighted = flat = unique = 0.0
     for session in sessions:
-        values = [r[field] or 0 for r in session]
+        values = [(r.get("tokens_in") if field == "tokens_out" and r.get("outcome") == "discarded"
+                   else r[field]) or 0 for r in session]
         total, peak = sum(values), max(values)
         flat += total
         unique += peak
@@ -1065,8 +1081,8 @@ def efficiency(rows, retrievals, abandoned=(), provider="openai"):
     # the flat ones, never instead of them: the flat sum is what the engine
     # looked at and the weighted one is what that work was worth, and a reader
     # comparing two runs needs to know which they are holding.
-    billed_in, _, unique_in = billed_tokens(compressed, "tokens_in")
-    billed_out, _, unique_out = billed_tokens(compressed, "tokens_out")
+    billed_in, _, unique_in = billed_tokens(compressed, "tokens_in", provider)
+    billed_out, _, unique_out = billed_tokens(compressed, "tokens_out", provider)
     losses = cache_losses(rows)
     prompt = sum(r["prompt_tokens"] or 0 for r in rows)
     completion = sum(r["completion_tokens"] or 0 for r in rows)
@@ -1148,7 +1164,7 @@ def efficiency(rows, retrievals, abandoned=(), provider="openai"):
                         and r.get("completion_tokens") is None
                         and r.get("prompt_tokens") is None
                         and (r.get("model") or r.get("messages_total") is not None)
-                        and r not in walked_out]
+                        and not r.get("error")]
     zero_usage = [r for r in rows
                   if int(r.get("status") or 0) == 200
                   and r.get("completion_tokens") == 0
@@ -1239,7 +1255,9 @@ def efficiency(rows, retrievals, abandoned=(), provider="openai"):
                                 if r.get("ranged") and not r.get("withheld")),
         "retrieval_withheld": sum(1 for r in retrievals if r.get("withheld")),
         "retrieved_tokens": returned,
+        # Keep the legacy field for consumers; neither measure is dollar savings.
         "saved_net": (tokens_in - tokens_out) - returned,
+        "saved_after_injection": (tokens_in - tokens_out) - injected,
         "content_types": types,
     }
 
@@ -1317,18 +1335,12 @@ def validity_flags(eff, acc, selftest, mode="recoverable"):
         flags.append(f"{eff['requests_failed']} proxy requests failed or returned "
                      f">=400 ({eff['status_counts']})")
     if eff.get("requests_answered_nothing"):
-        streamed = eff.get("requests_answered_nothing_streamed") or 0
         flags.append(
             f"{eff['requests_answered_nothing']} of {eff['requests']} request(s) "
-            "returned HTTP 200 carrying no usage at all"
-            + (". A streaming provider sends headers before it knows it will "
-               "refuse, so a quota or policy refusal arrives inside the stream "
-               "where neither the status code nor the relay can see it"
-               if streamed else
-               " (none of them streamed, so a mid-stream refusal is not the "
-               "explanation here)")
-            + " -- the run reports every request OK while the agent got nothing. "
-            "Read the agent's own log for the refusal")
+            "returned HTTP 200 without reported usage and without a recorded "
+            "transport error. Inspect provider error frames and agent logs; "
+            "missing usage alone does not establish a quota or policy refusal. "
+            "Known transport failures are counted separately above.")
     # A usage object that parsed and said zero is a weaker signal than no usage
     # at all, so it is reported only when it is widespread enough to mean
     # something. One probe in a run is noise; most of a run is the same quota
@@ -1353,21 +1365,13 @@ def validity_flags(eff, acc, selftest, mode="recoverable"):
             f"{worst['gap_ms'] / 1000:.1f}s after the previous turn, "
             f"{worst['was']:,} -> {worst['now']:,}"
             + (f", and {eff['cache_lost_rewritten']:,} of those tokens were "
-               "written back into a cache this provider charges to write, so "
-               "they are billed twice"
+               "associated with cache writes; price writes separately from reads"
                if eff.get("cache_lost_rewritten") else "")
-            + "). Everything after the first "
-            "missing byte was billed at full price again, so this run's cost does "
-            "not compare with one that had none. DIFF THE CAPTURED BODIES at "
-            "that turn before concluding anything -- "
-            "`scripts/harbor/cache-loss-diff.py <run-dir>` does it and exits "
-            "non-zero if the loss was ours. By hand: join kompressor-bodies.jsonl "
-            "to proxy_requests on request_id, and compare the losing request "
-            "against the one before it -- tools array, instructions, and the "
-            "conversation separately. All three identical means the provider "
-            "dropped it and the proxy is not at fault; anything of ours that "
-            "changed is. The magnitude does not tell them apart: 11,648 -> "
-            "10,624 has been both")
+            + "). Compare ingress and egress bodies before attributing the loss. "
+            "Run `scripts/harbor/cache-loss-diff.py <run-dir>` to distinguish "
+            "proxy rewrites, client changes, and unresolved cache metadata or "
+            "expiry candidates. Cache-read drops alone do not establish cause "
+            "or incremental billing cost.")
     if any(entry is None for entry in (selftest or {}).values()):
         flags.append("the compression self-test did not complete")
     if acc.get("counts") and acc["counts"][1] == 0:
@@ -1448,7 +1452,7 @@ def report(cfg, krs, acc, eff, selftest, effective, window):
         add(f"  first send only  {eff['unique_in']:,.0f} tokens -> "
             f"{eff['unique_out']:,.0f}  "
             f"({fmt_pct(eff['unique_reduction_pct'])} removed) "
-            "<- the content itself, each byte once")
+            "<- session-peak estimate; not unique byte tracking")
     if eff.get("requests_discarded"):
         add(f"  discarded        {eff['requests_discarded']:,} request(s), "
             f"{eff['discarded_tokens']:,} tokens the engine removed and the proxy "
@@ -1513,8 +1517,7 @@ def report(cfg, krs, acc, eff, selftest, effective, window):
     # rewritten" would invite the reader to wonder what went uncounted.
     if rewritten:
         add(f"  of which rewrit  {rewritten:,} tokens were also written back into "
-            "the cache, and this provider bills writes -- so those tokens are "
-            "paid for twice, and the write is the dearer half")
+            "the cache; price cache writes separately from cache reads")
     add(f"  handles minted   {eff['refs_emitted']:,}")
     add(f"  retrievals       {eff['retrievals']:,} "
         f"({eff['retrieval_hits']:,} hits, {eff['retrieval_ranged']:,} narrowed) "
@@ -1557,9 +1560,10 @@ def report(cfg, krs, acc, eff, selftest, effective, window):
             withheld_line += ("proxy.retrieve_max_rounds or "
                               "proxy.retrieve_max_tokens_per_request was spent. ")
         add(withheld_line + "Not counted above: asks the model made and did not get")
-    add(f"  put back         {eff['retrieved_tokens']:,} tokens")
-    add(f"  saved net        {eff['saved_net']:,} tokens  "
-        "(gross minus what retrieval re-injected)")
+    add(f"  put back         {eff['retrieved_tokens']:,} fragment tokens; "
+        f"{eff['retrieve_tokens_injected']:,} injected tokens including overhead")
+    add(f"  after injection  {eff['saved_after_injection']:,} tokens  "
+        "(gross minus injected tokens; excludes extra upstream rounds and billing effects)")
     if eff["content_types"]:
         top = sorted(eff["content_types"].items(), key=lambda kv: -kv[1])[:8]
         add("  by type          " + ", ".join(f"{k} {v}" for k, v in top))
@@ -1577,6 +1581,18 @@ def report(cfg, krs, acc, eff, selftest, effective, window):
 
 
 # ------------------------------------------------------------------------ dump
+def file_sha256(path):
+    """Identify the executable actually used, independently of checkout HEAD."""
+    try:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
 def capture_provenance(cfg):
     repo = os.path.dirname(os.path.dirname(os.path.dirname(cfg.kompressor_bin)))
     def git(*args):
@@ -1595,6 +1611,7 @@ def capture_provenance(cfg):
         cfg.kompressor_version = "unknown"
     return {"repo": repo, "commit": cfg.kompressor_commit,
             "dirty": cfg.kompressor_dirty, "version": cfg.kompressor_version,
+            "binary_sha256": file_sha256(cfg.kompressor_bin),
             "binary_mtime": dt.datetime.fromtimestamp(
                 os.path.getmtime(cfg.kompressor_bin)).isoformat(timespec="seconds")
             if os.path.exists(cfg.kompressor_bin) else None}

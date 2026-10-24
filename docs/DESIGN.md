@@ -214,7 +214,7 @@ Makefile          every target, self-documenting via `make`
 | observability | `tracing`, `tracing-subscriber` (json/env-filter), `metrics` + `metrics-exporter-prometheus` | |
 | tests | `wiremock` (upstream mock) | `proptest`, `insta`, `criterion` and `cargo-fuzz` are **not** in the tree. Golden vectors are a hand-rolled snapshot (`fixtures/golden.json.gz`, §18) and the benchmark is `kompressor bench replay` against a recorded baseline, not criterion |
 
-Edition 2021. MSRV is **1.90**, declared in `Cargo.toml` and gated by a CI job that builds on exactly that toolchain — the floor is set by the dependency graph (`tree-sitter-language`), not by anything this workspace writes, and `--no-default-features` does not lower it because cargo resolves `rust-version` across the whole locked graph. `#![forbid(unsafe_code)]` is in nine of the ten crates; `kompressor-cli` is the exception.
+Edition 2024. MSRV is **1.95**, declared in `Cargo.toml` and gated by a CI job that builds on exactly that toolchain — the floor is set by the dependency graph (`parking_lot` 0.13; it was 1.90 for `tree-sitter-language` until that bump), not by anything this workspace writes, and `--no-default-features` does not lower it because cargo resolves `rust-version` across the whole locked graph. `#![forbid(unsafe_code)]` is in nine of the ten crates; `kompressor-cli` is the exception.
 
 ## 4. `kompressor-engine`: types, traits, pipeline
 
@@ -285,6 +285,7 @@ pub struct EngineOptions {
     pub enable_code_aware: bool,                    // true
     pub enable_mixed_content: bool,                 // true
     pub enable_config_compressor: bool,             // true
+    pub enable_config_sections: bool,               // true
     pub enable_nested_routing: bool,                // true
     pub enable_redraw_fold: bool,                   // true  (arbitrated; needs a collector)
     pub enable_build_templates: bool,               // true  (build output folds by name too, §7.4)
@@ -2040,6 +2041,7 @@ enable_listing_compressor = true
 enable_code_aware = true
 enable_mixed_content = true
 enable_config_compressor = true
+enable_config_sections = true
 enable_nested_routing = true
 enable_redraw_fold = true           # arbitrated transforms
 enable_build_templates = true       # build output may fold by name, §7.4
@@ -2164,6 +2166,17 @@ Designed in this document but **not built**: `migrate` (schemas are
 applied on open), `compress --ephemeral`, and the `bench sample`, `needles`
 and `calibrate-tokens` subcommands (§18.6 describes the metrics). `bench
 replay` and `bench extract` ship.
+
+`bench replay` is the one command that does **not** consult configuration
+discovery. Every other command reads `$KOMPRESSOR_CONFIG`, then
+`./kompressor.toml`, then the XDG path; the replay reads `--config` if given and
+the compiled-in defaults otherwise. It is a gate measured against a committed
+baseline, so it has to measure the engine rather than the machine — a personal
+config carrying `enable_normalised_text_fold = false` otherwise moves the `text`
+bucket by 47 points and `make bench` reports it as a code regression. `--config`
+still works, which is the A/B case the command reads configuration for at all,
+and it applies to `--save` as much as to `--compare`: a baseline recorded under
+someone's local settings would move the gate for everyone.
 
 `compress --explain` prints the detection result, the chosen reading (mixed vs
 whole, redraw arbitration), the per-slot kinds, markers and refs, and the
@@ -2738,7 +2751,7 @@ that `make check` locally and CI cannot hold different opinions:
 |---|---|
 | `lint` | `make lint` — `cargo fmt --check`, `cargo clippy --all-targets -D warnings` |
 | `test` | `cargo test --workspace`, twice: default features and `--no-default-features` |
-| `msrv` | `cargo check --workspace --all-targets` on 1.90 exactly, so the declared MSRV is a fact rather than a claim |
+| `msrv` | `cargo check --workspace --all-targets` on 1.95 exactly, so the declared MSRV is a fact rather than a claim |
 | `gate` | `make release` then `make bench` (the fixture replay gate: coverage, claimed and billed not regressed, no invariant violated, determinism), `make docs-check`, `make smoke` |
 | `e2e` | `make e2e` — the hermetic Docker suite on an `internal: true` network |
 
