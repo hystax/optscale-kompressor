@@ -68,6 +68,14 @@ mod imp {
         language: Option<Language>,
     ) -> Option<String> {
         let language = language?;
+        // The switch is honoured here, not only where whole payloads are
+        // routed: the mixed segmenter, the lead-in and multi-file retries all
+        // reach this function directly, and with the check only in routing a
+        // run configured without code elision still elided the bodies inside
+        // every `ls && cat` and fenced block.
+        if !opts.enable_code_aware {
+            return None;
+        }
         // Eliding a function body is not reversible, so this compressor has no
         // business running in `lossless` — the one mode whose promise is that
         // nothing is dropped. With `strict_lossless` off the check is skipped

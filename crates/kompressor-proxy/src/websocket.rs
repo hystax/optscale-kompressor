@@ -674,6 +674,9 @@ async fn compress_value(
         // measured rate is the honest value to pass, not a placeholder that
         // would start lying the day the exemption above is reconsidered.
         state.prefixes.cache_hit_per_mille(),
+        // Unpriced for the same reason: the demands above clear any bar.
+        0,
+        None,
         // No conversation on this transport, so nothing to pin against. The
         // `u32::MAX` demands above already make every promotion here permanent.
         None,

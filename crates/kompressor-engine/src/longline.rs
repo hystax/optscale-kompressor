@@ -64,9 +64,44 @@ fn longest_opaque_run(line: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Fewest tokens a line needs before it can read as a token list.
+const MIN_LIST_TOKENS: usize = 64;
+
+/// Share of a token list's tokens that must be machine-shaped.
+///
+/// The second way a line is opaque: no single token is long, but almost every
+/// one is a symbol, a number pair or a path. `nm` symbol tables, `addr:count`
+/// dumps and opcode histograms came to 19% of the untouched bytes on the Claude
+/// Code replay corpus, one 17,932-character symbol list on two lines re-sent 38
+/// times. Measured over every long line in both corpora, prose scores 0.00 to
+/// 0.01; the highest-scoring lines that must survive are C++ template
+/// diagnostics (0.52 to 0.65) and an HTML row (0.68). 0.8 clears all of them.
+const MIN_MACHINE_SHARE: f32 = 0.8;
+
+/// A token a person would not write in a sentence: it carries a digit or one
+/// of `_ : / = $`, or a dot that is not closing punctuation.
+fn machine_token(token: &str) -> bool {
+    token
+        .bytes()
+        .any(|b| b.is_ascii_digit() || matches!(b, b'_' | b':' | b'/' | b'=' | b'$'))
+        || token
+            .trim_end_matches(['.', ',', ';', ':', '!', '?', ')'])
+            .contains('.')
+}
+
+/// Whether `line` is a long run of short machine tokens.
+fn token_list(line: &str) -> bool {
+    let (mut tokens, mut machine) = (0usize, 0usize);
+    for token in line.split_whitespace() {
+        tokens += 1;
+        machine += usize::from(machine_token(token));
+    }
+    tokens >= MIN_LIST_TOKENS && machine as f32 >= tokens as f32 * MIN_MACHINE_SHARE
+}
+
 /// Whether `line` is both long enough and opaque enough to clip.
 fn worth_clipping(line: &str, limit: usize) -> bool {
-    chars_len(line) > limit && longest_opaque_run(line) >= MIN_OPAQUE_RUN
+    chars_len(line) > limit && (longest_opaque_run(line) >= MIN_OPAQUE_RUN || token_list(line))
 }
 
 /// Clip every line longer than `opts.max_line_chars`.
@@ -167,6 +202,38 @@ mod tests {
             run(&format!("{line}\n"), Mode::Aggressive).is_none(),
             "119 characters is under the run threshold however many bytes it is"
         );
+    }
+
+    #[test]
+    fn a_long_list_of_short_symbols_is_clipped() {
+        // `nm` output: no token is long, every token is a symbol.
+        let symbols: String = (0..400).map(|i| format!("__mips16_op{i}sf3 ")).collect();
+        let line = format!("/usr/lib/gcc-cross/mipsel-linux-gnu/12/libgcc.a\n{symbols}\n");
+        let out = run(&line, Mode::Aggressive).expect("clipped");
+        assert!(
+            out.starts_with("/usr/lib/gcc-cross/"),
+            "the short header line stays"
+        );
+        assert!(out.contains("__mips16_op0sf3"), "the list's head stays");
+        assert!(out.len() < line.len() / 2);
+        // and `addr:count` pairs, the other measured shape
+        let pairs: String = (0..300)
+            .map(|i| format!("{}:{} ", 3597 + i, 1500 + i))
+            .collect();
+        assert!(run(&format!("{pairs}\n"), Mode::Aggressive).is_some());
+    }
+
+    #[test]
+    fn a_long_template_diagnostic_is_never_clipped() {
+        // The most machine-like line that must survive: a C++ instantiation
+        // trace scores ~0.6, and an agent fixing the build needs all of it.
+        let line = "/usr/include/Eigen/src/Core/Redux.h:243:63:   required from ‘static \
+            Eigen::internal::redux_impl<Func, Evaluator, 3, 0>::Scalar with Func = \
+            Eigen::internal::scalar_sum_op<double, double> and Evaluator = the \
+            evaluator of the product of the left hand side and the right hand side ’ "
+            .repeat(4);
+        assert!(line.len() > 512 && line.split_whitespace().count() >= MIN_LIST_TOKENS);
+        assert!(run(&format!("{line}\n"), Mode::Aggressive).is_none());
     }
 
     #[test]

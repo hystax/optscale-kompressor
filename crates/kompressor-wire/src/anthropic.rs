@@ -40,6 +40,7 @@
 use serde_json::{Map, Value};
 
 use kompressor_engine::messages::{MessageMeta, Protection, TextSlot};
+use kompressor_engine::tokens::estimate_tokens;
 
 use crate::path::SlotPath;
 use crate::tools::{ToolCall, ToolCallIndex, file_path_in_arguments};
@@ -71,7 +72,13 @@ impl Walker for AnthropicMessagesWalker {
             // its absence means we are not looking at a Messages body at all
             match message.get("content")? {
                 Value::String(text) => {
-                    builder.push_text(role, MessageMeta::default(), text, here.key("content"));
+                    // One block to the provider's cache lookback, and never a
+                    // breakpoint: a plain string has nowhere to carry one.
+                    let meta = MessageMeta {
+                        cache_blocks: Some(1),
+                        ..MessageMeta::default()
+                    };
+                    builder.push_text(role, meta, text, here.key("content"));
                 }
                 Value::Array(blocks) => {
                     let marker = cache_marker_position(blocks);
@@ -95,6 +102,20 @@ impl Walker for AnthropicMessagesWalker {
                         protected: false,
                         tool_name,
                         file_path,
+                        // What the provider's 20-block lookback counts, so the
+                        // engine can tell a rewrite it will find a cache entry
+                        // behind from one it will not. Earlier turns' thinking
+                        // is not counted: with it, three promotions that hit
+                        // the cache 22-23 blocks back read as misses; without
+                        // it, hits span 17-20 blocks and misses 29-32.
+                        cache_blocks: Some(
+                            u32::try_from(
+                                blocks.iter().filter(|block| !is_thinking(block)).count(),
+                            )
+                            .unwrap_or(u32::MAX),
+                        ),
+                        cache_breakpoint: marker.is_some(),
+                        unseen_tokens: unseen_tokens(blocks),
                     };
                     builder.push_blocks(role, meta, slots);
                 }
@@ -158,6 +179,48 @@ fn protection_of(block: &Map<String, Value>) -> Protection {
 ///
 /// Nested `tool_result` content is scanned too: a marker there pins the prefix
 /// just as much as one on the block that contains it.
+/// What a block costs the provider that no text slot will show the engine.
+///
+/// An estimate, for pricing a promotion and nothing else: the walker hands the
+/// engine text, and on a Claude Code turn most of what the provider bills is
+/// not text — the `tool_use` input that ran a command, an image, a server tool
+/// result. Earlier turns' thinking is left out because the provider does not
+/// bill it as input. An image is a fixed allowance: its size in base64 says
+/// nothing about its size in tokens.
+fn unseen_tokens(blocks: &[Value]) -> u32 {
+    const IMAGE_TOKENS: u32 = 1_600;
+    fn json_tokens(value: &Value) -> u32 {
+        estimate_tokens(&value.to_string(), "tool")
+    }
+    fn block_tokens(block: &Value) -> u32 {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") | Some("thinking") | Some("redacted_thinking") => 0,
+            Some("image") | Some("document") => IMAGE_TOKENS,
+            Some("tool_use") | Some("server_tool_use") => {
+                let name = block.get("name").map_or(0, json_tokens);
+                name.saturating_add(block.get("input").map_or(0, json_tokens))
+            }
+            // A string body is a text slot; a block list is slots for its text
+            // and unseen for the rest.
+            Some("tool_result") => match block.get("content") {
+                Some(Value::Array(inner)) => {
+                    inner.iter().map(block_tokens).fold(0, u32::saturating_add)
+                }
+                _ => 0,
+            },
+            _ => json_tokens(block),
+        }
+    }
+    blocks.iter().map(block_tokens).fold(0, u32::saturating_add)
+}
+
+fn is_thinking(block: &Value) -> bool {
+    matches!(
+        block.get("type").and_then(Value::as_str),
+        Some("thinking" | "redacted_thinking")
+    )
+}
+
 fn cache_marker_position(blocks: &[Value]) -> Option<usize> {
     blocks
         .iter()
@@ -778,6 +841,68 @@ mod tests {
             AnthropicMessagesWalker
                 .walk(&json!({"messages": [{"role": "user", "content": ["bare string block"]}]}))
                 .is_none()
+        );
+    }
+
+    /// The engine prices a promotion against the provider's 20-block cache
+    /// lookback, which it can only do if the walk counts blocks and says where
+    /// the breakpoints are.
+    #[test]
+    fn every_message_reports_its_blocks_and_whether_it_carries_a_breakpoint() {
+        let body = json!({"messages": [
+            {"role": "user", "content": "plain"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "plan", "signature": "sig"},
+                {"type": "text", "text": "calling"},
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1",
+                 "content": [{"type": "text", "text": "a.rs", "cache_control": {"type": "ephemeral"}}]}
+            ]}
+        ]});
+        let walk = AnthropicMessagesWalker.walk(&body).expect("known shape");
+        let seen: Vec<_> = walk
+            .messages
+            .iter()
+            .map(|m| (m.meta.cache_blocks, m.meta.cache_breakpoint))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![(Some(1), false), (Some(2), false), (Some(1), true)]
+        );
+    }
+
+    /// Promotion pricing needs what the provider bills, and on agent traffic
+    /// most of that is not text.
+    #[test]
+    fn billed_content_outside_text_slots_is_counted_and_thinking_is_not() {
+        let body = json!({"messages": [
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "a long plan ".repeat(200), "signature": "sig"},
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "running it"},
+                {"type": "tool_use", "id": "t1", "name": "Bash",
+                 "input": {"command": "make -C build all 2>&1 | tail -n 200 ".repeat(20)}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [
+                    {"type": "text", "text": "ok"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0".repeat(5000)}}
+                ]}
+            ]}
+        ]});
+        let walk = AnthropicMessagesWalker.walk(&body).expect("known shape");
+        let unseen: Vec<u32> = walk.messages.iter().map(|m| m.meta.unseen_tokens).collect();
+        assert_eq!(
+            unseen[0], 0,
+            "earlier turns' thinking is not billed as input"
+        );
+        assert!(unseen[1] > 100, "the tool call's input is: {}", unseen[1]);
+        assert_eq!(
+            unseen[2], 1_600,
+            "an image is an allowance, not its base64 length"
         );
     }
 }

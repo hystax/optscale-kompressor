@@ -285,6 +285,60 @@ async fn an_anthropic_frozen_prefix_and_its_cache_control_block_reach_the_upstre
 }
 
 #[tokio::test]
+async fn a_one_hour_cache_ttl_reaches_the_upstream_only_when_asked_for() {
+    let body = json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 1024,
+        "system": [{"type": "text", "text": "rules", "cache_control": {"type": "ephemeral"}}],
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_0", "content": log_payload(400)},
+                {"type": "text", "text": "next", "cache_control": {"type": "ephemeral"}}
+            ]}
+        ]
+    });
+
+    let asked = Harness::with(|config| {
+        config.proxy.cache_ttl = kompressor_core::config::CacheTtl::OneHour;
+    })
+    .await;
+    answering(&asked).await;
+    asked.post("/v1/messages", &body).await;
+    let upstream = &asked.upstream_json().await[0];
+    assert_eq!(upstream["system"][0]["cache_control"]["ttl"], "1h");
+    assert_eq!(
+        upstream["messages"][0]["content"][1]["cache_control"]["ttl"],
+        "1h"
+    );
+
+    // Compression off still asks for an hour when told to: the TTL is a
+    // separate decision from compressing, and the one docs/CLAUDE-CODE.md
+    // describes as working either way.
+    let off = Harness::with(|config| {
+        config.proxy.compress = false;
+        config.proxy.cache_ttl = kompressor_core::config::CacheTtl::OneHour;
+    })
+    .await;
+    answering(&off).await;
+    off.post("/v1/messages", &body).await;
+    let upstream = &off.upstream_json().await[0];
+    assert_eq!(upstream["system"][0]["cache_control"]["ttl"], "1h");
+
+    // The default sends the client's markers as written: the TTL is a price
+    // decision, and nothing the operator did not ask for changes it.
+    let default = Harness::new().await;
+    answering(&default).await;
+    default.post("/v1/messages", &body).await;
+    let upstream = &default.upstream_json().await[0];
+    assert!(upstream["system"][0]["cache_control"].get("ttl").is_none());
+    assert!(
+        upstream["messages"][0]["content"][1]["cache_control"]
+            .get("ttl")
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn a_previous_response_id_protects_the_turn_but_not_the_tool_output() {
     // Earlier turns live on the provider's side, where we cannot see them, so
     // anything this request might be *re-sending* must not be rewritten. That

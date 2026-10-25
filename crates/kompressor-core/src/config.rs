@@ -306,6 +306,34 @@ pub enum RetrieveTool {
     Never,
 }
 
+/// How long Anthropic should keep the cache entries a request writes.
+///
+/// The client's `cache_control` markers ask for the provider's default, five
+/// minutes. An agent that waits on a long build or test run outlives it, and
+/// the next request writes the whole conversation again: on aset-check04 that
+/// was 698,697 tokens over five turns, 63% of every cache write in the run.
+/// A one-hour entry costs 2x the input price to write instead of 1.25x, so it
+/// pays only where gaps actually exceed five minutes. Replayed over eight
+/// Anthropic runs, upgrading every marker cost 2.3% more overall (up to 27%
+/// on runs with no long gap); upgrading a conversation only after it first
+/// idled past five minutes cost 7.7% less, and never more than 1.6% more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheTtl {
+    /// The client's markers go out as written. The shipped default.
+    #[default]
+    Default,
+    /// Every marker asks for one hour.
+    #[serde(rename = "1h")]
+    OneHour,
+    /// One hour, from the first request after a conversation has been idle
+    /// longer than the five-minute default. The request that finds the gap
+    /// keeps the client's TTL: it rewrites the expired prefix at the cheaper
+    /// write price, and the next one moves the whole prefix to a one-hour
+    /// entry at the price of its own new tail.
+    Adaptive,
+}
+
 /// Where the frozen prefix ends: what the client says, or what the provider
 /// has actually cached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -386,6 +414,8 @@ pub struct ProxyConfig {
     pub retrieve_execution: RetrieveExecution,
     /// Where the frozen prefix ends. See [`FrozenPrefix`].
     pub frozen_prefix: FrozenPrefix,
+    /// The cache TTL Anthropic requests ask for. See [`CacheTtl`].
+    pub cache_ttl: CacheTtl,
     /// How many retrieve rounds may be **answered** in one request.
     ///
     /// The metric counts one more than this. Reaching the cap does not end the
@@ -606,6 +636,7 @@ impl Default for ProxyConfig {
             upstream_read_timeout: Duration::from_secs(600),
             retrieve_tool: RetrieveTool::Auto,
             frozen_prefix: FrozenPrefix::Marker,
+            cache_ttl: CacheTtl::Default,
             retrieve_execution: RetrieveExecution::Server,
             retrieve_max_rounds: 3,
             retrieve_max_tokens_per_request: 16_384,
@@ -1013,6 +1044,16 @@ impl Config {
                     self.proxy.frozen_prefix
                 };
             }
+            "cache_ttl" => {
+                // Unrecognised values leave the setting alone, for the reason
+                // `frozen_prefix` does: it changes what the provider bills.
+                self.proxy.cache_ttl = match value.to_ascii_lowercase().as_str() {
+                    "default" => CacheTtl::Default,
+                    "1h" => CacheTtl::OneHour,
+                    "adaptive" => CacheTtl::Adaptive,
+                    _ => self.proxy.cache_ttl,
+                };
+            }
             "enabled" => {
                 self.proxy.enabled = parse_bool_setting("proxy.enabled", value, self.proxy.enabled);
             }
@@ -1262,6 +1303,22 @@ mod tests {
         assert_eq!(config.proxy.frozen_prefix, FrozenPrefix::FirstSeen);
         config.apply_env(&[("KOMPRESSOR__PROXY__FROZEN_PREFIX".into(), "marker".into())]);
         assert_eq!(config.proxy.frozen_prefix, FrozenPrefix::Marker);
+    }
+
+    #[test]
+    fn the_cache_ttl_setting_can_be_set_from_the_environment_and_a_typo_changes_nothing() {
+        let mut config = Config::default();
+        assert_eq!(config.proxy.cache_ttl, CacheTtl::Default);
+        config.apply_env(&[("KOMPRESSOR__PROXY__CACHE_TTL".into(), "adaptive".into())]);
+        assert_eq!(config.proxy.cache_ttl, CacheTtl::Adaptive);
+        config.apply_env(&[("KOMPRESSOR__PROXY__CACHE_TTL".into(), "1h".into())]);
+        assert_eq!(config.proxy.cache_ttl, CacheTtl::OneHour);
+        // It changes what the provider bills, so an unknown value is ignored
+        // rather than read as any of the three.
+        config.apply_env(&[("KOMPRESSOR__PROXY__CACHE_TTL".into(), "60m".into())]);
+        assert_eq!(config.proxy.cache_ttl, CacheTtl::OneHour);
+        let parsed: Config = toml::from_str("[proxy]\ncache_ttl = \"1h\"\n").expect("parses");
+        assert_eq!(parsed.proxy.cache_ttl, CacheTtl::OneHour);
     }
 
     #[test]

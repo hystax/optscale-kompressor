@@ -21,6 +21,7 @@ login (`oauth-2025-04-20`), model `claude-opus-5[1m]`, OptScale Kompressor in
 - [Verify it for yourself](#verify-it-for-yourself)
 - [Reading the outcome field](#reading-the-outcome-field)
 - [What the proxy changes about your request](#what-the-proxy-changes-about-your-request)
+- [What compression costs, measured](#what-compression-costs-measured)
 - [When wrapping Claude Code is still worth it](#when-wrapping-claude-code-is-still-worth-it)
 
 ## What a wrapped session actually does
@@ -368,6 +369,45 @@ Verified against Claude Code 2.1.278:
 (see [`headers`](../crates/kompressor-proxy/src/headers.rs)). Closing it means
 teaching the client to decompress and then stripping `content-encoding` from
 what is relayed onward, which is a real change rather than a header tweak.
+
+## What compression costs, measured
+
+Measured 2026-10-25 on two 89-task Harbor runs of Claude Code on Claude Opus
+5.5 with one binary: `proxy.frozen_prefix = "first_seen"` against compression
+off (`proxy.compress = false`). Both solved 79 of 89. Scored task by task on the
+proxy's own bill with `scripts/harbor/panel-score.py`, which prices every
+upstream request at its model's rates — Harbor's own cost missed requests
+outside the agent's trajectory and moved the comparison by nine points on its
+own:
+
+| Compressed vs off | Change | 95% CI over tasks |
+|---|---|---|
+| Cost per agent step | +0.9% | −3.6% .. +5.8% |
+| Cost per trial | +9.0% | +0.4% .. +18.8% |
+| Cost per solved task | +7.9% | −11.4% .. +29.1% |
+
+Three facts account for it:
+
+- **Re-sent history is already cheap.** About 93% of the billed prompt was cache
+  reads, and Claude Opus 5.5 reads at $0.20 against $4.00 input. Compression
+  saved about 8% of input on an ordinary request, roughly $1.70 over the run.
+- **A retrieval round is an extra answer.** The model writes the retrieve call
+  and answers again after the hidden round, so a request with one cost about
+  $0.046 more than an ordinary one, mostly output: about $3.30 over 70 such
+  requests. Elided code bodies were fetched back 57% of the time, other elided
+  text 14%.
+- **Most lost cache is expiry, not rewriting.** 92% of the cache-read drops
+  followed a pause past Anthropic's five-minute entry lifetime, while the agent
+  waited on a build or a test run.
+
+Two settings act on those, and are what is being measured next:
+`engine.enable_code_aware = false` stops eliding function bodies (removal on
+the replay corpus falls from 48.9% to 40.8%, and the fetches that cost more
+than they saved go with it), and `proxy.cache_ttl = "adaptive"` asks for
+one-hour cache entries in a conversation once it has paused past five minutes,
+which is estimated at 5.6% off the compressed run. `adaptive` needs the proxy to
+follow the conversation, so it does nothing with compression off; `"1h"` applies
+either way and costs more than it saves on runs without long pauses.
 
 ## When wrapping Claude Code is still worth it
 

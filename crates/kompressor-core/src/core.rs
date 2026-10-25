@@ -166,6 +166,9 @@ impl AppCore {
             keep_inline,
             fetches,
             cache_hit_per_mille,
+            // This surface sees messages alone; nothing outside them to price.
+            outside_tokens: 0,
+            cache_pricing: None,
         };
         let computed = Computed {
             stats: compress_messages(messages, options, &req, &mut refs),
@@ -205,6 +208,12 @@ impl AppCore {
         keep_inline: &[RefId],
         fetches: &[(RefId, u32)],
         cache_hit_per_mille: u32,
+        // Tokens the provider bills outside the messages — system prompt and
+        // tool schemas — which a retrieve round re-sends. Zero when unknown.
+        outside_tokens: u32,
+        // The provider's prices for a promotion, when the caller knows them.
+        // `None` prices it from `cache_hit_per_mille`.
+        cache_pricing: Option<kompressor_engine::messages::CachePricing>,
     ) -> Computed {
         let started = Instant::now();
         let time_ms = now_ms();
@@ -217,6 +226,8 @@ impl AppCore {
             keep_inline,
             fetches,
             cache_hit_per_mille,
+            outside_tokens,
+            cache_pricing,
         };
         let stats = compress_messages(messages, options, &req, &mut refs);
         Computed {
@@ -916,6 +927,8 @@ mod tests {
             &[],
             &[],
             1000,
+            0,
+            None,
         );
         assert!(
             computed.stats.tokens_out < computed.stats.tokens_in,

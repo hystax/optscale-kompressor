@@ -93,6 +93,18 @@ fn load() -> Vec<Record> {
 /// would hide a real regression behind a deliberate one.
 const KNOWN_DELTAS: &[(&str, &str, &str)] = &[
     (
+        "97cf0b663b3a8011",
+        "*",
+        "`ls && cat algo.py`: three file names and then the source. The vectors \
+         were recorded by an engine whose grammar failed on the first file name, \
+         so the code compressor declined and the payload shipped whole at 1,249 \
+         characters. This one sets the lead-in aside verbatim — frame and \
+         listing byte for byte — and compresses the source behind it as the \
+         Python it is, eliding `map`'s 34-line body. Every mode moved because \
+         the recorded options run code elision in all three. On the Claude \
+         Code replay corpus the same shape was the largest single loss.",
+    ),
+    (
         "77084080070a4e1d",
         "*",
         "An apt transcript whose frame carries `Warning: truncated output` and \

@@ -336,6 +336,8 @@ fn read_meta(object: &Map<String, Value>) -> MessageMeta {
             .get("file_path")
             .and_then(Value::as_str)
             .map(str::to_string),
+        // A message API names no provider, so it is priced as any-prefix.
+        ..MessageMeta::default()
     }
 }
 

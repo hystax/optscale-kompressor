@@ -23,7 +23,9 @@ use serde_json::{Value, json};
 use tracing::Instrument;
 
 use kompressor_core::auth::{Credentials, Identity};
-use kompressor_core::config::{FrozenPrefix, ProxyConfig, RetrieveExecution, RetrieveTool};
+use kompressor_core::config::{
+    CacheTtl, FrozenPrefix, ProxyConfig, RetrieveExecution, RetrieveTool,
+};
 use kompressor_core::{AppCore, RequestInfo};
 use kompressor_engine::estimate_tokens;
 use kompressor_engine::messages::{Message, PrefixCache};
@@ -581,6 +583,14 @@ async fn prepare(
     provider: &str,
 ) -> Prepared {
     let fingerprint = prefix_identity(state, identity, family, mode, &body, provider);
+    // Decided once, here: under `adaptive` the question itself moves the
+    // conversation's state. Anthropic only; the TTL is its field.
+    let long_ttl = family == Some(ApiFamily::AnthropicMessages)
+        && match state.core.config().proxy.cache_ttl {
+            CacheTtl::Default => false,
+            CacheTtl::OneHour => true,
+            CacheTtl::Adaptive => fingerprint.is_some_and(|key| state.prefixes.long_ttl(key)),
+        };
     let mut prepared = prepare_inner(
         state,
         identity,
@@ -592,12 +602,42 @@ async fn prepare(
         request_id,
         provider,
         fingerprint,
+        long_ttl,
     )
     .await;
     if prepared.prefix.is_none() {
         prepared.prefix = fingerprint;
     }
+    // After every way `prepare_inner` can decline, for the reason the identity
+    // is stamped here: under the default marker floor Claude Code freezes its
+    // whole conversation, so nearly every request is a passthrough, and a TTL
+    // applied only to compressed bodies would almost never reach the provider.
+    if long_ttl {
+        extend_cache_ttl(&mut prepared);
+    }
     prepared
+}
+
+/// Ask for one-hour cache entries on whatever `prepared` will send.
+///
+/// A passthrough body is parsed for it and re-serialized. That changes JSON
+/// bytes, never the prompt: the provider keys its cache on the rendered prompt,
+/// and `serde_json` here keeps key order and numbers exact. A body that does
+/// not parse, or carries no marker, goes out as it was.
+fn extend_cache_ttl(prepared: &mut Prepared) {
+    let mut parsed = None;
+    let value = match prepared.json.as_mut() {
+        Some(value) => value,
+        None => match serde_json::from_slice::<Value>(&prepared.body) {
+            Ok(value) => parsed.insert(value),
+            Err(_) => return,
+        },
+    };
+    if crate::cachettl::extend_cache_ttl(value) > 0
+        && let Ok(out) = serde_json::to_vec(value)
+    {
+        prepared.body = Bytes::from(out);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -612,6 +652,9 @@ async fn prepare_inner(
     request_id: &str,
     provider: &str,
     conversation: Option<u64>,
+    // Whether this request will ask for one-hour cache entries, decided before
+    // compression so a promotion is priced at the write it will cost.
+    long_ttl: bool,
 ) -> Prepared {
     let config = state.core.config();
     let proxy = &config.proxy;
@@ -781,7 +824,7 @@ async fn prepare_inner(
     // Counts beside the ids: the engine prices a promotion's prefix rewrite
     // against how often the fragment would otherwise be fetched again, and this
     // is the only place that number is known.
-    let fetches = state.prefixes.retrieved_with_counts(conversation);
+    let fetches = state.prefixes.demand(conversation);
     let mut keep_inline: Vec<RefId> = fetches.iter().map(|(id, _)| *id).collect();
     for id in wanted_fragments(state, identity, conversation, &walk.messages) {
         if !keep_inline.contains(&id) {
@@ -822,6 +865,18 @@ async fn prepare_inner(
         fetches,
         // Measured from what this provider has actually reported, not assumed.
         state.prefixes.cache_hit_per_mille(),
+        outside_tokens(&value),
+        // At the TTL this request will ask for: a rewrite under one-hour
+        // entries is written at 2x, not 1.25x.
+        Some(
+            state
+                .prefixes
+                .promotion_pricing(crate::prefixcache::CachePrices::for_model(
+                    family,
+                    model.as_deref(),
+                    long_ttl,
+                )),
+        ),
         conversation,
         proxy.compress_timeout,
     )
@@ -921,6 +976,22 @@ async fn prepare_inner(
 /// forwarded. The blocking task is left to finish on its own — it cannot be
 /// cancelled, and abandoning it is cheaper than making every request wait for a
 /// pathological payload.
+/// The prompt a request carries outside its messages — system prompt,
+/// instructions, tool schemas — in estimated tokens.
+///
+/// Every retrieve round re-sends it, so the engine prices a round with it. On
+/// Claude Code it is ~13,600 tokens before the first message, and leaving it out
+/// made a 23,000-token prompt read as 9,347: a fragment fetched in three
+/// consecutive requests was refused twice for a rewrite it would have repaid.
+fn outside_tokens(body: &Value) -> u32 {
+    ["system", "instructions", "tools"]
+        .iter()
+        .filter_map(|key| body.get(*key))
+        .filter(|value| !value.is_null())
+        .map(|value| estimate_tokens(&value.to_string(), "system"))
+        .fold(0, u32::saturating_add)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn compress_with_deadline(
     state: &ProxyState,
@@ -943,6 +1014,10 @@ pub(crate) async fn compress_with_deadline(
     keep_inline: Vec<RefId>,
     fetches: Vec<(RefId, u32)>,
     cache_hit_per_mille: u32,
+    // What the provider bills outside the messages; see `outside_tokens`.
+    outside_tokens: u32,
+    // The provider's prices for a promotion; `None` prices it from the rate.
+    cache_pricing: Option<kompressor_engine::messages::CachePricing>,
     // Which conversation to pin a promotion against. `None` for a transport
     // with no conversation of its own, which then keeps nothing pinned.
     conversation: Option<u64>,
@@ -973,6 +1048,8 @@ pub(crate) async fn compress_with_deadline(
             &keep_inline,
             &fetches,
             cache_hit_per_mille,
+            outside_tokens,
+            cache_pricing,
         );
         (
             core, identity, options, request_id, model, provider, messages, computed,
@@ -1893,6 +1970,21 @@ fn billed(usage: &Value, keys: &[&str]) -> Option<u32> {
 mod tests {
     use super::{RefId, inline_set_under_ceiling};
     use kompressor_engine::refs::ref_for;
+
+    #[test]
+    fn the_prompt_outside_the_messages_is_its_system_prompt_and_tools() {
+        let messages_only = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+        assert_eq!(super::outside_tokens(&messages_only), 0);
+        let full = serde_json::json!({
+            "system": [{"type": "text", "text": "You are a coding agent. ".repeat(100)}],
+            "tools": [{"name": "Bash", "description": "Run a command. ".repeat(50), "input_schema": {}}],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let outside = super::outside_tokens(&full);
+        assert!(outside > 500, "{outside}");
+        let without_tools = serde_json::json!({"system": full["system"].clone(), "messages": []});
+        assert!(super::outside_tokens(&without_tools) < outside);
+    }
 
     fn priced(sizes: &[u32]) -> Vec<(RefId, u32)> {
         sizes

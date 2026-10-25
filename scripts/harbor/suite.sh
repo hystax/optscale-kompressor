@@ -175,7 +175,8 @@ echo "mode=$MODE${NO_RETRIEVE:+  retrieve_tool=OFF}${TAG:+  tag=$TAG}  out=$OUT"
 # exactly like a run without it -- near-zero compression -- and the only
 # way to tell them apart afterwards was to grep the effective config.
 for v in KOMPRESSOR_MIN_TOKENS KOMPRESSOR_MIN_CHARS KOMPRESSOR_MAX_REF_BYTES \
-         KOMPRESSOR__PROXY__FROZEN_PREFIX KOMPRESSOR__PROXY__RETRIEVE_TOOL; do
+         KOMPRESSOR__PROXY__FROZEN_PREFIX KOMPRESSOR__PROXY__RETRIEVE_TOOL \
+         KOMPRESSOR__PROXY__CACHE_TTL KOMPRESSOR__ENGINE__ENABLE_CODE_AWARE; do
   [ -n "${!v:-}" ] && echo "  env $v=${!v}"
 done
 echo "watch it with: KOMPRESSOR_RUNS=$RUNS $ROOT/scripts/harbor/watch.py"

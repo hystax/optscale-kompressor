@@ -71,7 +71,9 @@ venv/
 # Review output, not part of the project
 findings.md
 
-#experiments
-
-scripts/claude-desktop-experiment
+# Local experiments and working notes. The Claude Desktop experiment kit and
+# the dated investigation write-ups under docs/investigations/ reference local
+# run directories and are not part of the published documentation; nothing
+# committed links to either.
+scripts/claude-desktop-experiment/
 docs/investigations/

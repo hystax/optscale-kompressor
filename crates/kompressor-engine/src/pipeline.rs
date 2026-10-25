@@ -17,7 +17,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use crate::code::crush_code;
 use crate::configs::crush_config;
 use crate::crusher::crush_json;
-use crate::detect::{detect_result, strategy_for};
+use crate::detect::{code_starts_at, detect_result, file_joins, strategy_for};
 use crate::diff::crush_diff;
 use crate::gutter::split_line_gutter;
 use crate::listing::crush_listing;
@@ -578,6 +578,14 @@ fn route_whole(
                 Strategy::CodeAware => {
                     let language = detection.meta.language;
                     guarded(|| crush_code(content, opts, ctx, refs, language))
+                        .or_else(|| {
+                            refs.rollback(mark);
+                            code_behind_a_lead_in(content, role, opts, ctx, refs)
+                        })
+                        .or_else(|| {
+                            refs.rollback(mark);
+                            code_across_files(content, role, opts, ctx, refs)
+                        })
                 }
                 Strategy::Passthrough => {
                     // Duplicate folding still applies, but only to prose: every
@@ -827,6 +835,77 @@ fn accounted(
 /// *wrong* grammar nests it much further, so an unexpected panic in a compressor
 /// is a real possibility on adversarial input — and the caller's contract is
 /// that the original content survives it.
+/// Source code behind a lead-in the grammar cannot parse.
+///
+/// The code compressor refuses a parse with errors in it, which is right for a
+/// file and wrong for `ls && cat interp.py`: the file is fine, the listing in
+/// front of it is the error. Set the lead-in aside verbatim, compress what
+/// follows as the code it is, and put the two back together — the lead-in's
+/// bytes are untouched, so nothing about it needs accounting.
+fn code_behind_a_lead_in(
+    content: &str,
+    role: &str,
+    opts: &EngineOptions,
+    ctx: &Context,
+    refs: &mut RefCollector,
+) -> Option<String> {
+    let (lead_in, body) = content.split_at(code_starts_at(content)?);
+    let found = detect_result(body, role, opts);
+    if found.content_type != ContentType::SourceCode {
+        return None;
+    }
+    let body = guarded(|| crush_code(body, opts, ctx, refs, found.meta.language))?;
+    Some(format!("{lead_in}{body}"))
+}
+
+/// Several source files concatenated by `cat`, compressed one file at a time.
+///
+/// Each file goes to the grammar of its own language, behind any listing in
+/// front of it. A file that does not compress is kept byte for byte and its
+/// fragments are rolled back, so the result is the concatenation it arrived
+/// as with only the files that understood themselves rewritten. `None` when
+/// there is one file, or when none of them compressed.
+fn code_across_files(
+    content: &str,
+    role: &str,
+    opts: &EngineOptions,
+    ctx: &Context,
+    refs: &mut RefCollector,
+) -> Option<String> {
+    let joins = file_joins(content);
+    if joins.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(content.len());
+    let mut compressed = false;
+    let mut start = 0;
+    for end in joins.into_iter().chain(std::iter::once(content.len())) {
+        let file = &content[start..end];
+        start = end;
+        let mark = refs.mark();
+        let found = detect_result(file, role, opts);
+        let shrunk = (found.content_type == ContentType::SourceCode)
+            .then(|| guarded(|| crush_code(file, opts, ctx, refs, found.meta.language)))
+            .flatten()
+            .or_else(|| {
+                refs.rollback(mark);
+                code_behind_a_lead_in(file, role, opts, ctx, refs)
+            })
+            .filter(|shrunk| chars_len(shrunk) < chars_len(file));
+        match shrunk {
+            Some(shrunk) => {
+                out.push_str(&shrunk);
+                compressed = true;
+            }
+            None => {
+                refs.rollback(mark);
+                out.push_str(file);
+            }
+        }
+    }
+    compressed.then_some(out)
+}
+
 fn guarded<T>(f: impl FnOnce() -> Option<T>) -> Option<T> {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(result) => result,
@@ -1323,6 +1402,133 @@ mod fold_fallback_tests {
     }
 }
 
+#[cfg(all(test, feature = "code-aware"))]
+mod lead_in_tests {
+    use super::*;
+
+    /// `ls && cat interp.py`: the listing used to make the grammar fail on the
+    /// first line and the whole payload ship at 0%.
+    #[test]
+    fn source_behind_a_listing_is_compressed_and_the_listing_kept_verbatim() {
+        let lead_in = "interp.py\ntest\n01-factorial.scm\n02-fibonacci.scm\nREADME.md\n";
+        let mut source = String::from("#!/usr/bin/env python3\nimport sys\n\n");
+        for f in 0..12 {
+            source.push_str(&format!("def handler_{f}(env, args):\n"));
+            for line in 0..30 {
+                source.push_str(&format!(
+                    "    value_{line} = env.lookup(args[{line}]) + {f}\n"
+                ));
+            }
+            source.push_str("    return value_0\n\n");
+        }
+        let content = format!("{lead_in}{source}");
+        let opts = EngineOptions {
+            mode: Mode::Recoverable,
+            ..Default::default()
+        };
+        let mut refs = opts.collector();
+        let mut applied = Vec::new();
+        let ctx = Context::for_role("tool");
+        let (out, kind) =
+            compress_content(&content, "tool", &opts, None, &mut refs, &ctx, &mut applied);
+        assert_eq!(kind, Some(Kind::SourceCode));
+        assert!(out.starts_with(lead_in), "the listing is untouched");
+        assert!(
+            out.len() < content.len() / 2,
+            "the bodies go: {}",
+            out.len()
+        );
+        assert!(
+            out.contains("def handler_11(env, args):"),
+            "every signature stays"
+        );
+        assert!(!refs.is_empty(), "and what left is retrievable");
+    }
+
+    /// Turning code-aware compression off turns it off on every path that
+    /// reaches the code compressor, not only whole-payload routing.
+    #[test]
+    fn code_elision_off_means_off_behind_a_listing_and_across_files() {
+        let mut source = String::from("#!/usr/bin/env python3\nimport sys\n\n");
+        for f in 0..6 {
+            source.push_str(&format!("def handler_{f}(env, args):\n"));
+            for line in 0..30 {
+                source.push_str(&format!(
+                    "    value_{line} = env.lookup(args[{line}]) + {f}\n"
+                ));
+            }
+            source.push_str("    return value_0\n\n");
+        }
+        let content = format!("interp.py\nREADME.md\n{source}");
+        let opts = EngineOptions {
+            mode: Mode::Recoverable,
+            enable_code_aware: false,
+            ..Default::default()
+        };
+        let mut refs = opts.collector();
+        let mut applied = Vec::new();
+        let ctx = Context::for_role("tool");
+        let (out, _) =
+            compress_content(&content, "tool", &opts, None, &mut refs, &ctx, &mut applied);
+        assert!(
+            !out.contains("body lines omitted"),
+            "no body is elided: {}",
+            &out[..out.len().min(300)]
+        );
+    }
+
+    /// `cat baseline.py ext.c wrapper.py`: each file goes to its own grammar,
+    /// and a file that cannot be compressed is kept byte for byte.
+    #[test]
+    fn concatenated_files_are_compressed_one_grammar_at_a_time() {
+        let body = |name: &str| -> String {
+            let mut out = format!("def {name}(weights, cov):\n");
+            for line in 0..30 {
+                out.push_str(&format!(
+                    "    total_{line} = {name}_weights[{line}] * cov[{line}][{line}]\n"
+                ));
+            }
+            out.push_str("    return total_0\n\n");
+            out
+        };
+        let baseline = format!(
+            "import math\n\n{}{}print(risk_a([1], [[1]]))",
+            body("risk_a"),
+            body("risk_b")
+        );
+        let ext = "/*\n * extension\n */\n#include <math.h>\nstatic double half(double w) {\n    return w / 2;\n}\n";
+        let wrapper = format!(
+            "\"\"\"wrapper\"\"\"\n\n{}{}",
+            body("call_a"),
+            body("call_b")
+        );
+        let content = format!("{baseline}{ext}{wrapper}");
+        let opts = EngineOptions {
+            mode: Mode::Recoverable,
+            ..Default::default()
+        };
+        let mut refs = opts.collector();
+        let mut applied = Vec::new();
+        let ctx = Context::for_role("tool");
+        let (out, kind) =
+            compress_content(&content, "tool", &opts, None, &mut refs, &ctx, &mut applied);
+        assert_eq!(kind, Some(Kind::SourceCode));
+        assert!(
+            out.contains(ext),
+            "the file that did not compress is untouched"
+        );
+        for name in ["def risk_a(", "def risk_b(", "def call_a(", "def call_b("] {
+            assert!(out.contains(name), "every signature stays: {name}");
+        }
+        assert!(
+            out.len() < content.len() / 2,
+            "the Python bodies go: {}",
+            out.len()
+        );
+        assert_eq!(refs.len(), 4, "one retrievable fragment per elided body");
+    }
+}
+
 #[cfg(test)]
 mod longline_tests {
     use super::*;
@@ -1502,6 +1708,9 @@ mod gutter_tests {
         out
     }
 
+    // The code compressor is what reaches the body; without the grammars there
+    // is nothing for the lifted column to hand it to.
+    #[cfg(feature = "code-aware")]
     #[test]
     fn a_numbered_source_file_compresses_once_the_column_is_off() {
         let src = numbered_source();

@@ -231,12 +231,16 @@ fixes, and a 40-turn Opus run held the incremental-cache identity 37 times out o
 sets for Anthropic clients, and what `docs/CLAUDE-DESKTOP.md` requires.
 
 The engine default stays `marker`, for one remaining reason and it is not churn:
-the **cost** case is unmeasured, and the obvious experiment is invalid —
-`$/MTok out` correlates +0.80 with run length, so two runs of different
-trajectories cannot be compared however carefully they are matched. That wants a
-replay-based A/B over recorded turns. Until then the default is conservative on
-economics rather than on safety. The argument in full:
-[docs/CLAUDE-CODE.md](docs/CLAUDE-CODE.md).
+on cost, compression has not yet paid on this traffic. Measured 2026-10-25 on
+two 89-task Harbor runs of Claude Code on Claude Opus 5.5, `first_seen` against
+compression off, scored task by task on the proxy's own bill
+(`scripts/harbor/panel-score.py`): **+0.9% per agent step** (95% CI −3.6% to
++5.8%), +9.0% per trial. Re-sent history is already ~93% cache reads at 0.05x
+input, so removing it saves little, while retrieval rounds — each one an extra
+answer from the model — cost about twice what that saved; elided code bodies were
+fetched back 57% of the time. A paired panel with code-body elision off
+(`engine.enable_code_aware = false`) and `proxy.cache_ttl = "adaptive"` is the
+next measurement. The argument in full: [docs/CLAUDE-CODE.md](docs/CLAUDE-CODE.md).
 
 ### Claude Desktop — intercepted, because it cannot be pointed
 

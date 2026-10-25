@@ -142,6 +142,7 @@ impl From<WireMessage> for Message {
                 protected: message.meta.protected,
                 tool_name: message.meta.tool_name,
                 file_path: message.meta.file_path,
+                ..Default::default()
             },
         }
     }
@@ -404,6 +405,7 @@ mod tests {
                 protected: false,
                 tool_name: Some("Bash".into()),
                 file_path: None,
+                ..Default::default()
             },
         };
         let back: Message = WireMessage::from(original.clone()).into();

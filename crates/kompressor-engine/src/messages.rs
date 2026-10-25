@@ -131,6 +131,30 @@ pub struct MessageMeta {
     /// The file the tool acted on, when it names one.
     #[serde(default)]
     pub file_path: Option<String>,
+    /// How many content blocks this message counts as, on a provider that
+    /// caches only at explicit breakpoints and finds an earlier entry by
+    /// looking a bounded number of blocks back — Anthropic. `None` everywhere
+    /// else, where any cached prefix is reusable and a rewrite costs only what
+    /// follows it. See `tokens_a_rewrite_rereads`.
+    #[serde(default)]
+    pub cache_blocks: Option<u32>,
+    /// The message carries a cache breakpoint of its own, in any block.
+    ///
+    /// Separate from `cache_control`, which reports a message wholly inside
+    /// the cached prefix and so decides what is frozen. This one only says
+    /// where the provider can find a cache entry.
+    #[serde(default)]
+    pub cache_breakpoint: bool,
+    /// Tokens the provider bills for this message that no text slot carries:
+    /// tool-call inputs, structured tool results, images. Zero where the walker
+    /// cannot tell.
+    ///
+    /// Promotion pricing counts them, compression never does. The engine's
+    /// own view of a prompt is its text, and on agent traffic that is a
+    /// fraction of it: one Claude Code request read as 9,347 tokens was ~23,000
+    /// billed, and a rewrite priced at 6,554 tokens cost 50,563.
+    #[serde(default)]
+    pub unseen_tokens: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,6 +247,15 @@ pub struct RequestOptions<'a> {
     /// caller with no measurement should send — makes a round look as cheap as
     /// it can be and so demands the most before rewriting anything.
     pub cache_hit_per_mille: u32,
+    /// Tokens the provider bills outside `messages`: system prompt and tool
+    /// schemas. Every retrieve round re-sends them, so they are part of what a
+    /// round costs; nothing behind a message's rewrite is among them, so they
+    /// are never part of what a rewrite costs. Zero means unknown, and reads
+    /// as a prompt that is all messages — the old, more demanding pricing.
+    pub outside_tokens: u32,
+    /// The provider's real prices for a promotion, when the caller knows them.
+    /// `None` prices it from `cache_hit_per_mille` as the rule always has.
+    pub cache_pricing: Option<CachePricing>,
 }
 
 impl Default for RequestOptions<'_> {
@@ -241,11 +274,20 @@ impl Default for RequestOptions<'_> {
             keep_inline: &[],
             fetches: &[],
             cache_hit_per_mille: 1000,
+            outside_tokens: 0,
+            cache_pricing: None,
         }
     }
 }
 
 impl RequestOptions<'_> {
+    /// What a promotion is priced against: the caller's prices, or the
+    /// hit-rate reading.
+    fn pricing(&self) -> CachePricing {
+        self.cache_pricing
+            .unwrap_or_else(|| CachePricing::from_hit_rate(self.cache_hit_per_mille))
+    }
+
     /// How many messages must come back byte-identical.
     ///
     /// Zero on a cold prefix however many the caller froze: the bytes it was
@@ -393,20 +435,113 @@ const CACHE_DISCOUNT: u32 = 10;
 /// from what the provider has actually reported rather than being a constant
 /// that is right for one run.
 ///
-/// `hit_per_mille` of 1000 recovers the old value of 9 and is the default where
-/// nothing has been observed: it is the most demanding reading, and erring
-/// towards refusing is the cheap mistake. Anthropic bills the rewrite as a
-/// cache write, which puts its true figure above this; the proxy folds that
-/// premium into the rate it sends rather than this rule knowing providers.
-fn fetches_to_repay_a_break(behind: u32, whole: u32, hit_per_mille: u32) -> u64 {
+/// The rates come from [`CachePricing`]. Built from a hit rate alone they are
+/// the shape above, `fresh − cached` against the blend; the proxy, which knows
+/// the provider, the model and the TTL it asked for, sends the real ones —
+/// on Anthropic a rewrite is a cache *write*, and on Claude Opus 5.5 a read is
+/// a twentieth of fresh, not a tenth.
+fn fetches_to_repay_a_break(behind: u32, whole: u32, pricing: impl Into<CachePricing>) -> u64 {
     if whole == 0 {
         return 0;
     }
-    let hit = u64::from(hit_per_mille.min(1000));
-    // blended / cached, in per-mille: hit + (1 − hit) × discount.
-    let blended = hit + (1000 - hit) * u64::from(CACHE_DISCOUNT);
-    let numerator = u64::from(CACHE_DISCOUNT - 1) * 1000 * u64::from(behind.min(whole));
-    numerator / (blended * u64::from(whole))
+    let pricing = pricing.into();
+    let round = u64::from(pricing.round_ppm.max(1));
+    u64::from(pricing.rewrite_ppm) * u64::from(behind.min(whole)) / (round * u64::from(whole))
+}
+
+/// What a promotion trades, priced in millionths of the provider's uncached
+/// input price: rewriting one token of prompt, and one prompt token of a
+/// retrieve round.
+///
+/// Before this the rule knew one price list — fresh ten times a cache read, no
+/// write premium — and providers were folded into a "price-equivalent" hit
+/// rate. That could not express a bar above nine demands at any hit rate, and
+/// two real ones are above it: Claude Opus 5.5 reads at 0.05x, and a one-hour
+/// cache entry writes at 2x. With both, a rewrite near the head of a 95%-read
+/// prompt needs ~14 demands where the old reading allowed at most 9.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CachePricing {
+    /// One token a rewrite makes the provider store again, less the cache read
+    /// it would otherwise have been.
+    pub rewrite_ppm: u32,
+    /// One prompt token of a retrieve round, as this traffic bills it: reads,
+    /// writes and uncached input in the proportions the provider reported.
+    pub round_ppm: u32,
+}
+
+impl CachePricing {
+    /// The reading this rule has always made from a hit rate: fresh ten times
+    /// a cache read, a miss billed fresh, and a rewrite the difference.
+    pub fn from_hit_rate(hit_per_mille: u32) -> Self {
+        let hit = hit_per_mille.min(1000);
+        let cached = 1_000_000 / CACHE_DISCOUNT;
+        CachePricing {
+            rewrite_ppm: 1_000_000 - cached,
+            round_ppm: (hit * cached + (1000 - hit) * 1_000_000) / 1000,
+        }
+    }
+}
+
+impl From<u32> for CachePricing {
+    fn from(hit_per_mille: u32) -> Self {
+        CachePricing::from_hit_rate(hit_per_mille)
+    }
+}
+
+/// How far back a breakpoint-cached provider looks for an earlier cache entry,
+/// in content blocks. Anthropic's documented lookback.
+const CACHE_LOOKBACK_BLOCKS: u32 = 20;
+
+/// The prompt a rewrite at `index` makes the provider read again, and whether
+/// that is because the rewrite falls outside the provider's cache lookback.
+///
+/// Where any cached prefix is reusable (OpenAI), that is everything after the
+/// rewritten message. Anthropic reads a cache entry only at a breakpoint or up
+/// to [`CACHE_LOOKBACK_BLOCKS`] blocks before one. A client that marks only
+/// its system prompt and its last message — Claude Code — leaves a rewrite
+/// deeper than that with nothing to read but the entry at the previous
+/// breakpoint, so everything after *that* is written again, the messages ahead
+/// of the rewrite included. Measured on aset-check02: a promotion 43 blocks
+/// behind the last breakpoint was priced at 6,554 of 27,739 tokens and cost
+/// 50,563 of a 64,171-token prompt, the read falling to exactly the system
+/// prompt's 13,608. Across all eight promotions captured so far, the spans
+/// that still hit run 14-20 blocks and the two that missed 29 and 32, counted
+/// without earlier turns' thinking — which the walker leaves out.
+///
+/// Without block counts (any other provider) or without a breakpoint at or
+/// after `index` the old reading stands.
+fn tokens_a_rewrite_rereads(messages: &[Message], index: usize) -> (u32, bool) {
+    let tokens = |range: &[Message]| -> u32 { range.iter().map(billed_tokens).sum() };
+    let incremental = (tokens(&messages[index + 1..]), false);
+    if messages[index].meta.cache_blocks.is_none() {
+        return incremental;
+    }
+    let Some(last) = messages.iter().rposition(|each| each.meta.cache_breakpoint) else {
+        return incremental;
+    };
+    if last < index {
+        return incremental;
+    }
+    let blocks: u32 = messages[index..=last]
+        .iter()
+        .map(|each| each.meta.cache_blocks.unwrap_or(1))
+        .fold(0, u32::saturating_add);
+    if blocks <= CACHE_LOOKBACK_BLOCKS {
+        return incremental;
+    }
+    let from = messages[..index]
+        .iter()
+        .rposition(|each| each.meta.cache_breakpoint)
+        .map_or(0, |breakpoint| breakpoint + 1);
+    // The rewritten message itself is priced by `forfeited`, as before.
+    let rewritten = tokens(&messages[from..index]).saturating_add(incremental.0);
+    (rewritten, true)
+}
+
+/// What the provider bills for `message`: its text as it stands, plus what the
+/// walker saw it carry outside any text slot.
+fn billed_tokens(message: &Message) -> u32 {
+    count_tokens(&message.content, &message.role).saturating_add(message.meta.unseen_tokens)
 }
 
 /// Is shipping this message whole worth it, to stop re-eliding a fragment the
@@ -433,7 +568,7 @@ fn keeping_it_inline_is_worth_it(
     break_cost: u32,
     whole: u32,
     fetches: u32,
-    hit_per_mille: u32,
+    pricing: impl Into<CachePricing>,
 ) -> bool {
     if protected == 0 {
         return false;
@@ -449,7 +584,7 @@ fn keeping_it_inline_is_worth_it(
     }
     // Worth it once the fragment has been asked for as many times as the
     // rewrite costs rounds.
-    u64::from(fetches) >= fetches_to_repay_a_break(break_cost, whole, hit_per_mille)
+    u64::from(fetches) >= fetches_to_repay_a_break(break_cost, whole, pricing)
 }
 
 /// What one compression run did.
@@ -899,14 +1034,16 @@ pub fn compress_messages(
                 // already past have shipped in their final form, and the ones
                 // still ahead can only shrink, so the ratio errs towards
                 // admitting rather than refusing.
-                let break_cost: u32 = messages[index + 1..]
-                    .iter()
-                    .map(|later| count_tokens(&later.content, &later.role))
-                    .sum();
+                let (break_cost, beyond_lookback) = tokens_a_rewrite_rereads(messages, index);
+                // In provider tokens, like `break_cost`: the ratio between the
+                // two is the whole decision, and pricing both in the text the
+                // engine can read overstated it wherever the system prompt,
+                // tool schemas and tool calls are most of the prompt.
                 let whole: u32 = messages
                     .iter()
-                    .map(|each| count_tokens(&each.content, &each.role))
-                    .sum();
+                    .map(billed_tokens)
+                    .sum::<u32>()
+                    .saturating_add(req.outside_tokens);
                 // Whether the rewrite is repaid, before any representation is
                 // priced. When it is not, no candidate can change the answer,
                 // and building one re-parses a large source message on every
@@ -918,7 +1055,7 @@ pub fn compress_messages(
                     break_cost,
                     whole,
                     fetches,
-                    req.cache_hit_per_mille,
+                    req.pricing(),
                 );
                 // Price the representation we would actually ship. A single
                 // fetched function must not be charged for restoring every
@@ -938,13 +1075,21 @@ pub fn compress_messages(
                     break_cost,
                     whole,
                     fetches,
-                    req.cache_hit_per_mille,
+                    req.pricing(),
                 ) {
-                    tracing::info!(
-                        handles = ?demanded, fetches, forfeited, protected,
-                        break_cost, whole, selective = selective.is_some(),
-                        "keeping demanded fragments inline"
-                    );
+                    // A pinned promotion is re-kept on every later turn with
+                    // `u32::MAX` demands; logging each at `info` buried the 11
+                    // real decisions of aset-check02 under 441 repeats.
+                    if fetches == u32::MAX {
+                        tracing::debug!(handles = ?demanded, "keeping pinned fragments inline");
+                    } else {
+                        tracing::info!(
+                            handles = ?demanded, fetches, forfeited, protected,
+                            break_cost, whole, beyond_lookback,
+                            selective = selective.is_some(),
+                            "keeping demanded fragments inline"
+                        );
+                    }
                     kept_inline_ids.extend(demanded);
                     refs.rollback(inline_mark);
                     compressed_here = if let Some((content, kinds)) = selective {
@@ -963,24 +1108,37 @@ pub fn compress_messages(
                     // doing it. The same reasoning put the ranged-retrieval
                     // salvage on `warn`: two paid runs narrowed nothing at all
                     // while it was a `debug`.
-                    tracing::warn!(
-                        handles = ?demanded,
-                        // `forfeited` is priced on the whole original when the
-                        // rewrite already failed, so it cannot name the reason.
-                        reason = if repaid { "inline_growth" } else { "prefix_rewrite" },
-                        selective = selective.is_some(),
-                        forfeited,
-                        protected,
-                        break_cost,
-                        whole,
-                        fetches,
-                        hit_per_mille = req.cache_hit_per_mille,
-                        needed =
-                            fetches_to_repay_a_break(break_cost, whole, req.cache_hit_per_mille),
-                        budget = KEEP_INLINE_MAX_FORFEIT,
-                        "keeping a fetched fragment inline would cost more than \
-                         it protects; compressing it again"
-                    );
+                    // Said out loud only while the fragment is in current
+                    // demand. A refusal re-taken every turn for a fragment
+                    // nobody has asked for in the demand window is the rule
+                    // working, and 60 of aset-check03's 74 warnings were that.
+                    if fetches > 0 {
+                        tracing::warn!(
+                            handles = ?demanded,
+                            // `forfeited` is priced on the whole original when the
+                            // rewrite already failed, so it cannot name the reason.
+                            reason = if repaid { "inline_growth" } else { "prefix_rewrite" },
+                            selective = selective.is_some(),
+                            forfeited,
+                            protected,
+                            break_cost,
+                            whole,
+                            fetches,
+                            hit_per_mille = req.cache_hit_per_mille,
+                            needed = fetches_to_repay_a_break(break_cost, whole, req.pricing()),
+                            rewrite_ppm = req.pricing().rewrite_ppm,
+                            round_ppm = req.pricing().round_ppm,
+                            budget = KEEP_INLINE_MAX_FORFEIT,
+                            beyond_lookback,
+                            "keeping a fetched fragment inline would cost more than \
+                             it protects; compressing it again"
+                        );
+                    } else {
+                        tracing::debug!(
+                            handles = ?demanded,
+                            "a fetched fragment is out of current demand; compressing it again"
+                        );
+                    }
                 }
             }
         }
@@ -2038,6 +2196,206 @@ mod skip_reason_tests {
             original.content.joined_text(),
             "and ships whole"
         );
+    }
+
+    fn cached(mut message: Message, blocks: u32, breakpoint: bool) -> Message {
+        message.meta.cache_blocks = Some(blocks);
+        message.meta.cache_breakpoint = breakpoint;
+        message
+    }
+
+    /// Anthropic finds an earlier cache entry only within 20 blocks of a
+    /// breakpoint, so a deep rewrite re-reads from the previous breakpoint —
+    /// the messages ahead of it included — not just from itself.
+    #[test]
+    fn a_rewrite_beyond_the_cache_lookback_rereads_from_the_previous_breakpoint() {
+        let line = |n: usize| "a line of conversation text\n".repeat(n);
+        let build = |tail: usize, anthropic: bool| {
+            let mut messages = vec![msg("user", &line(400)), msg("tool", &line(10))];
+            messages.extend((0..tail).map(|_| msg("user", &line(10))));
+            if anthropic {
+                let last = messages.len() - 1;
+                for (n, each) in messages.iter_mut().enumerate() {
+                    *each = cached(each.clone(), 1, n == last);
+                }
+            }
+            messages
+        };
+        let after = |messages: &[Message], from: usize| -> u32 {
+            messages[from..]
+                .iter()
+                .map(|each| count_tokens(&each.content, &each.role))
+                .sum()
+        };
+
+        // Within the lookback: the entry just ahead is reachable.
+        let near = build(10, true);
+        assert_eq!(tokens_a_rewrite_rereads(&near, 1), (after(&near, 2), false));
+        // Beyond it, with only the system prompt cached ahead: everything.
+        let far = build(30, true);
+        let (cost, beyond) = tokens_a_rewrite_rereads(&far, 1);
+        assert!(beyond);
+        assert_eq!(cost, after(&far, 0) - after(&far[1..2], 0));
+        // An earlier breakpoint is where the re-read starts instead.
+        let mut marked = far.clone();
+        marked[0].meta.cache_breakpoint = true;
+        assert_eq!(
+            tokens_a_rewrite_rereads(&marked, 1),
+            (after(&marked, 2), true)
+        );
+        // Any-prefix providers carry no block counts and keep the old price.
+        let other = build(30, false);
+        assert_eq!(
+            tokens_a_rewrite_rereads(&other, 1),
+            (after(&other, 2), false)
+        );
+    }
+
+    /// End to end: twice-fetched, a fragment near the tail is promoted, and the
+    /// same fragment deep behind the only message breakpoint is not — unless the
+    /// provider can reuse any prefix.
+    #[test]
+    fn a_promotion_beyond_the_cache_lookback_needs_the_demand_of_a_full_rewrite() {
+        let payload: String = (0..200)
+            .map(|i| {
+                format!(
+                    "2026-01-02T03:04:{:02}Z INFO worker seq={i} value={i}\n",
+                    i % 60
+                )
+            })
+            .collect();
+        let original = msg("tool", &payload);
+        let mut first = vec![original.clone()];
+        let mut refs = RefCollector::new(1 << 20);
+        compress_messages(&mut first, &opts(), &RequestOptions::default(), &mut refs);
+        let fetched = refs.pairs()[0].0;
+        let head: String = (0..3_000)
+            .map(|i| format!("the opening task statement, line {i}\n"))
+            .collect();
+
+        let promoted = |tail: usize, anthropic: bool| {
+            // Held as sent, so it weighs in the prompt at its full size.
+            let mut opening = msg("user", &head);
+            opening.meta.protected = true;
+            let mut messages = vec![opening, original.clone()];
+            messages.extend((0..tail).map(|n| msg("user", &format!("ok {n}"))));
+            if anthropic {
+                let last = messages.len() - 1;
+                for (n, each) in messages.iter_mut().enumerate() {
+                    *each = cached(each.clone(), 1, n == last);
+                }
+            }
+            let keep = [fetched];
+            let counts = [(fetched, 2)];
+            let mut refs = RefCollector::new(1 << 20);
+            let stats = compress_messages(
+                &mut messages,
+                &opts(),
+                &RequestOptions {
+                    keep_inline: &keep,
+                    fetches: &counts,
+                    cache_hit_per_mille: 947,
+                    ..Default::default()
+                },
+                &mut refs,
+            );
+            stats.kept_inline_refs.contains(&fetched)
+        };
+
+        assert!(promoted(5, true), "near the tail, two demands repay it");
+        assert!(
+            !promoted(30, true),
+            "43 blocks deep it rewrites the head too"
+        );
+        assert!(
+            promoted(30, false),
+            "an any-prefix cache rereads only the tail"
+        );
+    }
+
+    /// A retrieve round re-sends the system prompt and tool schemas, so they
+    /// make a rewrite relatively cheaper; billed content behind the message
+    /// makes it dearer again. Both are invisible to the engine's own count.
+    #[test]
+    fn a_promotion_is_priced_in_what_the_provider_bills() {
+        let payload: String = (0..200)
+            .map(|i| {
+                format!(
+                    "2026-01-02T03:04:{:02}Z INFO worker seq={i} value={i}\n",
+                    i % 60
+                )
+            })
+            .collect();
+        let original = msg("tool", &payload);
+        let mut first = vec![original.clone()];
+        let mut refs = RefCollector::new(1 << 20);
+        compress_messages(&mut first, &opts(), &RequestOptions::default(), &mut refs);
+        let fetched = refs.pairs()[0].0;
+        let tail: String = (0..2_000)
+            .map(|i| format!("a later turn, line {i}\n"))
+            .collect();
+
+        let promoted = |outside: u32, unseen_behind: u32| {
+            let mut later = msg("user", &tail);
+            later.meta.unseen_tokens = unseen_behind;
+            let mut messages = vec![original.clone(), later];
+            let keep = [fetched];
+            let counts = [(fetched, 2)];
+            let mut refs = RefCollector::new(1 << 20);
+            compress_messages(
+                &mut messages,
+                &opts(),
+                &RequestOptions {
+                    keep_inline: &keep,
+                    fetches: &counts,
+                    cache_hit_per_mille: 947,
+                    outside_tokens: outside,
+                    ..Default::default()
+                },
+                &mut refs,
+            )
+            .kept_inline_refs
+            .contains(&fetched)
+        };
+        assert!(
+            !promoted(0, 0),
+            "messages alone: nearly the whole prompt is behind it"
+        );
+        assert!(
+            promoted(10_000_000, 0),
+            "a prompt mostly outside the messages repays it"
+        );
+        assert!(
+            !promoted(10_000_000, 1_000_000_000),
+            "and tool calls behind it that the engine cannot read make it dear again"
+        );
+    }
+
+    /// The hit-rate reading caps the bar at nine demands whatever the rates.
+    /// Real prices do not: a twentieth-of-fresh read and a 2x write put a
+    /// rewrite of most of the prompt well above it.
+    #[test]
+    fn real_cache_prices_can_ask_for_more_than_the_hit_rate_reading_allows() {
+        let reading = CachePricing::from_hit_rate(1000);
+        let opus_one_hour = CachePricing {
+            rewrite_ppm: 1_950_000,
+            round_ppm: 137_500,
+        };
+        assert_eq!(fetches_to_repay_a_break(1_000, 1_000, reading), 9);
+        assert_eq!(fetches_to_repay_a_break(1_000, 1_000, opus_one_hour), 14);
+        assert!(keeping_it_inline_is_worth_it(
+            10, 10, 1_000, 1_000, 9, reading
+        ));
+        assert!(!keeping_it_inline_is_worth_it(
+            10,
+            10,
+            1_000,
+            1_000,
+            9,
+            opus_one_hour
+        ));
+        // and the reading is exactly the old formula
+        assert_eq!(fetches_to_repay_a_break(1_000, 1_000, 913), 5);
     }
 
     /// The guard's whole job is the ratio, so it is tested as a ratio.

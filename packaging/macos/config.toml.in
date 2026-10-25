@@ -35,6 +35,14 @@ format = "json"
 # left to a default.
 frozen_prefix = "first_seen"
 
+# How long Anthropic keeps the cache entries a request writes. "adaptive" asks
+# for one hour once a conversation has paused past the provider's five minutes,
+# which an agent waiting on a long build does; it is estimated at 5-9% cheaper
+# on such workloads and is being measured. "1h" asks on every request and costs
+# more than it saves where pauses are rare. It changes what the provider bills,
+# so it is written out rather than left to the default.
+cache_ttl = "default"
+
 # Codex opens ws://.../v1/responses before trying HTTPS, and a ChatGPT-plan
 # session cannot be told not to. Relaying that upgrade is what makes such a
 # session compressible; refusing it costs about thirteen seconds of retries per
