@@ -22,6 +22,7 @@ import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -33,7 +34,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent.parent
 BIN = ROOT / "target" / "release" / "kompressor"
 DOCS = ["README.md", "docs/QUICKSTART.md", "docs/DESIGN.md"]
-PORT = int(os.environ.get("KOMPRESSOR_CHECK_PORT", "8899"))
+
+
+def free_port() -> int:
+    """A port nothing is listening on. A fixed default collided with whatever
+    else the machine runs, and the probe then talked to that instead."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+PORT = int(os.environ.get("KOMPRESSOR_CHECK_PORT") or free_port())
 
 problems: list[str] = []
 
@@ -441,13 +452,18 @@ def check_endpoints() -> None:
         )
         try:
             for _ in range(60):
+                if proc.poll() is not None:
+                    fail("http", f"the server exited {proc.returncode} before answering on "
+                         f"127.0.0.1:{PORT} (is the port taken?); skipping the endpoint check")
+                    return
                 try:
                     urllib.request.urlopen(f"http://127.0.0.1:{PORT}/healthz", timeout=1)
                     break
                 except Exception:
                     time.sleep(0.25)
             else:
-                fail("http", "the server did not come up; skipping the endpoint check")
+                fail("http", f"the server did not come up on 127.0.0.1:{PORT}; "
+                     "skipping the endpoint check")
                 return
             for path in sorted(paths):
                 post = any(k in path for k in ("compress", "retrieve", "detect"))

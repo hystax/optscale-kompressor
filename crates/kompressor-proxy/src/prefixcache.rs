@@ -39,8 +39,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use kompressor_engine::messages::PrefixCache;
+use kompressor_engine::messages::{CachePricing, PrefixCache};
 use kompressor_engine::refs::RefId;
+use kompressor_wire::ApiFamily;
 
 /// How many distinct prefixes to remember.
 ///
@@ -131,6 +132,11 @@ struct Seen {
     /// misread as churn twice — so a drop following a retrieve turn is not
     /// reported.
     rounds: u32,
+    /// Whether this conversation has ever sat idle past the provider's
+    /// five-minute cache TTL. Sticky: an agent that waited on a ten-minute
+    /// test run once is the kind that does it again. What `CacheTtl::Adaptive`
+    /// reads.
+    idled_past_ttl: bool,
 }
 
 /// Remembers, per frozen prefix, whether the provider last served it from cache.
@@ -147,7 +153,11 @@ pub struct PrefixTracker {
     /// required. Measured rather than assumed, and process-wide rather than
     /// per-conversation: it is a rate, and the two conversations in a run are
     /// the same workload against the same provider.
-    billed: Mutex<(u64, u64)>,
+    ///
+    /// Cache reads, the whole billed prompt, and the part of it the provider
+    /// billed as a cache *write* — which only Anthropic reports, and which
+    /// prices a rewrite above a plain miss.
+    billed: Mutex<(u64, u64, u64)>,
     seen: Mutex<HashMap<u64, Seen>>,
     /// Openings already seen, so a later turn is recognised as the same
     /// conversation rather than hashed into a new one.
@@ -159,6 +169,9 @@ pub struct PrefixTracker {
     /// because this is keyed by something a caller controls and an unbounded
     /// map keyed by caller input is a memory leak with extra steps.
     retrieved: Mutex<HashMap<u64, HashMap<RefId, Fetched>>>,
+    /// Client requests seen per conversation, so a fetch can be placed in time.
+    /// Bounded like `retrieved`, and for the same reason.
+    turns: Mutex<HashMap<u64, u64>>,
     /// Age past which a prefix is assumed lapsed. Zero disables the age rule
     /// and leaves only observed evidence, which is the shipped default: a TTL
     /// is a guess about someone else's eviction policy, and guessing `Cold` is
@@ -213,6 +226,10 @@ struct Fetched {
     /// 2026-10-08: promoted while the running rate read 82%, demoted at 94%,
     /// 8,192 tokens. The rewrite is paid once, so the decision is taken once.
     inlined: bool,
+    /// The conversation turns that fetched this handle, most recent last and
+    /// at most `DEMAND_WINDOW` of them. What [`PrefixTracker::demand`]
+    /// counts.
+    recent: Vec<u64>,
 }
 
 /// Did the provider serve less of this prefix than it did last turn?
@@ -234,14 +251,66 @@ fn is_a_cache_loss(before: u32, now: u32, prior_rounds: u32, rounds: u32) -> boo
 const RETRIEVED_PER_CONVERSATION: usize = 64;
 /// Most conversations the retrieved map tracks at once.
 const RETRIEVED_CONVERSATIONS: usize = 1024;
+/// A provider's prices for one model, in millionths of its uncached input
+/// price: a cache read, and whatever a token the cache does not hold is billed
+/// as on the way in — a cache write where the provider charges for one,
+/// uncached input where it does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CachePrices {
+    pub read_ppm: u32,
+    pub write_ppm: u32,
+}
+
+impl CachePrices {
+    /// The published prices for `model` on `family`'s provider, with
+    /// `long_ttl` when this request asks for one-hour cache entries.
+    ///
+    /// Read prices that differ from the usual tenth are named: Claude Opus 5.5
+    /// reads at $0.20 against $4.00 input, Claude Fable 5.1 and Mythos 5.1 at
+    /// $0.25 against $10.00. Anthropic writes at 1.25x input for five-minute
+    /// entries and 2x for one-hour ones. OpenAI caches without a write charge,
+    /// so a miss there is uncached input.
+    pub fn for_model(family: ApiFamily, model: Option<&str>, long_ttl: bool) -> CachePrices {
+        if family != ApiFamily::AnthropicMessages {
+            return CachePrices {
+                read_ppm: 100_000,
+                write_ppm: 1_000_000,
+            };
+        }
+        let model = model.unwrap_or_default();
+        let read_ppm = if model.starts_with("claude-opus-5-5") {
+            50_000
+        } else if model.starts_with("claude-fable-5-1") || model.starts_with("claude-mythos-5-1") {
+            25_000
+        } else {
+            100_000
+        };
+        CachePrices {
+            read_ppm,
+            write_ppm: if long_ttl { 2_000_000 } else { 1_250_000 },
+        }
+    }
+}
+
+/// Anthropic's default cache lifetime, which `CacheTtl::Adaptive` watches for.
+const PROVIDER_CACHE_TTL: Duration = Duration::from_secs(300);
+/// How many of a conversation's latest requests count as current demand.
+///
+/// Replayed over every promotion decision in two Harbor runs (93 decisions,
+/// 18 fragment groups): no decision taken five or more requests after the
+/// fragment's last fetch was ever followed by another fetch (0 of 45), against
+/// 11 of 37 taken right after one. Windows of three to six requests decided
+/// all 18 groups identically; four is the middle of that range.
+const DEMAND_WINDOW: u32 = 4;
 
 impl PrefixTracker {
     pub fn new(ttl: Duration) -> PrefixTracker {
         PrefixTracker {
-            billed: Mutex::new((0, 0)),
+            billed: Mutex::new((0, 0, 0)),
             seen: Mutex::new(HashMap::new()),
             ids: Mutex::new(Identities::default()),
             retrieved: Mutex::new(HashMap::new()),
+            turns: Mutex::new(HashMap::new()),
             ttl,
         }
     }
@@ -288,6 +357,13 @@ impl PrefixTracker {
     }
 
     /// Record what the provider reported for this prefix.
+    ///
+    /// `prompt_tokens` is the *whole* billed prompt, cached part included. On
+    /// OpenAI that is the reported `prompt_tokens`; on Anthropic the reported
+    /// `input_tokens` is only the uncached remainder, and the caller must add
+    /// the cache reads and writes back. Passed raw, it made every Anthropic
+    /// run read as 1000 — 41,116 cached over 8 "prompt" tokens — so the engine
+    /// priced every promotion at the most demanding bar there is.
     pub fn record(
         &self,
         fingerprint: u64,
@@ -337,6 +413,9 @@ impl PrefixTracker {
         // The watermark is set at request time and must survive the response
         // that follows it; this insert would otherwise wipe it every turn.
         let floor = seen.get(&fingerprint).and_then(|prior| prior.floor);
+        let idled_past_ttl = seen
+            .get(&fingerprint)
+            .is_some_and(|prior| prior.idled_past_ttl);
 
         // Within one conversation the prefix only grows, so the cache read the
         // provider reports should never fall. When it does, something outside
@@ -373,6 +452,7 @@ impl PrefixTracker {
                 floor,
                 was_warm,
                 rounds,
+                idled_past_ttl,
             },
         );
     }
@@ -400,6 +480,7 @@ impl PrefixTracker {
         {
             map.remove(&victim);
         }
+        let turn = self.turn(conversation);
         let held = map.entry(conversation).or_default();
         for id in ids {
             match held.get_mut(id) {
@@ -409,6 +490,12 @@ impl PrefixTracker {
                     if fetched.first_request != request_id {
                         fetched.promoted = true;
                         fetched.fetches = fetched.fetches.saturating_add(1);
+                    }
+                    if fetched.recent.last() != Some(&turn) {
+                        fetched.recent.push(turn);
+                        if fetched.recent.len() > DEMAND_WINDOW as usize {
+                            fetched.recent.remove(0);
+                        }
                     }
                 }
                 // First sight. Recorded, not acted on: a model narrowing twice
@@ -424,6 +511,7 @@ impl PrefixTracker {
                                 promoted: false,
                                 fetches: 1,
                                 inlined: false,
+                                recent: vec![turn],
                             },
                         );
                     }
@@ -474,6 +562,7 @@ impl PrefixTracker {
                                 // price it as though a round had been spent.
                                 fetches: 0,
                                 inlined: false,
+                                recent: Vec::new(),
                             },
                         );
                     }
@@ -500,15 +589,83 @@ impl PrefixTracker {
     /// be, so the engine demands the most before rewriting a prefix. Guessing
     /// the other way would promote on thin evidence, which is the mistake that
     /// cost 46,379 tokens of cache in one turn.
+    ///
+    /// The rate is what was measured, for reporting. Pricing a promotion needs
+    /// more than it — the cost of a write, and what this model charges for a
+    /// read — and [`PrefixTracker::promotion_pricing`] carries both.
     pub fn cache_hit_per_mille(&self) -> u32 {
         let Ok(billed) = self.billed.lock() else {
             return 1000;
         };
-        let (read, prompt) = *billed;
+        let (read, prompt, _) = *billed;
         if prompt == 0 {
             return 1000;
         }
-        ((read.saturating_mul(1000) / prompt) as u32).min(1000)
+        (read.min(prompt) * 1000 / prompt) as u32
+    }
+
+    /// What a promotion trades at `prices`, on the traffic this process has
+    /// billed so far: rewriting one token, and one prompt token of a retrieve
+    /// round in the measured blend of reads, writes and uncached input.
+    ///
+    /// Before any usage the round is priced as all reads, the cheapest a round
+    /// can be and so the most demanding bar — the same conservative reading
+    /// the hit rate has always defaulted to.
+    pub fn promotion_pricing(&self, prices: CachePrices) -> CachePricing {
+        let (read, prompt, written) = self.billed.lock().map(|billed| *billed).unwrap_or_default();
+        let round = if prompt == 0 {
+            u64::from(prices.read_ppm)
+        } else {
+            let read = read.min(prompt);
+            let written = written.min(prompt - read);
+            let fresh = prompt - read - written;
+            (read * u64::from(prices.read_ppm)
+                + written * u64::from(prices.write_ppm)
+                + fresh * 1_000_000)
+                / prompt
+        };
+        CachePricing {
+            rewrite_ppm: prices.write_ppm.saturating_sub(prices.read_ppm),
+            round_ppm: u32::try_from(round).unwrap_or(u32::MAX).max(1),
+        }
+    }
+
+    /// Record the part of a billed prompt the provider charged as a cache
+    /// write. Called beside [`PrefixTracker::record`], for the same usage, and
+    /// only when that call counted it.
+    pub fn record_cache_writes(&self, written: u32) {
+        if let Ok(mut billed) = self.billed.lock() {
+            billed.2 = billed.2.saturating_add(u64::from(written));
+        }
+    }
+
+    /// Whether this request should ask for one-hour cache entries under
+    /// `CacheTtl::Adaptive`: the conversation has gone quiet past the
+    /// provider's five-minute TTL, on this request or an earlier one.
+    ///
+    /// Measured from the previous request's end, which undercounts the
+    /// start-to-start gap the provider times entries by. Noticing a gap late
+    /// costs one expiry; inventing one costs a doubled write price on every
+    /// later turn.
+    ///
+    /// The request that finds the gap already answers `true`. Its prefix has
+    /// expired, so it rewrites it whatever it asks for, and asking for an hour
+    /// costs 2x on that one write. Waiting a request instead costs the whole
+    /// prefix twice: a request asking for an hour does not read the five-minute
+    /// entry its predecessor wrote. Measured on the 89-task tuned run, all 11
+    /// conversations that switched one request late rewrote the prefix again
+    /// 2-43 s after the first rewrite, 208K tokens at the one-hour price.
+    pub fn long_ttl(&self, fingerprint: u64) -> bool {
+        let Ok(mut seen) = self.seen.lock() else {
+            return false;
+        };
+        let Some(entry) = seen.get_mut(&fingerprint) else {
+            return false;
+        };
+        if entry.at.elapsed() > PROVIDER_CACHE_TTL {
+            entry.idled_past_ttl = true;
+        }
+        entry.idled_past_ttl
     }
 
     /// Pin fragments the engine has shipped whole, so the decision is not
@@ -531,6 +688,71 @@ impl PrefixTracker {
                 fetched.inlined = true;
             }
         }
+    }
+
+    /// Start a client request in `conversation` and return what the engine
+    /// should keep inline for it, each handle with its **current** demand: the
+    /// requests among the last `DEMAND_WINDOW` that fetched it.
+    ///
+    /// A lifetime count is the wrong predictor. A fragment fetched in four
+    /// consecutive requests is being worked with; one fetched at requests 4, 9,
+    /// 12 and 16 reaches the same count and is browsed. Priced on the lifetime
+    /// count, the second is promoted and its rewrite — 69% of the prompt, beyond
+    /// the cache lookback — buys two rounds that cost a fraction of it. A
+    /// pinned promotion keeps `u32::MAX`, as it always has.
+    pub fn demand(&self, conversation: Option<u64>) -> Vec<(RefId, u32)> {
+        let Some(conversation) = conversation else {
+            return Vec::new();
+        };
+        let now = self.advance_turn(conversation);
+        let Ok(map) = self.retrieved.lock() else {
+            return Vec::new();
+        };
+        map.get(&conversation)
+            .map(|held| {
+                held.iter()
+                    .filter(|(_, fetched)| fetched.promoted)
+                    .map(|(id, fetched)| {
+                        let current = if fetched.inlined {
+                            u32::MAX
+                        } else {
+                            let since = now.saturating_sub(u64::from(DEMAND_WINDOW));
+                            fetched
+                                .recent
+                                .iter()
+                                .filter(|&&turn| turn >= since && turn < now)
+                                .count() as u32
+                        };
+                        (*id, current)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The turn `conversation` is on.
+    fn turn(&self, conversation: u64) -> u64 {
+        self.turns
+            .lock()
+            .ok()
+            .and_then(|turns| turns.get(&conversation).copied())
+            .unwrap_or(0)
+    }
+
+    /// Count one more client request in `conversation`, returning its turn.
+    fn advance_turn(&self, conversation: u64) -> u64 {
+        let Ok(mut turns) = self.turns.lock() else {
+            return 0;
+        };
+        if turns.len() >= RETRIEVED_CONVERSATIONS
+            && !turns.contains_key(&conversation)
+            && let Some(&victim) = turns.keys().next()
+        {
+            turns.remove(&victim);
+        }
+        let turn = turns.entry(conversation).or_insert(0);
+        *turn += 1;
+        *turn
     }
 
     /// The same handles, each with how many distinct requests have asked for
@@ -669,6 +891,7 @@ impl PrefixTracker {
                 // Filed at request time, before any response: no round has
                 // happened yet, and nothing has been read from cache to drop.
                 rounds: 0,
+                idled_past_ttl: false,
             },
         );
         observed
@@ -844,6 +1067,154 @@ mod tests {
         tracker.record(3, None, Some(1_000_000), 0);
         tracker.record(4, Some(500), None, 0);
         assert_eq!(tracker.cache_hit_per_mille(), 480);
+    }
+
+    /// A promotion is priced at the provider's real rates, on the traffic's
+    /// measured blend of reads, writes and uncached input.
+    #[test]
+    fn a_promotion_is_priced_at_the_models_rates_and_the_ttl_it_asks_for() {
+        use kompressor_engine::messages::CachePricing;
+        let tracker = PrefixTracker::new(Duration::from_secs(0));
+        let opus =
+            CachePrices::for_model(ApiFamily::AnthropicMessages, Some("claude-opus-5-5"), false);
+        assert_eq!(
+            tracker.promotion_pricing(opus).round_ppm,
+            50_000,
+            "nothing billed yet: a round priced as all reads, the most demanding bar"
+        );
+
+        // afull89's totals, per ten thousand: 92.15% reads, 7.27% writes.
+        tracker.record(1, Some(9_215), Some(10_000), 0);
+        tracker.record_cache_writes(727);
+        assert_eq!(
+            tracker.cache_hit_per_mille(),
+            921,
+            "the rate reports what was measured"
+        );
+
+        let five = tracker.promotion_pricing(opus);
+        assert_eq!(
+            five,
+            CachePricing {
+                rewrite_ppm: 1_200_000,
+                round_ppm: 142_750
+            }
+        );
+        let hour = tracker.promotion_pricing(CachePrices::for_model(
+            ApiFamily::AnthropicMessages,
+            Some("claude-opus-5-5"),
+            true,
+        ));
+        assert_eq!(
+            hour,
+            CachePricing {
+                rewrite_ppm: 1_950_000,
+                round_ppm: 197_275
+            }
+        );
+        // Demands needed for a rewrite of the whole prompt: the hit-rate
+        // reading said 5; Opus 5.5 at five minutes says 8, at an hour 9.
+        let needed = |p: CachePricing| p.rewrite_ppm / p.round_ppm;
+        assert_eq!(needed(CachePricing::from_hit_rate(921)), 5);
+        assert_eq!(needed(five), 8);
+        assert_eq!(needed(hour), 9);
+
+        // A provider without write charges: a miss is uncached input, which is
+        // the shape the hit-rate reading always assumed.
+        let openai = tracker.promotion_pricing(CachePrices::for_model(
+            ApiFamily::OpenAiResponses,
+            Some("gpt-5.5"),
+            false,
+        ));
+        assert_eq!(openai.rewrite_ppm, 900_000);
+    }
+
+    #[test]
+    fn cache_read_prices_follow_the_model() {
+        let read = |model| {
+            CachePrices::for_model(ApiFamily::AnthropicMessages, Some(model), false).read_ppm
+        };
+        assert_eq!(read("claude-opus-5-5"), 50_000);
+        assert_eq!(read("claude-fable-5-1"), 25_000);
+        assert_eq!(read("claude-mythos-5-1"), 25_000);
+        assert_eq!(read("claude-opus-4-8"), 100_000);
+        assert_eq!(
+            CachePrices::for_model(ApiFamily::AnthropicMessages, None, true).write_ppm,
+            2_000_000
+        );
+    }
+
+    /// Demand is what the last few requests asked for, not what the
+    /// conversation ever did.
+    #[test]
+    fn demand_counts_only_fetches_inside_the_window() {
+        let tracker = PrefixTracker::new(Duration::from_secs(0));
+        let id = kompressor_engine::refs::ref_for("a fetched body");
+        tracker.demand(Some(7));
+        tracker.record_retrieved(7, "turn-1", &[id]);
+        tracker.demand(Some(7));
+        tracker.record_retrieved(7, "turn-2", &[id]);
+        assert_eq!(
+            tracker.demand(Some(7)),
+            vec![(id, 2)],
+            "two of the last requests fetched it"
+        );
+        for _ in 0..3 {
+            tracker.demand(Some(7));
+        }
+        assert_eq!(
+            tracker.demand(Some(7)),
+            vec![(id, 0)],
+            "four requests without a fetch: still eligible, no longer in demand"
+        );
+        assert_eq!(
+            tracker.retrieved_with_counts(Some(7)),
+            vec![(id, 2)],
+            "the lifetime count is untouched"
+        );
+        tracker.record_inlined(Some(7), &[id]);
+        assert_eq!(
+            tracker.demand(Some(7)),
+            vec![(id, u32::MAX)],
+            "a pinned promotion stays pinned"
+        );
+        assert!(tracker.demand(None).is_empty());
+    }
+
+    /// `CacheTtl::Adaptive` moves a conversation to one-hour entries on the
+    /// request that finds it idle past five minutes, not the one after.
+    #[test]
+    fn a_conversation_asks_for_an_hour_once_it_idles_past_the_ttl() {
+        let tracker = PrefixTracker::new(Duration::from_secs(0));
+        assert!(
+            !tracker.long_ttl(9),
+            "a conversation never seen asks for nothing"
+        );
+        tracker.floor(9, 1);
+        assert!(
+            !tracker.long_ttl(9),
+            "a busy conversation keeps the default"
+        );
+
+        let idle = |tracker: &PrefixTracker| {
+            let mut seen = tracker.seen.lock().unwrap();
+            let entry = seen.get_mut(&9).unwrap();
+            entry.at = Instant::now() - Duration::from_secs(301);
+        };
+        idle(&tracker);
+        assert!(
+            tracker.long_ttl(9),
+            "the request that finds the gap rewrites the expired prefix once, at an hour"
+        );
+        assert!(
+            tracker.long_ttl(9),
+            "every request after it asks for an hour"
+        );
+        tracker.record(9, Some(100), Some(1_000), 0);
+        assert!(
+            tracker.long_ttl(9),
+            "and the flag survives the response being recorded"
+        );
     }
 
     /// A promotion is taken once, because it is paid for once.

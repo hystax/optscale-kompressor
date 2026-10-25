@@ -14,7 +14,7 @@
 # Nothing Apple-proprietary is used or required. zig supplies macOS libc stubs
 # so linking works without Apple's SDK; `xar` and `mkbom` are open source
 # reimplementations of the container formats a .pkg is made of.
-FROM rust:1.90-bookworm
+FROM rust:1.95-bookworm
 
 # Pinned so an image rebuilt in six months produces the same artifact. zig is
 # the one with a real floor: cargo-zigbuild refuses anything below 0.9, and

@@ -221,6 +221,7 @@ mod tests {
             completion_tokens: Some(180),
             cache_read_tokens: Some(3_000),
             cache_write_tokens: None,
+            cache_write_1h_tokens: None,
             shadow_prompt_tokens: Some(9_000),
             conversation: None,
             retrieve_rounds: 2,
@@ -1034,6 +1035,7 @@ mod tests {
                      ALTER TABLE retrieval_events DROP COLUMN withheld;
                      ALTER TABLE proxy_requests DROP COLUMN rolled_up;
                      ALTER TABLE proxy_requests DROP COLUMN strip_usage;
+                     ALTER TABLE proxy_requests DROP COLUMN cache_write_1h_tokens;
                      PRAGMA user_version = 5;",
                 )
                 .unwrap();
@@ -1076,6 +1078,7 @@ mod tests {
                 ALTER TABLE retrieval_events DROP COLUMN withheld;
                 ALTER TABLE proxy_requests DROP COLUMN rolled_up;
                 ALTER TABLE proxy_requests DROP COLUMN strip_usage;
+                ALTER TABLE proxy_requests DROP COLUMN cache_write_1h_tokens;
                 PRAGMA user_version = 5;",
                 )
                 .unwrap();

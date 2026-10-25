@@ -329,7 +329,7 @@ fn fold_fallback(
         return (None, structured);
     }
     let mark = refs.mark();
-    match crate::pipeline::arbitrate_text(text, opts, ctx, refs) {
+    match crate::pipeline::arbitrate_text(text, opts, ctx, refs, crate::logs::Identity::Values) {
         Some(out) if chars_len(&out) < chars_len(text) => (Some(out), structured),
         _ => {
             refs.rollback(mark);

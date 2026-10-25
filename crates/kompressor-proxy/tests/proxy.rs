@@ -284,6 +284,220 @@ async fn an_anthropic_frozen_prefix_and_its_cache_control_block_reach_the_upstre
     );
 }
 
+/// A configuration with no `proxy.providers` table — every one written before
+/// it existed — treats Anthropic and OpenAI traffic alike: the deployment's
+/// mode and its `compress` switch reach both families.
+#[tokio::test]
+async fn an_old_configuration_treats_both_families_alike() {
+    let anthropic = |input: &str| {
+        json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_0", "content": input}
+            ]}]
+        })
+    };
+    let input = log_payload(400);
+
+    let aggressive = Harness::with(|config| {
+        config.engine.mode = kompressor_engine::Mode::Aggressive;
+    })
+    .await;
+    answering(&aggressive).await;
+    let chat = aggressive
+        .post("/v1/chat/completions", &chat_body(&input))
+        .await;
+    let messages = aggressive.post("/v1/messages", &anthropic(&input)).await;
+    assert_eq!(chat.header("x-kompressor-mode"), "aggressive");
+    assert_eq!(messages.header("x-kompressor-mode"), "aggressive");
+
+    let off = Harness::with(|config| config.proxy.compress = false).await;
+    answering(&off).await;
+    let chat = off.post("/v1/chat/completions", &chat_body(&input)).await;
+    let messages = off.post("/v1/messages", &anthropic(&input)).await;
+    assert_eq!(chat.header("x-kompressor-mode"), "off");
+    assert_eq!(messages.header("x-kompressor-mode"), "off");
+    let sent = off.upstream_json().await;
+    assert_eq!(sent[0]["messages"][3]["content"], input);
+    assert_eq!(sent[1]["messages"][0]["content"][0]["content"], input);
+}
+
+/// A provider table inherits every setting it does not name: here only
+/// OpenAI's `compress` is scoped, and Anthropic still gets the deployment's
+/// one-hour TTL and compression.
+#[tokio::test]
+async fn a_provider_table_inherits_the_settings_it_does_not_name() {
+    let harness = Harness::with(|config| {
+        config.proxy.cache_ttl = kompressor_core::config::CacheTtl::OneHour;
+        config.proxy.providers.insert(
+            "openai".into(),
+            kompressor_core::config::ProviderOverrides {
+                compress: Some(false),
+                ..Default::default()
+            },
+        );
+    })
+    .await;
+    answering(&harness).await;
+    let input = log_payload(400);
+    let body = json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 1024,
+        "system": [{"type": "text", "text": "rules", "cache_control": {"type": "ephemeral"}}],
+        "messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_0", "content": input}
+        ]}]
+    });
+    let reply = harness.post("/v1/messages", &body).await;
+    assert_ne!(reply.header("x-kompressor-mode"), "off");
+    let sent = &harness.upstream_json().await[0];
+    assert_eq!(
+        sent["system"][0]["cache_control"]["ttl"], "1h",
+        "the global TTL"
+    );
+    assert!(
+        sent["messages"][0]["content"][0]["content"]
+            .as_str()
+            .unwrap()
+            .len()
+            < input.len(),
+        "and global compression"
+    );
+    let reply = harness
+        .post("/v1/chat/completions", &chat_body(&input))
+        .await;
+    assert_eq!(
+        reply.header("x-kompressor-mode"),
+        "off",
+        "while openai's own switch holds"
+    );
+}
+
+/// `proxy.providers` applies to its provider's traffic and to nothing else:
+/// here Anthropic asks for one-hour entries and OpenAI is not compressed, from
+/// one proxy serving both.
+#[tokio::test]
+async fn provider_settings_apply_to_that_provider_only() {
+    let harness = Harness::with(|config| {
+        use kompressor_core::config::{CacheTtl, ProviderOverrides};
+        config.proxy.providers.insert(
+            "anthropic".into(),
+            ProviderOverrides {
+                cache_ttl: Some(CacheTtl::OneHour),
+                ..Default::default()
+            },
+        );
+        config.proxy.providers.insert(
+            "openai".into(),
+            ProviderOverrides {
+                compress: Some(false),
+                ..Default::default()
+            },
+        );
+    })
+    .await;
+    answering(&harness).await;
+
+    let input = log_payload(400);
+    let reply = harness
+        .post("/v1/chat/completions", &chat_body(&input))
+        .await;
+    assert_eq!(
+        reply.header("x-kompressor-mode"),
+        "off",
+        "openai is not compressed"
+    );
+    let sent = &harness.upstream_json().await[0];
+    assert_eq!(
+        sent["messages"][3]["content"], input,
+        "and goes out as it came"
+    );
+
+    let body = json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 1024,
+        "system": [{"type": "text", "text": "rules", "cache_control": {"type": "ephemeral"}}],
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_0", "content": input}
+            ]}
+        ]
+    });
+    let reply = harness.post("/v1/messages", &body).await;
+    assert_ne!(
+        reply.header("x-kompressor-mode"),
+        "off",
+        "anthropic still compresses"
+    );
+    let sent = &harness.upstream_json().await[1];
+    assert_eq!(
+        sent["system"][0]["cache_control"]["ttl"], "1h",
+        "and asks for an hour"
+    );
+    assert!(
+        sent["messages"][0]["content"][0]["content"]
+            .as_str()
+            .unwrap()
+            .len()
+            < input.len()
+    );
+}
+
+#[tokio::test]
+async fn a_one_hour_cache_ttl_reaches_the_upstream_only_when_asked_for() {
+    let body = json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 1024,
+        "system": [{"type": "text", "text": "rules", "cache_control": {"type": "ephemeral"}}],
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_0", "content": log_payload(400)},
+                {"type": "text", "text": "next", "cache_control": {"type": "ephemeral"}}
+            ]}
+        ]
+    });
+
+    let asked = Harness::with(|config| {
+        config.proxy.cache_ttl = kompressor_core::config::CacheTtl::OneHour;
+    })
+    .await;
+    answering(&asked).await;
+    asked.post("/v1/messages", &body).await;
+    let upstream = &asked.upstream_json().await[0];
+    assert_eq!(upstream["system"][0]["cache_control"]["ttl"], "1h");
+    assert_eq!(
+        upstream["messages"][0]["content"][1]["cache_control"]["ttl"],
+        "1h"
+    );
+
+    // Compression off still asks for an hour when told to: the TTL is a
+    // separate decision from compressing, and the one docs/CLAUDE-CODE.md
+    // describes as working either way.
+    let off = Harness::with(|config| {
+        config.proxy.compress = false;
+        config.proxy.cache_ttl = kompressor_core::config::CacheTtl::OneHour;
+    })
+    .await;
+    answering(&off).await;
+    off.post("/v1/messages", &body).await;
+    let upstream = &off.upstream_json().await[0];
+    assert_eq!(upstream["system"][0]["cache_control"]["ttl"], "1h");
+
+    // The default sends the client's markers as written: the TTL is a price
+    // decision, and nothing the operator did not ask for changes it.
+    let default = Harness::new().await;
+    answering(&default).await;
+    default.post("/v1/messages", &body).await;
+    let upstream = &default.upstream_json().await[0];
+    assert!(upstream["system"][0]["cache_control"].get("ttl").is_none());
+    assert!(
+        upstream["messages"][0]["content"][1]["cache_control"]
+            .get("ttl")
+            .is_none()
+    );
+}
+
 #[tokio::test]
 async fn a_previous_response_id_protects_the_turn_but_not_the_tool_output() {
     // Earlier turns live on the provider's side, where we cannot see them, so
@@ -481,6 +695,15 @@ async fn the_control_arm_forwards_unchanged_says_so_and_still_records() {
         })
         .collect();
     assert_eq!(rows.len(), 1, "a forwarded request is still a recorded one");
+    assert_eq!(
+        rows[0].model.as_deref(),
+        body["model"].as_str(),
+        "the control arm is priced per model like the treated one"
+    );
+    assert!(
+        rows[0].conversation.is_some(),
+        "and grouped into conversations, or its cache losses go unseen"
+    );
     assert!(
         rows[0].prompt_tokens.is_some_and(|tokens| tokens > 0),
         "the control arm's prompt tokens are the baseline -- without them the \
@@ -877,6 +1100,9 @@ async fn a_streamed_round_counts_each_input_token_once() {
         "\n\n",
         "event: message_delta\n",
         r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":8,"cache_read_input_tokens":41116,"cache_creation_input_tokens":3600,"output_tokens":214}}"#,
+        "\n\n",
+        "event: message_stop\n",
+        r#"data: {"type":"message_stop"}"#,
         "\n\n",
     );
     Mock::given(any())

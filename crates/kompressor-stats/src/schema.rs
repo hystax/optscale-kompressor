@@ -364,6 +364,16 @@ SELECT tenant, date(time_ms/1000,'unixepoch') AS day,
 FROM retrieval_events GROUP BY tenant, day;
 "#;
 
+/// v11: the part of `cache_write_tokens` the provider billed as one-hour cache
+/// entries. Anthropic prices those writes at 2x input against 1.25x for the
+/// five-minute default, and `proxy.cache_ttl` decides which a request asks
+/// for, so a cost comparison of TTL settings cannot be priced from the total.
+/// NULL where the provider reported no split; the five-minute part is the
+/// total less this.
+const V11: &str = r#"
+ALTER TABLE proxy_requests ADD COLUMN cache_write_1h_tokens INTEGER;
+"#;
+
 pub const MIGRATIONS: &[(u32, &str)] = &[
     (1, V1),
     (2, V2),
@@ -375,6 +385,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (8, V8),
     (9, V9),
     (10, V10),
+    (11, V11),
 ];
 
 /// The version a freshly migrated database reports in `PRAGMA user_version`.

@@ -64,9 +64,11 @@
 pub mod authmode;
 mod bodycapture;
 pub mod bodycodec;
+mod cachettl;
 pub mod failopen;
 mod handler;
 pub mod headers;
+pub mod intercept;
 pub mod mode;
 mod nonstream;
 mod piggyback;

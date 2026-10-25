@@ -1,0 +1,49 @@
+# kompressor — user service configuration.
+#
+# Written by the macOS package postinstall, which substitutes @STATE@ for a real
+# absolute path. The loader does NOT expand `$HOME` or `~`: a path spelled
+# `$HOME/.local/share/...` is taken literally and creates a directory called
+# `$HOME` next to wherever the process happens to be running. Expansion
+# therefore happens at install time, here, and never in the TOML.
+
+[server]
+listen = "127.0.0.1:8817"
+
+[engine]
+mode = "recoverable"
+# The 64 KiB default drops recoverability on exactly the payloads worth
+# compressing: a fold or an elision over that size keeps no fragment.
+max_ref_bytes = 1048576
+
+[refs]
+backend = "sqlite"
+path = "@STATE@/refs.db"
+
+[stats]
+enabled = true
+path = "@STATE@/stats.db"
+
+[log]
+level = "info"
+format = "json"
+
+[[proxy.upstreams]]
+name = "openai"
+path_prefix = "/v1"
+base_url = "https://api.openai.com"
+api_family = "openai"
+forward_auth = true
+
+# Where the same mount goes when the caller pays by subscription.
+[proxy.upstreams.subscription]
+base_url = "https://chatgpt.com"
+rewrite_prefix = "/backend-api/codex"
+
+# Explicit ChatGPT route for desktop clients; avoids user-agent classification.
+[[proxy.upstreams]]
+name = "codex-desktop-chatgpt"
+path_prefix = "/backend-api/codex"
+base_url = "https://chatgpt.com"
+strip_prefix = false
+api_family = "openai"
+forward_auth = true

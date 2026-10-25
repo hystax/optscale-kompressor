@@ -57,6 +57,10 @@ use kompressor_core::config::RetrieveTool;
 use kompressor_engine::estimate_tokens;
 use kompressor_engine::messages::PrefixCache;
 use kompressor_engine::options::EngineOptionsPatch;
+
+/// Every frame on this transport is an OpenAI Responses request, so it runs
+/// under `proxy.providers.openai`.
+const PROVIDER: &str = "openai";
 use kompressor_engine::refs::{RefId, refs_in};
 use kompressor_stats::events::{Event, ProxyRequestEvent, Surface};
 use kompressor_wire::{ApiFamily, walker_for};
@@ -238,6 +242,7 @@ pub async fn relay(
                 completion_tokens: None,
                 cache_read_tokens: None,
                 cache_write_tokens: None,
+                cache_write_1h_tokens: None,
                 shadow_prompt_tokens: None,
                 conversation: None,
                 // The retrieve tool is deliberately not offered on this
@@ -349,7 +354,14 @@ async fn rewrite_frame(
 ///
 /// Must run against the client's own text, before the engine rewrites it.
 fn note_what_the_turn_asks_for(session: &Session, value: &Value, piggyback: &Mutex<Piggyback>) {
-    if session.state.core.config().proxy.retrieve_tool == RetrieveTool::Never {
+    if session
+        .state
+        .core
+        .config_for(Some(PROVIDER))
+        .proxy
+        .retrieve_tool
+        == RetrieveTool::Never
+    {
         return;
     }
     let mut held = piggyback
@@ -387,7 +399,7 @@ fn restore_fragments(
     request_id: &str,
     piggyback: &Mutex<Piggyback>,
 ) -> usize {
-    let config = session.state.core.config();
+    let config = session.state.core.config_for(Some(PROVIDER));
     // The operator's switch for the HTTP retrieve tool governs here too. There
     // is no second knob for a second transport: "do not give elided content
     // back to the model" is one decision, however it is carried out.
@@ -597,7 +609,7 @@ async fn compress_value(
     provider: &str,
     piggyback: &Mutex<Piggyback>,
 ) -> bool {
-    let config = state.core.config();
+    let config = state.core.config_for(Some(PROVIDER));
     let proxy = &config.proxy;
     // Every decline says why. The failure mode of this whole path is silence —
     // a frame that is not compressed looks exactly like one that had nothing to
@@ -627,8 +639,9 @@ async fn compress_value(
         return false;
     }
 
-    let options = state.core.options_for(
+    let options = state.core.options_for_provider(
         identity,
+        Some(PROVIDER),
         Some(&EngineOptionsPatch {
             mode: mode.engine_mode(),
             enable_stale_read: (!proxy.stale_read).then_some(false),
@@ -674,6 +687,9 @@ async fn compress_value(
         // measured rate is the honest value to pass, not a placeholder that
         // would start lying the day the exemption above is reconsidered.
         state.prefixes.cache_hit_per_mille(),
+        // Unpriced for the same reason: the demands above clear any bar.
+        0,
+        None,
         // No conversation on this transport, so nothing to pin against. The
         // `u32::MAX` demands above already make every promotion here permanent.
         None,

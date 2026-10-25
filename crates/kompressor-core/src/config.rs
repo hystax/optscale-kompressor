@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use kompressor_engine::EngineOptions;
+use kompressor_engine::{EngineOptions, EngineOptionsPatch};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ConfigError;
@@ -175,6 +175,63 @@ impl Default for RefsConfig {
     }
 }
 
+/// The CONNECT listener that lets a client which pins its own base URL be
+/// compressed anyway.
+///
+/// A client that reads `ANTHROPIC_BASE_URL` needs none of this: point it at the
+/// proxy and the bytes arrive. Claude Desktop sets that variable itself when it
+/// spawns a session, overwriting both the inherited environment and
+/// `settings.json`, so there is no value to set. What it does honour is a proxy
+/// and a certificate authority, which is what this serves.
+///
+/// Off unless [`Self::listen`] names an address. A CONNECT proxy that appeared
+/// because somebody upgraded would be an unpleasant surprise, and a listener
+/// holding a signing key more so.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InterceptConfig {
+    /// Where to accept CONNECT. `None`, the default, serves nothing.
+    ///
+    /// One field rather than a bool beside an address, which can contradict
+    /// itself.
+    pub listen: Option<String>,
+    /// Hosts whose TLS this terminates. Everything else is tunnelled blind.
+    ///
+    /// Exact, lowercased hostnames; no globs and no patterns. mitmproxy takes a
+    /// regex here and the anchors in `'^api\.anthropic\.com:443$'` are doing
+    /// real work — a pattern that loses them intercepts hosts nobody meant it
+    /// to, quietly, while still appearing to function. Equality cannot.
+    pub intercept_hosts: Vec<String>,
+    /// Directory holding `ca.pem` and `ca.key`, created on first use.
+    pub ca_path: PathBuf,
+    /// What to advertise in ALPN.
+    ///
+    /// Both, in preference order, because `http/1.1` alone does not work.
+    /// Claude Desktop's client offers **only** `h2` for `api.anthropic.com`,
+    /// and a server that cannot speak it answers `no_application_protocol`:
+    /// the client hangs up mid-handshake and the listener logs a handshake
+    /// EOF, which looks exactly like an untrusted certificate and is not one.
+    /// Measured with `openssl s_client -alpn h2` against this listener —
+    /// alert 120 with `Verify return code: 0 (ok)`, trust intact, protocol
+    /// refused.
+    pub alpn: Vec<String>,
+    /// How many minted leaves to keep. Bounds memory, not disk; nothing about a
+    /// leaf is written down.
+    pub leaf_cache_entries: usize,
+}
+
+impl Default for InterceptConfig {
+    fn default() -> Self {
+        InterceptConfig {
+            listen: None,
+            intercept_hosts: Vec::new(),
+            ca_path: PathBuf::from("./data/ca"),
+            alpn: vec!["h2".to_string(), "http/1.1".to_string()],
+            leaf_cache_entries: 64,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StatsFileConfig {
@@ -247,6 +304,34 @@ pub enum RetrieveTool {
     Auto,
     Always,
     Never,
+}
+
+/// How long Anthropic should keep the cache entries a request writes.
+///
+/// The client's `cache_control` markers ask for the provider's default, five
+/// minutes. An agent that waits on a long build or test run outlives it, and
+/// the next request writes the whole conversation again: on aset-check04 that
+/// was 698,697 tokens over five turns, 63% of every cache write in the run.
+/// A one-hour entry costs 2x the input price to write instead of 1.25x, so it
+/// pays only where gaps actually exceed five minutes. Replayed over eight
+/// Anthropic runs, upgrading every marker cost 2.3% more overall (up to 27%
+/// on runs with no long gap); upgrading a conversation only after it first
+/// idled past five minutes cost 7.7% less, and never more than 1.6% more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheTtl {
+    /// The client's markers go out as written. The shipped default.
+    #[default]
+    Default,
+    /// Every marker asks for one hour.
+    #[serde(rename = "1h")]
+    OneHour,
+    /// One hour, from the request that finds a conversation idle longer than
+    /// the five-minute default. That request has lost its prefix anyway, so it
+    /// writes it once at the one-hour price. Switching a request later costs
+    /// the prefix twice: a request asking for an hour does not read the
+    /// five-minute entry its predecessor wrote.
+    Adaptive,
 }
 
 /// Where the frozen prefix ends: what the client says, or what the provider
@@ -329,6 +414,8 @@ pub struct ProxyConfig {
     pub retrieve_execution: RetrieveExecution,
     /// Where the frozen prefix ends. See [`FrozenPrefix`].
     pub frozen_prefix: FrozenPrefix,
+    /// The cache TTL Anthropic requests ask for. See [`CacheTtl`].
+    pub cache_ttl: CacheTtl,
     /// How many retrieve rounds may be **answered** in one request.
     ///
     /// The metric counts one more than this. Reaching the cap does not end the
@@ -533,6 +620,131 @@ pub struct ProxyConfig {
     pub upstreams: Vec<Upstream>,
     pub default_upstream: String,
     pub allow_insecure_upstream: bool,
+    /// See [`InterceptConfig`]. Off unless its `listen` is set.
+    pub intercept: InterceptConfig,
+    /// Settings that apply to one provider's traffic only, keyed `anthropic`
+    /// (Messages) or `openai` (Chat Completions and Responses). See
+    /// [`ProviderOverrides`].
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, ProviderOverrides>,
+}
+
+/// The providers [`ProxyConfig::providers`] may name: the API family a request
+/// arrives as, not the upstream it is sent to, so a mount renamed or split in
+/// two still gets its provider's settings.
+pub const PROVIDERS: &[&str] = &["anthropic", "openai"];
+
+/// What one provider's traffic does differently from the deployment default.
+///
+/// Every field is optional and an absent one inherits. It exists because the
+/// settings that pay are not the same on every provider: on Claude Code against
+/// Claude Opus 5.5, eliding function bodies cost more in retrieval rounds than
+/// it saved and the one-hour cache TTL is Anthropic's field alone, while the
+/// Codex traffic the defaults were measured on has neither problem. One
+/// deployment serving both had to pick one set for both.
+///
+/// ```toml
+/// [proxy.providers.anthropic]
+/// cache_ttl = "adaptive"
+/// frozen_prefix = "first_seen"
+///
+/// [proxy.providers.anthropic.engine]
+/// enable_code_aware = false
+/// ```
+///
+/// From the environment, `KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__CACHE_TTL`
+/// and `KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__ENGINE__ENABLE_CODE_AWARE`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderOverrides {
+    /// `false` forwards this provider's traffic uncompressed, measured as the
+    /// control arm is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compress: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieve_tool: Option<RetrieveTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frozen_prefix: Option<FrozenPrefix>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_ttl: Option<CacheTtl>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_read: Option<bool>,
+    /// Engine options, any of `[engine]`'s that a request may override.
+    #[serde(skip_serializing_if = "patch_is_empty")]
+    pub engine: EngineOptionsPatch,
+}
+
+fn patch_is_empty(patch: &EngineOptionsPatch) -> bool {
+    toml::Value::try_from(patch)
+        .ok()
+        .and_then(|value| value.as_table().map(toml::map::Map::is_empty))
+        .unwrap_or(true)
+}
+
+impl ProviderOverrides {
+    /// `base` with these overrides applied.
+    fn applied_to(&self, base: &Config) -> Config {
+        let mut out = base.clone();
+        let proxy = &mut out.proxy;
+        macro_rules! set {
+            ($($field:ident),* $(,)?) => { $(if let Some(v) = self.$field { proxy.$field = v; })* };
+        }
+        set!(
+            compress,
+            min_tokens,
+            retrieve_tool,
+            frozen_prefix,
+            cache_ttl,
+            stale_read
+        );
+        out.engine = out.engine.merged(&self.engine);
+        out
+    }
+
+    /// Set one field from its environment spelling, `cache_ttl` or
+    /// `engine__enable_code_aware`, through the same serde names the file uses.
+    ///
+    /// A value is tried as an integer, then a boolean, then a string, and the
+    /// first one the field accepts is kept, so `KOMPRESSOR__…__MIN_TOKENS=0`
+    /// and `…__ENGINE__ENABLE_CODE_AWARE=false` both mean what they say.
+    fn set_from_env(&mut self, field: &str, value: &str) -> Result<(), String> {
+        let path: Vec<&str> = field.split("__").collect();
+        let lowered = value.to_ascii_lowercase();
+        let mut candidates = Vec::new();
+        if let Ok(n) = value.parse::<i64>() {
+            candidates.push(toml::Value::Integer(n));
+        }
+        if let Some(b) = parse_bool(value) {
+            candidates.push(toml::Value::Boolean(b));
+        }
+        candidates.push(toml::Value::String(lowered));
+        candidates.push(toml::Value::String(value.to_string()));
+        let mut last = String::new();
+        for candidate in candidates {
+            let mut table = toml::Value::try_from(&*self).map_err(|e| e.to_string())?;
+            let mut node = &mut table;
+            for key in &path[..path.len() - 1] {
+                node = node
+                    .as_table_mut()
+                    .ok_or("not a table")?
+                    .entry(key.to_string())
+                    .or_insert_with(|| toml::Value::Table(Default::default()));
+            }
+            node.as_table_mut()
+                .ok_or("not a table")?
+                .insert(path[path.len() - 1].to_string(), candidate);
+            match table.try_into::<ProviderOverrides>() {
+                Ok(parsed) => {
+                    *self = parsed;
+                    return Ok(());
+                }
+                Err(error) => last = error.to_string(),
+            }
+        }
+        Err(last)
+    }
 }
 
 impl Default for ProxyConfig {
@@ -547,6 +759,7 @@ impl Default for ProxyConfig {
             upstream_read_timeout: Duration::from_secs(600),
             retrieve_tool: RetrieveTool::Auto,
             frozen_prefix: FrozenPrefix::Marker,
+            cache_ttl: CacheTtl::Default,
             retrieve_execution: RetrieveExecution::Server,
             retrieve_max_rounds: 3,
             retrieve_max_tokens_per_request: 16_384,
@@ -567,6 +780,8 @@ impl Default for ProxyConfig {
             upstreams: Vec::new(),
             default_upstream: String::new(),
             allow_insecure_upstream: false,
+            intercept: InterceptConfig::default(),
+            providers: BTreeMap::new(),
         }
     }
 }
@@ -684,10 +899,27 @@ impl Config {
         }
         let xdg = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?
-            .join("kompressor")
-            .join("config.toml");
-        xdg.is_file().then_some(xdg)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+            .map(|base| base.join("kompressor").join("config.toml"));
+        if let Some(xdg) = xdg
+            && xdg.is_file()
+        {
+            return Some(xdg);
+        }
+        None
+    }
+
+    /// Where a Linux package installs the system configuration.
+    ///
+    /// Deliberately **not** part of [`Self::discover`]. Reading it there would
+    /// make `kompressor compress` on a developer machine behave differently
+    /// depending on whether a package happened to be installed — measured as
+    /// six hermetic CLI tests changing their output the moment this file
+    /// existed. Commands that are *about the running service* opt in instead;
+    /// `kompressor stats` is the one that does.
+    pub fn system_path() -> Option<std::path::PathBuf> {
+        let system = PathBuf::from("/etc/kompressor/config.toml");
+        system.is_file().then_some(system)
     }
 
     pub fn load(path: Option<&std::path::Path>) -> Result<Config, ConfigError> {
@@ -865,6 +1097,7 @@ impl Config {
             "enable_listing_compressor" => flag!(e.enable_listing_compressor),
             "enable_code_aware" => flag!(e.enable_code_aware),
             "enable_mixed_content" => flag!(e.enable_mixed_content),
+            "enable_config_sections" => flag!(e.enable_config_sections),
             "enable_config_compressor" => flag!(e.enable_config_compressor),
             "enable_nested_routing" => flag!(e.enable_nested_routing),
             "enable_redraw_fold" => flag!(e.enable_redraw_fold),
@@ -935,6 +1168,16 @@ impl Config {
                     self.proxy.frozen_prefix
                 };
             }
+            "cache_ttl" => {
+                // Unrecognised values leave the setting alone, for the reason
+                // `frozen_prefix` does: it changes what the provider bills.
+                self.proxy.cache_ttl = match value.to_ascii_lowercase().as_str() {
+                    "default" => CacheTtl::Default,
+                    "1h" => CacheTtl::OneHour,
+                    "adaptive" => CacheTtl::Adaptive,
+                    _ => self.proxy.cache_ttl,
+                };
+            }
             "enabled" => {
                 self.proxy.enabled = parse_bool_setting("proxy.enabled", value, self.proxy.enabled);
             }
@@ -950,6 +1193,34 @@ impl Config {
             "websocket_relay" => {
                 self.proxy.websocket_relay =
                     parse_bool_setting("proxy.websocket_relay", value, self.proxy.websocket_relay);
+            }
+            provider if provider.starts_with("providers__") => {
+                let rest = &provider["providers__".len()..];
+                let Some((name, setting)) = rest.split_once("__") else {
+                    tracing::warn!(
+                        key = provider,
+                        "KOMPRESSOR__PROXY__PROVIDERS__ needs a provider and a setting"
+                    );
+                    return;
+                };
+                if !PROVIDERS.contains(&name) {
+                    tracing::warn!(
+                        provider = name,
+                        known = ?PROVIDERS,
+                        "KOMPRESSOR__PROXY__PROVIDERS__* names a provider this build does not know; ignored"
+                    );
+                    return;
+                }
+                let overrides = self.proxy.providers.entry(name.to_string()).or_default();
+                if let Err(error) = overrides.set_from_env(setting, value) {
+                    tracing::warn!(
+                        provider = name,
+                        setting,
+                        value,
+                        %error,
+                        "KOMPRESSOR__PROXY__PROVIDERS__* could not be applied; it has been ignored"
+                    );
+                }
             }
             // A field on `ProxyConfig` is not reachable from `KOMPRESSOR__*`
             // until it is added above, and the arm that used to be here
@@ -1016,7 +1287,28 @@ impl Config {
                 "retrieve.max_retrieve_chars must be positive".into(),
             ));
         }
+        for (name, overrides) in &self.proxy.providers {
+            if !PROVIDERS.contains(&name.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "proxy.providers.{name} names no provider this build knows; use one of {PROVIDERS:?}"
+                )));
+            }
+            overrides
+                .applied_to(self)
+                .engine
+                .validate()
+                .map_err(|e| ConfigError::Invalid(format!("proxy.providers.{name}.engine: {e}")))?;
+        }
         Ok(())
+    }
+
+    /// This configuration as one provider's traffic sees it: `self` with
+    /// `proxy.providers.<provider>` applied, or `None` when it sets nothing.
+    pub fn for_provider(&self, provider: &str) -> Option<Config> {
+        self.proxy
+            .providers
+            .get(provider)
+            .map(|overrides| overrides.applied_to(self))
     }
 
     /// The config as TOML, with secrets replaced.
@@ -1118,6 +1410,113 @@ mod tests {
     }
 
     #[test]
+    fn provider_overrides_read_from_a_file_apply_to_that_provider_only() {
+        let config: Config = toml::from_str(
+            "[proxy]\ncache_ttl = \"default\"\n\
+             [proxy.providers.anthropic]\ncache_ttl = \"adaptive\"\nfrozen_prefix = \"first_seen\"\n\
+             [proxy.providers.anthropic.engine]\nenable_code_aware = false\n",
+        )
+        .expect("parses");
+        config.validate().expect("valid");
+        let anthropic = config.for_provider("anthropic").expect("named");
+        assert_eq!(anthropic.proxy.cache_ttl, CacheTtl::Adaptive);
+        assert_eq!(anthropic.proxy.frozen_prefix, FrozenPrefix::FirstSeen);
+        assert!(!anthropic.engine.enable_code_aware);
+        assert_eq!(
+            anthropic.proxy.retrieve_tool, config.proxy.retrieve_tool,
+            "what it does not name it inherits"
+        );
+        assert!(
+            config.for_provider("openai").is_none(),
+            "openai keeps the defaults"
+        );
+        assert!(config.engine.enable_code_aware);
+        assert_eq!(config.proxy.cache_ttl, CacheTtl::Default);
+    }
+
+    #[test]
+    fn a_provider_this_build_does_not_know_is_rejected() {
+        let config: Config =
+            toml::from_str("[proxy.providers.antrhopic]\ncache_ttl = \"1h\"\n").expect("parses");
+        assert!(
+            config.validate().is_err(),
+            "a typo must not silently do nothing"
+        );
+        assert!(
+            toml::from_str::<Config>("[proxy.providers.anthropic]\ncache_tll = \"1h\"\n").is_err(),
+            "nor a misspelt setting"
+        );
+    }
+
+    #[test]
+    fn provider_overrides_can_be_set_from_the_environment() {
+        let mut config = Config::default();
+        config.apply_env(&[
+            (
+                "KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__CACHE_TTL".into(),
+                "adaptive".into(),
+            ),
+            (
+                "KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__FROZEN_PREFIX".into(),
+                "first_seen".into(),
+            ),
+            (
+                "KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__RETRIEVE_TOOL".into(),
+                "Always".into(),
+            ),
+            (
+                "KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__MIN_TOKENS".into(),
+                "1000".into(),
+            ),
+            (
+                "KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__ENGINE__ENABLE_CODE_AWARE".into(),
+                "false".into(),
+            ),
+            (
+                "KOMPRESSOR__PROXY__PROVIDERS__OPENAI__COMPRESS".into(),
+                "false".into(),
+            ),
+        ]);
+        config.validate().expect("valid");
+        let anthropic = config.for_provider("anthropic").unwrap();
+        assert_eq!(anthropic.proxy.cache_ttl, CacheTtl::Adaptive);
+        assert_eq!(anthropic.proxy.frozen_prefix, FrozenPrefix::FirstSeen);
+        assert_eq!(anthropic.proxy.retrieve_tool, RetrieveTool::Always);
+        assert_eq!(anthropic.proxy.min_tokens, 1000);
+        assert!(!anthropic.engine.enable_code_aware);
+        assert!(anthropic.proxy.compress);
+        let openai = config.for_provider("openai").unwrap();
+        assert!(!openai.proxy.compress);
+        assert!(openai.engine.enable_code_aware);
+        assert_eq!(openai.proxy.cache_ttl, CacheTtl::Default);
+    }
+
+    #[test]
+    fn an_unreadable_provider_override_changes_nothing() {
+        let mut config = Config::default();
+        config.apply_env(&[
+            (
+                "KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__CACHE_TTL".into(),
+                "60m".into(),
+            ),
+            (
+                "KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__NOT_A_SETTING".into(),
+                "1".into(),
+            ),
+            (
+                "KOMPRESSOR__PROXY__PROVIDERS__GEMINI__CACHE_TTL".into(),
+                "1h".into(),
+            ),
+        ]);
+        assert!(!config.proxy.providers.contains_key("gemini"));
+        let anthropic = config
+            .for_provider("anthropic")
+            .unwrap_or_else(|| config.clone());
+        assert_eq!(anthropic.proxy.cache_ttl, CacheTtl::Default);
+        config.validate().expect("still valid");
+    }
+
+    #[test]
     fn the_retrieve_tool_can_be_set_from_the_environment() {
         // Needed to test `retrieve_tool = "always"` against the cache break the
         // `auto` injection causes: the tool appears in `tools` the turn the
@@ -1184,6 +1583,22 @@ mod tests {
         assert_eq!(config.proxy.frozen_prefix, FrozenPrefix::FirstSeen);
         config.apply_env(&[("KOMPRESSOR__PROXY__FROZEN_PREFIX".into(), "marker".into())]);
         assert_eq!(config.proxy.frozen_prefix, FrozenPrefix::Marker);
+    }
+
+    #[test]
+    fn the_cache_ttl_setting_can_be_set_from_the_environment_and_a_typo_changes_nothing() {
+        let mut config = Config::default();
+        assert_eq!(config.proxy.cache_ttl, CacheTtl::Default);
+        config.apply_env(&[("KOMPRESSOR__PROXY__CACHE_TTL".into(), "adaptive".into())]);
+        assert_eq!(config.proxy.cache_ttl, CacheTtl::Adaptive);
+        config.apply_env(&[("KOMPRESSOR__PROXY__CACHE_TTL".into(), "1h".into())]);
+        assert_eq!(config.proxy.cache_ttl, CacheTtl::OneHour);
+        // It changes what the provider bills, so an unknown value is ignored
+        // rather than read as any of the three.
+        config.apply_env(&[("KOMPRESSOR__PROXY__CACHE_TTL".into(), "60m".into())]);
+        assert_eq!(config.proxy.cache_ttl, CacheTtl::OneHour);
+        let parsed: Config = toml::from_str("[proxy]\ncache_ttl = \"1h\"\n").expect("parses");
+        assert_eq!(parsed.proxy.cache_ttl, CacheTtl::OneHour);
     }
 
     #[test]

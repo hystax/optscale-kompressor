@@ -155,6 +155,8 @@ pub fn refs_in(content: &str) -> Vec<RefId> {
 #[derive(Clone, Debug)]
 pub struct RefCollector {
     enabled: bool,
+    /// Source bodies that a selective anti-re-elision pass must preserve.
+    inline_code: HashSet<RefId>,
     max_ref_bytes: usize,
     pairs: Vec<(RefId, String)>,
     seen: HashSet<RefId>,
@@ -189,6 +191,7 @@ impl RefCollector {
     pub fn new(max_ref_bytes: usize) -> Self {
         RefCollector {
             enabled: true,
+            inline_code: HashSet::new(),
             max_ref_bytes,
             pairs: Vec::new(),
             seen: HashSet::new(),
@@ -201,12 +204,22 @@ impl RefCollector {
     pub fn disabled() -> Self {
         RefCollector {
             enabled: false,
+            inline_code: HashSet::new(),
             max_ref_bytes: 0,
             pairs: Vec::new(),
             seen: HashSet::new(),
             oversized_attempts: 0,
             oversized_refusals: 0,
         }
+    }
+
+    pub(crate) fn preserve_code(&mut self, ids: &[RefId]) {
+        self.inline_code.extend(ids.iter().copied());
+    }
+
+    #[cfg(feature = "code-aware")]
+    pub(crate) fn code_is_preserved(&self, fragment: &str) -> bool {
+        !self.inline_code.is_empty() && self.inline_code.contains(&ref_for(fragment))
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -303,6 +316,7 @@ impl RefCollector {
     pub fn scratch(&self) -> RefCollector {
         RefCollector {
             enabled: self.enabled,
+            inline_code: self.inline_code.clone(),
             max_ref_bytes: self.max_ref_bytes,
             pairs: Vec::new(),
             seen: HashSet::new(),

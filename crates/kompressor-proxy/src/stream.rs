@@ -88,6 +88,7 @@ pub(crate) struct StreamOutcome {
     /// the cost is unknown rather than guessing at it.
     pub(crate) client_gone: bool,
     pub(crate) upstream_error: bool,
+    pub(crate) error_detail: Option<String>,
 }
 
 /// The state machine's configured environment.
@@ -178,6 +179,65 @@ struct Held {
     call: Option<usize>,
 }
 
+/// Track protocol completion independently of socket EOF and relay state.
+fn observe_terminal(family: ApiFamily, frame: &SseFrame, terminal: &mut Option<bool>) {
+    if frame.is_done() {
+        if family == ApiFamily::OpenAiChat && *terminal != Some(false) {
+            *terminal = Some(true);
+        }
+        return;
+    }
+    // Most frames are content deltas that can be neither. Skipping their parse
+    // keeps this check off the per-token path; a delta whose text happens to
+    // say "error" or "stop" is simply parsed and found to be a delta.
+    let data = frame.data();
+    if frame.event() != Some("error")
+        && !data.contains("error")
+        && !data.contains("stop")
+        && !data.contains("response.")
+        && !data.contains("finish_reason")
+    {
+        return;
+    }
+    let value = frame.json();
+    let kind = value
+        .as_ref()
+        .and_then(|v| v.get("type"))
+        .and_then(Value::as_str)
+        .or_else(|| frame.event())
+        .unwrap_or_default();
+    let failed = kind == "error"
+        || kind == "response.failed"
+        || value
+            .as_ref()
+            .is_some_and(|v| v.get("error").is_some_and(|e| !e.is_null()));
+    if failed {
+        *terminal = Some(false);
+    } else if *terminal != Some(false) {
+        let complete = match family {
+            ApiFamily::AnthropicMessages => kind == "message_stop",
+            ApiFamily::OpenAiResponses => {
+                matches!(kind, "response.completed" | "response.incomplete")
+            }
+            // `[DONE]` is handled above. Not every OpenAI-compatible server
+            // sends it, but each one ends a choice with a `finish_reason`, and
+            // a stream that reached one has delivered its answer.
+            ApiFamily::OpenAiChat => value
+                .as_ref()
+                .and_then(|v| v.get("choices"))
+                .and_then(Value::as_array)
+                .is_some_and(|choices| {
+                    choices
+                        .iter()
+                        .any(|choice| choice.get("finish_reason").is_some_and(|r| !r.is_null()))
+                }),
+        };
+        if complete {
+            *terminal = Some(true);
+        }
+    }
+}
+
 /// How one upstream stream ended.
 enum RoundEnd {
     /// The client has the whole answer.
@@ -191,7 +251,7 @@ enum RoundEnd {
     },
     /// The client hung up. Nothing left to do for it.
     ClientGone,
-    Failed,
+    Failed(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -226,7 +286,8 @@ impl StreamRelay {
                     outcome.client_gone = true;
                     break;
                 }
-                RoundEnd::Failed => {
+                RoundEnd::Failed(detail) => {
+                    outcome.error_detail = Some(detail);
                     outcome.upstream_error = true;
                     break;
                 }
@@ -334,6 +395,7 @@ impl StreamRelay {
         intercept: bool,
     ) -> RoundEnd {
         let mut decoder = SseDecoder::new();
+        let mut terminal = None;
         let mut turn = StreamTurn::new(self.family);
         let mut buffered: Vec<Held> = Vec::new();
         let mut buffered_bytes = 0usize;
@@ -408,11 +470,9 @@ impl StreamRelay {
                     }
                     continue;
                 }
-                Pull::UpstreamError => {
-                    let _ = tx
-                        .send(Err(std::io::Error::other("upstream stream ended early")))
-                        .await;
-                    return RoundEnd::Failed;
+                Pull::UpstreamError(detail) => {
+                    let _ = tx.send(Err(std::io::Error::other(detail.clone()))).await;
+                    return RoundEnd::Failed(detail);
                 }
                 // What the client was waiting on when it gave up. Without this
                 // there is no way to tell "the provider sent nothing at all"
@@ -466,6 +526,15 @@ impl StreamRelay {
             }
 
             while let Some(frame) = decoder.next_frame() {
+                observe_terminal(self.family, &frame, &mut terminal);
+                if terminal == Some(false) {
+                    // Preserve the provider's error payload instead of replacing
+                    // it with a generic EOF or attempting a recovery call.
+                    if !self.emit(tx, &frame, rounds, hidden).await {
+                        return RoundEnd::ClientGone;
+                    }
+                    return RoundEnd::Failed("upstream provider error event".to_string());
+                }
                 if let Some(carried) = frame_usage(self.family, &frame) {
                     // The maximum, not the sum: these frames are two reports of
                     // one call, and summing them doubled the whole input side.
@@ -683,6 +752,16 @@ impl StreamRelay {
         }
 
         if let Some(frame) = decoder.flush() {
+            observe_terminal(self.family, &frame, &mut terminal);
+            if terminal == Some(false) {
+                if !self.emit(tx, &frame, rounds, hidden).await {
+                    return RoundEnd::ClientGone;
+                }
+                return RoundEnd::Failed("upstream provider error event".to_string());
+            }
+            if let Some(carried) = frame_usage(self.family, &frame) {
+                turn::max_usage(&mut usage, &carried);
+            }
             match state {
                 State::Passthrough => {
                     if !self.emit(tx, &frame, rounds, hidden).await {
@@ -696,6 +775,18 @@ impl StreamRelay {
             }
         }
 
+        if terminal != Some(true) {
+            let detail = if terminal == Some(false) {
+                "upstream reported a stream error"
+            } else {
+                "upstream stream ended without a terminal event"
+            }
+            .to_string();
+            // Never execute a partial retrieval call or manufacture a successful
+            // end to a truncated stream. Already-forwarded output is not retried.
+            let _ = tx.send(Err(std::io::Error::other(detail.clone()))).await;
+            return RoundEnd::Failed(detail);
+        }
         if state == State::Intercepting && turn.has_calls() {
             return RoundEnd::Intercepted { turn, usage };
         }
@@ -1042,7 +1133,7 @@ fn filter_our_chat_calls(frame: &SseFrame, ours: &mut Vec<String>) -> ChatFilter
     }
 }
 
-/// Record the item id a frame of ours belongs to, so its later parts can be
+/// Record the item id or block index a frame of ours belongs to, so its later parts can be
 /// recognised.
 ///
 /// Responses names the tool only on `output_item.added`/`done`; the argument
@@ -1051,6 +1142,12 @@ fn filter_our_chat_calls(frame: &SseFrame, ours: &mut Vec<String>) -> ChatFilter
 /// after hand-over is unrecognisable and reaches a client that never saw the
 /// call it belongs to.
 fn note_our_item(family: ApiFamily, frame: &SseFrame, ours: &mut Vec<String>) {
+    if family == ApiFamily::AnthropicMessages {
+        // The opening block may be buffered while its deltas arrive after
+        // hand-over. Preserve its index before dropping that opening frame.
+        belongs_to_our_call(family, frame, ours);
+        return;
+    }
     if family != ApiFamily::OpenAiResponses {
         return;
     }
@@ -1076,8 +1173,8 @@ fn note_our_item(family: ApiFamily, frame: &SseFrame, ours: &mut Vec<String>) {
 /// the argument deltas, which reference the item by id rather than by name —
 /// hence the running set.
 ///
-/// Responses only. Chat reports a turn's calls inside the same delta frames as
-/// its text, so there is no whole frame to drop there and `scrub` handles it.
+/// Responses and Anthropic. Chat reports calls alongside text in the same
+/// delta frames, so `filter_our_chat_calls` filters their entries instead.
 fn belongs_to_our_call(family: ApiFamily, frame: &SseFrame, ours: &mut Vec<String>) -> bool {
     let Some(value) = frame.json() else {
         return false;
@@ -1251,7 +1348,7 @@ enum Pull {
     Chunk(Bytes),
     /// The upstream stream ended, cleanly or not.
     Done,
-    UpstreamError,
+    UpstreamError(String),
     /// The client hung up. Nothing further is worth reading.
     ClientGone,
     /// The hold outlasted its bound with nothing arriving.
@@ -1317,8 +1414,9 @@ async fn next_chunk(
             item = stream.next() => return match item {
                 Some(Ok(chunk)) => Pull::Chunk(chunk),
                 Some(Err(error)) => {
-                    tracing::warn!(%error, "upstream stream ended early");
-                    Pull::UpstreamError
+                    let detail = format!("upstream body read failed: {:?}", error.without_url());
+                    tracing::warn!(error = %detail, "upstream stream ended early");
+                    Pull::UpstreamError(detail)
                 }
                 None => Pull::Done,
             },
@@ -2495,7 +2593,7 @@ mod upstream_error_tests {
         for _ in 0..4 {
             match next_chunk(&mut body, &tx, Duration::from_secs(1), false, false, None).await {
                 Pull::Chunk(_) => continue,
-                Pull::UpstreamError => {
+                Pull::UpstreamError(_) => {
                     failed = true;
                     break;
                 }
@@ -2575,5 +2673,122 @@ mod hold_deadline_tests {
             waited.is_err(),
             "passthrough holds nothing back, so nothing is overdue"
         );
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    fn relay(family: ApiFamily) -> StreamRelay {
+        StreamRelay {
+            outbound: Outbound::new(
+                reqwest::Client::new(),
+                http::Method::POST,
+                "http://127.0.0.1:1/unused".into(),
+                http::HeaderMap::new(),
+                Bytes::new(),
+                crate::bodycodec::BodyEncoding::Identity,
+            ),
+            family,
+            retriever: None,
+            budget: Budget::new(3, 16384),
+            buffer_limit: 262144,
+            buffer_timeout: Duration::ZERO,
+            intercept_limit: 1048576,
+            intercept_timeout: Duration::from_secs(90),
+            keepalive: Duration::ZERO,
+            content_grace: 0,
+            strip_usage: false,
+            failopen: Arc::new(FailOpen::default()),
+            log_payloads: false,
+            capture: None,
+        }
+    }
+
+    async fn read(
+        family: ApiFamily,
+        bytes: &'static str,
+        intercept: bool,
+    ) -> (RoundEnd, Vec<ClientChunk>) {
+        let relay = relay(family);
+        let mut stream: BoxStream<'static, reqwest::Result<Bytes>> = Box::pin(
+            futures_util::stream::iter(vec![Ok(Bytes::from_static(bytes.as_bytes()))]),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let result = relay
+            .read_round(&mut stream, &tx, 0, &json!({}), intercept)
+            .await;
+        drop(tx);
+        let mut chunks = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            chunks.push(chunk);
+        }
+        (result, chunks)
+    }
+
+    #[tokio::test]
+    async fn eof_after_partial_text_is_not_success() {
+        let (end, chunks) = read(ApiFamily::AnthropicMessages,
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n", false).await;
+        assert!(matches!(end, RoundEnd::Failed(ref detail) if detail.contains("terminal event")));
+        assert!(chunks.iter().any(Result::is_ok));
+        assert!(chunks.last().unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn partial_retrieval_must_not_be_executed_at_eof() {
+        let (end, chunks) = read(ApiFamily::AnthropicMessages,
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call\",\"name\":\"optscale_kompressor_retrieve\",\"input\":{}}}\n\n", true).await;
+        assert!(matches!(end, RoundEnd::Failed(_)));
+        assert!(chunks.last().unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_chat_choice_is_not_success() {
+        let (end, chunks) = read(
+            ApiFamily::OpenAiChat,
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+            false,
+        )
+        .await;
+        assert!(matches!(end, RoundEnd::Failed(ref detail) if detail.contains("terminal event")));
+        assert!(chunks.last().unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn protocol_terminals_finish_even_without_final_blank_line() {
+        for (family, bytes) in [
+            (
+                ApiFamily::AnthropicMessages,
+                "data: {\"type\":\"message_stop\"}",
+            ),
+            (
+                ApiFamily::OpenAiResponses,
+                "data: {\"type\":\"response.completed\"}",
+            ),
+            (
+                ApiFamily::OpenAiResponses,
+                "data: {\"type\":\"response.incomplete\"}",
+            ),
+            (ApiFamily::OpenAiChat, "data: [DONE]"),
+            // An OpenAI-compatible server that never sends `[DONE]`.
+            (
+                ApiFamily::OpenAiChat,
+                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}",
+            ),
+        ] {
+            let (end, chunks) = read(family, bytes, false).await;
+            assert!(matches!(end, RoundEnd::Finished { .. }));
+            assert!(chunks.iter().all(Result::is_ok));
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_error_is_forwarded_and_recorded_as_failure() {
+        let bytes = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"overloaded\"}}\n\n";
+        let (end, chunks) = read(ApiFamily::AnthropicMessages, bytes, false).await;
+        assert!(matches!(end, RoundEnd::Failed(ref detail) if detail.contains("provider error")));
+        assert_eq!(chunks[0].as_ref().unwrap().as_ref(), bytes.as_bytes());
     }
 }

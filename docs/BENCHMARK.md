@@ -161,6 +161,57 @@ the engine declines, so the average over it is lower and more honest. A bucket
 comparison is what the gate actually checks, and every bucket is unchanged to
 four decimal places.
 
+### Claude Code payloads, and what they did to the averages (2026-10-25)
+
+The corpus held only Codex traffic, so none of Claude Code's tool outputs —
+`Bash` and `Read` results, often a listing glued to a `cat` — was measured at
+all. `scripts/bench/extract-tool-outputs.py` reads a run's captured *ingress*
+bodies, so a payload the engine declined is extracted like one it compressed,
+and deduplicates every `tool_result` of at least 512 characters across the runs
+given. From six Anthropic runs that added **535 payloads** (359 → 894). Captured
+agent output is not safe to commit as it stands, so the script drops anything
+credential-shaped (a secret-scrubbing task plants fake keys, which still trip
+push protection) and anything carrying an email address outside a short
+placeholder allow-list (git authors, a CV); 5 and 6 payloads respectively. Run
+today it reproduces 531 of the 535 — it is stricter than the first pass, which
+kept four hex dumps whose ASCII column happens to read like an address.
+
+The recorded baseline moved with it, and as before **neither move is a
+regression**: coverage 66.99% → 58.76% on the same engine, because Claude Code
+traffic carries more short prose and more source the agent is editing. The
+e2e floors moved for the same reason (`e2e/runner/floors.json` records the
+measurement); two were lowered, which that file otherwise never does, because a
+floor is a fraction of a corpus and this is a different corpus.
+
+It moved again on 2026-10-25, this time because the engine changed what it
+removes: coverage **58.92% → 48.78%** on the same 894 payloads. Plain text now
+folds only within a run of consecutive lines, and disassembly ships whole
+(DESIGN §7.10c). Most of what the wider fold removed was source the detector
+does not name and data whose order is the content. On the 89-task tuned run,
+the tasks where that fold fired took 17.5% more agent steps than the
+uncompressed run. That is a cost per step the coverage figure never showed.
+
+### Score a paired comparison on the proxy's bill
+
+Two scripts read finished runs without spending anything:
+
+- `scripts/harbor/panel-score.py --arm off='<glob>' --arm rec='<glob>'` scores
+  arms task by task: cost per agent step, per trial and per solved task, each
+  with a 95% bootstrap interval over tasks. Costs are the **proxy's bill**, every
+  upstream request priced at its model's rates and assigned to its task by the
+  trial's tool-call ids and its first user message. Harbor's own cost is printed
+  and not used: it sees only the requests in the agent's trajectory, and on two
+  89-task runs it missed $5.11 of one arm's bill and $2.66 of the other's.
+- `scripts/harbor/ttl-check.py <run-dir>...` reads each step's
+  `cache_creation` split from the trajectories — five-minute against one-hour
+  writes, which the proxy's stats do not keep — and reports how much cache a
+  request kept after a pause, and whether a conversation's switch to one-hour
+  entries read the five-minute entry before it (§12.10 of DESIGN.md).
+
+Per-task log cost per step varied with an sd of 0.27–0.37 between two runs of
+the same configuration, so a panel of sixteen tasks with four repeats per arm
+resolves an effect of about 7%.
+
 ### Three bases for one number, and only one of them compares
 
 `compressible X -> Y` sums what the engine looked at on **every request**. An
@@ -290,10 +341,11 @@ compares the engine's own counter against the same run's billed total.
 The measured price table (§12.5b) predicted both arms' billed cost to **0.001%**
 from their token counts, on data recorded after it was fitted.
 
-One limitation the control arm has by construction: conversation identity is
-derived in the compression path, so a passthrough run records `conversation =
-NULL` on every row and cannot be grouped by conversation. Per-conversation
-comparison between the arms is therefore not available.
+The control arm names conversations the same way the compressed arm does, from
+the conversation's opening, and records each row's model, so the arms can be
+compared conversation by conversation. Runs recorded before 1.4.0 have
+`conversation = NULL` and no model on every passthrough row; `panel-score.py`
+assigns those by the trial's tool-call ids and first user message instead.
 
 ## The gates
 

@@ -309,6 +309,9 @@ pub struct ProxyRequestEvent {
     pub cache_read_tokens: Option<u32>,
     /// Prompt tokens written into the provider's cache.
     pub cache_write_tokens: Option<u32>,
+    /// The part of `cache_write_tokens` billed as one-hour cache entries, when
+    /// the provider reports the split (Anthropic's `cache_creation`).
+    pub cache_write_1h_tokens: Option<u32>,
     /// What the prompt would have billed uncompressed, when a shadow count was
     /// taken.
     pub shadow_prompt_tokens: Option<u32>,
