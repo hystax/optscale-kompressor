@@ -578,10 +578,10 @@ page how to install:
 
 * **for the current user** (the default) — no administrator rights. The binary
   goes to `%LOCALAPPDATA%\Programs\kompressor`, which is added to your `PATH`.
-* **as a system service** — asks for administrator rights. The binary goes to
-  `Program Files\kompressor`, which is added to the system `PATH`; a default
-  config is written to `%ProgramData%\kompressor\config.toml`; and
-  the *OptScale Kompressor* service, run by [WinSW](https://github.com/winsw/winsw)
+* **as a system service** — asks for administrator rights. The binary always
+  goes to `Program Files\kompressor` (no folder choice), which is added to the
+  system `PATH`; a default config is written to `%ProgramData%\kompressor\config.toml`;
+  and the *OptScale Kompressor* service, run by [WinSW](https://github.com/winsw/winsw)
   as `LocalService`, starts now and with Windows.
 
 Either way it registers an uninstaller under *Installed apps*, which takes the

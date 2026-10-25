@@ -7,7 +7,8 @@
 ;   * as a system service: Program Files, the system PATH, HKLM, a default
 ;     config in %ProgramData%\kompressor and an automatic service (WinSW runs
 ;     `kompressor serve`). Needs elevation: the installer restarts itself
-;     through UAC with /SYSTEM.
+;     through UAC with /SYSTEM. Always Program Files (/D= is ignored), so
+;     users cannot replace what the service runs.
 ; An existing install keeps its mode; switching means uninstalling first.
 ; Silent: /S for the user mode, /S /SYSTEM from an elevated prompt for the service.
 ;
@@ -76,7 +77,7 @@ Var FinishText
 Page custom ModePage ModeLeave
 Page custom ReinstallPage ReinstallLeave
 !insertmacro MUI_PAGE_LICENSE "${LICENSE}"
-!define MUI_PAGE_CUSTOMFUNCTION_PRE SkipOnUpgrade
+!define MUI_PAGE_CUSTOMFUNCTION_PRE SkipDirectory
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !define MUI_FINISHPAGE_TEXT_LARGE
@@ -259,9 +260,9 @@ Function ApplyMode
         SetShellVarContext current
         StrCpy $INSTDIR "$LOCALAPPDATA\Programs\${APP}"
         StrCpy $FinishText "Thank you for installing OptScale Kompressor.$\r$\n$\r$\nTo get started, open a new PowerShell window and type kompressor."
-    ${EndIf}
-    ${If} $CmdDir != ""
-        StrCpy $INSTDIR $CmdDir
+        ${If} $CmdDir != ""
+            StrCpy $INSTDIR $CmdDir
+        ${EndIf}
     ${EndIf}
     ${If} $PrevDir != ""
         StrCpy $INSTDIR $PrevDir
@@ -364,9 +365,10 @@ Function ReinstallLeave
     Abort
 FunctionEnd
 
-; An upgrade keeps the installed directory.
-Function SkipOnUpgrade
+; No choice on an upgrade or for the service.
+Function SkipDirectory
     ${If} $PrevDir != ""
+    ${OrIf} $SystemMode == 1
         Abort
     ${EndIf}
 FunctionEnd
@@ -392,20 +394,108 @@ Function CheckNotRunning
     Abort "kompressor.exe is in use"
 FunctionEnd
 
-Function InstallService
-    ; Everyone may read the stores, as on Linux; only the service and
-    ; administrators write them, and only they read the CA key.
-    CreateDirectory "$APPDATA\${APP}\logs"
-    CreateDirectory "$APPDATA\${APP}\ca"
-    nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$APPDATA\${APP}" /inheritance:r /grant:r ${SID_SYSTEM}:(OI)(CI)F ${SID_ADMINS}:(OI)(CI)F ${SID_SERVICE}:(OI)(CI)M ${SID_USERS}:(OI)(CI)RX'
+; Exit 4, naming the item, if anything under KOMPRESSOR_SETUP_STATE is a link or
+; is not owned by administrators, SYSTEM, LocalService or the user running
+; setup. Any user may create folders in ProgramData and plant a config or CA.
+!define CHECK_OWNERS `${POWERSHELL} "$$ErrorActionPreference = 'Stop'; $$ok = @('BA', 'SY', 'LS', 'LA'); if ((& ($$env:SystemRoot + '\System32\whoami.exe') /user /fo csv /nh | Out-String) -match 'S-1-[0-9-]+') { $$ok += $$Matches[0] }; $$q = @($$env:KOMPRESSOR_SETUP_STATE); for ($$n = 0; $$n -lt $$q.Count; $$n++) { $$i = Get-Item -LiteralPath $$q[$$n] -Force -ErrorAction SilentlyContinue; if (!$$i) { continue }; if (('' + $$i.Attributes) -match 'ReparsePoint') { $$i.FullName; exit 4 }; $$o = ''; if ((Get-Acl -LiteralPath $$i.FullName).Sddl -match '^O:(.+?)G:') { $$o = $$Matches[1] }; if ($$ok -notcontains $$o) { $$i.FullName + ' is owned by ' + $$o; exit 4 }; if ($$i.PSIsContainer) { $$q += @(Get-ChildItem -LiteralPath $$i.FullName -Force | ForEach-Object { $$_.FullName }) } }; 'checked ' + $$q.Count"`
+
+; The state folder's owner SID in $3, or empty.
+Function StateOwner
+    StrCpy $3 ""
+    ; SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION
+    System::Call 'advapi32::GetNamedSecurityInfoW(w "$APPDATA\${APP}", i 1, i 1, *p .r1, p 0, p 0, p 0, *p .r2) i .r0'
+    ${If} $0 == 0
+        System::Call 'advapi32::ConvertSidToStringSidW(p r1, *p .r4) i .r0'
+        ${If} $0 != 0
+            System::Call 'kernel32::lstrcpyW(w .r3, p r4)'
+            System::Call 'kernel32::LocalFree(p r4)'
+        ${EndIf}
+        System::Call 'kernel32::LocalFree(p r2)'
+    ${EndIf}
+FunctionEnd
+
+; Aborts setup unless CHECK_OWNERS passes. The only fix offered is deleting the
+; folder: taking ownership keeps its creator's permissions. Without PowerShell
+; only an upgrade passes, and only if the folder is still owned by
+; administrators, SYSTEM or the service.
+Function CheckState
+    nsExec::ExecToLog `${CHECK_OWNERS}`
     Pop $0
-    nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$APPDATA\${APP}\ca" /inheritance:r /grant:r ${SID_SYSTEM}:(OI)(CI)F ${SID_ADMINS}:(OI)(CI)F ${SID_SERVICE}:(OI)(CI)M'
-    Pop $1
-    ${If} $0 != 0
-    ${OrIf} $1 != 0
-        DetailPrint "could not set permissions on $APPDATA\${APP}"
+    ${If} $0 == 0
+        Return
+    ${ElseIf} $0 == "error"
+    ${AndIf} $PrevVersion != ""
+        Call StateOwner
+        ${If} $3 == "S-1-5-32-544"
+        ${OrIf} $3 == "S-1-5-18"
+        ${OrIf} $3 == "S-1-5-19"
+            DetailPrint "PowerShell could not be started; checked only the owner of $APPDATA\${APP}"
+            Return
+        ${EndIf}
+        DetailPrint "$APPDATA\${APP} is owned by $3"
+        StrCpy $0 4
+    ${EndIf}
+    ${If} $0 == 4
+        MessageBox MB_OK|MB_ICONSTOP "$APPDATA\${APP}, or something in it, was not created by an administrator: another user may have put a configuration or a CA key there for the service to use. The installation log names the item.$\r$\n$\r$\nDelete the folder and run setup again." /SD IDOK
+        Abort "$APPDATA\${APP} is not owned by administrators"
+    ${ElseIf} $0 == "error"
+        MessageBox MB_OK|MB_ICONSTOP "Could not check who owns $APPDATA\${APP}: PowerShell could not be started; a policy on this computer may block it.$\r$\n$\r$\nDelete the folder and run setup again: a folder setup creates itself needs no check." /SD IDOK
+    ${Else}
+        MessageBox MB_OK|MB_ICONSTOP "Could not check who owns $APPDATA\${APP}: PowerShell reported an error (exit $0).$\r$\n$\r$\nRun setup again." /SD IDOK
+    ${EndIf}
+    Abort "could not check $APPDATA\${APP}"
+FunctionEnd
+
+; The service's state folder: refuses one another user prepared, then creates
+; or locks it down. Everyone reads the stores, as on Linux; only the service and
+; administrators write them and read the CA key.
+Function SecureState
+    !insertmacro SetEnv "KOMPRESSOR_SETUP_STATE" "$APPDATA\${APP}"
+    ${If} ${FileExists} "$APPDATA\${APP}"
+        Call CheckState
+        ; Checked again after icacls: users may add to it until then. /L
+        ; changes a link, not its target.
+        nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$APPDATA\${APP}" /L /inheritance:r /grant:r ${SID_SYSTEM}:(OI)(CI)F ${SID_ADMINS}:(OI)(CI)F ${SID_SERVICE}:(OI)(CI)M ${SID_USERS}:(OI)(CI)RX'
+        Pop $0
+        ${If} $0 != 0
+            MessageBox MB_OK|MB_ICONSTOP "Could not set the permissions of $APPDATA\${APP}." /SD IDOK
+            Abort "could not set permissions on $APPDATA\${APP}"
+        ${EndIf}
+        ; Catches a link without PowerShell; so does an unreadable folder.
+        System::Call 'kernel32::GetFileAttributesW(w "$APPDATA\${APP}") i .r0'
+        IntOp $0 $0 & 0x400 ; FILE_ATTRIBUTE_REPARSE_POINT
+        ${If} $0 != 0
+            MessageBox MB_OK|MB_ICONSTOP "$APPDATA\${APP} is a link. Delete it and run setup again." /SD IDOK
+            Abort "$APPDATA\${APP} is a link"
+        ${EndIf}
+        Call CheckState
+    ${Else}
+        ; Created with its permissions in one call that fails if the folder
+        ; exists by then, so no one else can get in and it needs no check.
+        System::Call 'advapi32::ConvertStringSecurityDescriptorToSecurityDescriptorW(w "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;LS)(A;OICI;0x1200a9;;;BU)", i 1, *p .r1, p 0) i .r0'
+        ${If} $0 != 0
+            System::Call '*(&l4, p r1, i 0) p .r2' ; SECURITY_ATTRIBUTES
+            System::Call 'kernel32::CreateDirectoryW(w "$APPDATA\${APP}", p r2) i .r0'
+            System::Free $2
+            System::Call 'kernel32::LocalFree(p r1)'
+        ${EndIf}
+        ${If} $0 == 0
+            MessageBox MB_OK|MB_ICONSTOP "Could not create $APPDATA\${APP}, or another user created it during setup. Delete it if it exists and run setup again." /SD IDOK
+            Abort "could not create $APPDATA\${APP}"
+        ${EndIf}
     ${EndIf}
 
+    CreateDirectory "$APPDATA\${APP}\logs"
+    CreateDirectory "$APPDATA\${APP}\ca"
+    nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$APPDATA\${APP}\ca" /L /inheritance:r /grant:r ${SID_SYSTEM}:(OI)(CI)F ${SID_ADMINS}:(OI)(CI)F ${SID_SERVICE}:(OI)(CI)M'
+    Pop $0
+    ${If} $0 != 0
+        MessageBox MB_OK|MB_ICONSTOP "Could not set the permissions of $APPDATA\${APP}\ca." /SD IDOK
+        Abort "could not set permissions on $APPDATA\${APP}\ca"
+    ${EndIf}
+FunctionEnd
+
+Function InstallService
     ; The default config, only if there is none: cmdlets only, so Constrained
     ; Language Mode runs it too. Written as UTF-8 (with a BOM, which the loader
     ; accepts); the state path is absolute with forward slashes (TOML escapes
@@ -421,6 +511,13 @@ Function InstallService
         DetailPrint "could not write the config (exit $0)"
         !insertmacro PowerShellFailure $0 $1
         MessageBox MB_OK|MB_ICONEXCLAMATION "Could not write $APPDATA\${APP}\config.toml: $1$\r$\n$\r$\nCopy $INSTDIR\config.toml.in there, replace @STATE@ with $APPDATA\${APP} written with forward slashes, and restart the OptScale Kompressor service." /SD IDOK
+    ${EndIf}
+    ; What setup creates is owned by the admin running it; hand it all to
+    ; Administrators, so another admin's upgrade passes the owner check.
+    nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$APPDATA\${APP}" /setowner ${SID_ADMINS} /T /C /L /Q'
+    Pop $0
+    ${If} $0 != 0
+        DetailPrint "could not make Administrators the owner of $APPDATA\${APP} (exit $0)"
     ${EndIf}
 
     ; WinSW reads the XML file named after itself. Name, start mode and failure
@@ -438,14 +535,28 @@ Function InstallService
         MessageBox MB_OK|MB_ICONEXCLAMATION "The OptScale Kompressor service could not be registered. If Windows says it is marked for deletion, close the Services window and run setup again, or restart Windows." /SD IDOK
         Return
     ${EndIf}
-    ; WinSW registers the service as LocalSystem; it is started only once it is
-    ; switched to LocalService, so a failed switch never runs it with more.
+    ; WinSW registers it as LocalSystem. If it cannot be switched to
+    ; LocalService it is removed, or else disabled, so it never runs as SYSTEM.
     nsExec::ExecToLog '"$SYSDIR\sc.exe" config ${APP} obj= "NT AUTHORITY\LocalService" password= ""'
     Pop $0
     ${If} $0 != 0
-        DetailPrint "could not run the service as LocalService (exit $0); not started"
-        StrCpy $FinishText "OptScale Kompressor is installed, but its service was not started: it could not be set to run as LocalService.$\r$\n$\r$\nFrom an administrator PowerShell:$\r$\n      sc.exe config ${APP} obj= $\"NT AUTHORITY\LocalService$\" password= $\"$\"$\r$\n      Start-Service ${APP}"
-        MessageBox MB_OK|MB_ICONEXCLAMATION "The OptScale Kompressor service could not be set to run as LocalService, so it was not started. The last page says how to finish by hand." /SD IDOK
+        DetailPrint "could not run the service as LocalService (exit $0)"
+        nsExec::ExecToLog '"${SERVICE}" uninstall'
+        Pop $0
+        ${If} $0 == 0
+            StrCpy $FinishText "OptScale Kompressor is installed, but its service is not: it could not be set to run as LocalService.$\r$\n$\r$\nFrom an administrator PowerShell:$\r$\n      & $\"$INSTDIR\kompressor-service.exe$\" install$\r$\n      sc.exe config ${APP} obj= $\"NT AUTHORITY\LocalService$\" password= $\"$\"$\r$\n      Start-Service ${APP}"
+            MessageBox MB_OK|MB_ICONEXCLAMATION "The OptScale Kompressor service could not be set to run as LocalService, so it was removed again. The last page says how to finish by hand." /SD IDOK
+            Return
+        ${EndIf}
+        nsExec::ExecToLog '"$SYSDIR\sc.exe" config ${APP} start= disabled'
+        Pop $0
+        ${If} $0 == 0
+            StrCpy $FinishText "OptScale Kompressor is installed, but its service is disabled: it could not be set to run as LocalService.$\r$\n$\r$\nFrom an administrator PowerShell:$\r$\n      sc.exe config ${APP} obj= $\"NT AUTHORITY\LocalService$\" password= $\"$\" start= auto$\r$\n      Start-Service ${APP}"
+            MessageBox MB_OK|MB_ICONEXCLAMATION "The OptScale Kompressor service could not be set to run as LocalService, so it was disabled. The last page says how to finish by hand." /SD IDOK
+            Return
+        ${EndIf}
+        StrCpy $FinishText "OptScale Kompressor is installed, but its service is registered to run as LocalSystem and could not be removed or disabled.$\r$\n$\r$\nRemove it from an administrator PowerShell before Windows restarts:$\r$\n      & $\"$INSTDIR\kompressor-service.exe$\" uninstall"
+        MessageBox MB_OK|MB_ICONSTOP "The OptScale Kompressor service is registered to run as LocalSystem and could not be set to LocalService, removed or disabled. It is not started, but it would start with Windows. The last page says how to remove it." /SD IDOK
         Return
     ${EndIf}
     nsExec::ExecToLog '"${SERVICE}" start'
@@ -475,6 +586,9 @@ Function InstallService
 FunctionEnd
 
 Section "kompressor" Main
+    ${If} $SystemMode == 1
+        Call SecureState
+    ${EndIf}
     ; An upgrade replaces kompressor.exe under the running service. `stopwait`,
     ; not `stop`: WinSW's `stop` returns before serve has exited.
     ${If} $SystemMode == 1
