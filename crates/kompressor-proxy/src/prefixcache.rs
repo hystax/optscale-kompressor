@@ -640,18 +640,21 @@ impl PrefixTracker {
     }
 
     /// Whether this request should ask for one-hour cache entries under
-    /// `CacheTtl::Adaptive`: the conversation went quiet past the provider's
-    /// five-minute TTL on some **earlier** request.
+    /// `CacheTtl::Adaptive`: the conversation has gone quiet past the
+    /// provider's five-minute TTL, on this request or an earlier one.
     ///
     /// Measured from the previous request's end, which undercounts the
     /// start-to-start gap the provider times entries by. Noticing a gap late
     /// costs one expiry; inventing one costs a doubled write price on every
     /// later turn.
     ///
-    /// The request that finds the gap answers `false` and is what sets the
-    /// flag. It has already lost the cache, and rewriting the expired prefix at
-    /// the 1.25x price rather than 2x is the cheaper half; its successor's
-    /// one-hour entry covers the whole prefix for the price of its own tail.
+    /// The request that finds the gap already answers `true`. Its prefix has
+    /// expired, so it rewrites it whatever it asks for, and asking for an hour
+    /// costs 2x on that one write. Waiting a request instead costs the whole
+    /// prefix twice: a request asking for an hour does not read the five-minute
+    /// entry its predecessor wrote. Measured on the 89-task tuned run, all 11
+    /// conversations that switched one request late rewrote the prefix again
+    /// 2-43 s after the first rewrite, 208K tokens at the one-hour price.
     pub fn long_ttl(&self, fingerprint: u64) -> bool {
         let Ok(mut seen) = self.seen.lock() else {
             return false;
@@ -659,11 +662,10 @@ impl PrefixTracker {
         let Some(entry) = seen.get_mut(&fingerprint) else {
             return false;
         };
-        let before = entry.idled_past_ttl;
         if entry.at.elapsed() > PROVIDER_CACHE_TTL {
             entry.idled_past_ttl = true;
         }
-        before
+        entry.idled_past_ttl
     }
 
     /// Pin fragments the engine has shipped whole, so the decision is not
@@ -1180,9 +1182,9 @@ mod tests {
     }
 
     /// `CacheTtl::Adaptive` moves a conversation to one-hour entries on the
-    /// request *after* the one that found it idle past five minutes.
+    /// request that finds it idle past five minutes, not the one after.
     #[test]
-    fn a_conversation_asks_for_an_hour_after_it_first_idles_past_the_ttl() {
+    fn a_conversation_asks_for_an_hour_once_it_idles_past_the_ttl() {
         let tracker = PrefixTracker::new(Duration::from_secs(0));
         assert!(
             !tracker.long_ttl(9),
@@ -1201,8 +1203,8 @@ mod tests {
         };
         idle(&tracker);
         assert!(
-            !tracker.long_ttl(9),
-            "the request that finds the gap rewrites the expired prefix at the cheaper price"
+            tracker.long_ttl(9),
+            "the request that finds the gap rewrites the expired prefix once, at an hour"
         );
         assert!(
             tracker.long_ttl(9),

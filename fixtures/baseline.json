@@ -1,14 +1,14 @@
 {
   "format": 4,
-  "coverage_pct": 58.9201,
-  "claimed_pct": 83.2071,
+  "coverage_pct": 48.7794,
+  "claimed_pct": 68.8171,
   "payloads": 894,
   "chars_in": 3821424,
-  "chars_out": 1569838,
+  "chars_out": 1957356,
   "billed": {
-    "coverage_pct": 58.1182,
+    "coverage_pct": 48.4097,
     "chars_in": 15886252.0,
-    "chars_out": 6653445.0,
+    "chars_out": 8195757.6,
     "cache_read_rate": 0.1
   },
   "buckets": {
@@ -34,11 +34,11 @@
       "billed_out": 47200.9
     },
     "listing": {
-      "payloads": 57,
-      "chars_in": 448903,
-      "chars_out": 23679,
-      "saved_pct": 94.7251,
-      "billed_out": 107118.8
+      "payloads": 52,
+      "chars_in": 417403,
+      "chars_out": 21583,
+      "saved_pct": 94.8292,
+      "billed_out": 98913.6
     },
     "log": {
       "payloads": 49,
@@ -48,11 +48,11 @@
       "billed_out": 1146314.0
     },
     "mixed": {
-      "payloads": 64,
-      "chars_in": 526114,
-      "chars_out": 118046,
-      "saved_pct": 77.5627,
-      "billed_out": 464915.8
+      "payloads": 62,
+      "chars_in": 498393,
+      "chars_out": 101508,
+      "saved_pct": 79.6329,
+      "billed_out": 400287.7
     },
     "search": {
       "payloads": 22,
@@ -68,19 +68,12 @@
       "saved_pct": 53.2994,
       "billed_out": 825302.3
     },
-    "tabular": {
-      "payloads": 8,
-      "chars_in": 17327,
-      "chars_out": 2727,
-      "saved_pct": 84.2616,
-      "billed_out": 13394.1
-    },
     "text": {
-      "payloads": 161,
-      "chars_in": 760933,
-      "chars_out": 337489,
-      "saved_pct": 55.648,
-      "billed_out": 1154643.2
+      "payloads": 59,
+      "chars_in": 287578,
+      "chars_out": 196465,
+      "saved_pct": 31.6829,
+      "billed_out": 653889.4
     },
     "untouched:build": {
       "payloads": 21,
@@ -111,11 +104,11 @@
       "billed_out": 67410.1
     },
     "untouched:listing": {
-      "payloads": 74,
-      "chars_in": 84710,
-      "chars_out": 84710,
+      "payloads": 69,
+      "chars_in": 77023,
+      "chars_out": 77023,
       "saved_pct": 0.0,
-      "billed_out": 280707.8
+      "billed_out": 254066.0
     },
     "untouched:search": {
       "payloads": 20,
@@ -125,25 +118,25 @@
       "billed_out": 127923.8
     },
     "untouched:source_code": {
-      "payloads": 31,
-      "chars_in": 88888,
-      "chars_out": 88888,
+      "payloads": 65,
+      "chars_in": 252365,
+      "chars_out": 252365,
       "saved_pct": 0.0,
-      "billed_out": 423737.3
+      "billed_out": 907269.1
     },
     "untouched:tabular": {
-      "payloads": 17,
-      "chars_in": 42156,
-      "chars_out": 42156,
+      "payloads": 12,
+      "chars_in": 21646,
+      "chars_out": 21646,
       "saved_pct": 0.0,
-      "billed_out": 79695.4
+      "billed_out": 47323.4
     },
     "untouched:text": {
-      "payloads": 241,
-      "chars_in": 288023,
-      "chars_out": 288023,
+      "payloads": 334,
+      "chars_in": 702646,
+      "chars_out": 702646,
       "saved_pct": 0.0,
-      "billed_out": 1146835.8
+      "billed_out": 2851611.6
     }
   },
   "per_payload": {
@@ -188,9 +181,9 @@
       931
     ],
     "02d83b1972ac7f6a": [
-      "text",
+      "untouched:text",
       8791,
-      2020
+      8791
     ],
     "02f14ffa5fbc664d": [
       "text",
@@ -198,7 +191,7 @@
       2560
     ],
     "0311ccced9f682f0": [
-      "untouched:listing",
+      "untouched:source_code",
       1598,
       1598
     ],
@@ -223,9 +216,9 @@
       614
     ],
     "041b5059cc68a534": [
-      "text",
+      "untouched:text",
       1098,
-      1063
+      1098
     ],
     "041b5db4c5ab3a94": [
       "untouched:tabular",
@@ -260,7 +253,7 @@
     "0665565bad3c55be": [
       "text",
       1213,
-      1064
+      1209
     ],
     "0678c6c1538acda7": [
       "text",
@@ -313,14 +306,14 @@
       407
     ],
     "098fff6bf13db1b4": [
-      "text",
+      "untouched:text",
       1426,
-      650
+      1426
     ],
     "09e5187cf666541e": [
-      "text",
+      "untouched:text",
       3704,
-      608
+      3704
     ],
     "0J-F-bZ0ti9X": [
       "search",
@@ -403,9 +396,9 @@
       562
     ],
     "0f3ef3789d43407d": [
-      "text",
+      "untouched:text",
       881,
-      876
+      881
     ],
     "0f66694c3629": [
       "untouched:text",
@@ -413,9 +406,9 @@
       641
     ],
     "0f702d363c313a93": [
-      "text",
+      "untouched:text",
       2458,
-      2445
+      2458
     ],
     "0f8354ac5c6c77a5": [
       "untouched:build",
@@ -453,9 +446,9 @@
       1400
     ],
     "10f1d1df08474fb0": [
-      "text",
+      "untouched:text",
       4374,
-      4225
+      4374
     ],
     "1253b4eee537666c": [
       "mixed",
@@ -490,7 +483,7 @@
     "13df402405cd8f64": [
       "text",
       2419,
-      2067
+      2093
     ],
     "14e292bf6e7f": [
       "untouched:text",
@@ -498,9 +491,9 @@
       972
     ],
     "15125d4f365fb23e": [
-      "tabular",
+      "untouched:source_code",
       1702,
-      346
+      1702
     ],
     "1591da8122034dec": [
       "untouched:source_code",
@@ -513,12 +506,12 @@
       1140
     ],
     "160dd5259e439aff": [
-      "text",
+      "untouched:text",
       23475,
-      3298
+      23475
     ],
     "165b7b8cc798bb2d": [
-      "untouched:tabular",
+      "untouched:source_code",
       3849,
       3849
     ],
@@ -538,7 +531,7 @@
       585
     ],
     "17b15ad93c8d6a74": [
-      "untouched:listing",
+      "untouched:source_code",
       2610,
       2610
     ],
@@ -560,7 +553,7 @@
     "188619dadda80a3f": [
       "text",
       584,
-      536
+      544
     ],
     "190fe160409e138f": [
       "untouched:text",
@@ -618,9 +611,9 @@
       679
     ],
     "1c9eb48e4dc6d673": [
-      "text",
+      "untouched:text",
       4110,
-      3509
+      4110
     ],
     "1e2d27a750004329": [
       "config",
@@ -628,9 +621,9 @@
       1606
     ],
     "1ea77e9d3a5c9476": [
-      "text",
+      "untouched:source_code",
       2250,
-      1991
+      2250
     ],
     "1ec11229a2e83edb": [
       "untouched:listing",
@@ -658,9 +651,9 @@
       3447
     ],
     "2039bf14cbf09db2": [
-      "text",
+      "untouched:text",
       1690,
-      1021
+      1690
     ],
     "209911d9627dc883": [
       "diff",
@@ -683,7 +676,7 @@
       596
     ],
     "21e8d47881da76c9": [
-      "untouched:listing",
+      "untouched:source_code",
       885,
       885
     ],
@@ -698,14 +691,14 @@
       1134
     ],
     "22773b8bd51c6208": [
-      "text",
+      "untouched:text",
       2776,
-      2566
+      2776
     ],
     "22b9cb17eace37c5": [
-      "text",
+      "untouched:source_code",
       15394,
-      6522
+      15394
     ],
     "2339781e83d40c4e": [
       "untouched:listing",
@@ -738,14 +731,14 @@
       733
     ],
     "24ea38e153318824": [
-      "text",
+      "untouched:text",
       2329,
-      2241
+      2329
     ],
     "250c090e27b73adb": [
-      "text",
+      "untouched:text",
       4186,
-      449
+      4186
     ],
     "25bddccc576bfce2": [
       "source_code",
@@ -765,7 +758,7 @@
     "266c00367241a1ae": [
       "text",
       10338,
-      1066
+      10116
     ],
     "267e8bf71452dc2f": [
       "untouched:diff",
@@ -803,9 +796,9 @@
       9818
     ],
     "28e4b59a6765deee": [
-      "mixed",
+      "untouched:source_code",
       3803,
-      2790
+      3803
     ],
     "295ade05bb4d7045": [
       "mixed",
@@ -813,14 +806,14 @@
       284
     ],
     "29a47b77f709afa4": [
-      "text",
+      "untouched:text",
       686,
-      670
+      686
     ],
     "29a6c7520f0c8e66": [
-      "text",
+      "untouched:text",
       1311,
-      1292
+      1311
     ],
     "29e5a13da921e64f": [
       "mixed",
@@ -858,9 +851,9 @@
       514
     ],
     "2cffba23fec02e47": [
-      "text",
+      "untouched:text",
       5725,
-      2017
+      5725
     ],
     "2d705207533d142f": [
       "untouched:diff",
@@ -883,14 +876,14 @@
       1094
     ],
     "2e0926e57f629b64": [
-      "text",
+      "untouched:text",
       4241,
-      3977
+      4241
     ],
     "2e5d6062fd02dd34": [
       "text",
       8913,
-      2037
+      8809
     ],
     "2eb60c6cad1cd60c": [
       "untouched:build",
@@ -928,9 +921,9 @@
       1444
     ],
     "3026b55a11892936": [
-      "text",
+      "untouched:text",
       4241,
-      3977
+      4241
     ],
     "30386977219c4654": [
       "untouched:source_code",
@@ -1008,9 +1001,9 @@
       10763
     ],
     "347faeb87be0e674": [
-      "text",
+      "untouched:text",
       1626,
-      1613
+      1626
     ],
     "35c4d8915b6da68b": [
       "untouched:text",
@@ -1023,9 +1016,9 @@
       1100
     ],
     "35fdeac307fb1cde": [
-      "text",
+      "untouched:text",
       3551,
-      2964
+      3551
     ],
     "3634f832939ed240": [
       "untouched:listing",
@@ -1038,14 +1031,14 @@
       1089
     ],
     "36c95855c967cc11": [
-      "text",
+      "untouched:text",
       4947,
-      797
+      4947
     ],
     "36e7d56633cb4089": [
-      "text",
+      "untouched:text",
       12619,
-      1586
+      12619
     ],
     "36f369b3d75ee9bc": [
       "untouched:listing",
@@ -1088,19 +1081,19 @@
       981
     ],
     "39371e2a4de290c4": [
-      "text",
+      "untouched:text",
       1246,
-      1231
+      1246
     ],
     "397557eb126ef496": [
-      "text",
+      "untouched:text",
       5393,
-      4208
+      5393
     ],
     "397ff5fbc5974c18": [
-      "text",
+      "untouched:text",
       1294,
-      1269
+      1294
     ],
     "3MYDtIHRT9Iy": [
       "log",
@@ -1113,9 +1106,9 @@
       18370
     ],
     "3a36adcff8882d24": [
-      "text",
+      "untouched:text",
       2569,
-      2538
+      2569
     ],
     "3ae886c42a3d0844": [
       "untouched:source_code",
@@ -1163,9 +1156,9 @@
       815
     ],
     "3f338419af402e83": [
-      "text",
+      "untouched:text",
       3446,
-      1670
+      3446
     ],
     "3f4c9a961630b64f": [
       "untouched:source_code",
@@ -1228,9 +1221,9 @@
       429
     ],
     "43932ce1767aa3dd": [
-      "text",
+      "untouched:text",
       1398,
-      470
+      1398
     ],
     "439da0a62e98fb31": [
       "untouched:text",
@@ -1278,14 +1271,14 @@
       1544
     ],
     "4702b833c9221ba9": [
-      "text",
+      "untouched:text",
       4582,
-      3771
+      4582
     ],
     "47de144e76014d2a": [
-      "listing",
+      "untouched:source_code",
       13747,
-      350
+      13747
     ],
     "48bedede9df6b003": [
       "mixed",
@@ -1300,7 +1293,7 @@
     "4954d637fec89d7f": [
       "text",
       3370,
-      3275
+      3337
     ],
     "496ff0347a5ab3a9": [
       "untouched:text",
@@ -1343,9 +1336,9 @@
       834
     ],
     "4c110aeb83fd5552": [
-      "text",
+      "untouched:text",
       619,
-      579
+      619
     ],
     "4ce9ed3a4f7edf4e": [
       "untouched:build",
@@ -1368,9 +1361,9 @@
       514
     ],
     "4d4e982bf58f1048": [
-      "text",
+      "untouched:text",
       10104,
-      573
+      10104
     ],
     "4d597b06cf757112": [
       "untouched:tabular",
@@ -1383,7 +1376,7 @@
       1140
     ],
     "4dabbfe7f031f4d0": [
-      "untouched:tabular",
+      "untouched:source_code",
       3241,
       3241
     ],
@@ -1405,7 +1398,7 @@
     "4efe6baeacf08079": [
       "text",
       1316,
-      769
+      740
     ],
     "50110f99c3b088fb": [
       "untouched:listing",
@@ -1433,9 +1426,9 @@
       2076
     ],
     "5142369b993191a3": [
-      "text",
+      "untouched:text",
       4241,
-      4233
+      4241
     ],
     "51b1cb1d890b5d58": [
       "search",
@@ -1448,14 +1441,14 @@
       692
     ],
     "52049c82e7f195dc": [
-      "text",
+      "untouched:text",
       1439,
-      1408
+      1439
     ],
     "5212a2529237ba1c": [
-      "text",
+      "untouched:text",
       1912,
-      1720
+      1912
     ],
     "523aacd25e739bb1": [
       "untouched:text",
@@ -1523,9 +1516,9 @@
       1052
     ],
     "5581bdf9a8935d58": [
-      "text",
+      "untouched:text",
       5181,
-      1075
+      5181
     ],
     "55be4f256ede3050": [
       "listing",
@@ -1558,9 +1551,9 @@
       5286
     ],
     "5817e90a3e10b974": [
-      "text",
+      "untouched:text",
       1851,
-      1586
+      1851
     ],
     "582d71148db8dfaa": [
       "config",
@@ -1588,9 +1581,9 @@
       1688
     ],
     "590bfdd62c655579": [
-      "text",
+      "untouched:text",
       1206,
-      1028
+      1206
     ],
     "591755c6f11b6db7": [
       "untouched:text",
@@ -1598,9 +1591,9 @@
       912
     ],
     "5918a26d5cfbd1e3": [
-      "text",
+      "untouched:text",
       1085,
-      1070
+      1085
     ],
     "592cfe224165a52b": [
       "source_code",
@@ -1695,7 +1688,7 @@
     "5ff6e60afbae98ab": [
       "text",
       19614,
-      17008
+      19527
     ],
     "603e4e4a82f72602": [
       "untouched:text",
@@ -1728,9 +1721,9 @@
       606
     ],
     "61df8a6a9788f2e1": [
-      "text",
+      "untouched:text",
       1672,
-      1660
+      1672
     ],
     "61f8f9fc86bca3fb": [
       "untouched:diff",
@@ -1738,9 +1731,9 @@
       4321
     ],
     "621a6e807e3f487f": [
-      "text",
+      "untouched:text",
       13962,
-      2080
+      13962
     ],
     "62b4b0b0c1fc954b": [
       "listing",
@@ -1813,9 +1806,9 @@
       736
     ],
     "6a99b022637d93d7": [
-      "text",
+      "untouched:text",
       4123,
-      3769
+      4123
     ],
     "6ac59a1e255822b3": [
       "untouched:text",
@@ -1868,9 +1861,9 @@
       891
     ],
     "6f48157368544fb1": [
-      "text",
+      "untouched:text",
       1491,
-      461
+      1491
     ],
     "6f84e644131a9fdc": [
       "untouched:text",
@@ -1928,9 +1921,9 @@
       899
     ],
     "70cfbbc785d41d18": [
-      "tabular",
+      "untouched:source_code",
       3445,
-      216
+      3445
     ],
     "71127fe5a37fbc8e": [
       "log",
@@ -1940,22 +1933,22 @@
     "7141cd25d4d4a18d": [
       "text",
       7660,
-      5109
+      5565
     ],
     "716a822b39912cdf": [
-      "text",
+      "untouched:source_code",
       2866,
-      2461
+      2866
     ],
     "721a060c70b6abf8": [
-      "text",
+      "untouched:text",
       637,
-      611
+      637
     ],
     "725f0127558cd26e": [
       "text",
       1444,
-      1403
+      1410
     ],
     "732484d4a4e077af": [
       "log",
@@ -1998,9 +1991,9 @@
       429
     ],
     "757f3dd44fd6280e": [
-      "text",
+      "untouched:text",
       2172,
-      1151
+      2172
     ],
     "75a3c6117e0aa687": [
       "untouched:tabular",
@@ -2018,14 +2011,14 @@
       670
     ],
     "76881461a2b74626": [
-      "text",
+      "untouched:text",
       3083,
-      3033
+      3083
     ],
     "76c1484986a99a18": [
       "text",
       1253,
-      978
+      1043
     ],
     "76f66cdbc6729b55": [
       "untouched:text",
@@ -2043,9 +2036,9 @@
       766
     ],
     "780b60a25468a293": [
-      "mixed",
+      "untouched:source_code",
       11900,
-      6240
+      11900
     ],
     "781d8df95c0d4c7e": [
       "untouched:build",
@@ -2073,9 +2066,9 @@
       2359
     ],
     "79b6a7517ed40fa5": [
-      "text",
+      "untouched:text",
       6638,
-      439
+      6638
     ],
     "7Cjpte_uS4jP": [
       "search",
@@ -2093,9 +2086,9 @@
       4697
     ],
     "7abf9f3999562978": [
-      "text",
+      "untouched:text",
       4406,
-      1831
+      4406
     ],
     "7ad71ecab9245176": [
       "mixed",
@@ -2128,9 +2121,9 @@
       693
     ],
     "7eaee3ead6c96c94": [
-      "listing",
+      "mixed",
       5288,
-      449
+      607
     ],
     "7ec25fd74e97ccde": [
       "untouched:text",
@@ -2160,7 +2153,7 @@
     "80892e9722238d72": [
       "text",
       2540,
-      785
+      2387
     ],
     "808e72a8dea8d3f3": [
       "listing",
@@ -2178,9 +2171,9 @@
       356
     ],
     "819f7d6cfcd3059b": [
-      "text",
+      "untouched:text",
       13600,
-      1992
+      13600
     ],
     "81af847e20c6f0e2": [
       "mixed",
@@ -2198,14 +2191,14 @@
       1352
     ],
     "82831e10d8c8bb52": [
-      "mixed",
+      "untouched:source_code",
       8830,
-      4055
+      8830
     ],
     "83225c86093fef33": [
-      "text",
+      "untouched:text",
       2303,
-      1391
+      2303
     ],
     "83832b1f6da126eb": [
       "listing",
@@ -2220,7 +2213,7 @@
     "83ed7d4590189696": [
       "text",
       13117,
-      2479
+      12622
     ],
     "841c24584ca80baa": [
       "untouched:text",
@@ -2278,9 +2271,9 @@
       1814
     ],
     "8637e176bcc3f084": [
-      "text",
+      "untouched:text",
       1245,
-      1185
+      1245
     ],
     "867c1c0d745ef090": [
       "mixed",
@@ -2288,14 +2281,14 @@
       347
     ],
     "873acc1635006074": [
-      "text",
+      "untouched:text",
       1913,
-      1600
+      1913
     ],
     "87b8175458152233": [
-      "tabular",
+      "untouched:source_code",
       1270,
-      397
+      1270
     ],
     "87ea16bb7d1cdb59": [
       "untouched:text",
@@ -2313,12 +2306,12 @@
       611
     ],
     "88e8f1f67f907f2b": [
-      "text",
+      "untouched:text",
       2610,
-      1144
+      2610
     ],
     "89a42e50d251a7e0": [
-      "untouched:tabular",
+      "untouched:source_code",
       9284,
       9284
     ],
@@ -2403,9 +2396,9 @@
       604
     ],
     "8dabd8f5229f48b9": [
-      "text",
+      "untouched:source_code",
       11368,
-      8150
+      11368
     ],
     "8e7b0bd80d62": [
       "untouched:text",
@@ -2433,9 +2426,9 @@
       9327
     ],
     "90296324399811b0": [
-      "text",
+      "untouched:text",
       1258,
-      1242
+      1258
     ],
     "9043eb0e70300f47": [
       "mixed",
@@ -2498,9 +2491,9 @@
       547
     ],
     "928cab06113737ac": [
-      "text",
+      "untouched:source_code",
       10271,
-      910
+      10271
     ],
     "929b1161bb4e84d6": [
       "untouched:tabular",
@@ -2538,9 +2531,9 @@
       608
     ],
     "948a7c93f19497e7": [
-      "text",
+      "untouched:text",
       5790,
-      1126
+      5790
     ],
     "94d7ead1cc526d7e": [
       "untouched:text",
@@ -2553,9 +2546,9 @@
       608
     ],
     "95ebae7528f42664": [
-      "text",
+      "untouched:text",
       2352,
-      2048
+      2352
     ],
     "961a8e449922b869": [
       "source_code",
@@ -2613,9 +2606,9 @@
       1249
     ],
     "981ad173fa7f1bae": [
-      "text",
+      "untouched:text",
       3249,
-      1281
+      3249
     ],
     "98438a4be6dfdf3c": [
       "untouched:source_code",
@@ -2653,9 +2646,9 @@
       2674
     ],
     "99c6041ea4b7c60e": [
-      "text",
+      "untouched:text",
       3408,
-      3244
+      3408
     ],
     "9a3a7e0eb6c89de9": [
       "untouched:text",
@@ -2668,9 +2661,9 @@
       1180
     ],
     "9b2c8b31fddf85a7": [
-      "text",
+      "untouched:text",
       5833,
-      1766
+      5833
     ],
     "9b482a10a3b15203": [
       "untouched:text",
@@ -2690,7 +2683,7 @@
     "9be67207bf642a79": [
       "text",
       1834,
-      1824
+      1552
     ],
     "9c186e8e4b68": [
       "untouched:text",
@@ -2708,14 +2701,14 @@
       616
     ],
     "9cec7d0cdf6ae0a4": [
-      "text",
+      "untouched:text",
       2287,
-      2189
+      2287
     ],
     "9d426000800f3101": [
-      "text",
+      "untouched:text",
       6100,
-      4820
+      6100
     ],
     "9e0439d6afc3abee": [
       "untouched:text",
@@ -2723,7 +2716,7 @@
       555
     ],
     "9e30b9c78d2555aa": [
-      "untouched:tabular",
+      "untouched:source_code",
       2358,
       2358
     ],
@@ -2873,9 +2866,9 @@
       1433
     ],
     "a11872a3d57fefd2": [
-      "text",
+      "untouched:text",
       4046,
-      3921
+      4046
     ],
     "a19bdb429aed7d57": [
       "untouched:html",
@@ -2898,9 +2891,9 @@
       911
     ],
     "a22f0e4c24f6f260": [
-      "text",
+      "untouched:text",
       16420,
-      1939
+      16420
     ],
     "a24d478f27b34322": [
       "mixed",
@@ -2963,9 +2956,9 @@
       494
     ],
     "a63daf8634f20b47": [
-      "tabular",
+      "untouched:source_code",
       1552,
-      348
+      1552
     ],
     "a6753de766ee": [
       "untouched:text",
@@ -2973,9 +2966,9 @@
       1686
     ],
     "a6c8e58868efe84b": [
-      "text",
+      "untouched:text",
       1717,
-      1627
+      1717
     ],
     "a6f600ddd2d9a0d5": [
       "untouched:text",
@@ -2983,9 +2976,9 @@
       576
     ],
     "a7a11b29f7f71676": [
-      "text",
+      "untouched:text",
       849,
-      780
+      849
     ],
     "a7cb071674d3c0e4": [
       "text",
@@ -2993,9 +2986,9 @@
       709
     ],
     "a809af20f7ca92ee": [
-      "text",
+      "untouched:text",
       1558,
-      1557
+      1558
     ],
     "a870d19f0993": [
       "untouched:text",
@@ -3020,12 +3013,12 @@
     "a9b2ab3c937973d6": [
       "text",
       9284,
-      1489
+      2516
     ],
     "aa3c2ad45dd3297d": [
-      "tabular",
+      "untouched:source_code",
       2018,
-      385
+      2018
     ],
     "aa5763100159": [
       "untouched:text",
@@ -3038,9 +3031,9 @@
       598
     ],
     "aae1bbd46f2e47a7": [
-      "text",
+      "untouched:text",
       1652,
-      1004
+      1652
     ],
     "ab3d4090aae436d4": [
       "listing",
@@ -3058,9 +3051,9 @@
       395
     ],
     "aba93700acd9d41b": [
-      "tabular",
+      "untouched:source_code",
       1380,
-      369
+      1380
     ],
     "ac20177a64e95f7d": [
       "mixed",
@@ -3143,9 +3136,9 @@
       2297
     ],
     "af315d3ade85dc6f": [
-      "text",
+      "untouched:text",
       6647,
-      6455
+      6647
     ],
     "af52ae90010d6292": [
       "untouched:search",
@@ -3163,9 +3156,9 @@
       7785
     ],
     "b0a4e08ef63f7759": [
-      "tabular",
+      "untouched:source_code",
       3938,
-      220
+      3938
     ],
     "b0eea54976b61728": [
       "listing",
@@ -3198,9 +3191,9 @@
       519
     ],
     "b2964072662e6ada": [
-      "text",
+      "untouched:text",
       21033,
-      2896
+      21033
     ],
     "b2c3cae08eedbf43": [
       "untouched:listing",
@@ -3303,9 +3296,9 @@
       1587
     ],
     "b72fc7e320aff77a": [
-      "text",
+      "mixed",
       6314,
-      1390
+      4132
     ],
     "b735efafe2439aa7": [
       "config",
@@ -3338,9 +3331,9 @@
       3342
     ],
     "b9020ce49c5548b8": [
-      "text",
+      "untouched:text",
       6772,
-      1416
+      6772
     ],
     "b93dd817d10db04c": [
       "log",
@@ -3355,7 +3348,7 @@
     "b9b934ab81415854": [
       "text",
       8913,
-      2003
+      8820
     ],
     "b9bf95a81695cedd": [
       "mixed",
@@ -3408,9 +3401,9 @@
       4767
     ],
     "bceda9507f8558ba": [
-      "text",
+      "untouched:text",
       4768,
-      3644
+      4768
     ],
     "bd1dcb8477381d8e": [
       "untouched:html",
@@ -3418,9 +3411,9 @@
       593
     ],
     "bda4af890f455bbf": [
-      "text",
+      "untouched:text",
       1611,
-      1596
+      1611
     ],
     "bdb31e511e64215c": [
       "untouched:text",
@@ -3438,9 +3431,9 @@
       139
     ],
     "be4636629a1b0c9e": [
-      "listing",
+      "untouched:source_code",
       4791,
-      371
+      4791
     ],
     "bf710e24fc74498e": [
       "text",
@@ -3468,9 +3461,9 @@
       1552
     ],
     "bffa95cc56726745": [
-      "text",
+      "untouched:text",
       22575,
-      1947
+      22575
     ],
     "c01b75010e8758e3": [
       "untouched:listing",
@@ -3513,9 +3506,9 @@
       695
     ],
     "c3fa633924aa93ff": [
-      "text",
+      "untouched:text",
       5412,
-      5335
+      5412
     ],
     "c3faae86b3603e5b": [
       "untouched:listing",
@@ -3553,9 +3546,9 @@
       586
     ],
     "c77a73191a93e4ca": [
-      "tabular",
+      "untouched:source_code",
       2022,
-      446
+      2022
     ],
     "c7ddd7579efeee7d": [
       "untouched:search",
@@ -3598,7 +3591,7 @@
       854
     ],
     "cad459b85c8453ba": [
-      "untouched:tabular",
+      "untouched:source_code",
       1778,
       1778
     ],
@@ -3608,9 +3601,9 @@
       528
     ],
     "cb02f6537603d96f": [
-      "text",
+      "untouched:source_code",
       6304,
-      3372
+      6304
     ],
     "cb0a1d531439ada4": [
       "source_code",
@@ -3618,7 +3611,7 @@
       1066
     ],
     "cb2e5c69658adbed": [
-      "untouched:listing",
+      "untouched:source_code",
       1380,
       1380
     ],
@@ -3628,9 +3621,9 @@
       1233
     ],
     "cb8367fb1a239809": [
-      "text",
+      "untouched:text",
       1879,
-      1043
+      1879
     ],
     "cbad860ed8875151": [
       "listing",
@@ -3638,9 +3631,9 @@
       312
     ],
     "cbd7e399fed8ea4c": [
-      "untouched:text",
+      "text",
       912,
-      912
+      888
     ],
     "cce595fc144f0bf9": [
       "untouched:build",
@@ -3708,9 +3701,9 @@
       690
     ],
     "d1dc8cfbf82ebdc5": [
-      "text",
+      "untouched:text",
       3264,
-      3199
+      3264
     ],
     "d2180781aef0243b": [
       "source_code",
@@ -3723,9 +3716,9 @@
       488
     ],
     "d3411969597018f0": [
-      "mixed",
+      "untouched:source_code",
       8611,
-      6190
+      8611
     ],
     "d365f7626b0dff33": [
       "untouched:text",
@@ -3768,9 +3761,9 @@
       983
     ],
     "d6b30a5009ce1cb1": [
-      "text",
+      "untouched:text",
       4524,
-      438
+      4524
     ],
     "d786fabe85937762": [
       "untouched:source_code",
@@ -3858,9 +3851,9 @@
       799
     ],
     "dae24a04ef823b86": [
-      "listing",
+      "untouched:source_code",
       4096,
-      523
+      4096
     ],
     "daf07dc98aac4d7a": [
       "mixed",
@@ -3868,9 +3861,9 @@
       1118
     ],
     "db029e0aedda2124": [
-      "text",
+      "untouched:text",
       13493,
-      13471
+      13493
     ],
     "db0ce5f5f1cbe838": [
       "untouched:text",
@@ -3885,12 +3878,12 @@
     "db7d8e95d4af9138": [
       "text",
       40210,
-      815
+      39748
     ],
     "dbaffb06e5ad4914": [
-      "text",
+      "untouched:text",
       1988,
-      885
+      1988
     ],
     "dc7cb682d83241a2": [
       "untouched:search",
@@ -3943,9 +3936,9 @@
       723
     ],
     "dda06812435af9a9": [
-      "text",
+      "untouched:text",
       2223,
-      1145
+      2223
     ],
     "dde88efb7bda6861": [
       "untouched:text",
@@ -3958,14 +3951,14 @@
       671
     ],
     "de3025202d9343c9": [
-      "text",
+      "untouched:source_code",
       1548,
-      1496
+      1548
     ],
     "dee61a71df31838c": [
-      "text",
+      "untouched:source_code",
       2417,
-      2093
+      2417
     ],
     "df09eee06381668f": [
       "config",
@@ -4000,7 +3993,7 @@
     "e08cec1e48ccc8d9": [
       "text",
       5622,
-      1053
+      5609
     ],
     "e0c6c4097b064e9e": [
       "untouched:source_code",
@@ -4023,9 +4016,9 @@
       971
     ],
     "e22f59d9307ed365": [
-      "text",
+      "untouched:text",
       5337,
-      679
+      5337
     ],
     "e24ebe13d1c40aa5": [
       "listing",
@@ -4043,9 +4036,9 @@
       1395
     ],
     "e29a09de26fbf96d": [
-      "text",
+      "untouched:text",
       3542,
-      1560
+      3542
     ],
     "e2b2da4fe07ce28f": [
       "untouched:text",
@@ -4108,9 +4101,9 @@
       9685
     ],
     "e62fb925ce59fd6b": [
-      "text",
+      "untouched:text",
       1866,
-      1576
+      1866
     ],
     "e67351376dee471f": [
       "mixed",
@@ -4128,9 +4121,9 @@
       2957
     ],
     "e6e80fbc331e536b": [
-      "text",
+      "untouched:text",
       2570,
-      2466
+      2570
     ],
     "e7189245506618bf": [
       "untouched:listing",
@@ -4178,9 +4171,9 @@
       8423
     ],
     "ea003b39f7f4a40a": [
-      "text",
+      "untouched:text",
       3432,
-      3053
+      3432
     ],
     "ea60f5ec1fdec94a": [
       "untouched:text",
@@ -4213,9 +4206,9 @@
       791
     ],
     "edd95442fd9778ef": [
-      "text",
+      "untouched:text",
       1320,
-      1073
+      1320
     ],
     "eddc8c49605841e0": [
       "untouched:source_code",
@@ -4223,9 +4216,9 @@
       4950
     ],
     "edfeb6ef3b3c1525": [
-      "text",
+      "untouched:text",
       4484,
-      4472
+      4484
     ],
     "eed8b5e55ffc472f": [
       "untouched:text",
@@ -4288,7 +4281,7 @@
       3898
     ],
     "f1144ae3cf28560d": [
-      "untouched:listing",
+      "untouched:source_code",
       1214,
       1214
     ],
@@ -4323,9 +4316,9 @@
       220
     ],
     "f3a2d6a22bab5f08": [
-      "text",
+      "untouched:text",
       2334,
-      759
+      2334
     ],
     "f500436f92613bbe": [
       "mixed",
@@ -4353,14 +4346,14 @@
       18788
     ],
     "f70f3119c245dbf6": [
-      "text",
+      "untouched:text",
       3410,
-      412
+      3410
     ],
     "f71482746c8d78bd": [
-      "text",
+      "untouched:text",
       1348,
-      1330
+      1348
     ],
     "f73bf5a41718491a": [
       "untouched:text",
@@ -4375,7 +4368,7 @@
     "f77897c833d80e11": [
       "text",
       2158,
-      2050
+      2139
     ],
     "f7825e64feae3d57": [
       "untouched:text",
@@ -4393,9 +4386,9 @@
       903
     ],
     "f8f1b1fbd2a88e9f": [
-      "text",
+      "untouched:text",
       4249,
-      1834
+      4249
     ],
     "f902772cc700": [
       "untouched:text",
@@ -4403,9 +4396,9 @@
       721
     ],
     "f93491002d10c0c6": [
-      "text",
+      "untouched:text",
       9274,
-      7838
+      9274
     ],
     "f94614718548db6a": [
       "untouched:search",
@@ -4445,7 +4438,7 @@
     "fab77f87eb0e3706": [
       "text",
       953,
-      700
+      713
     ],
     "fac91b502c209c9f": [
       "untouched:text",
@@ -4463,9 +4456,9 @@
       823
     ],
     "fb23d1ef09b6b658": [
-      "mixed",
+      "untouched:source_code",
       9757,
-      2612
+      9757
     ],
     "fb329518bcbd25d6": [
       "log",
@@ -4473,9 +4466,9 @@
       8431
     ],
     "fbefce129c4c9592": [
-      "text",
+      "untouched:text",
       1399,
-      494
+      1399
     ],
     "fc24771ba6a0bbe9": [
       "untouched:text",
@@ -4498,9 +4491,9 @@
       3527
     ],
     "fe621d977a32e884": [
-      "text",
+      "untouched:text",
       1855,
-      485
+      1855
     ],
     "fe989d5f46f6": [
       "untouched:text",
@@ -4508,9 +4501,9 @@
       638
     ],
     "feade93208325bf1": [
-      "listing",
+      "mixed",
       3578,
-      403
+      610
     ],
     "fefad31915ad9900": [
       "mixed",
@@ -4523,9 +4516,9 @@
       146
     ],
     "ff15b294c5873c22": [
-      "text",
+      "untouched:text",
       8741,
-      831
+      8741
     ],
     "ff3572cea378d9da": [
       "source_code",
@@ -4624,11 +4617,11 @@
     "ids": []
   },
   "timing": {
-    "ms_per_kb": 0.2941,
-    "p50_ms": 0.1869,
-    "p95_ms": 6.3399,
-    "max_ms": 36.3666,
-    "mean_ms": 1.2278
+    "ms_per_kb": 0.3002,
+    "p50_ms": 0.2071,
+    "p95_ms": 5.9238,
+    "max_ms": 38.7508,
+    "mean_ms": 1.253
   },
   "violations": {}
 }

@@ -179,6 +179,10 @@ for v in KOMPRESSOR_MIN_TOKENS KOMPRESSOR_MIN_CHARS KOMPRESSOR_MAX_REF_BYTES \
          KOMPRESSOR__PROXY__CACHE_TTL KOMPRESSOR__ENGINE__ENABLE_CODE_AWARE; do
   [ -n "${!v:-}" ] && echo "  env $v=${!v}"
 done
+# Provider-scoped settings (`proxy.providers`), whatever their names.
+for v in $(compgen -e | grep '^KOMPRESSOR__PROXY__PROVIDERS__' || true); do
+  echo "  env $v=${!v}"
+done
 echo "watch it with: KOMPRESSOR_RUNS=$RUNS $ROOT/scripts/harbor/watch.py"
 
 exec /usr/bin/env python3 "$ROOT/scripts/harbor/bench.py" \

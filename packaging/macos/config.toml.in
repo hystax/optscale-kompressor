@@ -43,6 +43,18 @@ frozen_prefix = "first_seen"
 # so it is written out rather than left to the default.
 cache_ttl = "default"
 
+# Any of the settings above, and any engine option, can be set for one
+# provider's traffic only: "anthropic" (Messages) or "openai" (Chat Completions
+# and Responses). What Claude Code was measured to need is not what Codex
+# needs, so a proxy serving both can scope it (DESIGN.md §12.11):
+#
+#   [proxy.providers.anthropic]
+#   cache_ttl = "adaptive"
+#   frozen_prefix = "first_seen"
+#
+#   [proxy.providers.anthropic.engine]
+#   enable_code_aware = false
+
 # Codex opens ws://.../v1/responses before trying HTTPS, and a ChatGPT-plan
 # session cannot be told not to. Relaying that upgrade is what makes such a
 # session compressible; refusing it costs about thirteen seconds of retries per

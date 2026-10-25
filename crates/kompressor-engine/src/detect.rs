@@ -152,6 +152,83 @@ const LISTING_RATIO: f32 = 0.6;
 /// folded address is useless to an agent reversing a binary.
 static OFFSET_ROW: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\s*[0-9a-f]{3,16}:?\s").unwrap());
 
+/// One line of disassembly or assembler source, with whatever a tool puts in
+/// front of the instruction taken off first: gdb's `=>` cursor, an address
+/// (`401744:`, `0x401136 <+4>:`) and the raw bytes `objdump` prints after it by
+/// default. Bytes only after an address: a row of numbers that merely opens with
+/// two hex digits is data, not an encoding.
+/// What is left must be a lowercase mnemonic and operands built only from what
+/// operands are built from.
+static ASM_PREFIX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^\s*(?:=>\s*)?(?:(?:0x)?[0-9a-f]+(?:\s*<[^>]*>)?:\s+(?:(?:[0-9a-f]{2}\s)+\s*)?)?")
+        .unwrap()
+});
+static ASM_INSTRUCTION: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^(?:(?:lock|rep[a-z]*|bnd|notrack|data16|cs|ds)\s+)*([a-z][a-z0-9]{1,11}(?:\.[a-z0-9]{1,4})*)(?:\s+([\w%$#\[\]()+\-*,.:<>@!{} ]+?))?\s*(?:[#;].*)?$")
+        .unwrap()
+});
+/// Operands that only an instruction has: a register, an immediate, a memory
+/// reference or a branch target.
+static ASM_OPERAND: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"%[a-z]|\$-?(?:0x)?[0-9a-f]+\b|\$(?:[a-z]{1,2}\d?|\d{1,2})\b|\bPTR\b|\[|#-?(?:0x)?[0-9a-f]+|\b[0-9a-f]+ <|\b(?:[re]?[abcd]x|[re]?[sd]i|[re]?[sb]p|r(?:[89]|1[0-5])[dwb]?|[xyz]mm\d{1,2}|[abcd][lh]|[xwqdsv]\d{1,2}|sp|lr|pc|fp)\b")
+        .unwrap()
+});
+/// Instructions that take no operands, which the operand test cannot see.
+const ASM_NULLARY: &[&str] = &[
+    "ret",
+    "retq",
+    "retl",
+    "leave",
+    "leaveq",
+    "endbr64",
+    "endbr32",
+    "nop",
+    "nopw",
+    "nopl",
+    "cltq",
+    "cqto",
+    "cltd",
+    "cdq",
+    "cdqe",
+    "cqo",
+    "cwtl",
+    "cbw",
+    "cwde",
+    "syscall",
+    "sysenter",
+    "hlt",
+    "int3",
+    "ud2",
+    "pause",
+    "lfence",
+    "mfence",
+    "sfence",
+    "cpuid",
+    "rdtsc",
+    "eret",
+    "wfi",
+    "vzeroupper",
+    "fldz",
+    "fld1",
+    "fchs",
+    "fabs",
+    "fsqrt",
+    "fwait",
+];
+/// A function header (`0000000000401fd0 <vector_create>:`), a label
+/// (`main:`, `$L2:`, `.LBB0_3:`), a directive (`.frame $sp,72,$31`) or the
+/// banner `objdump` opens with. Part of a listing, not evidence of one.
+static ASM_FRAME: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^\s*(?:[0-9a-f]{4,16} <[^>]+>:|[\w.$@]+:|\.[a-z_]\w*(?:\s.*)?|Disassembly of section .*|.*file format \S+|Dump of assembler code.*|End of assembler dump\.?)\s*$")
+        .unwrap()
+});
+/// Lines a payload must have before it can be called a listing of instructions.
+const ASM_MIN_LINES: usize = 12;
+/// Of its non-blank lines, the share that must be instructions...
+const ASM_INSTRUCTION_RATIO: f32 = 0.5;
+/// ...and the share that must be instructions or their frame.
+const ASM_RATIO: f32 = 0.8;
+
 /// `rg` without `-n` emits `path:matching text`, which `SEARCH` cannot claim for
 /// want of a line number — and those lines all share the path, so they read as
 /// one template with a varying tail. They are not: they are the matches an agent
@@ -429,6 +506,21 @@ pub fn detect_content_with(content: &str, gutter_aware: bool, tabular_ratio: boo
 
     let lines = split_lines(sample);
 
+    // Before everything that reads lines as rows or as a log. An instruction
+    // stream is code whose order is its meaning: the listing sampler drops its
+    // middle and the plain-text fold merges every `movss` into the first, and
+    // either leaves an agent reversing a binary with nothing it can read. On a
+    // measured run it paged a folded `objdump` through `sed -n` instead of
+    // fetching it, 40 steps against 12 uncompressed. No grammar parses it, so
+    // as source with no language it is declined and shipped whole.
+    if looks_like_assembly(&lines) {
+        let meta = DetectionMeta {
+            assembly: true,
+            ..Default::default()
+        };
+        return Detection::with_meta(ContentType::SourceCode, 0.8, meta);
+    }
+
     let diagnostics = DIAGNOSTIC.find_iter(sample).count();
     if diagnostics >= 3 {
         return build(0.9, true, false);
@@ -688,6 +780,33 @@ pub(crate) fn file_joins(content: &str) -> Vec<usize> {
     }
     joins.dedup();
     joins
+}
+
+/// Whether a payload is disassembly or assembler source.
+fn looks_like_assembly(lines: &[&str]) -> bool {
+    let body: Vec<&str> = lines.iter().copied().filter(|l| !is_blank(l)).collect();
+    if body.len() < ASM_MIN_LINES {
+        return false;
+    }
+    let mut instructions = 0;
+    let mut framing = 0;
+    for line in &body {
+        let rest = &line[ASM_PREFIX.find(line).map_or(0, |m| m.end())..];
+        if let Some(caps) = ASM_INSTRUCTION.captures(rest) {
+            let operands = caps.get(2).map_or("", |m| m.as_str());
+            let nullary = operands.is_empty() && ASM_NULLARY.contains(&&caps[1]);
+            if nullary || ASM_OPERAND.is_match(operands) {
+                instructions += 1;
+                continue;
+            }
+        }
+        if ASM_FRAME.is_match(line) {
+            framing += 1;
+        }
+    }
+    let lines = body.len() as f32;
+    instructions as f32 / lines >= ASM_INSTRUCTION_RATIO
+        && (instructions + framing) as f32 / lines >= ASM_RATIO
 }
 
 fn code(confidence: f32, language: Language) -> Detection {
@@ -1223,5 +1342,114 @@ mod tests {
             "a summary of absence is not an event"
         );
         assert_eq!(strategy, Strategy::Listing);
+    }
+
+    /// A function body the way `objdump -d -M intel --no-show-raw-insn`
+    /// prints it, with `address` choosing whether each row keeps its address.
+    fn disassembly(address: bool) -> String {
+        let body = [
+            "endbr64",
+            "sub    rsp,0x78",
+            "mov    rax,rdi",
+            "movss  xmm2,DWORD PTR [rsp+0x8c]",
+            "movq   QWORD PTR [rsp+0x60],xmm0",
+            "movss  xmm10,DWORD PTR [rsp+0x90]",
+            "movaps xmm12,xmm2",
+            "mulss  xmm0,xmm10",
+            "subss  xmm3,xmm5",
+            "addss  xmm12,xmm0",
+            "pxor   xmm3,xmm3",
+            "comiss xmm3,xmm1",
+            "ja     4023a0 <sphere_intersect+0x200>",
+            "call   402020 <vector_dot>",
+            "add    rsp,0x78",
+            "ret",
+        ];
+        let mut out = vec!["00000000004021a0 <sphere_intersect>:".to_string()];
+        for (i, insn) in body.iter().enumerate() {
+            out.push(if address {
+                format!("  {:x}:\t{insn}", 0x4021a0 + 4 * i)
+            } else {
+                insn.to_string()
+            });
+        }
+        out.join("\n")
+    }
+
+    #[test]
+    fn disassembly_is_code_with_or_without_its_addresses() {
+        for address in [false, true] {
+            let found = detect_content(&disassembly(address));
+            assert_eq!(
+                found.content_type,
+                ContentType::SourceCode,
+                "address {address}"
+            );
+            assert!(found.meta.assembly);
+            assert_eq!(found.meta.language, None, "no grammar parses it");
+        }
+    }
+
+    #[test]
+    fn disassembly_in_other_dialects_is_code_too() {
+        let att = (0..16)
+            .map(|i| {
+                format!(
+                    "  {:x}:\t48 89 7d f8          \tmov    %rdi,-0x{:x}(%rbp)",
+                    0x1b4d + 4 * i,
+                    8 + i
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let gdb = (0..16)
+            .map(|i| format!("   0x0000000000401136 <+{i}>:\tpush   %rbp"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mips = ["main:", "\t.frame\t$sp,72,$31", "\t.mask\t0x80010000,-4"]
+            .iter()
+            .map(|l| l.to_string())
+            .chain((0..14).map(|i| format!("\tsw\t$31,{}($sp)", 4 * i)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let numbered = disassembly(true)
+            .lines()
+            .enumerate()
+            .map(|(i, line)| format!("{}: {line}", i + 1))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (name, payload) in [
+            ("att", att),
+            ("gdb", gdb),
+            ("mips", mips),
+            ("numbered", numbered),
+        ] {
+            assert!(detect_content(&payload).meta.assembly, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_table_of_numbers_with_register_shaped_words_is_not_disassembly() {
+        // `48 ` reads as a raw byte and `cx` as a register; neither may make a
+        // row of measurements into an instruction.
+        let rows = (0..20)
+            .map(|i| {
+                format!(
+                    "{} bbox 859 316 45 18 bottom 333 area 469 cx 883.{i}",
+                    40 + i
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!detect_content(&rows).meta.assembly);
+        let symbols = (0..20)
+            .map(|i| format!("0000000000{:x} T handler_{i}", 0x401000 + 16 * i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let found = detect_content(&symbols);
+        assert!(
+            !found.meta.assembly,
+            "an `nm` table lists, it does not execute"
+        );
     }
 }

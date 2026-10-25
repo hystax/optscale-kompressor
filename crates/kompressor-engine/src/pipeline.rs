@@ -335,6 +335,20 @@ fn lift_gutter(
     }
 }
 
+/// Whether `content` is a source file behind a line-number gutter — `cat -n`,
+/// or Claude Code's `Read`.
+///
+/// The segmenter must not have it. Its dump-row rule reads a decimal gutter as
+/// offsets, so a numbered file is one long "listing" to it and has rows
+/// dropped: sixty Rust functions came back with seven signatures, while the
+/// same file unnumbered shipped whole. Detection already lifts the gutter
+/// before it classifies anything; this asks the same question here.
+fn numbered_source(content: &str, role: &str, opts: &EngineOptions) -> bool {
+    crate::gutter::split_line_gutter(content).is_some_and(|gutter| {
+        detect_result(&gutter.body, role, opts).content_type == ContentType::SourceCode
+    })
+}
+
 /// Route one body, arbitrating between the segmenter and whole-message routing.
 ///
 /// A heterogeneous body has two readings and they are not ordered by quality.
@@ -370,7 +384,11 @@ fn route<'a>(
     }
 
     let mut mixed_candidate: Option<(String, Kind, Vec<Kind>, RefCollector)> = None;
-    if forced.is_none() && opts.enable_mixed_content && has_mixed_content(content, opts) {
+    if forced.is_none()
+        && opts.enable_mixed_content
+        && !numbered_source(content, role, opts)
+        && has_mixed_content(content, opts)
+    {
         let mut scratch = refs.scratch();
         if let Some((out, subtypes)) = guarded(|| crush_mixed(content, opts, ctx, &mut scratch))
             && chars_len(&out) < chars_len(content)
@@ -592,7 +610,7 @@ fn route_whole(
                     // other type that reaches here has a reason for declining,
                     // and folding its lines would undo that reason.
                     if detection.content_type == ContentType::PlainText {
-                        arbitrate_text(content, opts, ctx, refs)
+                        arbitrate_text(content, opts, ctx, refs, Identity::AdjacentValues)
                     } else {
                         None
                     }
@@ -613,10 +631,17 @@ fn route_whole(
             // distinct lines, and neither reaches this. What does reach it is
             // output that is the same handful of lines over and over, where
             // folding is the right answer whatever the payload looked like.
+            //
+            // Except an instruction stream. Its repeats are `pxor xmm0,xmm0`
+            // and `ret`, which pass the guard, and folding them moves
+            // instructions out of the order that is their meaning.
             let mut folded_instead = false;
             let out = match out {
                 Some(out) => Some(out),
-                None if opts.enable_fold_fallback && mostly_repeated_lines(content) => {
+                None if opts.enable_fold_fallback
+                    && !detection.meta.assembly
+                    && mostly_repeated_lines(content) =>
+                {
                     refs.rollback(mark);
                     // Both identities, shorter wins. `Exact` alone is the wrong
                     // reading for the shape that reaches here most often — a
@@ -624,7 +649,16 @@ fn route_whole(
                     // every line. A 700-section INI came back at 32.96% folding
                     // only its byte-identical lines, where normalising the
                     // values takes 98.39%.
-                    let folded = arbitrate_text(content, opts, ctx, refs);
+                    // Source keeps its lines in order and is never sampled: the
+                    // wide reading runs the log scorer on fifty lines or more,
+                    // and with code elision off a C file reached it and came
+                    // back as `233 log lines omitted`, 79% of the file gone.
+                    let normalised = if detection.content_type == ContentType::SourceCode {
+                        Identity::AdjacentValues
+                    } else {
+                        Identity::Values
+                    };
+                    let folded = arbitrate_text(content, opts, ctx, refs, normalised);
                     folded_instead = folded.is_some();
                     folded
                 }
@@ -682,14 +716,27 @@ fn route_whole(
 /// which keeps prose exactly where it was — a payload whose lines repeat
 /// verbatim folds the same under either identity, so the normalised reading can
 /// only win where the lines actually differ, which is where it should.
+///
+/// `normalised` is the reading the second candidate folds by. Text that reached
+/// the plain route, and source the fold fallback reaches, get
+/// [`Identity::AdjacentValues`] — with [`Identity::AdjacentExact`] as the exact
+/// reading — which keeps every line where it stood; any other payload already
+/// shown to be mostly repeated lines gets [`Identity::Values`], since there a
+/// template recurring across the whole payload is the shape being folded.
 pub(crate) fn arbitrate_text(
     content: &str,
     opts: &EngineOptions,
     ctx: &Context,
     refs: &mut RefCollector,
+    normalised: Identity,
 ) -> Option<String> {
     let mark = refs.mark();
-    let exact = guarded(|| crush_log(content, opts, ctx, refs, Identity::Exact));
+    let exact_identity = if normalised == Identity::AdjacentValues {
+        Identity::AdjacentExact
+    } else {
+        Identity::Exact
+    };
+    let exact = guarded(|| crush_log(content, opts, ctx, refs, exact_identity));
     let exact_fragments: Vec<String> = refs.pairs()[mark.pairs..]
         .iter()
         .map(|(_, fragment)| fragment.clone())
@@ -701,7 +748,7 @@ pub(crate) fn arbitrate_text(
         refs.restash_all(&exact_fragments);
         return exact;
     }
-    match guarded(|| crush_log(content, opts, ctx, refs, Identity::Values)) {
+    match guarded(|| crush_log(content, opts, ctx, refs, normalised)) {
         Some(values) if exact_len.is_none_or(|e| chars_len(&values) < e) => Some(values),
         _ => {
             refs.rollback(mark);
@@ -1405,6 +1452,44 @@ mod fold_fallback_tests {
 #[cfg(all(test, feature = "code-aware"))]
 mod lead_in_tests {
     use super::*;
+
+    /// The 89-task run's failure: a disassembly reached the plain-text fold,
+    /// came back as `movss xmm10,DWORD PTR [rsp+0x90] [×46 similar …]`, and the
+    /// agent paged the listing by hand instead. It ships whole now, with code
+    /// elision on or off.
+    #[test]
+    fn a_disassembly_ships_whole() {
+        let registers = [
+            "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+        ];
+        let mut lines = vec!["00000000004021a0 <sphere_intersect>:".to_string()];
+        for i in 0..120 {
+            let reg = registers[i % registers.len()];
+            lines.push(match i % 5 {
+                0 => format!("movss  {reg},DWORD PTR [rsp+0x{:x}]", 0x60 + 4 * i),
+                1 => format!("mulss  {reg},xmm{}", (i + 3) % 8),
+                2 => format!("addss  xmm{},{reg}", (i + 5) % 8),
+                3 => "pxor   xmm3,xmm3".to_string(),
+                _ => format!("movaps xmm{},{reg}", (i + 1) % 8),
+            });
+        }
+        lines.push("ret".to_string());
+        let content = lines.join("\n");
+        for enable_code_aware in [true, false] {
+            let opts = EngineOptions {
+                mode: Mode::Recoverable,
+                enable_code_aware,
+                ..Default::default()
+            };
+            let mut refs = opts.collector();
+            let mut applied = Vec::new();
+            let ctx = Context::for_role("tool");
+            let (out, _) =
+                compress_content(&content, "tool", &opts, None, &mut refs, &ctx, &mut applied);
+            assert_eq!(out, content, "code-aware {enable_code_aware}");
+            assert!(refs.is_empty());
+        }
+    }
 
     /// `ls && cat interp.py`: the listing used to make the grammar fail on the
     /// first line and the whole payload ship at 0%.

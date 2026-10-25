@@ -12,9 +12,12 @@ asks the questions `proxy.cache_ttl = "adaptive"` stands or falls on:
 * **Retained after a pause**: of the cache the previous request held (read +
   written), how much this one read back. Expect ~0 past five minutes on the
   default TTL and ~1 under one-hour entries, below an hour.
-* **The switch**: the first request writing one-hour entries. Did it read the
-  five-minute entry the previous request left, or rewrite the prefix? The
-  provider's documentation does not say, and the estimate assumed it reads.
+* **The switch**: the first request writing one-hour entries. It should be
+  the request that found the pause, whose prefix had expired anyway. A switch
+  a request later, after a short gap, rewrites the prefix a second time: a
+  request asking for an hour does not read the five-minute entry its
+  predecessor wrote (on the 89-task tuned run of 2026-10-25, all 11 late
+  switches did).
 * **Stray five-minute writes** after the switch: a marker the rewrite missed.
 
 Prices are Claude Opus 5.5's ($4 input, $0.20 cache read, $5 / $8 for 5-minute /
@@ -118,8 +121,12 @@ def main() -> int:
                   f">60m {mean(r['long'])}")
             if r["switch"]:
                 s = r["switch"]
-                verdict = ("read the 5-minute entry" if s["retained"] and s["retained"] > 0.8
-                           else "REWROTE the prefix on switching")
+                if s["gap_s"] > FIVE_MIN:
+                    verdict = "on the request that found the pause"
+                elif s["retained"] and s["retained"] > 0.8:
+                    verdict = "read the 5-minute entry"
+                else:
+                    verdict = "LATE: rewrote the prefix a second time"
                 print(f"    switch to 1h after a {s['gap_s']}s gap: retained {s['retained']:.2f} "
                       f"of {s['held']:,} held, wrote {s['w1h']:,} 1h -> {verdict}")
             if r["stray_5m"]:

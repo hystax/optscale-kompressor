@@ -183,6 +183,14 @@ e2e floors moved for the same reason (`e2e/runner/floors.json` records the
 measurement); two were lowered, which that file otherwise never does, because a
 floor is a fraction of a corpus and this is a different corpus.
 
+It moved again on 2026-10-25, this time because the engine changed what it
+removes: coverage **58.92% → 48.78%** on the same 894 payloads. Plain text now
+folds only within a run of consecutive lines, and disassembly ships whole
+(DESIGN §7.10c). Most of what the wider fold removed was source the detector
+does not name and data whose order is the content. On the 89-task tuned run,
+the tasks where that fold fired took 17.5% more agent steps than the
+uncompressed run. That is a cost per step the coverage figure never showed.
+
 ### Score a paired comparison on the proxy's bill
 
 Two scripts read finished runs without spending anything:
@@ -333,10 +341,11 @@ compares the engine's own counter against the same run's billed total.
 The measured price table (§12.5b) predicted both arms' billed cost to **0.001%**
 from their token counts, on data recorded after it was fitted.
 
-One limitation the control arm has by construction: conversation identity is
-derived in the compression path, so a passthrough run records `conversation =
-NULL` on every row and cannot be grouped by conversation. Per-conversation
-comparison between the arms is therefore not available.
+The control arm names conversations the same way the compressed arm does, from
+the conversation's opening, and records each row's model, so the arms can be
+compared conversation by conversation. Runs recorded before 1.4.0 have
+`conversation = NULL` and no model on every passthrough row; `panel-score.py`
+assigns those by the trial's tool-call ids and first user message instead.
 
 ## The gates
 

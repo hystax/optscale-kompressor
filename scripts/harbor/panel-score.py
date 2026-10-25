@@ -124,14 +124,24 @@ def proxy_costs(run: str, tasks: dict) -> tuple[dict, float]:
         if row["request_id"] in task_of and row.get("conversation") is not None:
             by_conversation.setdefault(row["conversation"], task_of[row["request_id"]])
     cost, unassigned = collections.Counter(), 0.0
+    unpriced = collections.Counter()
     for row in rows:
         name = row.get("model") or model.get(row["request_id"])
         price = PRICE.get(name or "")
         if not price:
+            # Visible, not skipped: a model missing from the table is cost the
+            # comparison would otherwise silently leave out of one arm.
+            if any(row.get(k) for k in ("prompt_tokens", "cache_read_tokens", "cache_write_tokens", "completion_tokens")):
+                unpriced[name or "unknown"] += 1
             continue
-        inp, read, w5, _w1, out = price
+        inp, read, w5, w1, out = price
+        # One-hour writes cost 2x input, five-minute ones 1.25x; the split is
+        # recorded from schema v11. Without it every write is priced five-minute,
+        # which under-prices an arm that asked for one-hour entries.
+        written = row.get("cache_write_tokens") or 0
+        hour = min(row.get("cache_write_1h_tokens") or 0, written)
         dollars = ((row.get("prompt_tokens") or 0) * inp + (row.get("cache_read_tokens") or 0) * read
-                   + (row.get("cache_write_tokens") or 0) * w5 + (row.get("completion_tokens") or 0) * out) / 1e6
+                   + (written - hour) * w5 + hour * w1 + (row.get("completion_tokens") or 0) * out) / 1e6
         task = (task_of.get(row["request_id"])
                 or by_opening.get(opening_of.get(row["request_id"]))
                 or by_conversation.get(row.get("conversation")))
@@ -139,7 +149,7 @@ def proxy_costs(run: str, tasks: dict) -> tuple[dict, float]:
             cost[task] += dollars
         else:
             unassigned += dollars
-    return cost, unassigned
+    return cost, unassigned, unpriced
 
 
 def load_arm(pattern: str) -> tuple[dict, dict]:
@@ -150,9 +160,13 @@ def load_arm(pattern: str) -> tuple[dict, dict]:
         tasks = trials(run)
         if not tasks:
             continue
-        cost, unassigned = proxy_costs(run, tasks)
+        cost, unassigned, unpriced = proxy_costs(run, tasks)
         totals["runs"] += 1
         totals["unassigned"] += unassigned
+        for name, count in unpriced.items():
+            totals[f"unpriced:{name}"] += count
+        totals["split_known"] += any(r.get("cache_write_1h_tokens") is not None
+                                     for r in (load_json(os.path.join(run, "proxy_requests.json"), []) or []))
         for task, t in tasks.items():
             if t["errored"] or t["steps"] == 0:
                 totals["errored"] += 1
@@ -194,6 +208,14 @@ def main() -> int:
         print(f"{name:10} {tot['runs']:>4} {tot['trials']:>6} {tot['errored']:>7} "
               f"{tot['solved']:>7.0f} {tot['cost']:>9.2f} {tot['harbor']:>9.2f} {tot['unassigned']:>12.2f} "
               f"{per_step:>8.4f} {per_solved:>9.3f}")
+
+    for name, (_, tot) in loaded.items():
+        unpriced = {k.split(":", 1)[1]: v for k, v in tot.items() if k.startswith("unpriced:")}
+        if unpriced:
+            print(f"  !! {name}: requests with usage but no price, left out: {unpriced}")
+        if tot["runs"] and tot["split_known"] < tot["runs"]:
+            print(f"  note {name}: {tot['runs'] - tot['split_known']} run(s) recorded no 5m/1h write split "
+                  "(stats before schema v11); their writes are priced at the five-minute rate")
 
     base_name, (base, _) = arms[0][0], loaded[arms[0][0]]
     for name, _ in arms[1:]:

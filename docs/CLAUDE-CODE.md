@@ -400,14 +400,28 @@ Three facts account for it:
   followed a pause past Anthropic's five-minute entry lifetime, while the agent
   waited on a build or a test run.
 
-Two settings act on those, and are what is being measured next:
+Two settings act on those. Measured together on the same 89 tasks, they came to
+**+0.2% per step** against compression off (95% CI −4.6% .. +5.6%), with 6% more
+agent steps. That run found two faults, both fixed since: plain text folded
+similar lines from anywhere in a payload into one, and tasks where that
+happened took 17.5% more steps; and the adaptive TTL switched one request late,
+so every switching conversation wrote its prefix twice. The two settings:
 `engine.enable_code_aware = false` stops eliding function bodies (removal on
-the replay corpus falls from 48.9% to 40.8%, and the fetches that cost more
+the replay corpus falls from 48.8% to 43.3%, and the fetches that cost more
 than they saved go with it), and `proxy.cache_ttl = "adaptive"` asks for
 one-hour cache entries in a conversation once it has paused past five minutes,
-which is estimated at 5.6% off the compressed run. `adaptive` needs the proxy to
-follow the conversation, so it does nothing with compression off; `"1h"` applies
-either way and costs more than it saves on runs without long pauses.
+which is estimated at 5.6% off the compressed run. Both apply with compression off as
+well (the proxy follows the conversation in either mode); `"1h"` costs more than
+it saves on runs without long pauses.
+
+To set these for Claude traffic only, leaving any OpenAI clients of the same
+proxy on the defaults, scope them to the provider (DESIGN §12.11):
+
+```bash
+export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__ENGINE__ENABLE_CODE_AWARE=false
+export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__CACHE_TTL=adaptive
+export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__FROZEN_PREFIX=first_seen
+```
 
 ## When wrapping Claude Code is still worth it
 

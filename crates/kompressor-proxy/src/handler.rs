@@ -99,7 +99,12 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         // headers, and once the socket is open there are no headers left to
         // read. The tenant and the mode belong to the session, not to a frame.
         let identity = resolve_identity(&state, &parts.headers);
-        let mode = resolve_mode(&state, &parts.headers, &identity);
+        let mode = resolve_mode(
+            &state,
+            &parts.headers,
+            &identity,
+            detect_family(&route.path).map(ApiFamily::provider),
+        );
         let provider = upstream.name.clone();
         let mut parts = parts;
         return match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
@@ -177,20 +182,24 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     // from one the engine declined.
     let decoded = body.clone();
 
+    let family = if upstream.api_family.eq_ignore_ascii_case("passthrough") {
+        None
+    } else {
+        detect_family(&route.path)
+    };
     let identity = resolve_identity(&state, &parts.headers);
-    let mode = resolve_mode(&state, &parts.headers, &identity);
+    let mode = resolve_mode(
+        &state,
+        &parts.headers,
+        &identity,
+        family.map(ApiFamily::provider),
+    );
     tracing::debug!(
         tenant = %identity.tenant.as_str(),
         upstream = %upstream.name,
         mode = mode.as_str(),
         "routing"
     );
-
-    let family = if upstream.api_family.eq_ignore_ascii_case("passthrough") {
-        None
-    } else {
-        detect_family(&route.path)
-    };
     let prepared = prepare(
         &state,
         &identity,
@@ -533,13 +542,15 @@ fn prefix_identity(
     state: &ProxyState,
     identity: &Identity,
     family: Option<ApiFamily>,
-    mode: ProxyMode,
     body: &Bytes,
     provider: &str,
 ) -> Option<u64> {
-    if mode.is_off() {
-        return None;
-    }
+    // Identified with compression off too. The control arm of a comparison has
+    // to be observed the way the treated arm is: without a conversation its
+    // rows filed no conversation, its cache-read drops went untracked — an
+    // off run reported zero cache loss over 992 requests — and `cache_ttl =
+    // "adaptive"` could never switch there. Reading the body is all this does;
+    // what is forwarded is decided elsewhere.
     let family = family?;
     let value: Value = serde_json::from_slice(body).ok()?;
     let walk = walker_for(family).walk(&value)?;
@@ -582,11 +593,16 @@ async fn prepare(
     request_id: &str,
     provider: &str,
 ) -> Prepared {
-    let fingerprint = prefix_identity(state, identity, family, mode, &body, provider);
+    let fingerprint = prefix_identity(state, identity, family, &body, provider);
     // Decided once, here: under `adaptive` the question itself moves the
     // conversation's state. Anthropic only; the TTL is its field.
     let long_ttl = family == Some(ApiFamily::AnthropicMessages)
-        && match state.core.config().proxy.cache_ttl {
+        && match state
+            .core
+            .config_for(family.map(ApiFamily::provider))
+            .proxy
+            .cache_ttl
+        {
             CacheTtl::Default => false,
             CacheTtl::OneHour => true,
             CacheTtl::Adaptive => fingerprint.is_some_and(|key| state.prefixes.long_ttl(key)),
@@ -656,7 +672,8 @@ async fn prepare_inner(
     // compression so a promotion is priced at the write it will cost.
     long_ttl: bool,
 ) -> Prepared {
-    let config = state.core.config();
+    // This provider's settings: `proxy.providers` applied over the defaults.
+    let config = state.core.config_for(family.map(ApiFamily::provider));
     let proxy = &config.proxy;
     let Some(family) = family else {
         let stream = unparsed_asks_to_stream(&body, request_headers);
@@ -664,7 +681,19 @@ async fn prepare_inner(
     };
     if mode.is_off() || !proxy.enabled || method != Method::POST || !is_json(request_headers) {
         let stream = unparsed_asks_to_stream(&body, request_headers);
-        return Prepared::passthrough(body, stream, None);
+        // The model still goes on the row, so the control arm can be priced
+        // per model like the treated one; the body is forwarded untouched.
+        let model = mode
+            .is_off()
+            .then(|| serde_json::from_slice::<Value>(&body).ok())
+            .flatten()
+            .and_then(|value| {
+                value
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        return Prepared::passthrough(body, stream, model);
     }
 
     let Ok(mut value) = serde_json::from_slice::<Value>(&body) else {
@@ -696,8 +725,9 @@ async fn prepare_inner(
     // has to decide whether to offer the retrieve tool, and that decision is the
     // engine's effective mode rather than the proxy's patch -- offering it on
     // some turns of a conversation and not others is what moves the prefix.
-    let options = state.core.options_for(
+    let options = state.core.options_for_provider(
         identity,
+        Some(family.provider()),
         Some(&EngineOptionsPatch {
             mode: mode.engine_mode(),
             // The proxy's own knob can withhold the read lifecycle but never
@@ -1566,9 +1596,11 @@ fn wanted_fragments(
     wanted
 }
 
-/// The request's mode: its own header, then the tenant's, then the deployment's.
+/// The request's mode: its own header, then the tenant's, then the provider's
+/// (`proxy.providers`), then the deployment's.
 ///
-/// `proxy.compress = false` is checked before any of them: it is the
+/// `proxy.compress = false` — the deployment's, or the provider's — is checked
+/// before any of them: it is the
 /// deployment saying it does not compress, and a switch a client header can
 /// turn back on is not one.
 ///
@@ -1586,8 +1618,10 @@ pub(crate) fn resolve_mode(
     state: &ProxyState,
     headers: &HeaderMap,
     identity: &Identity,
+    provider: Option<&str>,
 ) -> ProxyMode {
-    let proxy = &state.core.config().proxy;
+    let config = state.core.config_for(provider);
+    let proxy = &config.proxy;
     if !proxy.compress || !proxy.enabled {
         return ProxyMode::Off;
     }
@@ -1601,7 +1635,7 @@ pub(crate) fn resolve_mode(
     if let Some(mode) = identity.mode {
         return ProxyMode::On(mode);
     }
-    ProxyMode::On(state.core.config().engine.mode)
+    ProxyMode::On(config.engine.mode)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1870,6 +1904,7 @@ impl Recorder {
             completion_tokens: None,
             cache_read_tokens: None,
             cache_write_tokens: None,
+            cache_write_1h_tokens: None,
             shadow_prompt_tokens: None,
             // Hex rather than the raw u64: SQLite integers are signed, so
             // half the fingerprint space would be written as a negative
@@ -1922,6 +1957,12 @@ impl Recorder {
                         .map(|tokens| tokens as u32)
                 });
             self.event.cache_write_tokens = billed(usage, &["cache_creation_input_tokens"]);
+            // The TTL split, which prices the write: 1.25x input for five-minute
+            // entries, 2x for one-hour ones.
+            self.event.cache_write_1h_tokens = usage
+                .pointer("/cache_creation/ephemeral_1h_input_tokens")
+                .and_then(Value::as_u64)
+                .map(|tokens| tokens as u32);
         }
         // Filed only when this request actually froze a prefix. `None` for
         // cache reads means the response carried no usage at all, which is not
@@ -2162,7 +2203,6 @@ mod tests {
     #[test]
     fn identical_openings_do_not_share_prefix_state_across_tenants_or_models() {
         use kompressor_core::Config;
-        use kompressor_engine::Mode;
         use kompressor_store::memory::MemoryRefStore;
         use kompressor_store::types::Tenant;
 
@@ -2191,7 +2231,6 @@ mod tests {
                 &state,
                 identity,
                 Some(ApiFamily::OpenAiChat),
-                ProxyMode::On(Mode::Recoverable),
                 &body(model),
                 provider,
             )

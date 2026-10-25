@@ -1,0 +1,98 @@
+# One proxy for Codex (OpenAI Responses, HTTP and websocket) and Claude Code
+# (Anthropic Messages), each with the settings measured for it.
+#
+#   kompressor check-config --config kompressor-codex-and-claude.toml
+#   kompressor serve --config kompressor-codex-and-claude.toml
+#
+# Codex:       OPENAI_BASE_URL=http://127.0.0.1:8817/v1   (or `kompressor wrap codex`)
+# Claude Code: ANTHROPIC_BASE_URL=http://127.0.0.1:8817    (or `kompressor wrap claude`)
+
+[server]
+listen = "127.0.0.1:8817"
+
+# Deployment defaults: what Codex traffic runs under. Code elision on, the
+# client's own cache markers, the provider's default cache lifetime.
+[engine]
+mode = "recoverable"
+max_ref_bytes = 1048576
+
+[refs]
+backend = "sqlite"
+path = "/var/lib/kompressor/refs.db"
+
+[stats]
+enabled = true
+path = "/var/lib/kompressor/stats.db"
+
+[log]
+level = "info"
+format = "json"
+
+[proxy]
+retrieve_tool = "auto"
+frozen_prefix = "marker"
+cache_ttl = "default"
+# Codex opens ws://.../v1/responses first; relaying it is what keeps a
+# ChatGPT-plan session on this proxy (compressed, but with no usage reported).
+websocket_relay = true
+
+# Claude Code against Claude Opus 5.5 (DESIGN.md §12.11): no function-body
+# elision, freeze only what the provider has cached, one-hour cache entries
+# once a conversation has paused past five minutes. Applies to every
+# /v1/messages request and to nothing else.
+[proxy.providers.anthropic]
+retrieve_tool = "always"
+frozen_prefix = "first_seen"
+cache_ttl = "adaptive"
+
+[proxy.providers.anthropic.engine]
+enable_code_aware = false
+
+# --- OpenAI / Codex -------------------------------------------------------
+# API-key callers go to api.openai.com; ChatGPT-plan callers are recognised by
+# their credential and sent to chatgpt.com instead, websocket included.
+[[proxy.upstreams]]
+name = "openai"
+path_prefix = "/v1"
+base_url = "https://api.openai.com"
+api_family = "openai"
+forward_auth = true
+
+[proxy.upstreams.subscription]
+base_url = "https://chatgpt.com"
+rewrite_prefix = "/backend-api/codex"
+
+# Codex desktop on a ChatGPT plan calls this path directly.
+[[proxy.upstreams]]
+name = "codex-desktop-chatgpt"
+path_prefix = "/backend-api/codex"
+base_url = "https://chatgpt.com"
+strip_prefix = false
+api_family = "openai"
+forward_auth = true
+
+# The rest of the ChatGPT surface (rate limits, identity, token refresh),
+# forwarded untouched. A 404 here makes codex drop the subscription.
+[[proxy.upstreams]]
+name = "chatgpt-rest"
+path_prefix = "/backend-api"
+base_url = "https://chatgpt.com"
+api_family = "passthrough"
+forward_auth = true
+
+# --- Anthropic / Claude Code ---------------------------------------------
+# Longer prefixes win, so /v1/messages lands here rather than on "openai".
+[[proxy.upstreams]]
+name = "anthropic"
+path_prefix = "/v1/messages"
+base_url = "https://api.anthropic.com"
+api_family = "anthropic"
+forward_auth = true
+
+# Everything else Claude Code calls on the Anthropic API, forwarded untouched.
+[[proxy.upstreams]]
+name = "anthropic-api"
+path_prefix = "/api"
+base_url = "https://api.anthropic.com"
+api_family = "passthrough"
+forward_auth = true

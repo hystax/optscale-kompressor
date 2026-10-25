@@ -349,8 +349,8 @@ fn insert_proxy(conn: &Connection, e: &ProxyRequestEvent) -> Result<(), StatsErr
             time_ms, tenant, request_id, api_family, model, upstream, status, stream,
             prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens,
             shadow_prompt_tokens, retrieve_rounds, retrieve_tokens_injected,
-            upstream_ms, total_ms, error, conversation, strip_usage)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+            upstream_ms, total_ms, error, conversation, strip_usage, cache_write_1h_tokens)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
     )?
     .execute(params![
         e.time_ms,
@@ -373,6 +373,7 @@ fn insert_proxy(conn: &Connection, e: &ProxyRequestEvent) -> Result<(), StatsErr
         e.error,
         e.conversation,
         i64::from(e.strip_usage),
+        e.cache_write_1h_tokens.map(i64::from),
     ])?;
     // `compression_event_id` stays NULL. The rowid it would point at may not
     // exist yet — the proxy can finish a request before the compression event

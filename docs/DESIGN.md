@@ -291,7 +291,7 @@ pub struct EngineOptions {
     pub enable_build_templates: bool,               // true  (build output folds by name too, §7.4)
     pub fold_handles_identical_repeats: bool,       // false (a `[×N]` over identical lines needs no handle, §7.4)
     pub enable_html_compressor: bool,               // true  (HTML folds through the log route, §7.10a)
-    pub enable_normalised_text_fold: bool,          // true  (a plain-text fold may normalise values, §7.10c)
+    pub enable_normalised_text_fold: bool,          // true  (a plain-text fold may normalise values within a run, §7.10c)
     pub enable_tabular_ratio: bool,                 // true  (a table must be mostly rows, §6)
     pub enable_code_budget: bool,                   // true  (a second pass when no body cleared the floor, §7.9)
     pub code_budget_min_body_lines: usize,          // 6
@@ -727,6 +727,7 @@ the reason lives on the slot, so the origin is matched back to it by index.
 | 1 | `json_array` | Stripped sample starts with `[`/`{` and `json.loads` succeeds (conf 1.0; metadata `item_count`); else every non-blank line parses (NDJSON, conf 0.9, `concatenated_json`); else if `len(content) > 1M` and the content ends with `]`/`}` → conf 0.6 `sample_truncated` (the crusher does the authoritative parse). | Compact documents over the 1 MB window cannot parse from a prefix; they used to fall to text at 0%. |
 | 2 | `diff` | `^(diff --git |@@ -\d|--- a/|\+\+\+ b/)` anywhere (conf 0.95). | |
 | 3 | `html` | A `<!doctype|html|body|div|table|script` tag **and** structure: a document root (`<!doctype html`/`<html`) or tags on ≥ 20% of non-blank lines (conf 0.95). No compressor — it is a passthrough type. | A Python script was claimed for the comment `# remove <script> tags` (one tag on 9% of lines; real markup 21–100%). |
+| 3a | `source_code` (assembly) | ≥ 12 non-blank lines, ≥ 50% of them instructions and ≥ 80% instructions or their frame. An instruction is a lowercase mnemonic with register, immediate, memory or branch-target operands (or one of a short list of operand-less ones: `ret`, `endbr64`, `nop`, `leave`, …), after any gdb cursor, address and — only after an address — raw bytes. The frame is function headers (`0000000000401fd0 <f>:`), labels, directives and the `objdump`/gdb banners. Conf 0.8, no language, `meta.assembly`. Nothing compresses it: no grammar parses it, and the fold fallback skips it. | Before the listing rule read `objdump` rows as a listing and sampled away the middle of a function, and the text fold merged similar instructions (§7.10c); an agent reversing a binary paged the result by hand, 40 steps against 12. |
 | 4 | `build` (diagnostics) | ≥ 3 lines matching `^\s*(drive:)?[^\s:]+:\d+(:\d+)?:\s*(fatal error|error|warning|note|undefined reference)\b` (conf 0.9); or 1–2 such lines corroborated by ≥ 2 compiler echo/caret lines within 3 lines on either side and runs ≤ 16 lines (conf 0.85). | Diagnostics are shaped like grep hits and were grouped "by file" with matches dropped. The keyword must *begin* the message so `mod.py:4: raise ValueError("error: bad")` stays a search hit. Echo bounds measured on 164 corpus payloads: 2,039/2,040 echo runs within 3 lines; longest compiler run 14; gcc leads with the diagnostic, rustc trails it. |
 | 5 | `search` | ≥ 3 lines and ≥ 60% of lines are grep hits: `^(drive:)?(?P<path>[A-Za-z_./\\][^:\n]*?)[:\-]\d+[:\-].+`, not a log line, and the path does not end in a clock (`[ \t]\d{1,2}$`) (conf = ratio). | Count alone once let an `apt-get` log match at 7.9% "confidence" via hyphenated versions (`cpp-14-x86-64-linux-gnu`); glog `I20260805 07:39:31…` parsed as `path='I20260805 07'`. |
 | 6 | `build` (timestamped log) | ≥ 5 and ≥ 60% of lines match `^\s*(\d{4}-\d\d-\d\d[T ]|TRACE|DEBUG|INFO|WARN|ERROR|FATAL|[IWEFD]\d{4,8}[ \t]+\d{1,2}:\d{2}:\d{2}|Mon 5 07:39:31 syslog)` (conf 0.85). The date **must** be followed by a time separator. | `2025-07-03_api.log` is a filename; folding a listing of dated logs as templates destroyed 20 of 25 distinct dates on a date-range task. |
@@ -821,8 +822,10 @@ repeats are allowed to differ in:
 
 | `Identity` | Folds lines differing in | Given to |
 |---|---|---|
-| `Exact` | nothing — byte-identical only | plain text, and anything in `lossless` |
-| `Values` | timestamps, uuids, hex runs, numbers | every log and every forced-log payload |
+| `Exact` | nothing — byte-identical only | anything in `lossless`, forced text |
+| `AdjacentExact` | nothing, and only within a run of consecutive lines | plain text (§7.10c) |
+| `AdjacentValues` | timestamps, uuids, hex runs, numbers — within a run of ≥ 4 consecutive lines, or any run of identical ones; never the scored sampler | plain text, and source the fold fallback reaches (§7.10c) |
+| `Values` | timestamps, uuids, hex runs, numbers | every log and every forced-log payload, and the fold fallback for anything but source |
 | `ValuesAndNames` | also a package, path or artefact name | build output, when `enable_build_templates` |
 
 1. Preamble split.
@@ -955,13 +958,17 @@ So when the config compressor's own output removed less than `CONFIG_THIN` (70%)
 
 The corpus is untouched by this — its 17 config payloads compress at 80.33%, all above the threshold — which is the point: the change reaches generated configuration and leaves hand-written configuration alone. In recoverable mode the fold's occurrences keep a handle, which is what makes it acceptable at all, because a config's values are the whole point of it.
 
-### 7.10c The plain-text fold is arbitrated between two identities
+### 7.10c The plain-text fold is arbitrated between two identities, and stays in place
 
 A plain-text fold matched lines byte for byte and nothing else. That is the right reading of prose — normalising numbers would merge sentences differing only in one — and the wrong reading of *generated* text, which is the other thing that arrives classified as plain. Measured on a live codex session: a markdown guide of 80 near-identical fenced blocks came back at **7.15%** exact and **97.10%** normalised, and a 700-section INI its own compressor declined came back at **32.96%** and **98.39%**.
 
 Both readings are now computed and the shorter ships, with the exact one running first and winning ties. That ordering is what keeps prose where it was: a payload whose lines repeat verbatim folds identically under either identity, so the normalised reading can only win where the lines actually differ — which is exactly where it should. The same arbitration is used by the `enable_fold_fallback` path, so a payload its own compressor declined gets both readings too.
 
-Corpus coverage **64.3069% → 68.7817%** (+4.47pp), almost all of it the `text` bucket going from 16.63% to 62.71%. Inspecting those payloads explains the size of the jump: they are R and Python sources and data dumps that the detector calls plain text, where value normalisation is simply the correct reading. `enable_normalised_text_fold = false` restores the exact-only fold. What the normalised reading removes stays behind a handle in recoverable mode, which is what makes it acceptable on anything whose values carry meaning.
+Corpus coverage **64.3069% → 68.7817%** (+4.47pp), almost all of it the `text` bucket going from 16.63% to 62.71%. Inspecting those payloads explained the size of the jump: they were R and Python sources and data dumps that the detector calls plain text. That was read as value normalisation being the correct reading for them. Live, it was not.
+
+**Both readings now fold only within a run of consecutive lines.** A fold keeps the first occurrence of a template and pulls every later one up into it, which is right for a progress stream and destroys anything whose *order* is the content. An 89-task Claude Code run on 2026-10-25 measured what that cost. A disassembly reached this path and came back as `movss xmm10,DWORD PTR [rsp+0x90] [×46 similar ref:…]`, forty-six instructions from across a function merged into one line; the agent did not fetch it but paged the listing through `sed -n` in forty-line slices, 40 steps where the uncompressed run took 12. The wide fold reached 36 tool results in that run — x86 and MIPS assembly, `grep -n` over C lookup tables, CoreWars Redcode, game maps — and the nineteen tasks that met it took **17.5% more agent steps** than the uncompressed run, against +4.5% for tasks that saw only other elisions and −3.4% for tasks that saw none. Of what the wide fold removed from the replay corpus, most was source the detector does not name (an interpreter's opcode handlers, Scheme, COBOL, R, LaTeX): code elision by another route, on a run configured without code elision.
+
+So plain text gets `AdjacentExact` and `AdjacentValues` (§7.4): a run of identical lines folds at any length, a run of lines sharing a value-normalised template folds from four lines, and a line never moves. Two or three similar lines in a row are what code looks like; a progress or retry stream repeats far longer. The fold fallback (§7.10c's arbitration, reached when a payload's own compressor declines) keeps the wide `Values` reading for a payload already shown to be mostly repeated lines, except source, which gets the adjacent pair: with code elision off, a `cat a.c b.c` reached it and the global exact reading pulled the second file into the first (`} [×17]`), and a C file reached the scored sampler as `233 log lines omitted`. Disassembly never reaches either (§6, rule 3a). Coverage on the committed corpus **58.92% → 48.78%**, the `text` bucket 42.28% → 11.70%; `enable_normalised_text_fold = false` still turns the value-normalised candidate off.
 
 ### 7.10a HTML (no compressor of its own)
 
@@ -981,7 +988,7 @@ In recoverable mode the folded occurrences keep a handle, so the differences bet
 2. If no fence shrank: **embedded JSON spans** — a bounded `raw_decode` scan (≤ 256 attempts) accepting every complete value ≥ `min_nested_chars`, wherever it sits (the old rule fired only for a trailing blob with no brace before it).
 3. If still nothing: **plain sections** — per-line kinds (`diff` region tracking through hunk bodies and extended headers until a blank line; `build` via the shared log predicate; `search`; `tabular` rows with ≥ 3 delimited fields; `listing` bare entries or hex offset rows; plus promotion of aligned-column runs whose last field names a file), runs ≥ 5 lines. Tabular/listing sections are sampled only if ≥ `max(5, 3·max_array_items)` lines and < 30% of lines carry `<placeholder>`/`{placeholder}` cells (a 15-row CSV template in a task prompt lost 11 rows; the agent guessed the period definitions and failed for a 245-char prize).
 
-Rejected spans roll back their own refs (the whole-message rollback only fires when *no* span shrank). Returns `(content, sorted applied sub-types)`; the route unfolds `mixed` into the real types for analytics (`json`, `log`, not `json_array`/`build`).
+Rejected spans roll back their own refs (the whole-message rollback only fires when *no* span shrank). **A numbered source file is not offered to the segmenter at all** (`numbered_source`): its dump-row rule reads a decimal `cat -n` gutter as offsets, so sixty Rust functions behind Claude Code's `Read` numbering came back with seven signatures while the same file unnumbered shipped whole. Returns `(content, sorted applied sub-types)`; the route unfolds `mixed` into the real types for analytics (`json`, `log`, not `json_array`/`build`).
 
 
 ### 7.12 Line-number gutter lift (`engine::gutter`)
@@ -1211,7 +1218,7 @@ aggregate history beyond that.
   That last key exists because `content_types` counts only successes. A git workload where every diff is declined by the §7.6 gates reported `diff: 0`, which is indistinguishable from "no diffs were present" — and on one measured run 1,374 of 1,483 messages were skipped with the most interesting fact about the run inside them. The decline path detects a second time rather than widening `compress_content`'s return, which is `Option<Kind>` and `None` for every decline: one extra pass on the declines alone is cheaper than touching every caller, and a declined message is one the compressors have already finished with. `v_skip_reasons` unrolls the map one row per reason.
 - `retrieval_events(id, time_ms, tenant, request_id, surface, ref, found, expired, ranged, fragment_bytes, fragment_chars, fragment_tokens, returned_chars, returned_tokens, rolled_up, withheld)`. `withheld` arrived in v10: an ask the per-request token budget refused before the store was read, which is neither a hit nor a miss and is excluded from every rate computed over this table (§12.5b).
 - `protected_ref_events(id, time_ms, tenant, request_id, refs JSON, refs_total, reasons JSON, messages, touched)`.
-- `proxy_requests(id, time_ms, tenant, request_id, api_family, model, upstream, status, stream, compression_event_id, prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens, shadow_prompt_tokens, retrieve_rounds, retrieve_tokens_injected, upstream_ms, total_ms, error, conversation, rolled_up, strip_usage)`. `compression_event_id` and `shadow_prompt_tokens` are never populated — see E.2 for why the join goes through `request_id` instead. `conversation` arrived in v5, `rolled_up` in v7 and `strip_usage` in v9; this prose listing had drifted three columns behind the ladder. `check_schema` does compare table columns — but against the DDL blocks in E.1, not against prose, so a sentence like this one can rot while the gate stays green.
+- `proxy_requests(id, time_ms, tenant, request_id, api_family, model, upstream, status, stream, compression_event_id, prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens, shadow_prompt_tokens, retrieve_rounds, retrieve_tokens_injected, upstream_ms, total_ms, error, conversation, rolled_up, strip_usage, cache_write_1h_tokens)`. `compression_event_id` and `shadow_prompt_tokens` are never populated — see E.2 for why the join goes through `request_id` instead. `conversation` arrived in v5, `rolled_up` in v7, `strip_usage` in v9 and `cache_write_1h_tokens` in v11; this prose listing had drifted three columns behind the ladder. `check_schema` does compare table columns — but against the DDL blocks in E.1, not against prose, so a sentence like this one can rot while the gate stays green.
 
   **A relayed websocket files one row for the whole connection.** The HTTP path's unit — a request — does not exist on that transport: every frame shares one `request_id`, so the connection is what has an identity. The row carries `status = 101` (the handshake succeeded, and it keeps relayed sessions separable from forwarded 200s), `stream = 1`, the duration, and the error when the relay ends badly. **Token counters are NULL, not zero**, because the relay never reads a `response.completed` frame and so does not know what the provider billed; zero would read as "this cost nothing" and quietly deflate every cost report, the same distinction `opaque` draws in the skip taxonomy. `retrieve_rounds` is genuinely 0, because the retrieve tool cannot be offered on a transport whose tool tree executes inside the client; fragments do come back on that path, but as an append to the client's next frame rather than as a round (§12.5b), so there is no round to count. Without this row a relayed session was invisible to `kompressor stats summary`, the HTML report and the Harbor bench, all of which read `proxy_requests` — it contributed compression events and nothing else, and a relay failure had nowhere to land but a log line nobody tails.
 
@@ -1615,7 +1622,7 @@ What makes any of this safe is that the engine's output for a message does not d
 
 **The prefix-monotonic invariant, and the one transform that breaks it.** `crossturn` states the rule and every other decision respects it: a message is matched only against strictly earlier ones, so the output of `0..k` is byte-identical whether or not `k+1` exists, and appending a turn never rewrites an earlier turn. That is what lets the proxy compress history and still hit the provider's cache — demonstrated at scale on OpenAI, where the floor is zero, the engine rewrites all history every turn, and the cache still served 95.4% (median 97.2% over 50 turns).
 
-**Cache entries outlive a five-minute pause only on request** (`proxy.cache_ttl`, default `default`). Anthropic keeps an entry five minutes unless the marker asks for an hour, and an agent waiting on a long build or test run outlives five minutes: on aset-check04 the next request rewrote the whole conversation five times, 698,697 tokens and 63% of the run's cache writes. A one-hour entry costs 2x the input price to write instead of 1.25x, so where the gaps are does the deciding. Replayed over eight Anthropic runs at their models' prices, counting the reuse of Claude Code's shared opening across conversations: `1h` on every marker comes to **+0.5%** (up to +27% on runs with no pause past five minutes); `adaptive`, which moves a conversation to one-hour markers from the request after it first idles past five minutes, to **−9.0%**, never worse than +1.6% on any run, and −5.6% on the later 89-task compressed run. Live, the one-hour markers are accepted and billed as one-hour writes, and a run's opening was read back from an entry another run wrote 19 minutes earlier. `adaptive` needs the proxy to follow the conversation, which compression-off mode does not do, so there it never switches; `1h` applies with compression off too. The rewrite upgrades every marker the Messages API reads (top level, `system`, `tools`, content blocks, `tool_result` blocks) and nothing inside a `tool_use` input, so the longer-before-shorter ordering rule holds by construction. It applies to passthrough requests too, since under the marker floor nearly every Claude Code request is one. Re-sending the previous request with `max_tokens: 0` before the entry expires measured better still (11.4% less) and is not built: it means this proxy sending requests no client made.
+**Cache entries outlive a five-minute pause only on request** (`proxy.cache_ttl`, default `default`). Anthropic keeps an entry five minutes unless the marker asks for an hour, and an agent waiting on a long build or test run outlives five minutes: on aset-check04 the next request rewrote the whole conversation five times, 698,697 tokens and 63% of the run's cache writes. A one-hour entry costs 2x the input price to write instead of 1.25x, so where the gaps are does the deciding. Replayed over eight Anthropic runs at their models' prices, counting the reuse of Claude Code's shared opening across conversations: `1h` on every marker comes to **+0.5%** (up to +27% on runs with no pause past five minutes); `adaptive`, which moves a conversation to one-hour markers once it first idles past five minutes, to **−9.0%**, never worse than +1.6% on any run, and −5.6% on the later 89-task compressed run. Live, the one-hour markers are accepted and billed as one-hour writes, and a run's opening was read back from an entry another run wrote 19 minutes earlier. **The switch happens on the request that finds the pause**, not the one after it. A request asking for an hour does not read the five-minute entry its predecessor wrote: switching a request late, on the 89-task tuned run, made all 11 conversations that switched rewrite the prefix a second time 2–43 s after the first, 208K tokens at the one-hour price, and the measured TTL saving came to about 0.5% of the bill against the 5.7% estimated. The request that finds the pause has lost its prefix anyway, so writing it at an hour costs 2x on one write instead of 1.25x plus a second 2x write. Both apply with compression off too: off mode still names the conversation (from its opening, as compressed mode does) so `adaptive` can tell when it idled, and records the model and the one-hour share of each write (`cache_write_1h_tokens`, schema v11) so the two can be priced apart. The rewrite upgrades every marker the Messages API reads (top level, `system`, `tools`, content blocks, `tool_result` blocks) and nothing inside a `tool_use` input, so the longer-before-shorter ordering rule holds by construction. It applies to passthrough requests too, since under the marker floor nearly every Claude Code request is one. Re-sending the previous request with `max_tokens: 0` before the entry expires measured better still (11.4% less) and is not built: it means this proxy sending requests no client made.
 
 **Stale-read is the exception**: a later write to the same path replaces the read before it, so appending a turn *does* rewrite an earlier one. The two features cannot both be had, and `frozen_prefix = "first_seen"` therefore withholds `enable_stale_read`. The economics decide which goes: at Opus rates, re-writing a 20,000-token suffix to remove a 2,000-token stale read needs ~125 further turns to break even, against sessions that run 20 to 70. `stale_reads_are_the_one_transform_that_rewrites_what_came_before` asserts both directions, so whoever makes the transform causal finds the test rather than the bill.
 
@@ -1643,6 +1650,27 @@ Two things that were wrong on the way in, both caught by tests rather than revie
 
 - The fingerprint read `MessageContent::Text` only, so an Anthropic `tool_result` — which arrives as `Blocks` — hashed to nothing and every prefix stayed `Warm`. The end-to-end test passed anyway, because it asserted the second turn was *not larger*; `<=` is true when nothing happens. Asserting *strictly smaller* is what exposed it.
 - A request can reach `Recorder::finish` more than once (an abandoned stream, an error path), and the later call carries no usage. `None` overwrote the provider's own `Some(0)` and the next turn saw nothing known. `None` now means "no evidence" in both directions: it neither establishes nor erases.
+
+### 12.11 Per-provider settings (`proxy.providers`)
+
+The settings that pay are not the same on every provider. On Claude Code against Claude Opus 5.5, eliding function bodies cost more in retrieval rounds than it saved (§12.10), `first_seen` was the frozen prefix measured on it, and the one-hour cache TTL is a field only Anthropic has; the Codex traffic most defaults were measured on has none of those problems. A deployment serving both used to choose one set for both. `[proxy.providers.<name>]` sets them for one provider's traffic:
+
+```toml
+[proxy.providers.anthropic]
+cache_ttl = "adaptive"
+frozen_prefix = "first_seen"
+retrieve_tool = "always"
+
+[proxy.providers.anthropic.engine]
+enable_code_aware = false
+
+[proxy.providers.openai]
+compress = true
+```
+
+The name is the provider of the request's **API family**, not the upstream mount: `anthropic` for Messages, `openai` for Chat Completions and Responses, including frames on the websocket relay. A mount renamed or split in two still gets its provider's settings, and a name outside those two is a configuration error, as is a misspelt setting. The proxy fields a provider can set are `compress`, `min_tokens`, `retrieve_tool`, `frozen_prefix`, `cache_ttl` and `stale_read`. `engine` takes any engine option a request may override (`EngineOptionsPatch`). An absent field inherits the deployment's value. The per-provider configurations are merged once at startup (`AppCore::config_for`). The request path reads its provider's copy from the moment the family is known: mode resolution (so `compress = false` makes that provider's traffic the measured control arm), the token gate, the frozen prefix, the retrieve tool, the TTL and the engine options. A request header or a tenant's mode still overrides the mode, as it does the deployment's.
+
+From the environment, `KOMPRESSOR__PROXY__PROVIDERS__<NAME>__<SETTING>`, with `__ENGINE__` before an engine option: `KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__CACHE_TTL=adaptive`, `KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__ENGINE__ENABLE_CODE_AWARE=false`. These go through the same serde names as the file, so every field is reachable without a second parser to keep in step. A value that does not parse, an unknown setting and an unknown provider are each logged and ignored. The Harbor runner refuses a run whose effective config does not hold an override it was started with, and the report prints the provider settings under the frozen prefix line.
 
 ### 12.6 Retrieve tool: injection and server-side execution
 
@@ -2081,7 +2109,7 @@ enable_redraw_fold = true           # arbitrated transforms
 enable_build_templates = true       # build output may fold by name, §7.4
 fold_handles_identical_repeats = false # a `[×N]` over identical lines reconstructs itself, §7.4
 enable_html_compressor = true       # HTML folds its repeated lines, §7.10a
-enable_normalised_text_fold = true  # a plain-text fold may normalise values, §7.10c
+enable_normalised_text_fold = true  # a plain-text fold may normalise values within a run, §7.10c
 enable_tabular_ratio = true         # a table must be mostly rows, §6
 enable_code_budget = true           # second pass when no body cleared the floor, §7.9
 code_budget_min_body_lines = 6
@@ -2162,7 +2190,8 @@ payloads = false                    # DEBUG: bodies and fragments (API), relay f
 ```
 
 Durations are humantime strings (`2s`, `100ms`, `10m`); sizes are **plain byte
-counts**, not `"64MiB"` strings.
+counts**, not `"64MiB"` strings. `[proxy.providers.<name>]` tables are empty by
+default and so absent above; §12.11 describes them.
 
 Described elsewhere in this document and **absent from the schema**:
 `auth.trusted_proxies`, `proxy.openai_frozen_prefix`, `proxy.shadow_sample_rate`,
@@ -2208,7 +2237,7 @@ discovery. Every other command reads `$KOMPRESSOR_CONFIG`, then
 the compiled-in defaults otherwise. It is a gate measured against a committed
 baseline, so it has to measure the engine rather than the machine — a personal
 config carrying `enable_normalised_text_fold = false` otherwise moves the `text`
-bucket by 47 points and `make bench` reports it as a code regression. `--config`
+bucket by several points and `make bench` reports it as a code regression. `--config`
 still works, which is the A/B case the command reads configuration for at all,
 and it applies to `--save` as much as to `--compare`: a baseline recorded under
 someone's local settings would move the gate for everyone.
@@ -3495,6 +3524,13 @@ ALTER TABLE proxy_requests ADD COLUMN strip_usage INTEGER NOT NULL DEFAULT 0;
 -- view are both already in the schema block above, which is what `check_schema`
 -- applies, and repeating the ALTER here would add the column twice. The gate
 -- catches that, which is how this note came to be a comment.
+
+-- v11: the part of `cache_write_tokens` billed as one-hour cache entries
+-- (Anthropic `usage.cache_creation.ephemeral_1h_input_tokens`). A one-hour write
+-- costs 2x input against 1.25x, and `proxy.cache_ttl` decides which a request
+-- asks for, so the total alone cannot price a TTL comparison. NULL where the
+-- provider reported no split.
+ALTER TABLE proxy_requests ADD COLUMN cache_write_1h_tokens INTEGER;
 ```
 
 ## C. Configuration reference — flat environment mapping
@@ -3747,6 +3783,7 @@ A row is written **only** when a message the engine refused to compress contains
 | `compression_event_id` | INTEGER | FK to `optimization_events(id)` — **always NULL in practice**, see below |
 | `prompt_tokens`, `completion_tokens` | INTEGER | from the provider's usage block |
 | `cache_read_tokens`, `cache_write_tokens` | INTEGER | provider cache accounting; the ratio of `cache_read_tokens` to `prompt_tokens` is the single best health signal for byte-determinism |
+| `cache_write_1h_tokens` | INTEGER | the part of `cache_write_tokens` billed as one-hour entries (v11); the rest is five-minute. NULL where the provider reports no split |
 | `shadow_prompt_tokens` | INTEGER | reserved for the uncompressed prompt's billed size; **never written today** (the proxy passes `None`), so always NULL |
 | `retrieve_rounds` | INTEGER | how many extra upstream round trips the retrieve tool cost. Reads `proxy.retrieve_max_rounds + 1` on a request that spent its budget — the refusal that tells the model so is a round trip too |
 | `retrieve_tokens_injected` | INTEGER | tokens put back by those rounds |
