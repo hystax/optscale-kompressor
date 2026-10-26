@@ -909,7 +909,8 @@ impl Config {
         None
     }
 
-    /// Where a Linux package installs the system configuration.
+    /// Where a package installs the system configuration: `/etc/kompressor` on
+    /// Linux, `%ProgramData%\kompressor` for the Windows service.
     ///
     /// Deliberately **not** part of [`Self::discover`]. Reading it there would
     /// make `kompressor compress` on a developer machine behave differently
@@ -918,8 +919,23 @@ impl Config {
     /// existed. Commands that are *about the running service* opt in instead;
     /// `kompressor stats` is the one that does.
     pub fn system_path() -> Option<std::path::PathBuf> {
-        let system = PathBuf::from("/etc/kompressor/config.toml");
+        let system = Self::system_path_in(|name| std::env::var_os(name))?;
         system.is_file().then_some(system)
+    }
+
+    /// [`Self::system_path`] for a given environment, before the existence check.
+    fn system_path_in(
+        env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> Option<std::path::PathBuf> {
+        if cfg!(windows) {
+            // Not `/etc/...`: without a drive letter that is `C:\etc`, which
+            // any local user may create.
+            env("ProgramData")
+                .filter(|value| !value.is_empty())
+                .map(|base| PathBuf::from(base).join("kompressor").join("config.toml"))
+        } else {
+            Some(PathBuf::from("/etc/kompressor/config.toml"))
+        }
     }
 
     pub fn load(path: Option<&std::path::Path>) -> Result<Config, ConfigError> {
@@ -1564,6 +1580,26 @@ mod tests {
                 config.proxy.min_tokens,
             ),
             before
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_system_config_is_under_program_data() {
+        let env = |name: &str| (name == "ProgramData").then(|| r"C:\ProgramData".into());
+        assert_eq!(
+            Config::system_path_in(env),
+            Some(PathBuf::from(r"C:\ProgramData\kompressor\config.toml"))
+        );
+        assert_eq!(Config::system_path_in(|_| None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_unix_system_config_is_under_etc() {
+        assert_eq!(
+            Config::system_path_in(|_| None),
+            Some(PathBuf::from("/etc/kompressor/config.toml"))
         );
     }
 

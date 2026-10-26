@@ -260,6 +260,25 @@ macos-pkg-docker: ## macOS .pkg built in a container, so the host needs only Doc
 	docker run --rm -u "$$(id -u):$$(id -g)" -e MACOS_ARCH=$(MACOS_ARCH) \
 		-v "$(CURDIR):/src" kompressor-macos-builder
 
+.PHONY: win-builder
+win-builder:
+	docker build -f scripts/build/Dockerfile.windows -t kompressor-windows-builder \
+		--build-arg WITH_JSIGN=$(if $(WIN_SIGN_CMD),1,0) scripts/build
+
+# Optional Authenticode signing, see scripts/build/windows-sign.sh. Passed by
+# name only, so secrets never appear on a command line; unset ones are skipped.
+WIN_SIGN_ENV := -e WIN_SIGN_CMD -e WIN_SIGN_PFX -e WIN_SIGN_PASSWORD -e WIN_SIGN_TSA
+
+.PHONY: win
+win: win-builder ## Windows x86_64 .exe built in a container (signed if WIN_SIGN_* is set)
+	docker run --rm -u "$$(id -u):$$(id -g)" -v "$(CURDIR):/src" $(WIN_SIGN_ENV) \
+		kompressor-windows-builder ./scripts/build/windows.sh exe
+
+.PHONY: win-installer
+win-installer: win-builder ## Windows installer (setup .exe), built in the same container
+	docker run --rm -u "$$(id -u):$$(id -g)" -v "$(CURDIR):/src" $(WIN_SIGN_ENV) \
+		kompressor-windows-builder ./scripts/build/windows.sh installer
+
 .PHONY: docker
 docker: ## Container image from the static binary
 	./scripts/build/docker.sh $(DOCKER_IMAGE) $(DOCKER_TAG) $(STATIC_TARGET)

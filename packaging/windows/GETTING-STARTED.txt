@@ -1,0 +1,71 @@
+OptScale Kompressor - getting started
+=====================================
+
+kompressor is a command-line program. Open a new PowerShell window (one
+opened before the installation does not see it yet) and type:
+
+    kompressor
+
+That lists every command.
+
+
+Run a coding agent through it
+-----------------------------
+
+    kompressor wrap claude
+    kompressor wrap codex
+
+kompressor wrap --list shows every agent it knows. wrap starts the proxy,
+points the agent at it, runs the agent, and puts everything back when the
+agent exits.
+
+
+Run the proxy on its own
+------------------------
+
+For a client that wrap does not start, such as a desktop app:
+
+    kompressor serve --proxy --api
+
+and point the client at http://127.0.0.1:8817. Ctrl-C stops it.
+
+If kompressor was installed as a system service, that proxy is already
+running and starts with Windows; wrap uses it.
+
+
+Configuration
+-------------
+
+Without a configuration file kompressor runs on built-in defaults and keeps
+its data in a "data" folder in the directory it is started from. To keep it
+in one place, create
+
+    %USERPROFILE%\.config\kompressor\config.toml
+
+with, for example:
+
+    [refs]
+    backend = "sqlite"
+    path = "C:/Users/you/AppData/Local/kompressor/refs.db"
+
+    [stats]
+    enabled = true
+    path = "C:/Users/you/AppData/Local/kompressor/stats.db"
+
+Paths must be absolute and use forward slashes.
+
+    kompressor check-config
+
+shows the configuration your own commands use. The service reads its own,
+%ProgramData%\kompressor\config.toml; to see that one:
+
+    kompressor check-config --config "$env:ProgramData\kompressor\config.toml"
+
+After editing it, restart the service: Restart-Service kompressor, from an
+administrator PowerShell.
+
+
+Documentation
+-------------
+
+https://github.com/hystax/optscale-kompressor#readme

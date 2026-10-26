@@ -163,8 +163,9 @@ what it skipped and the command that would enable it, rather than failing deep
 inside a linker — no single host has a C toolchain for every target.
 
 The individual targets are `make deb`, `make rpm`, `make static` (musl),
-`make docker` and `make macos-pkg-docker`; each says what it needs if a tool is
-missing. `make deb-static` and `make rpm-static` build the same two packages
+`make docker`, `make macos-pkg-docker`, `make win` and `make win-installer`;
+each says what it needs if a tool is missing. `make deb-static` and
+`make rpm-static` build the same two packages
 from the musl binary, so they depend on no `libc6`/`glibc` and install on
 distributions older than the machine that built them. [docs/QUICKSTART.md](docs/QUICKSTART.md) covers running it as a service,
 and [docs/MACOS.md](docs/MACOS.md) covers the macOS paths.

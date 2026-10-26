@@ -244,3 +244,6 @@ assert_cmd = "2"
 tower = { workspace = true }
 predicates = "3"
 tempfile = "3"
+
+[build-dependencies]
+embed-resource = "3.0.12"

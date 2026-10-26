@@ -506,7 +506,8 @@ make all
 ```
 
 That runs every packaging target the host can run — both binaries, both `.deb`s,
-both `.rpm`s, the container image and the macOS `.pkg` — and collects the results
+both `.rpm`s, the container image, the macOS `.pkg` and the Windows `.exe` and
+installer — and collects the results
 into `target/dist` with a `SHA256SUMS` beside them. No host has a C toolchain
 for every target, so each leg is probed first: what cannot be built here is
 listed at the end with the command that would enable it, instead of failing
@@ -561,6 +562,32 @@ State goes to `~/Library/Application Support/kompressor/`, logs to
 `~/Library/Logs/kompressor.log`. `launchctl print gui/$(id -u)/com.kompressor.proxy`
 says whether it is loaded; `launchctl bootout gui/$(id -u)/com.kompressor.proxy`
 stops it until next login, and `launchctl disable` stops it for good.
+
+**On Windows**, `make win` cross-builds `kompressor.exe` and `make win-installer`
+wraps it in a setup program. Both run in a container, so the machine building
+them needs Docker and not Windows: mingw-w64 compiles it, NSIS packages it, and
+the binary depends only on DLLs every Windows 10 and 11 already has.
+
+```bash
+make win-installer
+```
+
+That leaves `target/windows/kompressor-<version>-x86_64-setup.exe` beside the
+bare `kompressor-<version>-x86_64-windows.exe`. The installer asks on its first
+page how to install:
+
+* **for the current user** (the default) — no administrator rights. The binary
+  goes to `%LOCALAPPDATA%\Programs\kompressor`, which is added to your `PATH`.
+* **as a system service** — asks for administrator rights. The binary always
+  goes to `Program Files\kompressor` (no folder choice), which is added to the
+  system `PATH`; a default config is written to `%ProgramData%\kompressor\config.toml`;
+  and the *OptScale Kompressor* service, run by [WinSW](https://github.com/winsw/winsw)
+  as `LocalService`, starts now and with Windows.
+
+Either way it registers an uninstaller under *Installed apps*, which takes the
+binary and the `PATH` entry back out (and the service), keeps the config and the
+data, and lists where they are on its last page. `/S` installs silently for the user;
+`/S /SYSTEM`, from an elevated prompt, installs the service.
 
 ### Upgrading
 

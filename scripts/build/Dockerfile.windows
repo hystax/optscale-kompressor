@@ -1,0 +1,56 @@
+# Builder image for the Windows binary and installer.
+#
+#   docker build -f scripts/build/Dockerfile.windows -t kompressor-windows-builder scripts/build
+#   docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/src" kompressor-windows-builder
+#
+# Or `make win` / `make win-installer`. The context is scripts/build because
+# nothing is copied in.
+FROM rust:1.95-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc-mingw-w64-x86-64 nsis ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add x86_64-pc-windows-gnu
+
+# WinSW runs kompressor as a Windows service for the installer's system mode.
+# Pinned with a digest; bump both together. The .NET 4.6.1 build needs only the
+# .NET Framework every Windows 10 and 11 ships.
+ARG WINSW_VERSION=2.12.0
+ARG WINSW_SHA256=b5066b7bbdfba1293e5d15cda3caaea88fbeab35bd5b38c41c913d492aadfc4f
+RUN mkdir -p /opt/winsw \
+    && curl -fsSL -o /opt/winsw/WinSW.exe \
+        "https://github.com/winsw/winsw/releases/download/v${WINSW_VERSION}/WinSW.NET461.exe" \
+    && echo "${WINSW_SHA256}  /opt/winsw/WinSW.exe" | sha256sum -c -
+
+# Optional Authenticode signing (scripts/build/windows-sign.sh). osslsigncode is
+# small and always here: it signs with a PKCS#12 file and checks signatures.
+RUN apt-get update && apt-get install -y --no-install-recommends osslsigncode \
+    && rm -rf /var/lib/apt/lists/* \
+    && osslsigncode --version
+
+# jsign, for cloud HSM keys, needs a JRE, so it is only added with
+# WITH_JSIGN=1 (the Makefile sets it when WIN_SIGN_CMD is). Not in Debian:
+# pinned with a digest; bump both together.
+ARG WITH_JSIGN=0
+ARG JSIGN_VERSION=7.4
+ARG JSIGN_SHA256=2327100d665eabd4f394b279d0183812b5c8c7393e769a95e82c4c83853de98a
+RUN if [ "$WITH_JSIGN" = 1 ]; then \
+        apt-get update && apt-get install -y --no-install-recommends default-jre-headless \
+        && curl -fsSL -o /tmp/jsign.deb \
+            "https://github.com/ebourg/jsign/releases/download/${JSIGN_VERSION}/jsign_${JSIGN_VERSION}_all.deb" \
+        && echo "${JSIGN_SHA256}  /tmp/jsign.deb" | sha256sum -c - \
+        && apt-get install -y --no-install-recommends /tmp/jsign.deb \
+        && rm -rf /tmp/jsign.deb /var/lib/apt/lists/* \
+        && jsign --help >/dev/null; \
+    fi
+
+# Writable by any uid, so `-u` leaves host-owned files; a uid with no passwd
+# entry would otherwise get HOME=/.
+ENV CARGO_HOME=/tmp/cargo \
+    XDG_CACHE_HOME=/tmp/.cache \
+    HOME=/tmp
+RUN mkdir -p /tmp/cargo /tmp/.cache && chmod 1777 /tmp /tmp/cargo /tmp/.cache
+
+WORKDIR /src
+CMD ["./scripts/build/windows.sh", "exe"]
