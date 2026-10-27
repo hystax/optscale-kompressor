@@ -108,9 +108,13 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
                 // because a session whose savings cannot be measured should be
                 // visible in the log rather than inferred from a silent gap in
                 // the cost report.
+                // The auth mode is what chose that upstream, so it is logged
+                // beside it: a subscription sent to the API host is otherwise
+                // a 401 with no visible cause.
                 tracing::info!(
                     request_id = %request_id,
                     upstream = %route.origin(),
+                    auth_mode = auth_mode.as_str(),
                     "relaying a websocket; requests are compressed, usage is not reported"
                 );
                 websocket::relay(
