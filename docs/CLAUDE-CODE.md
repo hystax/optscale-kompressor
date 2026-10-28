@@ -414,11 +414,29 @@ which is estimated at 5.6% off the compressed run. Both apply with compression o
 well (the proxy follows the conversation in either mode); `"1h"` costs more than
 it saves on runs without long pauses.
 
-To set these for Claude traffic only, leaving any OpenAI clients of the same
-proxy on the defaults, scope them to the provider (DESIGN §12.11):
+A third setting acts on the fetches that remain. `engine.min_elision_saving_chars
+= 4000` ships a tool result whole when compressing it would leave a handle but
+save fewer than 4,000 characters. Re-sent at cache-read prices, such a result
+saves less than the one fetch it invites, and it invites one often: across ten
+recoverable runs, tool results saving under 4,000 characters were fetched back
+30% of the time. Replaying all ten runs' tool outputs through the current
+engine, the gate removes 39% of the fetch rounds that would still happen (167
+to 102) and gives up a third of an already small removal value ($2.13 to $1.36
+over the ten runs), about $1.20 ahead at $0.03 a round and still ahead at $0.02.
+Markers without a handle are not gated.
+
+The packaged configurations (`/etc/kompressor/config.toml` on Linux,
+`~/.config/kompressor/config.toml` on macOS) ship these four settings, and
+`retrieve_tool = "always"`, under `[proxy.providers.anthropic]`, with Codex on
+the deployment defaults. An
+install that already has a config keeps it: dpkg leaves an edited conffile in
+place beside a `.dpkg-dist` copy, and the macOS installer never overwrites one.
+To set them by hand for Claude traffic only, leaving any OpenAI clients of the
+same proxy on the defaults, scope them to the provider (DESIGN §12.11):
 
 ```bash
 export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__ENGINE__ENABLE_CODE_AWARE=false
+export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__ENGINE__MIN_ELISION_SAVING_CHARS=4000
 export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__CACHE_TTL=adaptive
 export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__FROZEN_PREFIX=first_seen
 ```

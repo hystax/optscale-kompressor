@@ -1084,6 +1084,7 @@ impl Config {
             "ref_ttl_seconds" => num!(e.ref_ttl_seconds),
             "ref_max_lifetime_multiplier" => num!(e.ref_max_lifetime_multiplier),
             "max_ref_bytes" => num!(e.max_ref_bytes),
+            "min_elision_saving_chars" => num!(e.min_elision_saving_chars),
             "search_max_files" => num!(e.search_max_files),
             "diff_max_files" => num!(e.diff_max_files),
             "code_max_body_lines" => num!(e.code_max_body_lines),

@@ -174,9 +174,10 @@ fn old_environment_overrides_still_apply_to_every_provider() {
 }
 
 #[test]
-fn the_shipped_configurations_load_and_scope_nothing_by_default() {
-    // The example in them is commented out: installing this version changes
-    // nothing for a deployment until it opts in.
+fn the_shipped_configurations_scope_the_measured_settings_to_claude() {
+    // Both packages serve Codex and Claude from one proxy, so what Claude Code
+    // was measured to need is scoped to Anthropic traffic and Codex keeps the
+    // deployment defaults (DESIGN.md §12.11).
     for (name, text) in [
         (
             "packaging/kompressor.toml",
@@ -187,7 +188,31 @@ fn the_shipped_configurations_load_and_scope_nothing_by_default() {
             include_str!("../../../packaging/macos/config.toml.in"),
         ),
     ] {
-        assert!(parse(name, text).proxy.providers.is_empty(), "{name}");
+        let config = parse(name, text);
+        assert!(config.proxy.websocket_relay, "{name}");
+        assert!(config.proxy.intercept.listen.is_some(), "{name}");
+        let core = core(config);
+
+        let anthropic = core.config_for(Some("anthropic"));
+        assert_eq!(
+            anthropic.proxy.retrieve_tool,
+            RetrieveTool::Always,
+            "{name}"
+        );
+        assert_eq!(
+            anthropic.proxy.frozen_prefix,
+            FrozenPrefix::FirstSeen,
+            "{name}"
+        );
+        assert_eq!(anthropic.proxy.cache_ttl, CacheTtl::Adaptive, "{name}");
+        assert!(!anthropic.engine.enable_code_aware, "{name}");
+        assert_eq!(anthropic.engine.min_elision_saving_chars, 4000, "{name}");
+
+        let openai = core.config_for(Some("openai"));
+        assert_eq!(openai.proxy.frozen_prefix, FrozenPrefix::Marker, "{name}");
+        assert_eq!(openai.proxy.cache_ttl, CacheTtl::Default, "{name}");
+        assert!(openai.engine.enable_code_aware, "{name}");
+        assert_eq!(openai.engine.min_elision_saving_chars, 0, "{name}");
     }
 }
 
@@ -205,6 +230,7 @@ fn a_provider_table_overrides_only_its_provider_and_inherits_the_rest() {
     assert_eq!(anthropic.proxy.frozen_prefix, FrozenPrefix::FirstSeen);
     assert_eq!(anthropic.proxy.retrieve_tool, RetrieveTool::Always);
     assert!(!anthropic.engine.enable_code_aware);
+    assert_eq!(anthropic.engine.min_elision_saving_chars, 4000);
     // Not named in the table, so the deployment's.
     assert!(anthropic.proxy.websocket_relay);
     assert_eq!(anthropic.proxy.min_tokens, core.config().proxy.min_tokens);
@@ -223,6 +249,10 @@ fn a_provider_table_overrides_only_its_provider_and_inherits_the_rest() {
     assert_eq!(openai.proxy.cache_ttl, CacheTtl::Default);
     assert_eq!(openai.proxy.frozen_prefix, FrozenPrefix::Marker);
     assert!(openai.engine.enable_code_aware);
+    assert_eq!(
+        openai.engine.min_elision_saving_chars, 0,
+        "the gate is off by default"
+    );
 
     assert_eq!(
         printed(core.config_for(None)),
@@ -328,13 +358,26 @@ fn a_provider_table_in_a_file_and_the_environment_merge() {
         "codex-and-claude",
         include_str!("fixtures/configs/codex-and-claude.toml"),
     );
-    config.apply_env(&[(
-        "KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__MIN_TOKENS".into(),
-        "8192".into(),
-    )]);
+    config.apply_env(&[
+        (
+            "KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__MIN_TOKENS".into(),
+            "8192".into(),
+        ),
+        (
+            "KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__ENGINE__MIN_ELISION_SAVING_CHARS".into(),
+            "6000".into(),
+        ),
+    ]);
     let core = core(config);
     let anthropic = core.config_for(Some("anthropic"));
     assert_eq!(anthropic.proxy.min_tokens, 8192);
+    assert_eq!(anthropic.engine.min_elision_saving_chars, 6000);
+    assert_eq!(
+        core.config_for(Some("openai"))
+            .engine
+            .min_elision_saving_chars,
+        0
+    );
     assert_eq!(
         anthropic.proxy.cache_ttl,
         CacheTtl::Adaptive,

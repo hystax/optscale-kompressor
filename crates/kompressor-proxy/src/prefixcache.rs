@@ -76,9 +76,61 @@ struct Identity {
 struct Identities {
     by_prefix: HashMap<(usize, u64), Identity>,
     lengths: BTreeMap<usize, usize>,
+    /// The longest history each conversation has sent, as its identity
+    /// chain. What [`PrefixTracker::identify`] checks a match against: a
+    /// request that departs from it is another conversation that opened the
+    /// same way.
+    history: HashMap<u64, (Vec<u64>, Instant)>,
 }
 
+/// How far from the end of a conversation's history a request may differ and
+/// still be that conversation.
+///
+/// A later turn appends, so a departure is almost always another conversation.
+/// Measured on the 89-task gate run, comparing message text the way the chain
+/// does: one request in 958 rewrote its own history, two messages from the
+/// end. Three attempts of one Harbor task, by contrast, open identically and
+/// part after their second message, which merged them into one conversation
+/// that shared a cache-lifetime flag, a freeze watermark and a fetch history.
+const TAIL_REWRITE: usize = 2;
+
 impl Identities {
+    /// Note `chain` as `id`'s history when it extends, or rewrites the tail
+    /// of, the longest one seen; a shorter replay of it changes nothing.
+    fn extend(&mut self, id: u64, chain: &[u64]) {
+        if self.history.len() >= REMEMBER
+            && !self.history.contains_key(&id)
+            && let Some(&oldest) = self
+                .history
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(id, _)| id)
+        {
+            self.history.remove(&oldest);
+        }
+        let entry = self
+            .history
+            .entry(id)
+            .or_insert_with(|| (Vec::new(), Instant::now()));
+        if chain.len() >= entry.0.len() {
+            entry.0 = chain.to_vec();
+        }
+        entry.1 = Instant::now();
+    }
+
+    /// Where `chain` parts from `id`'s history, when it parts too early to be
+    /// a rewrite of its tail. `None` for an extension, a replay of an earlier
+    /// turn, a tail rewrite, or a conversation with no history on record.
+    fn departure(&self, id: u64, chain: &[u64]) -> Option<usize> {
+        let (history, _) = self.history.get(&id)?;
+        let common = history
+            .iter()
+            .zip(chain)
+            .take_while(|(a, b)| a == b)
+            .count();
+        (common < chain.len() && common + TAIL_REWRITE < history.len()).then_some(common)
+    }
+
     fn insert(&mut self, len: usize, hash: u64, id: u64) {
         if self.by_prefix.len() >= REMEMBER
             && let Some((&key, _)) = self.by_prefix.iter().min_by_key(|(_, entry)| entry.at)
@@ -846,6 +898,12 @@ impl PrefixTracker {
     /// Deepest match wins, so a conversation that opened inside another's
     /// preamble is still recognised as itself.
     ///
+    /// Two conversations that open identically match one entry, and are told
+    /// apart at the first request that departs from the history the entry's
+    /// conversation has sent: that request is filed as a new conversation,
+    /// registered at the message where the two part. Their very first request
+    /// cannot be told apart, and is filed under the earlier one.
+    ///
     /// `None` only for an empty chain. A poisoned lock degrades to the
     /// first-sight hash, which is stable for as long as the lock stays broken.
     pub fn identify(&self, chain: &[u64]) -> Option<u64> {
@@ -861,9 +919,20 @@ impl PrefixTracker {
             .filter(|&len| len <= chain.len())
             .find_map(|len| ids.by_prefix.get(&(len, chain[len - 1])).map(|e| e.id));
         if let Some(id) = found {
-            return Some(id);
+            let Some(at) = ids.departure(id, chain) else {
+                ids.extend(id, chain);
+                return Some(id);
+            };
+            // The same opening, then elsewhere: a conversation of its own,
+            // registered at the first message where the two differ so that
+            // its later turns match it rather than the one it opened like.
+            let fork = chain[at];
+            ids.insert(at + 1, fork, fork);
+            ids.extend(fork, chain);
+            return Some(fork);
         }
         ids.insert(chain.len(), newest, newest);
+        ids.extend(newest, chain);
         Some(newest)
     }
 

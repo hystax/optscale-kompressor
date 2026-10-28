@@ -2276,6 +2276,63 @@ mod tests {
     }
 
     #[test]
+    fn identical_openings_that_part_are_two_conversations() {
+        // Three attempts of one Harbor task open byte-identically. Filed as
+        // one conversation, the later attempts inherited the first one's
+        // cache-lifetime flag and wrote one-hour entries from their first
+        // request.
+        let tracker = prefixcache::PrefixTracker::new(Duration::ZERO);
+        let identify = |texts: &[String]| {
+            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            tracker.identify(&prefixcache::identity_chain(&refs))
+        };
+        let attempt = |name: &str, turns: usize| {
+            let mut texts = vec!["preamble".to_string(), "the task".to_string()];
+            for turn in 0..turns {
+                texts.push(format!("{name} call {turn}"));
+                texts.push(format!("{name} result {turn}"));
+            }
+            texts
+        };
+
+        let first = identify(&attempt("a", 0));
+        assert_eq!(identify(&attempt("a", 4)), first);
+        // Its opening alone cannot be told apart, and nothing has parted yet.
+        assert_eq!(identify(&attempt("b", 0)), first);
+
+        let second = identify(&attempt("b", 1));
+        assert_ne!(second, first, "a departure is another conversation");
+        for turns in 2..6 {
+            assert_eq!(identify(&attempt("b", turns)), second, "turn {turns}");
+            assert_eq!(identify(&attempt("a", turns + 4)), first, "turn {turns}");
+        }
+        let third = identify(&attempt("c", 1));
+        assert!(third != first && third != second);
+    }
+
+    #[test]
+    fn a_rewritten_tail_is_still_the_same_conversation() {
+        // The one rewrite measured in 958 requests reached two messages back.
+        let tracker = prefixcache::PrefixTracker::new(Duration::ZERO);
+        let identify = |texts: &[&str]| tracker.identify(&prefixcache::identity_chain(texts));
+        let id = identify(&["preamble", "task"]);
+        assert_eq!(
+            identify(&["preamble", "task", "call", "result", "reminder"]),
+            id
+        );
+        assert_eq!(
+            identify(&["preamble", "task", "call", "retried", "reminder"]),
+            id
+        );
+        assert_eq!(
+            identify(&["preamble", "task", "call", "retried", "reminder", "next"]),
+            id
+        );
+        // A replay of an earlier turn is not a departure either.
+        assert_eq!(identify(&["preamble", "task", "call"]), id);
+    }
+
+    #[test]
     fn a_conversation_that_opens_inside_anothers_preamble_is_told_apart() {
         // Deepest match wins. A conversation first seen at two messages must
         // not swallow one that opens with the same two and goes elsewhere.

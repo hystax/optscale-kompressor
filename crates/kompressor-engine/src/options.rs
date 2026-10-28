@@ -68,6 +68,20 @@ pub struct EngineOptions {
     /// which is the sign of a default in the wrong place.
     pub max_ref_bytes: usize,
 
+    /// In `recoverable` mode, a payload whose compression leaves a handle but
+    /// saves fewer characters than this ships whole instead. 0 turns it off.
+    ///
+    /// A handle is an invitation to fetch, and a fetch is a whole extra model
+    /// round. Where re-sent content is billed as cache reads, a small elision
+    /// saves less than one fetch costs. On Claude Opus 5.5 across ten
+    /// recoverable Harbor runs, tool results that saved under 4,000 characters
+    /// were fetched back 30% of the time: 402 of 535 handle-bearing results
+    /// accounted for 20% of what compression saved and 114 of 265 fetch rounds.
+    /// Shipping those whole came out about $1.3 ahead across the ten runs at
+    /// $0.03 a round, and stayed ahead at $0.02. Markers without a handle are
+    /// not gated: nothing can be fetched through them.
+    pub min_elision_saving_chars: usize,
+
     pub enable_smart_crusher: bool,
     pub enable_search_compressor: bool,
     pub enable_log_compressor: bool,
@@ -351,6 +365,7 @@ impl Default for EngineOptions {
             ref_ttl_seconds: 3600,
             ref_max_lifetime_multiplier: 8,
             max_ref_bytes: 1024 * 1024,
+            min_elision_saving_chars: 0,
             enable_smart_crusher: true,
             enable_search_compressor: true,
             enable_log_compressor: true,
@@ -469,6 +484,7 @@ pub struct EngineOptionsPatch {
     pub keep_tail_lines: Option<usize>,
     pub ref_ttl_seconds: Option<u64>,
     pub max_ref_bytes: Option<usize>,
+    pub min_elision_saving_chars: Option<usize>,
     pub enable_smart_crusher: Option<bool>,
     pub enable_search_compressor: Option<bool>,
     pub enable_log_compressor: Option<bool>,
@@ -520,6 +536,7 @@ impl EngineOptionsPatch {
             keep_tail_lines,
             ref_ttl_seconds,
             max_ref_bytes,
+            min_elision_saving_chars,
             enable_smart_crusher,
             enable_search_compressor,
             enable_log_compressor,

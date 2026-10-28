@@ -170,6 +170,11 @@ pub struct RefCollector {
     /// fragment limit cost this payload anything", whether that cost was the
     /// whole compression or one fold group that stayed inline.
     oversized_refusals: usize,
+    /// Payloads shipped whole by `min_elision_saving_chars`. Sticky like
+    /// `oversized_refusals`, and for the same reason: the gate rolls back
+    /// everything the payload stashed, so nothing else is left to say why it
+    /// went out uncompressed.
+    gated: usize,
 }
 
 /// A point to roll a collector back to.
@@ -197,6 +202,7 @@ impl RefCollector {
             seen: HashSet::new(),
             oversized_attempts: 0,
             oversized_refusals: 0,
+            gated: 0,
         }
     }
 
@@ -210,6 +216,7 @@ impl RefCollector {
             seen: HashSet::new(),
             oversized_attempts: 0,
             oversized_refusals: 0,
+            gated: 0,
         }
     }
 
@@ -290,6 +297,15 @@ impl RefCollector {
         self.oversized_refusals += other.oversized_refusals;
     }
 
+    /// Payloads `min_elision_saving_chars` has shipped whole so far.
+    pub fn gated(&self) -> usize {
+        self.gated
+    }
+
+    pub(crate) fn note_gated(&mut self) {
+        self.gated += 1;
+    }
+
     pub fn forgive_oversized(&mut self) {
         self.oversized_attempts = self.oversized_attempts.saturating_sub(1);
     }
@@ -322,6 +338,7 @@ impl RefCollector {
             seen: HashSet::new(),
             oversized_attempts: 0,
             oversized_refusals: 0,
+            gated: 0,
         }
     }
 
@@ -332,6 +349,7 @@ impl RefCollector {
     pub fn adopt(&mut self, other: RefCollector) {
         self.oversized_attempts += other.oversized_attempts;
         self.oversized_refusals += other.oversized_refusals;
+        self.gated += other.gated;
         for (_, fragment) in other.pairs {
             self.stash(&fragment);
         }

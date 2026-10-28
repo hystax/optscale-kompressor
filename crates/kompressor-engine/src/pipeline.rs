@@ -104,6 +104,17 @@ pub fn compress_content<'a>(
         applied.truncate(applied_before);
         return (Cow::Borrowed(content), None);
     }
+    if refs.is_enabled()
+        && result.1.is_some()
+        && chars_len(content).saturating_sub(chars_len(&result.0)) < opts.min_elision_saving_chars
+        && !crate::refs::refs_in(&result.0).is_empty()
+    {
+        // Worth less than the fetch it invites: see `min_elision_saving_chars`.
+        refs.rollback(mark);
+        refs.note_gated();
+        applied.truncate(applied_before);
+        return (Cow::Borrowed(content), None);
+    }
     result
 }
 
@@ -221,6 +232,12 @@ fn lift_gutter(
 
     let mut inner_opts = opts.clone();
     inner_opts.enable_line_gutter = false;
+    // The body is a file the agent read by line number, and the segmenter is
+    // not for those (`mixed::has_mixed_content` refuses the numbered form for
+    // the same reason). With the column off it no longer looks numbered, so
+    // the refusal has to be carried in here: a README read this way had the
+    // list inside it sampled down to 70 entries omitted.
+    inner_opts.enable_mixed_content = false;
     // Two lines that are byte-identical *once the column is off* were not
     // identical in the payload — their numbers differed, which is the whole
     // point of a line number. A bare `[×N]` says "this exact line, N times",
@@ -335,20 +352,6 @@ fn lift_gutter(
     }
 }
 
-/// Whether `content` is a source file behind a line-number gutter — `cat -n`,
-/// or Claude Code's `Read`.
-///
-/// The segmenter must not have it. Its dump-row rule reads a decimal gutter as
-/// offsets, so a numbered file is one long "listing" to it and has rows
-/// dropped: sixty Rust functions came back with seven signatures, while the
-/// same file unnumbered shipped whole. Detection already lifts the gutter
-/// before it classifies anything; this asks the same question here.
-fn numbered_source(content: &str, role: &str, opts: &EngineOptions) -> bool {
-    crate::gutter::split_line_gutter(content).is_some_and(|gutter| {
-        detect_result(&gutter.body, role, opts).content_type == ContentType::SourceCode
-    })
-}
-
 /// Route one body, arbitrating between the segmenter and whole-message routing.
 ///
 /// A heterogeneous body has two readings and they are not ordered by quality.
@@ -384,11 +387,7 @@ fn route<'a>(
     }
 
     let mut mixed_candidate: Option<(String, Kind, Vec<Kind>, RefCollector)> = None;
-    if forced.is_none()
-        && opts.enable_mixed_content
-        && !numbered_source(content, role, opts)
-        && has_mixed_content(content, opts)
-    {
+    if forced.is_none() && opts.enable_mixed_content && has_mixed_content(content, opts) {
         let mut scratch = refs.scratch();
         if let Some((out, subtypes)) = guarded(|| crush_mixed(content, opts, ctx, &mut scratch))
             && chars_len(&out) < chars_len(content)
@@ -1452,6 +1451,244 @@ mod fold_fallback_tests {
 #[cfg(all(test, feature = "code-aware"))]
 mod lead_in_tests {
     use super::*;
+
+    fn compress(content: &str, opts: &EngineOptions) -> (String, RefCollector) {
+        let mut refs = opts.collector();
+        let mut applied = Vec::new();
+        let ctx = Context::for_role("tool");
+        let (out, _) = compress_content(content, "tool", opts, None, &mut refs, &ctx, &mut applied);
+        (out.into_owned(), refs)
+    }
+
+    fn recoverable(enable_code_aware: bool) -> EngineOptions {
+        EngineOptions {
+            mode: Mode::Recoverable,
+            enable_code_aware,
+            ..Default::default()
+        }
+    }
+
+    /// `objdump -d` as it prints by default: address, raw bytes, instruction.
+    /// `per_function` matters: the segmenter samples only a long run of rows,
+    /// and a function of a few dozen instructions is what it used to take.
+    fn objdump(functions: usize, per_function: usize) -> String {
+        let insns = [
+            ("f3 0f 1e fa", "endbr64"),
+            ("48 83 ec 78", "sub    rsp,0x78"),
+            ("f3 0f 10 54 24 60", "movss  xmm2,DWORD PTR [rsp+0x60]"),
+            ("0f 28 c2", "movaps xmm0,xmm2"),
+            ("f3 0f 59 c2", "mulss  xmm0,xmm2"),
+            ("66 0f ef db", "pxor   xmm3,xmm3"),
+            ("0f 2f d9", "comiss xmm3,xmm1"),
+            ("e8 4b 00 00 00", "call   402020 <vector_dot>"),
+            ("48 83 c4 78", "add    rsp,0x78"),
+            ("c3", "ret"),
+        ];
+        let mut out = vec![
+            "vec:     file format elf64-x86-64".to_string(),
+            String::new(),
+            "Disassembly of section .text:".to_string(),
+        ];
+        let mut addr = 0x401090;
+        for f in 0..functions {
+            out.push(String::new());
+            out.push(format!("{addr:016x} <fn_{f}>:"));
+            for (bytes, insn) in insns.iter().cycle().take(per_function) {
+                out.push(format!("  {addr:x}:\t{bytes:<21}\t{insn}"));
+                addr += 4;
+            }
+        }
+        out.join("\n")
+    }
+
+    /// The fixed run's remaining failure: disassembly the detector named
+    /// correctly, sampled anyway by the segmenter, whose dump-row rule reads
+    /// `401090:` as an offset. Four fetches of one function in one task.
+    #[test]
+    fn a_disassembly_with_addresses_ships_whole_through_every_route() {
+        let dump = objdump(2, 120);
+        for enable_code_aware in [true, false] {
+            let opts = recoverable(enable_code_aware);
+            let (out, refs) = compress(&dump, &opts);
+            assert_eq!(out, dump, "whole, code-aware {enable_code_aware}");
+            assert!(refs.is_empty());
+
+            // numbered, the way `cat -n dis.txt` or Claude Code's Read shows it
+            let numbered: String = dump
+                .lines()
+                .enumerate()
+                .map(|(n, line)| format!("{:6}\t{line}\n", n + 294))
+                .collect();
+            let (out, _) = compress(&numbered, &opts);
+            assert_eq!(out, numbered, "numbered, code-aware {enable_code_aware}");
+        }
+    }
+
+    #[test]
+    fn a_disassembly_inside_compound_output_keeps_every_instruction() {
+        // `file x; objdump -d x; ls /usr/lib` in one call: the listing may be
+        // sampled, the instructions may not.
+        let names: String = (0..400)
+            .map(|i| format!("libmodule_{i:03}.so.1\n"))
+            .collect();
+        let dump = objdump(1, 90);
+        let content = format!(
+            "Checking the binary first, then its neighbours.\n\n{dump}\n\nThe libraries next to it:\n{names}"
+        );
+        let (out, _) = compress(&content, &recoverable(false));
+        for line in dump.lines().filter(|l| l.contains(":\t")) {
+            assert!(out.contains(line), "instruction dropped: {line:?}");
+        }
+        assert!(
+            out.len() < content.len(),
+            "the listing beside it still compresses"
+        );
+    }
+
+    #[test]
+    fn a_numbered_file_read_is_never_row_sampled() {
+        // Claude Code's Read of a README: the agent asked for these lines by
+        // number, and the segmenter used to drop 1,831 of them.
+        // Prose of varied shape, which the whole-message route reads as text
+        // and keeps in place; the list inside it is the section the segmenter
+        // sampled.
+        let prose = [
+            "This directory contains a number of test programs demonstrating various features.",
+            "Each program prints its result, and the expected output sits beside it.",
+            "Run them with the interpreter; a mismatch is reported as FAIL with a diff.",
+            "Tail calls must not grow the stack.",
+            "Some programs read from standard input, so pipe the matching .in file to them.",
+            "Errors are expected in a few cases and are part of the output that is compared.",
+            "Numbers print in their shortest exact form.",
+            "Strings print without quotes unless written with write rather than display.",
+        ];
+        let mut body = String::from("# Scheme Interpreter Test Suite\n\n");
+        for i in 0..96 {
+            body.push_str(prose[i % prose.len()]);
+            body.push_str(if i % 4 == 3 { "\n\n" } else { "\n" });
+        }
+        body.push_str("The programs:\n");
+        for i in 0..80 {
+            body.push_str(&format!("test/{i:02}-case-{i}.scm\n"));
+        }
+        let numbered: String = body
+            .lines()
+            .enumerate()
+            .map(|(n, line)| format!("{:6}\t{line}\n", n + 1))
+            .collect();
+        let (out, _) = compress(&numbered, &recoverable(false));
+        assert!(
+            !out.contains("entries omitted"),
+            "rows were sampled out of a file read"
+        );
+        // What may still happen is the in-place fold: a run of consecutive
+        // lines differing only in a number keeps its first line and a handle,
+        // where it stood. Every line of prose stays.
+        for line in body
+            .lines()
+            .filter(|l| l.ends_with('.') || l.starts_with('#'))
+        {
+            assert!(
+                out.contains(line),
+                "prose dropped from a file read: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn listing_sampling_off_reaches_the_segmenter_too() {
+        let names: String = (0..400)
+            .map(|i| format!("src/module_{i:03}/mod.rs\n"))
+            .collect();
+        let compound =
+            format!("Here is what the repository holds:\n{names}\nand that is all of it.\n");
+        let whole = names.clone();
+        let on = recoverable(false);
+        let off = EngineOptions {
+            enable_listing_compressor: false,
+            ..recoverable(false)
+        };
+        for (name, content) in [("compound", &compound), ("whole", &whole)] {
+            let (sampled, _) = compress(content, &on);
+            assert!(
+                sampled.contains("entries omitted"),
+                "{name}: the fixture must sample when on"
+            );
+            let (kept, refs) = compress(content, &off);
+            assert!(
+                !kept.contains("entries omitted"),
+                "{name}: sampled with the switch off"
+            );
+            assert!(refs.is_empty() || !kept.contains("ref:k_"), "{name}");
+        }
+    }
+
+    fn names(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("src/module_{i:03}/mod.rs\n"))
+            .collect()
+    }
+
+    fn gated(min_elision_saving_chars: usize) -> EngineOptions {
+        EngineOptions {
+            min_elision_saving_chars,
+            ..recoverable(false)
+        }
+    }
+
+    #[test]
+    fn an_elision_worth_less_than_the_gate_ships_whole() {
+        let small = names(60);
+        let (sampled, refs) = compress(&small, &gated(0));
+        let saved = small.len() - sampled.len();
+        assert!(
+            sampled.contains("ref:k_") && !refs.is_empty() && saved < 4000,
+            "the fixture must elide with a handle and save under the gate: saved {saved}"
+        );
+        let (kept, refs) = compress(&small, &gated(4000));
+        assert_eq!(kept, small, "shipped whole");
+        assert!(refs.is_empty(), "and retained nothing to fetch");
+    }
+
+    #[test]
+    fn an_elision_worth_more_than_the_gate_still_happens() {
+        let large = names(400);
+        let (sampled, refs) = compress(&large, &gated(4000));
+        assert!(large.len() - sampled.len() >= 4000);
+        assert!(sampled.contains("entries omitted") && !refs.is_empty());
+        assert_eq!(
+            sampled,
+            compress(&large, &gated(0)).0,
+            "and is unchanged by it"
+        );
+    }
+
+    #[test]
+    fn the_gate_leaves_compression_without_a_handle_alone() {
+        // Nothing can be fetched through a marker without a handle, so it
+        // invites no round and a small saving from one is still a saving.
+        let lossless = EngineOptions {
+            mode: Mode::Lossless,
+            ..gated(4000)
+        };
+        let small = names(60);
+        let (out, _) = compress(&small, &lossless);
+        let (ungated, _) = compress(
+            &small,
+            &EngineOptions {
+                mode: Mode::Lossless,
+                ..gated(0)
+            },
+        );
+        assert_eq!(out, ungated);
+        let repeated = "connection refused\n".repeat(60);
+        let (folded, refs) = compress(&repeated, &gated(4000));
+        assert!(
+            folded.len() < repeated.len() && !folded.contains("ref:k_") && refs.is_empty(),
+            "the fixture must fold without a handle: {folded}"
+        );
+        assert_eq!(folded, compress(&repeated, &gated(0)).0);
+    }
 
     /// The 89-task run's failure: a disassembly reached the plain-text fold,
     /// came back as `movss xmm10,DWORD PTR [rsp+0x90] [×46 similar …]`, and the
