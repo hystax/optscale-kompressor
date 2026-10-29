@@ -76,9 +76,61 @@ struct Identity {
 struct Identities {
     by_prefix: HashMap<(usize, u64), Identity>,
     lengths: BTreeMap<usize, usize>,
+    /// The longest history each conversation has sent, as its identity
+    /// chain. What [`PrefixTracker::identify`] checks a match against: a
+    /// request that departs from it is another conversation that opened the
+    /// same way.
+    history: HashMap<u64, (Vec<u64>, Instant)>,
 }
 
+/// How far from the end of a conversation's history a request may differ and
+/// still be that conversation.
+///
+/// A later turn appends, so a departure is almost always another conversation.
+/// Measured on the 89-task gate run, comparing message text the way the chain
+/// does: one request in 958 rewrote its own history, two messages from the
+/// end. Three attempts of one Harbor task, by contrast, open identically and
+/// part after their second message, which merged them into one conversation
+/// that shared a cache-lifetime flag, a freeze watermark and a fetch history.
+const TAIL_REWRITE: usize = 2;
+
 impl Identities {
+    /// Note `chain` as `id`'s history when it extends, or rewrites the tail
+    /// of, the longest one seen; a shorter replay of it changes nothing.
+    fn extend(&mut self, id: u64, chain: &[u64]) {
+        if self.history.len() >= REMEMBER
+            && !self.history.contains_key(&id)
+            && let Some(&oldest) = self
+                .history
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(id, _)| id)
+        {
+            self.history.remove(&oldest);
+        }
+        let entry = self
+            .history
+            .entry(id)
+            .or_insert_with(|| (Vec::new(), Instant::now()));
+        if chain.len() >= entry.0.len() {
+            entry.0 = chain.to_vec();
+        }
+        entry.1 = Instant::now();
+    }
+
+    /// Where `chain` parts from `id`'s history, when it parts too early to be
+    /// a rewrite of its tail. `None` for an extension, a replay of an earlier
+    /// turn, a tail rewrite, or a conversation with no history on record.
+    fn departure(&self, id: u64, chain: &[u64]) -> Option<usize> {
+        let (history, _) = self.history.get(&id)?;
+        let common = history
+            .iter()
+            .zip(chain)
+            .take_while(|(a, b)| a == b)
+            .count();
+        (common < chain.len() && common + TAIL_REWRITE < history.len()).then_some(common)
+    }
+
     fn insert(&mut self, len: usize, hash: u64, id: u64) {
         if self.by_prefix.len() >= REMEMBER
             && let Some((&key, _)) = self.by_prefix.iter().min_by_key(|(_, entry)| entry.at)
@@ -668,6 +720,20 @@ impl PrefixTracker {
         entry.idled_past_ttl
     }
 
+    /// A keep-warm ping just read this conversation's prefix from cache.
+    ///
+    /// The prefix was used, so the clock that decides whether the conversation
+    /// sat idle past the provider's TTL starts again. Without this a pause the
+    /// pings bridged would still flip `CacheTtl::Adaptive` to one-hour entries,
+    /// paying for the very lapse they prevented.
+    pub fn kept_warm(&self, fingerprint: u64) {
+        if let Ok(mut seen) = self.seen.lock()
+            && let Some(entry) = seen.get_mut(&fingerprint)
+        {
+            entry.at = Instant::now();
+        }
+    }
+
     /// Pin fragments the engine has shipped whole, so the decision is not
     /// re-taken against a bar that has since moved.
     pub fn record_inlined(&self, conversation: Option<u64>, ids: &[RefId]) {
@@ -846,6 +912,12 @@ impl PrefixTracker {
     /// Deepest match wins, so a conversation that opened inside another's
     /// preamble is still recognised as itself.
     ///
+    /// Two conversations that open identically match one entry, and are told
+    /// apart at the first request that departs from the history the entry's
+    /// conversation has sent: that request is filed as a new conversation,
+    /// registered at the message where the two part. Their very first request
+    /// cannot be told apart, and is filed under the earlier one.
+    ///
     /// `None` only for an empty chain. A poisoned lock degrades to the
     /// first-sight hash, which is stable for as long as the lock stays broken.
     pub fn identify(&self, chain: &[u64]) -> Option<u64> {
@@ -861,9 +933,20 @@ impl PrefixTracker {
             .filter(|&len| len <= chain.len())
             .find_map(|len| ids.by_prefix.get(&(len, chain[len - 1])).map(|e| e.id));
         if let Some(id) = found {
-            return Some(id);
+            let Some(at) = ids.departure(id, chain) else {
+                ids.extend(id, chain);
+                return Some(id);
+            };
+            // The same opening, then elsewhere: a conversation of its own,
+            // registered at the first message where the two differ so that
+            // its later turns match it rather than the one it opened like.
+            let fork = chain[at];
+            ids.insert(at + 1, fork, fork);
+            ids.extend(fork, chain);
+            return Some(fork);
         }
         ids.insert(chain.len(), newest, newest);
+        ids.extend(newest, chain);
         Some(newest)
     }
 
@@ -1214,6 +1297,35 @@ mod tests {
         assert!(
             tracker.long_ttl(9),
             "and the flag survives the response being recorded"
+        );
+    }
+
+    /// A pause a keep-warm ping bridged is not a pause: the cache was read
+    /// during it, so `CacheTtl::Adaptive` must not pay for one-hour entries.
+    #[test]
+    fn a_pause_kept_warm_does_not_switch_to_an_hour() {
+        let tracker = PrefixTracker::new(Duration::from_secs(0));
+        tracker.floor(9, 1);
+        let idle = |tracker: &PrefixTracker| {
+            let mut seen = tracker.seen.lock().unwrap();
+            seen.get_mut(&9).unwrap().at = Instant::now() - Duration::from_secs(301);
+        };
+        idle(&tracker);
+        tracker.kept_warm(9);
+        assert!(!tracker.long_ttl(9), "the ping read the prefix just now");
+
+        idle(&tracker);
+        assert!(tracker.long_ttl(9), "without one, the same pause switches");
+        tracker.kept_warm(9);
+        assert!(
+            tracker.long_ttl(9),
+            "and a ping later does not take the switch back"
+        );
+
+        tracker.kept_warm(42);
+        assert!(
+            !tracker.long_ttl(42),
+            "a conversation never seen is not created by a ping"
         );
     }
 

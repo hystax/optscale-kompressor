@@ -6,9 +6,21 @@
 # `$HOME` next to wherever the process happens to be running. Expansion
 # therefore happens at install time, here, and never in the TOML.
 
+# Serves Codex (HTTP and the websocket relay) and Claude (Claude Code on the
+# base URL, Claude Desktop through the TLS intercept below), each with the
+# settings measured for it. Anthropic-only settings sit under
+# [proxy.providers.anthropic]; Codex runs on the deployment defaults.
+#
+# Codex:          OPENAI_BASE_URL=http://127.0.0.1:8817/v1   (or `kompressor wrap codex`)
+# Claude Code:    ANTHROPIC_BASE_URL=http://127.0.0.1:8817    (or `kompressor wrap claude`)
+# Claude Desktop: HTTPS_PROXY=http://127.0.0.1:8840 and NODE_EXTRA_CA_CERTS set
+#                 to ca.pem under `ca_path` (docs/CLAUDE-DESKTOP.md)
+
 [server]
 listen = "127.0.0.1:8817"
 
+# Deployment defaults: what Codex traffic runs under. Code elision on, the
+# client's own cache markers, the provider's default cache lifetime.
 [engine]
 mode = "recoverable"
 # The 64 KiB default drops recoverability on exactly the payloads worth
@@ -28,43 +40,41 @@ level = "info"
 format = "json"
 
 [proxy]
-# Anthropic clients pin `cache_control` on the final message, and under the
-# default marker rule that freezes the whole conversation -- nothing is removed.
-# `first_seen` freezes only as far as the provider's cache already reached.
-# It changes what the provider is billed for, so it is named here rather than
-# left to a default.
-frozen_prefix = "first_seen"
-
-# How long Anthropic keeps the cache entries a request writes. "adaptive" asks
-# for one hour once a conversation has paused past the provider's five minutes,
-# which an agent waiting on a long build does; it is estimated at 5-9% cheaper
-# on such workloads and is being measured. "1h" asks on every request and costs
-# more than it saves where pauses are rare. It changes what the provider bills,
-# so it is written out rather than left to the default.
+retrieve_tool = "auto"
+frozen_prefix = "marker"
 cache_ttl = "default"
-
-# Any of the settings above, and any engine option, can be set for one
-# provider's traffic only: "anthropic" (Messages) or "openai" (Chat Completions
-# and Responses). What Claude Code was measured to need is not what Codex
-# needs, so a proxy serving both can scope it (DESIGN.md §12.11):
-#
-#   [proxy.providers.anthropic]
-#   cache_ttl = "adaptive"
-#   frozen_prefix = "first_seen"
-#
-#   [proxy.providers.anthropic.engine]
-#   enable_code_aware = false
-
 # Codex opens ws://.../v1/responses before trying HTTPS, and a ChatGPT-plan
-# session cannot be told not to. Relaying that upgrade is what makes such a
-# session compressible; refusing it costs about thirteen seconds of retries per
-# session and compresses nothing.
+# session cannot be told not to. Relaying it is what keeps such a session on
+# this proxy, compressed. Refusing it costs about thirteen seconds of retries
+# per session and compresses nothing.
 #
 # Written out rather than left to the default, which is `true`: commenting this
 # key out does not disable the relay, it only hides which way it is set.
 websocket_relay = true
 
-# --- Claude Desktop's Code tab ------------------------------------
+# --- Claude: provider-specific settings (DESIGN.md §12.11) -----------------
+# Applies to every Anthropic Messages request, whether it arrives on the base
+# URL (Claude Code CLI) or through the intercept below (Claude Desktop), and to
+# nothing else. Measured on Claude Opus 5.5:
+#   * retrieve_tool "always": changing the tool list mid-conversation would
+#     throw away Anthropic's cached prefix.
+#   * frozen_prefix "first_seen": Claude Code pins cache_control on the final
+#     message, so the marker rule would freeze the whole conversation.
+#   * cache_ttl "adaptive": one-hour cache entries once a conversation has
+#     paused past five minutes.
+#   * no function-body elision: bodies were fetched back 71% of the time.
+#   * no elision saving under 4,000 characters: worth less than the retrieve
+#     round it invites.
+[proxy.providers.anthropic]
+retrieve_tool = "always"
+frozen_prefix = "first_seen"
+cache_ttl = "adaptive"
+
+[proxy.providers.anthropic.engine]
+enable_code_aware = false
+min_elision_saving_chars = 4000
+
+# --- Claude Desktop's Code tab: TLS intercept ----------------------------
 # Desktop overwrites ANTHROPIC_BASE_URL when it spawns a session, so there is no
 # base URL to point at this proxy. It does honour HTTPS_PROXY and a custom CA.
 #
@@ -86,11 +96,13 @@ websocket_relay = true
 listen = "127.0.0.1:8840"
 intercept_hosts = ["api.anthropic.com"]
 ca_path = "@STATE@/ca"
-# h2 is required: Desktop's client offers only h2 for api.anthropic.com, and a
-# listener advertising http/1.1 alone fails the handshake in a way that looks
-# exactly like an untrusted certificate.
+# h2 is required: Desktop offers only h2 for api.anthropic.com, and a listener
+# advertising http/1.1 alone fails the handshake like an untrusted certificate.
 alpn = ["h2", "http/1.1"]
 
+# --- OpenAI / Codex -------------------------------------------------------
+# API-key callers go to api.openai.com; ChatGPT-plan callers are recognised by
+# their credential and sent to chatgpt.com instead, websocket included.
 [[proxy.upstreams]]
 name = "openai"
 path_prefix = "/v1"
@@ -98,12 +110,11 @@ base_url = "https://api.openai.com"
 api_family = "openai"
 forward_auth = true
 
-# Where the same mount goes when the caller pays by subscription.
 [proxy.upstreams.subscription]
 base_url = "https://chatgpt.com"
 rewrite_prefix = "/backend-api/codex"
 
-# Explicit ChatGPT route for desktop clients; avoids user-agent classification.
+# Codex desktop on a ChatGPT plan calls this path directly.
 [[proxy.upstreams]]
 name = "codex-desktop-chatgpt"
 path_prefix = "/backend-api/codex"
@@ -112,11 +123,21 @@ strip_prefix = false
 api_family = "openai"
 forward_auth = true
 
-# --- Anthropic ---------------------------------------------------------------
+# The rest of the ChatGPT surface (rate limits, identity, token refresh),
+# forwarded untouched. A 404 here makes Codex drop the subscription.
+[[proxy.upstreams]]
+name = "chatgpt-rest"
+path_prefix = "/backend-api"
+base_url = "https://chatgpt.com"
+api_family = "passthrough"
+forward_auth = true
+
+# --- Anthropic / Claude ---------------------------------------------------
 # Claude takes the longer prefix, Codex keeps /v1. That way round because
 # `rewrite_prefix` replaces the matched mount prefix: a mount on /v1/responses
 # leaves an empty tail and a subscription request reaches chatgpt.com as
-# /backend-api/codex/ -- a 404 that reads like a broken login.
+# /backend-api/codex/ -- a 404 that reads like a broken login. Longer prefixes
+# win, so /v1/messages lands here rather than on "openai".
 [[proxy.upstreams]]
 name = "anthropic"
 path_prefix = "/v1/messages"
@@ -124,7 +145,7 @@ base_url = "https://api.anthropic.com"
 api_family = "anthropic"
 forward_auth = true
 
-# A Claude session also probes /api/hello and signs in through /api/oauth/*.
+# Claude also probes /api/hello and signs in through /api/oauth/*.
 # Without this mount it takes a 404 from the proxy mid-session.
 [[proxy.upstreams]]
 name = "anthropic-api"

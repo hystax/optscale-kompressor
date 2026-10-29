@@ -629,6 +629,9 @@ pub struct CompressStats {
     /// * `declined:<type>` — the compressors ran on content detected as
     ///   `<type>` and none of them shrank it. This is the key that answers the
     ///   diff question.
+    /// * `below_min_saving` — it compressed, and `min_elision_saving_chars`
+    ///   shipped it whole: the handle would have invited a fetch worth more
+    ///   than the characters it saved.
     /// * `retrieved_before` — it compressed, and the compression was thrown
     ///   away because it would have re-elided a fragment the model already
     ///   fetched back. Not a decline: the engine could have taken these tokens
@@ -884,6 +887,7 @@ pub fn compress_messages(
         let stale = matches!(read_states.get(&index), Some(ReadState::Stale));
         let mut compressed_here = false;
         let mut applied: Vec<Kind> = Vec::new();
+        let gated_before = refs.gated();
 
         // Only cloned when there is something to check against, because the
         // overwhelming majority of requests have retrieved nothing.
@@ -1157,6 +1161,10 @@ pub fn compress_messages(
             stats.skipped_messages += 1;
             let reason = if kept_inline {
                 "retrieved_before".to_string()
+            } else if refs.gated() > gated_before {
+                // The compressors succeeded and the gate shipped the result
+                // whole; `declined:<type>` would say they had failed.
+                "below_min_saving".to_string()
             } else {
                 decline_reason(&messages[index].content, &role, opts)
             };
@@ -2666,5 +2674,30 @@ mod skip_reason_tests {
             &mut refs,
         );
         assert_eq!(stats.skipped_by_reason.get("below_min_chars"), Some(&1));
+    }
+
+    #[test]
+    fn a_payload_the_saving_gate_ships_whole_says_so_rather_than_declining() {
+        // The compressors succeeded on it; the gate threw the result away.
+        let listing: String = (0..60)
+            .map(|i| format!("src/module_{i:03}/mod.rs\n"))
+            .collect();
+        let run = |min_elision_saving_chars| {
+            let mut refs = RefCollector::new(1 << 20);
+            let mut messages = vec![msg("tool", &listing)];
+            let opts = EngineOptions {
+                min_elision_saving_chars,
+                ..opts()
+            };
+            compress_messages(&mut messages, &opts, &RequestOptions::default(), &mut refs)
+        };
+        assert_eq!(run(0).compressed_messages, 1, "the fixture must compress");
+
+        let gated = run(4000);
+        assert_eq!(gated.compressed_messages, 0);
+        assert_eq!(
+            gated.skipped_by_reason.keys().collect::<Vec<_>>(),
+            ["below_min_saving"]
+        );
     }
 }

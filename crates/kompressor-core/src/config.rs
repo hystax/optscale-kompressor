@@ -416,6 +416,55 @@ pub struct ProxyConfig {
     pub frozen_prefix: FrozenPrefix,
     /// The cache TTL Anthropic requests ask for. See [`CacheTtl`].
     pub cache_ttl: CacheTtl,
+    /// Keep an Anthropic conversation's cached prefix alive while the client
+    /// is busy running a tool. **Off by default.**
+    ///
+    /// An agent that waits on a long build or test run outlives the provider's
+    /// five-minute cache entry, and its next request writes the whole
+    /// conversation again at 25x the price of reading it. A read refreshes the
+    /// entry, so after a response that stopped on `tool_use` (or on `end_turn`
+    /// with a background task running, under
+    /// [`Self::cache_keep_warm_background_pings`]) the proxy re-sends
+    /// that request every [`Self::cache_keep_warm_interval`] with `max_tokens`
+    /// of 1 until the client's next request arrives, at most
+    /// [`Self::cache_keep_warm_max_pings`] times. Each ping is billed as cache
+    /// reads plus one output token, and is filed as its own `proxy_requests`
+    /// row with `keep_warm = 1` so the cost is in the bill.
+    ///
+    /// Replayed over the request logs of seven 89-task Harbor runs on Claude
+    /// Opus 5.5, it would have saved $1.84–$3.00 per run (5–9%) against what
+    /// expiry and one-hour writes actually cost, net of $0.34–$0.58 of pings.
+    /// Measured live on one such run: cache-write spend per agent step −20% and
+    /// cache-loss turns 13 → 2, for 25 pings costing $0.15.
+    ///
+    /// Anthropic only: OpenAI does not bill cache writes. Not armed for a
+    /// request that asked for one-hour entries, which do not need it, nor for
+    /// one whose `thinking` has a token budget, since `max_tokens` cannot go
+    /// below the budget without changing the cache key.
+    pub cache_keep_warm: bool,
+    /// How long after the cached request started the first keep-warm ping goes
+    /// out, and after each ping the next. Below the provider's five-minute TTL
+    /// with room for a slow ping, which is why the shipped 270s is not 299s;
+    /// zero and anything from five minutes up are rejected.
+    #[serde(with = "humantime_serde")]
+    pub cache_keep_warm_interval: Duration,
+    /// The most pings one wait may send: 11 at 270s is about 50 minutes, which
+    /// covers every pause in those seven runs bar one (4,924 s, of 192).
+    pub cache_keep_warm_max_pings: u32,
+    /// The most pings for a wait on a background task, and `0` to not keep
+    /// those warm at all.
+    ///
+    /// Claude Code can run a command in the background and end its turn on
+    /// `end_turn`; the model is woken by a notification when the job is done.
+    /// Those waits are kept warm too, while the conversation has a background
+    /// task it has started and not yet been told has finished. In the second
+    /// keep-warm run they were 13 of 30 pauses past five minutes, every one a
+    /// miss. The cap is lower than [`Self::cache_keep_warm_max_pings`] because
+    /// this wait can be a dead end: an agent that gives its final answer with a
+    /// job still running never sends another request, and 0–4 conversations a
+    /// run did. Four pings, about 20 minutes, covered 45 of the 48 such waits
+    /// past 270 s across four 89-task runs.
+    pub cache_keep_warm_background_pings: u32,
     /// How many retrieve rounds may be **answered** in one request.
     ///
     /// The metric counts one more than this. Reaching the cap does not end the
@@ -670,6 +719,8 @@ pub struct ProviderOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_ttl: Option<CacheTtl>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_keep_warm: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_read: Option<bool>,
     /// Engine options, any of `[engine]`'s that a request may override.
     #[serde(skip_serializing_if = "patch_is_empty")]
@@ -697,6 +748,7 @@ impl ProviderOverrides {
             retrieve_tool,
             frozen_prefix,
             cache_ttl,
+            cache_keep_warm,
             stale_read
         );
         out.engine = out.engine.merged(&self.engine);
@@ -760,6 +812,10 @@ impl Default for ProxyConfig {
             retrieve_tool: RetrieveTool::Auto,
             frozen_prefix: FrozenPrefix::Marker,
             cache_ttl: CacheTtl::Default,
+            cache_keep_warm: false,
+            cache_keep_warm_interval: Duration::from_secs(270),
+            cache_keep_warm_max_pings: 11,
+            cache_keep_warm_background_pings: 4,
             retrieve_execution: RetrieveExecution::Server,
             retrieve_max_rounds: 3,
             retrieve_max_tokens_per_request: 16_384,
@@ -1084,6 +1140,7 @@ impl Config {
             "ref_ttl_seconds" => num!(e.ref_ttl_seconds),
             "ref_max_lifetime_multiplier" => num!(e.ref_max_lifetime_multiplier),
             "max_ref_bytes" => num!(e.max_ref_bytes),
+            "min_elision_saving_chars" => num!(e.min_elision_saving_chars),
             "search_max_files" => num!(e.search_max_files),
             "diff_max_files" => num!(e.diff_max_files),
             "code_max_body_lines" => num!(e.code_max_body_lines),
@@ -1177,6 +1234,27 @@ impl Config {
                     "adaptive" => CacheTtl::Adaptive,
                     _ => self.proxy.cache_ttl,
                 };
+            }
+            "cache_keep_warm" => {
+                self.proxy.cache_keep_warm =
+                    parse_bool_setting("proxy.cache_keep_warm", value, self.proxy.cache_keep_warm);
+            }
+            "cache_keep_warm_interval" => match parse_duration(value) {
+                Some(interval) => self.proxy.cache_keep_warm_interval = interval,
+                None => tracing::warn!(
+                    value,
+                    "KOMPRESSOR__PROXY__CACHE_KEEP_WARM_INTERVAL is not a duration; ignored"
+                ),
+            },
+            "cache_keep_warm_max_pings" => {
+                if let Ok(v) = value.parse() {
+                    self.proxy.cache_keep_warm_max_pings = v;
+                }
+            }
+            "cache_keep_warm_background_pings" => {
+                if let Ok(v) = value.parse() {
+                    self.proxy.cache_keep_warm_background_pings = v;
+                }
             }
             "enabled" => {
                 self.proxy.enabled = parse_bool_setting("proxy.enabled", value, self.proxy.enabled);
@@ -1281,6 +1359,17 @@ impl Config {
                     upstream.name, upstream.api_family
                 )));
             }
+        }
+        // Checked whether or not the feature is on, so turning it on for one
+        // provider later cannot meet an interval nobody looked at.
+        if self.proxy.cache_keep_warm_interval.is_zero()
+            || self.proxy.cache_keep_warm_interval >= Duration::from_secs(300)
+        {
+            return Err(ConfigError::Invalid(
+                "proxy.cache_keep_warm_interval must be above zero and below the provider's \
+                 five-minute cache TTL, or the entry lapses between pings"
+                    .into(),
+            ));
         }
         if self.retrieve.max_retrieve_chars == 0 {
             return Err(ConfigError::Invalid(
@@ -1599,6 +1688,52 @@ mod tests {
         assert_eq!(config.proxy.cache_ttl, CacheTtl::OneHour);
         let parsed: Config = toml::from_str("[proxy]\ncache_ttl = \"1h\"\n").expect("parses");
         assert_eq!(parsed.proxy.cache_ttl, CacheTtl::OneHour);
+    }
+
+    #[test]
+    fn keep_warm_is_off_by_default_and_reachable_from_the_environment() {
+        let mut config = Config::default();
+        assert!(!config.proxy.cache_keep_warm);
+        config.apply_env(&[
+            ("KOMPRESSOR__PROXY__CACHE_KEEP_WARM".into(), "true".into()),
+            (
+                "KOMPRESSOR__PROXY__CACHE_KEEP_WARM_INTERVAL".into(),
+                "4m".into(),
+            ),
+            (
+                "KOMPRESSOR__PROXY__CACHE_KEEP_WARM_MAX_PINGS".into(),
+                "5".into(),
+            ),
+        ]);
+        assert!(config.proxy.cache_keep_warm);
+        assert_eq!(
+            config.proxy.cache_keep_warm_interval,
+            Duration::from_secs(240)
+        );
+        assert_eq!(config.proxy.cache_keep_warm_max_pings, 5);
+        assert_eq!(config.proxy.cache_keep_warm_background_pings, 4);
+        config.apply_env(&[(
+            "KOMPRESSOR__PROXY__CACHE_KEEP_WARM_BACKGROUND_PINGS".into(),
+            "0".into(),
+        )]);
+        assert_eq!(config.proxy.cache_keep_warm_background_pings, 0);
+        config.apply_env(&[(
+            "KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__CACHE_KEEP_WARM".into(),
+            "false".into(),
+        )]);
+        let anthropic = config.for_provider("anthropic").expect("scoped");
+        assert!(!anthropic.proxy.cache_keep_warm, "the provider table wins");
+        assert!(config.proxy.cache_keep_warm, "and changes nothing else");
+    }
+
+    #[test]
+    fn a_keep_warm_interval_the_cache_would_not_survive_is_rejected() {
+        for interval in [Duration::ZERO, Duration::from_secs(300)] {
+            let mut config = Config::default();
+            config.proxy.cache_keep_warm_interval = interval;
+            assert!(config.validate().is_err(), "{interval:?}");
+        }
+        assert!(Config::default().validate().is_ok());
     }
 
     #[test]

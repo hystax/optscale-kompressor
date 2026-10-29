@@ -96,6 +96,21 @@ const DISASSEMBLY_SHIPS_WHOLE: &str = "Disassembly. The vectors were recorded \
      one. It is source with no grammar now and ships whole: on a measured run an \
      agent paged a folded disassembly by hand, 40 steps against 12.";
 
+/// Why payloads moved when the segmenter stopped sampling instructions and
+/// line-numbered reads.
+const SEGMENTER_KEEPS_ORDER: &str = "The segmenter sampled these as dump rows. \
+     An instruction is no longer a row to it (`objdump` prints an address in \
+     front of each, which read as an offset), and a payload numbered like a \
+     file read is not offered to it at all. On the fixed 89-task run the \
+     segmenter's sampled disassembly was fetched back six times. Disassembly \
+     now ships whole, MIPS included (its raw bytes print as one word and its \
+     registers without `$`), as does disassembly sitting beside a table in \
+     one payload; a list of mnemonics keeps the entries that are \
+     instructions in their own right. A `readelf` symbol table and a pickle \
+     disassembly carry increasing row numbers that read as a gutter, so they \
+     take the whole-message route: the first comes out smaller as a listing, \
+     the second ships whole.";
+
 /// Payloads where the engine deliberately and verifiably differs from the
 /// vectors, and why.
 ///
@@ -109,6 +124,14 @@ const DISASSEMBLY_SHIPS_WHOLE: &str = "Disassembly. The vectors were recorded \
 /// mode's own policy rather than a compressor's output: exempting all three
 /// would hide a real regression behind a deliberate one.
 const KNOWN_DELTAS: &[(&str, &str, &str)] = &[
+    ("08c92201eb649bc8", "*", SEGMENTER_KEEPS_ORDER),
+    ("1050dae918634df1", "*", SEGMENTER_KEEPS_ORDER),
+    ("f152552d55d43587", "*", SEGMENTER_KEEPS_ORDER),
+    ("21688442b10fb59f", "*", SEGMENTER_KEEPS_ORDER),
+    ("48bedede9df6b003", "*", SEGMENTER_KEEPS_ORDER),
+    ("92b3b888230d1d58", "*", SEGMENTER_KEEPS_ORDER),
+    ("a89003688d70ff7a", "*", SEGMENTER_KEEPS_ORDER),
+    ("dd9ba3749d237e37", "*", SEGMENTER_KEEPS_ORDER),
     ("160dd5259e439aff", "*", TEXT_FOLDS_IN_PLACE),
     ("266c00367241a1ae", "*", TEXT_FOLDS_IN_PLACE),
     ("3a36adcff8882d24", "*", TEXT_FOLDS_IN_PLACE),
@@ -390,6 +413,10 @@ const KNOWN_DELTAS: &[(&str, &str, &str)] = &[
 /// about the name the detector gives it, and a change to the name that leaves
 /// the bytes alone has to be explainable in exactly one of them.
 const KNOWN_DETECTION_DELTAS: &[(&str, &str)] = &[
+    ("08c92201eb649bc8", DISASSEMBLY_SHIPS_WHOLE),
+    ("1050dae918634df1", DISASSEMBLY_SHIPS_WHOLE),
+    ("ca0536e8b53a396f", DISASSEMBLY_SHIPS_WHOLE),
+    ("f152552d55d43587", DISASSEMBLY_SHIPS_WHOLE),
     ("17b15ad93c8d6a74", DISASSEMBLY_SHIPS_WHOLE),
     ("21e8d47881da76c9", DISASSEMBLY_SHIPS_WHOLE),
     ("48bedede9df6b003", DISASSEMBLY_SHIPS_WHOLE),

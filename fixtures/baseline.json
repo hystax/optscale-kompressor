@@ -1,14 +1,14 @@
 {
   "format": 4,
-  "coverage_pct": 48.7794,
-  "claimed_pct": 68.8171,
+  "coverage_pct": 43.9486,
+  "claimed_pct": 63.3731,
   "payloads": 894,
   "chars_in": 3821424,
-  "chars_out": 1957356,
+  "chars_out": 2141962,
   "billed": {
-    "coverage_pct": 48.4097,
+    "coverage_pct": 45.0754,
     "chars_in": 15886252.0,
-    "chars_out": 8195757.6,
+    "chars_out": 8725468.1,
     "cache_read_rate": 0.1
   },
   "buckets": {
@@ -34,11 +34,11 @@
       "billed_out": 47200.9
     },
     "listing": {
-      "payloads": 52,
-      "chars_in": 417403,
-      "chars_out": 21583,
-      "saved_pct": 94.8292,
-      "billed_out": 98913.6
+      "payloads": 49,
+      "chars_in": 419030,
+      "chars_out": 20698,
+      "saved_pct": 95.0605,
+      "billed_out": 93101.3
     },
     "log": {
       "payloads": 49,
@@ -48,11 +48,11 @@
       "billed_out": 1146314.0
     },
     "mixed": {
-      "payloads": 62,
-      "chars_in": 498393,
-      "chars_out": 101508,
-      "saved_pct": 79.6329,
-      "billed_out": 400287.7
+      "payloads": 37,
+      "chars_in": 270242,
+      "chars_out": 60634,
+      "saved_pct": 77.5631,
+      "billed_out": 275005.6
     },
     "search": {
       "payloads": 22,
@@ -69,11 +69,11 @@
       "billed_out": 825302.3
     },
     "text": {
-      "payloads": 59,
-      "chars_in": 287578,
-      "chars_out": 196465,
-      "saved_pct": 31.6829,
-      "billed_out": 653889.4
+      "payloads": 62,
+      "chars_in": 306063,
+      "chars_out": 214791,
+      "saved_pct": 29.8213,
+      "billed_out": 701589.4
     },
     "untouched:build": {
       "payloads": 21,
@@ -104,11 +104,11 @@
       "billed_out": 67410.1
     },
     "untouched:listing": {
-      "payloads": 69,
-      "chars_in": 77023,
-      "chars_out": 77023,
+      "payloads": 67,
+      "chars_in": 74504,
+      "chars_out": 74504,
       "saved_pct": 0.0,
-      "billed_out": 254066.0
+      "billed_out": 245608.8
     },
     "untouched:search": {
       "payloads": 20,
@@ -118,25 +118,25 @@
       "billed_out": 127923.8
     },
     "untouched:source_code": {
-      "payloads": 65,
-      "chars_in": 252365,
-      "chars_out": 252365,
+      "payloads": 86,
+      "chars_in": 433147,
+      "chars_out": 433147,
       "saved_pct": 0.0,
-      "billed_out": 907269.1
+      "billed_out": 1348910.9
     },
     "untouched:tabular": {
-      "payloads": 12,
-      "chars_in": 21646,
-      "chars_out": 21646,
+      "payloads": 11,
+      "chars_in": 21664,
+      "chars_out": 21664,
       "saved_pct": 0.0,
-      "billed_out": 47323.4
+      "billed_out": 51688.3
     },
     "untouched:text": {
-      "payloads": 334,
-      "chars_in": 702646,
-      "chars_out": 702646,
+      "payloads": 341,
+      "chars_in": 732404,
+      "chars_out": 732404,
       "saved_pct": 0.0,
-      "billed_out": 2851611.6
+      "billed_out": 3027167.0
     }
   },
   "per_payload": {
@@ -301,9 +301,9 @@
       965
     ],
     "08c92201eb649bc8": [
-      "listing",
+      "untouched:text",
       7558,
-      407
+      7558
     ],
     "098fff6bf13db1b4": [
       "untouched:text",
@@ -431,9 +431,9 @@
       4323
     ],
     "1050dae918634df1": [
-      "listing",
+      "untouched:source_code",
       2365,
-      458
+      2365
     ],
     "10899f0d6cbaf5eb": [
       "untouched:listing",
@@ -451,9 +451,9 @@
       4374
     ],
     "1253b4eee537666c": [
-      "mixed",
+      "untouched:source_code",
       21107,
-      3908
+      21107
     ],
     "129a3dd5e72e1da8": [
       "untouched:listing",
@@ -521,9 +521,9 @@
       558
     ],
     "16df7f06bc56785a": [
-      "mixed",
+      "text",
       2056,
-      501
+      1930
     ],
     "170991ff0df3131f": [
       "untouched:text",
@@ -571,9 +571,9 @@
       581
     ],
     "19c8ff6fbe040617": [
-      "mixed",
+      "untouched:text",
       3586,
-      922
+      3586
     ],
     "19ce631658e4f7e5": [
       "untouched:text",
@@ -666,9 +666,9 @@
       539
     ],
     "21688442b10fb59f": [
-      "mixed",
+      "listing",
       15247,
-      874
+      756
     ],
     "21b89b39ad9202bf": [
       "untouched:text",
@@ -826,7 +826,7 @@
       11179
     ],
     "2a5d024a20bf96ce": [
-      "untouched:tabular",
+      "untouched:source_code",
       934,
       934
     ],
@@ -1281,9 +1281,9 @@
       13747
     ],
     "48bedede9df6b003": [
-      "mixed",
+      "untouched:source_code",
       11981,
-      4199
+      11981
     ],
     "494bd08052370ba7": [
       "log",
@@ -1356,9 +1356,9 @@
       2253
     ],
     "4d4e304d3c3c8c11": [
-      "mixed",
+      "untouched:source_code",
       11712,
-      514
+      11712
     ],
     "4d4e982bf58f1048": [
       "untouched:text",
@@ -1381,9 +1381,9 @@
       3241
     ],
     "4e04e9db1b8dcbff": [
-      "mixed",
+      "untouched:source_code",
       9609,
-      661
+      9609
     ],
     "4e22349ce9e0e3b6": [
       "config",
@@ -1791,9 +1791,9 @@
       14354
     ],
     "6a43a19a3de7ddea": [
-      "mixed",
+      "untouched:source_code",
       21294,
-      7809
+      21294
     ],
     "6a5a2b01b1efa91f": [
       "untouched:search",
@@ -1896,12 +1896,12 @@
       2923
     ],
     "7099999080e517a3": [
-      "untouched:tabular",
+      "untouched:source_code",
       3741,
       3741
     ],
     "70a64e10f5c2e8d6": [
-      "untouched:listing",
+      "untouched:text",
       1580,
       1580
     ],
@@ -2121,9 +2121,9 @@
       693
     ],
     "7eaee3ead6c96c94": [
-      "mixed",
+      "untouched:source_code",
       5288,
-      607
+      5288
     ],
     "7ec25fd74e97ccde": [
       "untouched:text",
@@ -2266,9 +2266,9 @@
       1787
     ],
     "8635d4d7ed7877b9": [
-      "mixed",
+      "untouched:source_code",
       13614,
-      1814
+      13614
     ],
     "8637e176bcc3f084": [
       "untouched:text",
@@ -2296,9 +2296,9 @@
       1519
     ],
     "886ba40898981234": [
-      "mixed",
+      "untouched:tabular",
       4693,
-      842
+      4693
     ],
     "88813cec09b6": [
       "untouched:text",
@@ -2366,9 +2366,9 @@
       574
     ],
     "8c3bb6fa6398cf30": [
-      "listing",
+      "untouched:source_code",
       2086,
-      373
+      2086
     ],
     "8c905fa3fcbc": [
       "untouched:text",
@@ -2508,7 +2508,7 @@
     "92b3b888230d1d58": [
       "mixed",
       528,
-      205
+      346
     ],
     "93465eae0df5caa1": [
       "log",
@@ -2761,9 +2761,9 @@
       307
     ],
     "9fd60a350b079cbc": [
-      "mixed",
+      "untouched:source_code",
       13627,
-      1122
+      13627
     ],
     "9ff4187899e8a496": [
       "untouched:text",
@@ -2896,9 +2896,9 @@
       16420
     ],
     "a24d478f27b34322": [
-      "mixed",
+      "untouched:text",
       2978,
-      1609
+      2978
     ],
     "a2eeb46e2d714cbe": [
       "untouched:text",
@@ -2996,9 +2996,9 @@
       1749
     ],
     "a89003688d70ff7a": [
-      "mixed",
+      "text",
       8333,
-      1154
+      8316
     ],
     "a899b9c4ae0c48cb": [
       "mixed",
@@ -3056,9 +3056,9 @@
       1380
     ],
     "ac20177a64e95f7d": [
-      "mixed",
+      "untouched:text",
       6803,
-      1609
+      6803
     ],
     "ac41b6b30c6b7500": [
       "listing",
@@ -3126,9 +3126,9 @@
       1705
     ],
     "ae948d3e7b09b256": [
-      "mixed",
+      "untouched:source_code",
       13352,
-      1287
+      13352
     ],
     "ae96769c235f2e7b": [
       "untouched:diff",
@@ -3296,9 +3296,9 @@
       1587
     ],
     "b72fc7e320aff77a": [
-      "mixed",
+      "untouched:text",
       6314,
-      4132
+      6314
     ],
     "b735efafe2439aa7": [
       "config",
@@ -3371,9 +3371,9 @@
       637
     ],
     "bb5642766a0573ad": [
-      "mixed",
+      "untouched:source_code",
       12221,
-      380
+      12221
     ],
     "bbc2294d2e8fca45": [
       "source_code",
@@ -3576,7 +3576,7 @@
       602
     ],
     "ca0536e8b53a396f": [
-      "untouched:listing",
+      "untouched:text",
       939,
       939
     ],
@@ -3641,9 +3641,9 @@
       1927
     ],
     "cd001cfdb01db2d6": [
-      "mixed",
+      "untouched:source_code",
       9582,
-      634
+      9582
     ],
     "cd30e4bccd776c37": [
       "untouched:text",
@@ -3711,9 +3711,9 @@
       842
     ],
     "d271d905ea57889b": [
-      "mixed",
+      "untouched:source_code",
       7038,
-      488
+      7038
     ],
     "d3411969597018f0": [
       "untouched:source_code",
@@ -3931,9 +3931,9 @@
       595
     ],
     "dd9ba3749d237e37": [
-      "mixed",
+      "untouched:source_code",
       3761,
-      723
+      3761
     ],
     "dda06812435af9a9": [
       "untouched:text",
@@ -4241,9 +4241,9 @@
       5474
     ],
     "efa0a0d92ee6ad37": [
-      "mixed",
+      "text",
       8096,
-      917
+      8080
     ],
     "f0205a0d3d3f": [
       "untouched:text",
@@ -4296,9 +4296,9 @@
       803
     ],
     "f152552d55d43587": [
-      "listing",
+      "untouched:source_code",
       1611,
-      403
+      1611
     ],
     "f23c626a1d4fd3ab": [
       "untouched:text",
@@ -4321,9 +4321,9 @@
       2334
     ],
     "f500436f92613bbe": [
-      "mixed",
+      "untouched:source_code",
       9933,
-      2890
+      9933
     ],
     "f57cd840ab135ff1": [
       "text",
@@ -4501,9 +4501,9 @@
       638
     ],
     "feade93208325bf1": [
-      "mixed",
+      "untouched:source_code",
       3578,
-      610
+      3578
     ],
     "fefad31915ad9900": [
       "mixed",
@@ -4541,9 +4541,9 @@
       569
     ],
     "fff45aaa5db8f205": [
-      "mixed",
+      "untouched:source_code",
       2348,
-      809
+      2348
     ],
     "hYsXEwHcYRoq": [
       "untouched:build",
@@ -4617,11 +4617,11 @@
     "ids": []
   },
   "timing": {
-    "ms_per_kb": 0.3002,
-    "p50_ms": 0.2071,
-    "p95_ms": 5.9238,
-    "max_ms": 38.7508,
-    "mean_ms": 1.253
+    "ms_per_kb": 0.2893,
+    "p50_ms": 0.2104,
+    "p95_ms": 5.8853,
+    "max_ms": 34.9229,
+    "mean_ms": 1.2078
   },
   "violations": {}
 }

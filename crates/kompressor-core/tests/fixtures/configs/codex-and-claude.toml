@@ -37,9 +37,10 @@ cache_ttl = "default"
 websocket_relay = true
 
 # Claude Code against Claude Opus 5.5 (DESIGN.md §12.11): no function-body
-# elision, freeze only what the provider has cached, one-hour cache entries
-# once a conversation has paused past five minutes. Applies to every
-# /v1/messages request and to nothing else.
+# elision, no elision that saves too little to pay for the fetch it invites,
+# freeze only what the provider has cached, one-hour cache entries once a
+# conversation has paused past five minutes. Applies to every /v1/messages
+# request and to nothing else.
 [proxy.providers.anthropic]
 retrieve_tool = "always"
 frozen_prefix = "first_seen"
@@ -47,6 +48,7 @@ cache_ttl = "adaptive"
 
 [proxy.providers.anthropic.engine]
 enable_code_aware = false
+min_elision_saving_chars = 4000
 
 # --- OpenAI / Codex -------------------------------------------------------
 # API-key callers go to api.openai.com; ChatGPT-plan callers are recognised by

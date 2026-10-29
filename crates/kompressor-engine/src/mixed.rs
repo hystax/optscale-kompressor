@@ -102,6 +102,9 @@ const MAX_JSON_SCAN_ATTEMPTS: usize = 256;
 /// A body that is *entirely* one JSON document or one log is not mixed: the
 /// whole-message route compresses it better and without a second scan.
 pub fn has_mixed_content(content: &str, opts: &EngineOptions) -> bool {
+    if is_a_numbered_read(content) {
+        return false;
+    }
     if FENCE.is_match(content) {
         return true;
     }
@@ -118,6 +121,19 @@ pub fn has_mixed_content(content: &str, opts: &EngineOptions) -> bool {
     false
 }
 
+/// Whether `content` is a file read through a line-number gutter — `cat -n`,
+/// `nl`, Claude Code's `Read`.
+///
+/// The segmenter is not for these. Its dump-row rule reads a decimal gutter as
+/// offsets, so a numbered file is one long listing to it and has rows dropped:
+/// sixty Rust functions came back with seven signatures, and a README the
+/// agent had just opened lost 1,831 of its lines. The agent asked for those
+/// lines by number. Whole-message routing lifts the gutter, compresses the body
+/// as what it is, and puts the numbers back (§7.12).
+fn is_a_numbered_read(content: &str) -> bool {
+    crate::gutter::split_line_gutter(content).is_some()
+}
+
 /// Compress only the structured spans of `content`.
 ///
 /// Returns the rewritten body and the sorted distinct kinds actually shrunk, so
@@ -130,6 +146,11 @@ pub fn crush_mixed(
     ctx: &Context<'_>,
     refs: &mut RefCollector,
 ) -> Option<(String, Vec<Kind>)> {
+    // Checked here as well as in `has_mixed_content`: a JSON string field
+    // reaches this directly, and a numbered read inside one is still a read.
+    if is_a_numbered_read(content) {
+        return None;
+    }
     let entry = refs.mark();
     let mut rewrite = Rewrite::default();
 
@@ -531,6 +552,14 @@ fn line_kind(line: &str, opts: &EngineOptions) -> Option<LineKind> {
         || line.starts_with("+++ b/")
     {
         return Some(LineKind::Diff);
+    }
+    // An instruction is not a row. `objdump` prints an address in front of
+    // every one, which reads as a dump offset, and `ret` or `endbr64` alone is
+    // a bare name to the listing test; either way a function got sampled, and
+    // an agent reversing a binary fetched it back four times in one task. Left
+    // unclassified, the lines stay where they are, whatever surrounds them.
+    if crate::detect::is_disassembly_line(line.strip_suffix('\n').unwrap_or(line)) {
+        return None;
     }
     // Both tests live in the detector: a line must not be able to read as a log
     // to `detect_content` and as a grep hit to the segmenter.

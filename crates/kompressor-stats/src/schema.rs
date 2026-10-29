@@ -374,6 +374,13 @@ const V11: &str = r#"
 ALTER TABLE proxy_requests ADD COLUMN cache_write_1h_tokens INTEGER;
 "#;
 
+/// v12: rows the proxy sent itself to keep a conversation's provider cache
+/// alive (`proxy.cache_keep_warm`). They carry real usage, so a cost total
+/// must include them; a count of client requests must not.
+const V12: &str = r#"
+ALTER TABLE proxy_requests ADD COLUMN keep_warm INTEGER NOT NULL DEFAULT 0;
+"#;
+
 pub const MIGRATIONS: &[(u32, &str)] = &[
     (1, V1),
     (2, V2),
@@ -386,6 +393,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (9, V9),
     (10, V10),
     (11, V11),
+    (12, V12),
 ];
 
 /// The version a freshly migrated database reports in `PRAGMA user_version`.

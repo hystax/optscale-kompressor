@@ -191,6 +191,11 @@ does not name and data whose order is the content. On the 89-task tuned run,
 the tasks where that fold fired took 17.5% more agent steps than the
 uncompressed run. That is a cost per step the coverage figure never showed.
 
+And on 2026-10-26, **48.78% → 43.95%**: the segmenter stopped sampling
+disassembly and line-numbered file reads (DESIGN §7.11). On the fixed 89-task
+run, listing elisions were fetched back 37% of the time, and a retrieve round
+costs about ten times what sampling a typical listing saves.
+
 ### Score a paired comparison on the proxy's bill
 
 Two scripts read finished runs without spending anything:
