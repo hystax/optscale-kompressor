@@ -398,6 +398,14 @@ fn keep_warm_for(
         upstream,
         conversation,
     )?;
+    let background = (proxy.cache_keep_warm_background_pings > 0
+        && crate::keepwarm::background_task_running(sent))
+    .then(|| crate::keepwarm::Schedule {
+        interval: proxy.cache_keep_warm_interval,
+        max_pings: proxy
+            .cache_keep_warm_background_pings
+            .min(proxy.cache_keep_warm_max_pings),
+    });
     Some(KeepWarmPlan {
         state: state.clone(),
         ping,
@@ -405,6 +413,7 @@ fn keep_warm_for(
             interval: proxy.cache_keep_warm_interval,
             max_pings: proxy.cache_keep_warm_max_pings,
         },
+        background,
     })
 }
 
@@ -413,6 +422,9 @@ pub(crate) struct KeepWarmPlan {
     state: ProxyState,
     ping: crate::keepwarm::Ping,
     schedule: crate::keepwarm::Schedule,
+    /// The schedule for an `end_turn` while a background task runs, or `None`
+    /// when there is no such task (or that case is turned off).
+    background: Option<crate::keepwarm::Schedule>,
 }
 
 /// What the compression stage decided to send.
@@ -1954,7 +1966,8 @@ pub(crate) struct Recorder {
     /// Provider wait, accumulated by the `Outbound` this request sends through.
     /// Shared rather than copied so the retrieve loop's extra rounds are in it.
     waited: Arc<AtomicU64>,
-    /// The keep-warm ping to arm if the response stops on `tool_use`.
+    /// The keep-warm ping to arm if the response stops on `tool_use`, or on
+    /// `end_turn` with a background task running.
     pub(crate) keep_warm: Option<KeepWarmPlan>,
     /// How the model stopped, where the path that relayed it could tell.
     pub(crate) stop_reason: Option<String>,
@@ -2041,14 +2054,19 @@ impl Recorder {
             .unwrap_or(0)
             .saturating_add(self.event.cache_read_tokens.unwrap_or(0))
             .saturating_add(self.event.cache_write_tokens.unwrap_or(0));
-        if !succeeded
-            || self.stop_reason.as_deref() != Some("tool_use")
-            || prompt < crate::keepwarm::MIN_PREFIX_TOKENS
-        {
+        if !succeeded || prompt < crate::keepwarm::MIN_PREFIX_TOKENS {
             return;
         }
+        let schedule = match self.stop_reason.as_deref() {
+            Some("tool_use") => plan.schedule,
+            Some("end_turn") => match plan.background {
+                Some(schedule) => schedule,
+                None => return,
+            },
+            _ => return,
+        };
         let keepwarm = plan.state.keepwarm.clone();
-        keepwarm.arm(plan.state, plan.ping, plan.schedule, started);
+        keepwarm.arm(plan.state, plan.ping, schedule, started);
     }
 
     fn finish(

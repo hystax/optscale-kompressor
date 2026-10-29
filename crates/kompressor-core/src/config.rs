@@ -422,7 +422,9 @@ pub struct ProxyConfig {
     /// An agent that waits on a long build or test run outlives the provider's
     /// five-minute cache entry, and its next request writes the whole
     /// conversation again at 25x the price of reading it. A read refreshes the
-    /// entry, so after a response that stopped on `tool_use` the proxy re-sends
+    /// entry, so after a response that stopped on `tool_use` (or on `end_turn`
+    /// with a background task running, under
+    /// [`Self::cache_keep_warm_background_pings`]) the proxy re-sends
     /// that request every [`Self::cache_keep_warm_interval`] with `max_tokens`
     /// of 1 until the client's next request arrives, at most
     /// [`Self::cache_keep_warm_max_pings`] times. Each ping is billed as cache
@@ -449,6 +451,20 @@ pub struct ProxyConfig {
     /// The most pings one wait may send: 11 at 270s is about 50 minutes, which
     /// covers every pause in those seven runs bar one (4,924 s, of 192).
     pub cache_keep_warm_max_pings: u32,
+    /// The most pings for a wait on a background task, and `0` to not keep
+    /// those warm at all.
+    ///
+    /// Claude Code can run a command in the background and end its turn on
+    /// `end_turn`; the model is woken by a notification when the job is done.
+    /// Those waits are kept warm too, while the conversation has a background
+    /// task it has started and not yet been told has finished. In the second
+    /// keep-warm run they were 13 of 30 pauses past five minutes, every one a
+    /// miss. The cap is lower than [`Self::cache_keep_warm_max_pings`] because
+    /// this wait can be a dead end: an agent that gives its final answer with a
+    /// job still running never sends another request, and 0–4 conversations a
+    /// run did. Four pings, about 20 minutes, covered 45 of the 48 such waits
+    /// past 270 s across four 89-task runs.
+    pub cache_keep_warm_background_pings: u32,
     /// How many retrieve rounds may be **answered** in one request.
     ///
     /// The metric counts one more than this. Reaching the cap does not end the
@@ -799,6 +815,7 @@ impl Default for ProxyConfig {
             cache_keep_warm: false,
             cache_keep_warm_interval: Duration::from_secs(270),
             cache_keep_warm_max_pings: 11,
+            cache_keep_warm_background_pings: 4,
             retrieve_execution: RetrieveExecution::Server,
             retrieve_max_rounds: 3,
             retrieve_max_tokens_per_request: 16_384,
@@ -1232,6 +1249,11 @@ impl Config {
             "cache_keep_warm_max_pings" => {
                 if let Ok(v) = value.parse() {
                     self.proxy.cache_keep_warm_max_pings = v;
+                }
+            }
+            "cache_keep_warm_background_pings" => {
+                if let Ok(v) = value.parse() {
+                    self.proxy.cache_keep_warm_background_pings = v;
                 }
             }
             "enabled" => {
@@ -1689,6 +1711,12 @@ mod tests {
             Duration::from_secs(240)
         );
         assert_eq!(config.proxy.cache_keep_warm_max_pings, 5);
+        assert_eq!(config.proxy.cache_keep_warm_background_pings, 4);
+        config.apply_env(&[(
+            "KOMPRESSOR__PROXY__CACHE_KEEP_WARM_BACKGROUND_PINGS".into(),
+            "0".into(),
+        )]);
+        assert_eq!(config.proxy.cache_keep_warm_background_pings, 0);
         config.apply_env(&[(
             "KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__CACHE_KEEP_WARM".into(),
             "false".into(),

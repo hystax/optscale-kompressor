@@ -445,16 +445,18 @@ A fifth setting, **off by default and not in the packaged configurations**,
 keeps the cache entry alive through those pauses instead of paying for them.
 With `proxy.cache_keep_warm = true`, after a response that stopped on
 `tool_use` the proxy re-sends that request with `max_tokens: 1` every 270
-seconds until Claude Code's next request arrives, at most 11 times. Each ping
-costs the conversation at the cache-read price plus one output token, and is
-recorded as its own `proxy_requests` row with `keep_warm = 1`. Simulated over
-the request logs of seven 89-task runs, it would have saved $1.84–$3.00 a run
-(5–9%) after $0.34–$0.58 of pings, which is more than compression saves on the
-same runs. Measured live on one 89-task run, it cut cache-write spend per agent
-step by 20% and cache-loss turns from 13 to 2, for 25 pings costing $0.15. It
-is off because it is the one thing the proxy does that no client asked for,
-using the client's credentials while the client is busy elsewhere (DESIGN
-§12.10):
+seconds until Claude Code's next request arrives, at most 11 times; after an
+`end_turn` while a background task Claude Code started is still running, at
+most 4 times (`proxy.cache_keep_warm_background_pings`, 0 to turn that off).
+Each ping costs the conversation at the cache-read price plus one output token,
+and is recorded as its own `proxy_requests` row with `keep_warm = 1`. Simulated
+over the request logs of seven 89-task runs, it would have saved $1.84–$3.00 a
+run (5–9%) after $0.34–$0.58 of pings, which is more than compression saves on
+the same runs. Measured live on one 89-task run, it cut cache-write spend per
+agent step by 20% and cache-loss turns from 13 to 2, for 25 pings costing
+$0.15. It is off because it is the one thing the proxy does that no client
+asked for, using the client's credentials while the client is busy elsewhere
+(DESIGN §12.10):
 
 ```bash
 export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__CACHE_KEEP_WARM=true

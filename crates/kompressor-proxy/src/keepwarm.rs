@@ -18,11 +18,20 @@
 //!
 //! # When it arms
 //!
-//! Only after a response that stopped on `tool_use`. That is the one point at
-//! which the client is known to come back with this conversation extended: it
-//! owes the model a tool result. A turn that ended on `end_turn` may be the
-//! last the conversation ever has, and pinging it would buy nothing for up to
-//! [`ProxyConfig::cache_keep_warm_max_pings`] intervals.
+//! After a response that stopped on `tool_use`. That is the one point at which
+//! the client is known to come back with this conversation extended: it owes
+//! the model a tool result.
+//!
+//! And after one that stopped on `end_turn` while the conversation has a
+//! background task running — one Claude Code reported starting ("running in
+//! background with ID: …", or "moved to the background (ID: …)") and has not
+//! yet reported on (`<task-id>…</task-id>` in its notification). The model is
+//! woken when the job ends, so the client will most likely be back; but an
+//! agent can also give its final answer with a job still running, and then no
+//! request ever comes. Those waits get their own, lower cap,
+//! [`ProxyConfig::cache_keep_warm_background_pings`]. In the second keep-warm
+//! run they were 13 of the 30 pauses past five minutes; any other `end_turn`
+//! may be the last turn the conversation has, and is not kept warm.
 //!
 //! It does not arm for a request that asked for one-hour entries, which outlast
 //! any pause this would cover, nor for one whose `thinking` has a token budget:
@@ -39,6 +48,7 @@
 //!
 //! [`ProxyConfig::cache_keep_warm_interval`]: kompressor_core::config::ProxyConfig::cache_keep_warm_interval
 //! [`ProxyConfig::cache_keep_warm_max_pings`]: kompressor_core::config::ProxyConfig::cache_keep_warm_max_pings
+//! [`ProxyConfig::cache_keep_warm_background_pings`]: kompressor_core::config::ProxyConfig::cache_keep_warm_background_pings
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -138,6 +148,80 @@ impl Ping {
             upstream: upstream.to_string(),
             conversation,
         })
+    }
+}
+
+/// What Claude Code says when a command starts in the background, or is moved
+/// there after outliving its timeout. The task id follows.
+const BACKGROUND_STARTED: &[&str] = &[
+    "running in background with ID: ",
+    "moved to the background (ID: ",
+];
+/// The tag a task notification names its task with, which it sends however
+/// the task ended: completed, failed or stopped.
+const BACKGROUND_REPORTED: (&str, &str) = ("<task-id>", "</task-id>");
+
+/// Whether the conversation in `body` has a background task it started and
+/// has not been told the end of.
+///
+/// Read from the request, not the response: a task the response started is
+/// one the client has not yet run, and a notification can only arrive in a
+/// later request. Every text the messages carry is read — a notification is
+/// a user text block on some turns and a system message on others.
+pub(crate) fn background_task_running(body: &Value) -> bool {
+    let mut started = Vec::new();
+    let mut reported = Vec::new();
+    for message in body
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        texts(message.get("content"), &mut |text| {
+            for marker in BACKGROUND_STARTED {
+                started.extend(ids_after(text, marker));
+            }
+            let (open, close) = BACKGROUND_REPORTED;
+            let mut rest = text;
+            while let Some(at) = rest.find(open) {
+                rest = &rest[at + open.len()..];
+                if let Some(end) = rest.find(close) {
+                    reported.push(rest[..end].to_string());
+                }
+            }
+        });
+    }
+    started.iter().any(|id| !reported.contains(id))
+}
+
+/// Every task id that follows `marker` in `text`.
+fn ids_after(text: &str, marker: &str) -> Vec<String> {
+    text.match_indices(marker)
+        .map(|(at, _)| {
+            text[at + marker.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                .collect::<String>()
+        })
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
+/// Call `each` on every text in a message's content: a plain string, a text
+/// block, or the content of a tool result, however nested.
+fn texts(content: Option<&Value>, each: &mut impl FnMut(&str)) {
+    match content {
+        Some(Value::String(text)) => each(text),
+        Some(Value::Array(blocks)) => {
+            for block in blocks {
+                texts(Some(block), each);
+            }
+        }
+        Some(Value::Object(block)) => {
+            texts(block.get("text"), each);
+            texts(block.get("content"), each);
+        }
+        _ => {}
     }
 }
 
@@ -391,6 +475,99 @@ mod tests {
         assert!(ping.headers.get(http::header::CONTENT_ENCODING).is_none());
         assert!(ping.headers.get(http::header::CONTENT_LENGTH).is_none());
         assert_eq!(ping.headers["x-api-key"], "sk-test");
+    }
+
+    fn with_messages(messages: Value) -> Value {
+        json!({"model": "claude-opus-5-5", "messages": messages})
+    }
+
+    #[test]
+    fn a_started_background_task_is_running_until_it_is_reported() {
+        let started = json!([
+            {"role": "user", "content": "train it"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash",
+                "input": {"command": "python train.py", "run_in_background": true}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1",
+                "content": "Command running in background with ID: b2s048qdc. Output is being written to: /tmp/x.output."}]},
+        ]);
+        assert!(background_task_running(&with_messages(started.clone())));
+
+        let mut reported = started.as_array().unwrap().clone();
+        reported.push(json!({"role": "user", "content": [{"type": "text", "text":
+            "<system-reminder>\n[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>b2s048qdc</task-id>\n<status>completed</status>"}]}));
+        assert!(!background_task_running(&with_messages(json!(reported))));
+    }
+
+    #[test]
+    fn a_command_moved_to_the_background_counts_and_so_does_any_one_of_several() {
+        let body = with_messages(json!([
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                {"type": "text", "text": "Command did not complete within its 600s timeout and was moved to the background (ID: boc9wtynk). You will be notified when it completes."}]}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_2",
+                "content": "Command running in background with ID: aaa111."}]},
+            {"role": "system", "content": "<task-id>aaa111</task-id>"},
+        ]));
+        assert!(
+            background_task_running(&body),
+            "boc9wtynk has not been reported"
+        );
+    }
+
+    #[test]
+    fn a_notification_for_another_task_does_not_end_this_one() {
+        let body = with_messages(json!([
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t",
+                "content": "Command running in background with ID: b_one-1."}]},
+            {"role": "user", "content": "<task-notification><task-id>b_two-2</task-id></task-notification>"},
+        ]));
+        assert!(background_task_running(&body));
+    }
+
+    #[test]
+    fn an_id_is_read_whole_and_a_marker_with_none_is_ignored() {
+        assert_eq!(
+            ids_after(
+                "running in background with ID: b2s_04-8qdc. Output",
+                BACKGROUND_STARTED[0]
+            ),
+            vec!["b2s_04-8qdc".to_string()]
+        );
+        let body = with_messages(json!([
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t",
+                "content": "Command running in background with ID: ."}]},
+        ]));
+        assert!(!background_task_running(&body), "no id, nothing to wait on");
+    }
+
+    #[test]
+    fn the_model_naming_a_task_is_not_the_client_starting_one() {
+        // Only the client's own report starts a task; an assistant that says
+        // it is waiting on one has not started anything.
+        let body = with_messages(json!([
+            {"role": "assistant", "content": [{"type": "text",
+                "text": "Waiting on the quantized run (b2s048qdc)."}]},
+        ]));
+        assert!(!background_task_running(&body));
+    }
+
+    #[test]
+    fn a_notification_sent_as_a_system_string_is_read() {
+        let body = with_messages(json!([
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": [
+                {"type": "text", "text": "Command did not complete within its 600s timeout and was moved to the background (ID: boc9wtynk)."}]}]},
+            {"role": "system", "content": "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-id>boc9wtynk</task-id>"},
+        ]));
+        assert!(!background_task_running(&body));
+    }
+
+    #[test]
+    fn a_conversation_without_background_tasks_has_none_running() {
+        let body = with_messages(json!([
+            {"role": "user", "content": "run the tests"},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "ok"}]},
+        ]));
+        assert!(!background_task_running(&body));
+        assert!(!background_task_running(&json!({})));
     }
 
     #[test]
