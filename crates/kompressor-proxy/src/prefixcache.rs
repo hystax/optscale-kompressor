@@ -720,6 +720,20 @@ impl PrefixTracker {
         entry.idled_past_ttl
     }
 
+    /// A keep-warm ping just read this conversation's prefix from cache.
+    ///
+    /// The prefix was used, so the clock that decides whether the conversation
+    /// sat idle past the provider's TTL starts again. Without this a pause the
+    /// pings bridged would still flip `CacheTtl::Adaptive` to one-hour entries,
+    /// paying for the very lapse they prevented.
+    pub fn kept_warm(&self, fingerprint: u64) {
+        if let Ok(mut seen) = self.seen.lock()
+            && let Some(entry) = seen.get_mut(&fingerprint)
+        {
+            entry.at = Instant::now();
+        }
+    }
+
     /// Pin fragments the engine has shipped whole, so the decision is not
     /// re-taken against a bar that has since moved.
     pub fn record_inlined(&self, conversation: Option<u64>, ids: &[RefId]) {
@@ -1283,6 +1297,35 @@ mod tests {
         assert!(
             tracker.long_ttl(9),
             "and the flag survives the response being recorded"
+        );
+    }
+
+    /// A pause a keep-warm ping bridged is not a pause: the cache was read
+    /// during it, so `CacheTtl::Adaptive` must not pay for one-hour entries.
+    #[test]
+    fn a_pause_kept_warm_does_not_switch_to_an_hour() {
+        let tracker = PrefixTracker::new(Duration::from_secs(0));
+        tracker.floor(9, 1);
+        let idle = |tracker: &PrefixTracker| {
+            let mut seen = tracker.seen.lock().unwrap();
+            seen.get_mut(&9).unwrap().at = Instant::now() - Duration::from_secs(301);
+        };
+        idle(&tracker);
+        tracker.kept_warm(9);
+        assert!(!tracker.long_ttl(9), "the ping read the prefix just now");
+
+        idle(&tracker);
+        assert!(tracker.long_ttl(9), "without one, the same pause switches");
+        tracker.kept_warm(9);
+        assert!(
+            tracker.long_ttl(9),
+            "and a ping later does not take the switch back"
+        );
+
+        tracker.kept_warm(42);
+        assert!(
+            !tracker.long_ttl(42),
+            "a conversation never seen is not created by a ping"
         );
     }
 

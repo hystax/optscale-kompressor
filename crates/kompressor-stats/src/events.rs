@@ -343,6 +343,13 @@ pub struct ProxyRequestEvent {
     pub total_ms: Option<f64>,
     /// Error text, if the request failed.
     pub error: Option<String>,
+    /// A keep-warm ping the proxy sent on its own, not a client request.
+    ///
+    /// Its usage is real spend — cache reads plus one output token — and is
+    /// filed so a cost report includes it. Anything that counts *client*
+    /// requests, or reads a turn's latency, should leave these rows out.
+    #[serde(default)]
+    pub keep_warm: bool,
 }
 
 /// A periodic measurement of what the fragment store is holding.

@@ -213,6 +213,13 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     )
     .await;
 
+    // The client is back in this conversation, so whatever was keeping its
+    // cache warm has done its job. Cancelled before this request is sent, so a
+    // ping cannot race the request it was waiting for.
+    if let Some(conversation) = prepared.prefix {
+        state.keepwarm.cancel(conversation);
+    }
+
     // Both bodies, before either is re-encoded, when a capture is asked for.
     // Which byte changed is the one question the aggregates cannot answer, and
     // whether it changed on the way in or on the way out is what says who
@@ -225,6 +232,16 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
 
     let upstream_headers =
         headers::upstream_headers(&parts.headers, upstream, &request_id, auth_mode);
+    let keep_warm = keep_warm_for(
+        &state,
+        family,
+        &prepared,
+        &route.url,
+        &upstream_headers,
+        &request_id,
+        &identity,
+        route.origin(),
+    );
     // What actually goes out. Unchanged means unchanged: the bytes that
     // arrived, in the coding they arrived in. Only a body this proxy rewrote
     // is re-encoded, and if that fails the original ships rather than a body
@@ -298,7 +315,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         proxy.retrieve_max_tokens_per_request,
     );
 
-    let recorder = Recorder::new(
+    let mut recorder = Recorder::new(
         &state,
         &identity,
         &request_id,
@@ -308,6 +325,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         // Taken before `outbound` is moved into whichever path sends it.
         outbound.waited(),
     );
+    recorder.keep_warm = keep_warm;
 
     if prepared.stream {
         stream_response(
@@ -340,6 +358,63 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     }
 }
 
+/// The keep-warm ping this request would leave behind, if its conversation is
+/// one to keep warm. Whether it is armed is decided when the response ends,
+/// on how the model stopped. See [`crate::keepwarm`].
+#[allow(clippy::too_many_arguments)]
+fn keep_warm_for(
+    state: &ProxyState,
+    family: Option<ApiFamily>,
+    prepared: &Prepared,
+    url: &str,
+    upstream_headers: &HeaderMap,
+    request_id: &str,
+    identity: &Identity,
+    upstream: &str,
+) -> Option<KeepWarmPlan> {
+    if family != Some(ApiFamily::AnthropicMessages) || prepared.one_hour {
+        return None;
+    }
+    let proxy = &state.core.config_for(Some("anthropic")).proxy;
+    if !proxy.cache_keep_warm {
+        return None;
+    }
+    let conversation = prepared.prefix?;
+    let parsed;
+    let sent = match prepared.json.as_ref() {
+        Some(value) => value,
+        None => {
+            parsed = serde_json::from_slice::<Value>(&prepared.body).ok()?;
+            &parsed
+        }
+    };
+    let ping = crate::keepwarm::Ping::for_request(
+        sent,
+        url,
+        upstream_headers,
+        request_id,
+        identity.tenant.as_str(),
+        prepared.model.clone(),
+        upstream,
+        conversation,
+    )?;
+    Some(KeepWarmPlan {
+        state: state.clone(),
+        ping,
+        schedule: crate::keepwarm::Schedule {
+            interval: proxy.cache_keep_warm_interval,
+            max_pings: proxy.cache_keep_warm_max_pings,
+        },
+    })
+}
+
+/// A ping ready to arm, held by the [`Recorder`] until the response ends.
+pub(crate) struct KeepWarmPlan {
+    state: ProxyState,
+    ping: crate::keepwarm::Ping,
+    schedule: crate::keepwarm::Schedule,
+}
+
 /// What the compression stage decided to send.
 struct Prepared {
     /// The bytes that go upstream.
@@ -360,6 +435,9 @@ struct Prepared {
     /// provider reports can be filed against it for next turn. `None` when
     /// nothing was frozen — there is no prefix to have an opinion about.
     prefix: Option<u64>,
+    /// The request asked for one-hour cache entries, which outlast any pause a
+    /// keep-warm ping would bridge.
+    one_hour: bool,
 }
 
 impl Prepared {
@@ -367,6 +445,7 @@ impl Prepared {
     fn passthrough(body: Bytes, stream: bool, model: Option<String>) -> Prepared {
         Prepared {
             prefix: None,
+            one_hour: false,
             body,
             json: None,
             saved_tokens: 0,
@@ -470,6 +549,7 @@ fn passthrough_with_stable_tools(
         // Stamped by `prepare`, which computes it for every request however
         // this one turned out.
         prefix: None,
+        one_hour: false,
     }
 }
 
@@ -630,6 +710,7 @@ async fn prepare(
     // applied only to compressed bodies would almost never reach the provider.
     if long_ttl {
         extend_cache_ttl(&mut prepared);
+        prepared.one_hour = true;
     }
     prepared
 }
@@ -991,6 +1072,7 @@ async fn prepare_inner(
                 strip_usage,
                 model,
                 prefix: fingerprint,
+                one_hour: false,
             }
         }
         Err(error) => {
@@ -1679,6 +1761,12 @@ async fn buffered_response(
         prepared.saved_tokens,
         relayed.rounds,
     );
+    let mut recorder = recorder;
+    if family == Some(ApiFamily::AnthropicMessages) {
+        recorder.stop_reason = serde_json::from_slice::<Value>(&relayed.body)
+            .ok()
+            .and_then(|body| body.get("stop_reason")?.as_str().map(str::to_string));
+    }
     recorder.finish(
         Some(relayed.status.as_u16()),
         relayed.rounds,
@@ -1775,8 +1863,10 @@ async fn stream_response(
     };
 
     let (tx, rx) = tokio::sync::mpsc::channel::<ClientChunk>(32);
+    let mut recorder = recorder;
     tokio::spawn(async move {
         let outcome = relay.run(upstream, tx).await;
+        recorder.stop_reason = outcome.stop_reason.clone();
         // A stream the client walked out on still gets a row, and the row says
         // so. Without the note it is a healthy 200 carrying usage for tokens
         // that reached nobody, which is worse than no row at all: it is a row
@@ -1864,6 +1954,10 @@ pub(crate) struct Recorder {
     /// Provider wait, accumulated by the `Outbound` this request sends through.
     /// Shared rather than copied so the retrieve loop's extra rounds are in it.
     waited: Arc<AtomicU64>,
+    /// The keep-warm ping to arm if the response stops on `tool_use`.
+    pub(crate) keep_warm: Option<KeepWarmPlan>,
+    /// How the model stopped, where the path that relayed it could tell.
+    pub(crate) stop_reason: Option<String>,
 }
 
 impl Recorder {
@@ -1916,6 +2010,7 @@ impl Recorder {
             upstream_ms: None,
             total_ms: None,
             error: None,
+            keep_warm: false,
         };
         Recorder {
             core: state.core.clone(),
@@ -1923,7 +2018,37 @@ impl Recorder {
             waited,
             prefixes: state.prefixes.clone(),
             prefix: prepared.prefix,
+            keep_warm: None,
+            stop_reason: None,
         }
+    }
+
+    /// Arm the keep-warm ping if this request left the client owing the model
+    /// a tool result, which is the one case where its next request is sure to
+    /// come and to extend this conversation.
+    fn arm_keep_warm(&mut self, started: Instant) {
+        let Some(plan) = self.keep_warm.take() else {
+            return;
+        };
+        let succeeded = self.event.error.is_none()
+            && self
+                .event
+                .status
+                .is_some_and(|status| (200..300).contains(&status));
+        let prompt = self
+            .event
+            .prompt_tokens
+            .unwrap_or(0)
+            .saturating_add(self.event.cache_read_tokens.unwrap_or(0))
+            .saturating_add(self.event.cache_write_tokens.unwrap_or(0));
+        if !succeeded
+            || self.stop_reason.as_deref() != Some("tool_use")
+            || prompt < crate::keepwarm::MIN_PREFIX_TOKENS
+        {
+            return;
+        }
+        let keepwarm = plan.state.keepwarm.clone();
+        keepwarm.arm(plan.state, plan.ping, plan.schedule, started);
     }
 
     fn finish(
@@ -1996,6 +2121,7 @@ impl Recorder {
                 self.prefixes.record_cache_writes(written);
             }
         }
+        self.arm_keep_warm(started);
         self.core.stats().send(Event::ProxyRequest(self.event));
     }
 }
