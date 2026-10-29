@@ -103,7 +103,7 @@ if not html:
     print(head)
     print("  " + "-" * (len(head) - 2))
     for r in sorted(ok, key=lambda r: -r["saved"]):
-        print(f"  {r['file']:<{w}}{r['kind']:<13}{r['lines']:>7}{r['chars_in']:>10}"
+        print(f"  {r['file']:<{w}}{r['kind'] or 'untouched':<13}{r['lines']:>7}{r['chars_in']:>10}"
               f"{r['chars_out']:>10}{r['saved']:>8.2f}%{r['handles']:>9}{kib(r['kept']):>11}")
     ci, co, pct = totals()
     print("  " + "-" * (len(head) - 2))
@@ -165,7 +165,7 @@ out = [f'<section id="{esc(section_id)}">',
        "<tr><th>file</th><th>type</th>" + nh("lines") + nh("chars in")
        + nh("chars out") + nh("saved") + nh("handles") + nh("kept") + "</tr>"]
 for r in sorted(ok, key=lambda r: -r["saved"]):
-    out.append(f"<tr><td>{esc(r['file'])}</td><td>{esc(r['kind'])}</td>"
+    out.append(f"<tr><td>{esc(r['file'])}</td><td>{esc(r['kind'] or 'untouched')}</td>"
                + n(f"{r['lines']:,}") + n(f"{r['chars_in']:,}")
                + n(f"{r['chars_out']:,}") + n(f"{r['saved']:.2f}%")
                + n(r["handles"]) + n(kib(r["kept"])) + "</tr>")

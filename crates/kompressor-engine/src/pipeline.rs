@@ -17,7 +17,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use crate::code::crush_code;
 use crate::configs::crush_config;
 use crate::crusher::crush_json;
-use crate::detect::{detect_result, strategy_for};
+use crate::detect::{code_starts_at, detect_result, file_joins, strategy_for};
 use crate::diff::crush_diff;
 use crate::gutter::split_line_gutter;
 use crate::listing::crush_listing;
@@ -101,6 +101,17 @@ pub fn compress_content<'a>(
     };
     if refs.is_enabled() && refs.oversized_attempts() != oversized_before {
         refs.rollback(mark);
+        applied.truncate(applied_before);
+        return (Cow::Borrowed(content), None);
+    }
+    if refs.is_enabled()
+        && result.1.is_some()
+        && chars_len(content).saturating_sub(chars_len(&result.0)) < opts.min_elision_saving_chars
+        && !crate::refs::refs_in(&result.0).is_empty()
+    {
+        // Worth less than the fetch it invites: see `min_elision_saving_chars`.
+        refs.rollback(mark);
+        refs.note_gated();
         applied.truncate(applied_before);
         return (Cow::Borrowed(content), None);
     }
@@ -221,6 +232,12 @@ fn lift_gutter(
 
     let mut inner_opts = opts.clone();
     inner_opts.enable_line_gutter = false;
+    // The body is a file the agent read by line number, and the segmenter is
+    // not for those (`mixed::has_mixed_content` refuses the numbered form for
+    // the same reason). With the column off it no longer looks numbered, so
+    // the refusal has to be carried in here: a README read this way had the
+    // list inside it sampled down to 70 entries omitted.
+    inner_opts.enable_mixed_content = false;
     // Two lines that are byte-identical *once the column is off* were not
     // identical in the payload — their numbers differed, which is the whole
     // point of a line number. A bare `[×N]` says "this exact line, N times",
@@ -578,13 +595,21 @@ fn route_whole(
                 Strategy::CodeAware => {
                     let language = detection.meta.language;
                     guarded(|| crush_code(content, opts, ctx, refs, language))
+                        .or_else(|| {
+                            refs.rollback(mark);
+                            code_behind_a_lead_in(content, role, opts, ctx, refs)
+                        })
+                        .or_else(|| {
+                            refs.rollback(mark);
+                            code_across_files(content, role, opts, ctx, refs)
+                        })
                 }
                 Strategy::Passthrough => {
                     // Duplicate folding still applies, but only to prose: every
                     // other type that reaches here has a reason for declining,
                     // and folding its lines would undo that reason.
                     if detection.content_type == ContentType::PlainText {
-                        arbitrate_text(content, opts, ctx, refs)
+                        arbitrate_text(content, opts, ctx, refs, Identity::AdjacentValues)
                     } else {
                         None
                     }
@@ -605,10 +630,17 @@ fn route_whole(
             // distinct lines, and neither reaches this. What does reach it is
             // output that is the same handful of lines over and over, where
             // folding is the right answer whatever the payload looked like.
+            //
+            // Except an instruction stream. Its repeats are `pxor xmm0,xmm0`
+            // and `ret`, which pass the guard, and folding them moves
+            // instructions out of the order that is their meaning.
             let mut folded_instead = false;
             let out = match out {
                 Some(out) => Some(out),
-                None if opts.enable_fold_fallback && mostly_repeated_lines(content) => {
+                None if opts.enable_fold_fallback
+                    && !detection.meta.assembly
+                    && mostly_repeated_lines(content) =>
+                {
                     refs.rollback(mark);
                     // Both identities, shorter wins. `Exact` alone is the wrong
                     // reading for the shape that reaches here most often — a
@@ -616,7 +648,16 @@ fn route_whole(
                     // every line. A 700-section INI came back at 32.96% folding
                     // only its byte-identical lines, where normalising the
                     // values takes 98.39%.
-                    let folded = arbitrate_text(content, opts, ctx, refs);
+                    // Source keeps its lines in order and is never sampled: the
+                    // wide reading runs the log scorer on fifty lines or more,
+                    // and with code elision off a C file reached it and came
+                    // back as `233 log lines omitted`, 79% of the file gone.
+                    let normalised = if detection.content_type == ContentType::SourceCode {
+                        Identity::AdjacentValues
+                    } else {
+                        Identity::Values
+                    };
+                    let folded = arbitrate_text(content, opts, ctx, refs, normalised);
                     folded_instead = folded.is_some();
                     folded
                 }
@@ -674,14 +715,27 @@ fn route_whole(
 /// which keeps prose exactly where it was — a payload whose lines repeat
 /// verbatim folds the same under either identity, so the normalised reading can
 /// only win where the lines actually differ, which is where it should.
+///
+/// `normalised` is the reading the second candidate folds by. Text that reached
+/// the plain route, and source the fold fallback reaches, get
+/// [`Identity::AdjacentValues`] — with [`Identity::AdjacentExact`] as the exact
+/// reading — which keeps every line where it stood; any other payload already
+/// shown to be mostly repeated lines gets [`Identity::Values`], since there a
+/// template recurring across the whole payload is the shape being folded.
 pub(crate) fn arbitrate_text(
     content: &str,
     opts: &EngineOptions,
     ctx: &Context,
     refs: &mut RefCollector,
+    normalised: Identity,
 ) -> Option<String> {
     let mark = refs.mark();
-    let exact = guarded(|| crush_log(content, opts, ctx, refs, Identity::Exact));
+    let exact_identity = if normalised == Identity::AdjacentValues {
+        Identity::AdjacentExact
+    } else {
+        Identity::Exact
+    };
+    let exact = guarded(|| crush_log(content, opts, ctx, refs, exact_identity));
     let exact_fragments: Vec<String> = refs.pairs()[mark.pairs..]
         .iter()
         .map(|(_, fragment)| fragment.clone())
@@ -693,7 +747,7 @@ pub(crate) fn arbitrate_text(
         refs.restash_all(&exact_fragments);
         return exact;
     }
-    match guarded(|| crush_log(content, opts, ctx, refs, Identity::Values)) {
+    match guarded(|| crush_log(content, opts, ctx, refs, normalised)) {
         Some(values) if exact_len.is_none_or(|e| chars_len(&values) < e) => Some(values),
         _ => {
             refs.rollback(mark);
@@ -827,6 +881,77 @@ fn accounted(
 /// *wrong* grammar nests it much further, so an unexpected panic in a compressor
 /// is a real possibility on adversarial input — and the caller's contract is
 /// that the original content survives it.
+/// Source code behind a lead-in the grammar cannot parse.
+///
+/// The code compressor refuses a parse with errors in it, which is right for a
+/// file and wrong for `ls && cat interp.py`: the file is fine, the listing in
+/// front of it is the error. Set the lead-in aside verbatim, compress what
+/// follows as the code it is, and put the two back together — the lead-in's
+/// bytes are untouched, so nothing about it needs accounting.
+fn code_behind_a_lead_in(
+    content: &str,
+    role: &str,
+    opts: &EngineOptions,
+    ctx: &Context,
+    refs: &mut RefCollector,
+) -> Option<String> {
+    let (lead_in, body) = content.split_at(code_starts_at(content)?);
+    let found = detect_result(body, role, opts);
+    if found.content_type != ContentType::SourceCode {
+        return None;
+    }
+    let body = guarded(|| crush_code(body, opts, ctx, refs, found.meta.language))?;
+    Some(format!("{lead_in}{body}"))
+}
+
+/// Several source files concatenated by `cat`, compressed one file at a time.
+///
+/// Each file goes to the grammar of its own language, behind any listing in
+/// front of it. A file that does not compress is kept byte for byte and its
+/// fragments are rolled back, so the result is the concatenation it arrived
+/// as with only the files that understood themselves rewritten. `None` when
+/// there is one file, or when none of them compressed.
+fn code_across_files(
+    content: &str,
+    role: &str,
+    opts: &EngineOptions,
+    ctx: &Context,
+    refs: &mut RefCollector,
+) -> Option<String> {
+    let joins = file_joins(content);
+    if joins.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(content.len());
+    let mut compressed = false;
+    let mut start = 0;
+    for end in joins.into_iter().chain(std::iter::once(content.len())) {
+        let file = &content[start..end];
+        start = end;
+        let mark = refs.mark();
+        let found = detect_result(file, role, opts);
+        let shrunk = (found.content_type == ContentType::SourceCode)
+            .then(|| guarded(|| crush_code(file, opts, ctx, refs, found.meta.language)))
+            .flatten()
+            .or_else(|| {
+                refs.rollback(mark);
+                code_behind_a_lead_in(file, role, opts, ctx, refs)
+            })
+            .filter(|shrunk| chars_len(shrunk) < chars_len(file));
+        match shrunk {
+            Some(shrunk) => {
+                out.push_str(&shrunk);
+                compressed = true;
+            }
+            None => {
+                refs.rollback(mark);
+                out.push_str(file);
+            }
+        }
+    }
+    compressed.then_some(out)
+}
+
 fn guarded<T>(f: impl FnOnce() -> Option<T>) -> Option<T> {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(result) => result,
@@ -1323,6 +1448,409 @@ mod fold_fallback_tests {
     }
 }
 
+#[cfg(all(test, feature = "code-aware"))]
+mod lead_in_tests {
+    use super::*;
+
+    fn compress(content: &str, opts: &EngineOptions) -> (String, RefCollector) {
+        let mut refs = opts.collector();
+        let mut applied = Vec::new();
+        let ctx = Context::for_role("tool");
+        let (out, _) = compress_content(content, "tool", opts, None, &mut refs, &ctx, &mut applied);
+        (out.into_owned(), refs)
+    }
+
+    fn recoverable(enable_code_aware: bool) -> EngineOptions {
+        EngineOptions {
+            mode: Mode::Recoverable,
+            enable_code_aware,
+            ..Default::default()
+        }
+    }
+
+    /// `objdump -d` as it prints by default: address, raw bytes, instruction.
+    /// `per_function` matters: the segmenter samples only a long run of rows,
+    /// and a function of a few dozen instructions is what it used to take.
+    fn objdump(functions: usize, per_function: usize) -> String {
+        let insns = [
+            ("f3 0f 1e fa", "endbr64"),
+            ("48 83 ec 78", "sub    rsp,0x78"),
+            ("f3 0f 10 54 24 60", "movss  xmm2,DWORD PTR [rsp+0x60]"),
+            ("0f 28 c2", "movaps xmm0,xmm2"),
+            ("f3 0f 59 c2", "mulss  xmm0,xmm2"),
+            ("66 0f ef db", "pxor   xmm3,xmm3"),
+            ("0f 2f d9", "comiss xmm3,xmm1"),
+            ("e8 4b 00 00 00", "call   402020 <vector_dot>"),
+            ("48 83 c4 78", "add    rsp,0x78"),
+            ("c3", "ret"),
+        ];
+        let mut out = vec![
+            "vec:     file format elf64-x86-64".to_string(),
+            String::new(),
+            "Disassembly of section .text:".to_string(),
+        ];
+        let mut addr = 0x401090;
+        for f in 0..functions {
+            out.push(String::new());
+            out.push(format!("{addr:016x} <fn_{f}>:"));
+            for (bytes, insn) in insns.iter().cycle().take(per_function) {
+                out.push(format!("  {addr:x}:\t{bytes:<21}\t{insn}"));
+                addr += 4;
+            }
+        }
+        out.join("\n")
+    }
+
+    /// The fixed run's remaining failure: disassembly the detector named
+    /// correctly, sampled anyway by the segmenter, whose dump-row rule reads
+    /// `401090:` as an offset. Four fetches of one function in one task.
+    #[test]
+    fn a_disassembly_with_addresses_ships_whole_through_every_route() {
+        let dump = objdump(2, 120);
+        for enable_code_aware in [true, false] {
+            let opts = recoverable(enable_code_aware);
+            let (out, refs) = compress(&dump, &opts);
+            assert_eq!(out, dump, "whole, code-aware {enable_code_aware}");
+            assert!(refs.is_empty());
+
+            // numbered, the way `cat -n dis.txt` or Claude Code's Read shows it
+            let numbered: String = dump
+                .lines()
+                .enumerate()
+                .map(|(n, line)| format!("{:6}\t{line}\n", n + 294))
+                .collect();
+            let (out, _) = compress(&numbered, &opts);
+            assert_eq!(out, numbered, "numbered, code-aware {enable_code_aware}");
+        }
+    }
+
+    #[test]
+    fn a_disassembly_inside_compound_output_keeps_every_instruction() {
+        // `file x; objdump -d x; ls /usr/lib` in one call: the listing may be
+        // sampled, the instructions may not.
+        let names: String = (0..400)
+            .map(|i| format!("libmodule_{i:03}.so.1\n"))
+            .collect();
+        let dump = objdump(1, 90);
+        let content = format!(
+            "Checking the binary first, then its neighbours.\n\n{dump}\n\nThe libraries next to it:\n{names}"
+        );
+        let (out, _) = compress(&content, &recoverable(false));
+        for line in dump.lines().filter(|l| l.contains(":\t")) {
+            assert!(out.contains(line), "instruction dropped: {line:?}");
+        }
+        assert!(
+            out.len() < content.len(),
+            "the listing beside it still compresses"
+        );
+    }
+
+    #[test]
+    fn a_numbered_file_read_is_never_row_sampled() {
+        // Claude Code's Read of a README: the agent asked for these lines by
+        // number, and the segmenter used to drop 1,831 of them.
+        // Prose of varied shape, which the whole-message route reads as text
+        // and keeps in place; the list inside it is the section the segmenter
+        // sampled.
+        let prose = [
+            "This directory contains a number of test programs demonstrating various features.",
+            "Each program prints its result, and the expected output sits beside it.",
+            "Run them with the interpreter; a mismatch is reported as FAIL with a diff.",
+            "Tail calls must not grow the stack.",
+            "Some programs read from standard input, so pipe the matching .in file to them.",
+            "Errors are expected in a few cases and are part of the output that is compared.",
+            "Numbers print in their shortest exact form.",
+            "Strings print without quotes unless written with write rather than display.",
+        ];
+        let mut body = String::from("# Scheme Interpreter Test Suite\n\n");
+        for i in 0..96 {
+            body.push_str(prose[i % prose.len()]);
+            body.push_str(if i % 4 == 3 { "\n\n" } else { "\n" });
+        }
+        body.push_str("The programs:\n");
+        for i in 0..80 {
+            body.push_str(&format!("test/{i:02}-case-{i}.scm\n"));
+        }
+        let numbered: String = body
+            .lines()
+            .enumerate()
+            .map(|(n, line)| format!("{:6}\t{line}\n", n + 1))
+            .collect();
+        let (out, _) = compress(&numbered, &recoverable(false));
+        assert!(
+            !out.contains("entries omitted"),
+            "rows were sampled out of a file read"
+        );
+        // What may still happen is the in-place fold: a run of consecutive
+        // lines differing only in a number keeps its first line and a handle,
+        // where it stood. Every line of prose stays.
+        for line in body
+            .lines()
+            .filter(|l| l.ends_with('.') || l.starts_with('#'))
+        {
+            assert!(
+                out.contains(line),
+                "prose dropped from a file read: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn listing_sampling_off_reaches_the_segmenter_too() {
+        let names: String = (0..400)
+            .map(|i| format!("src/module_{i:03}/mod.rs\n"))
+            .collect();
+        let compound =
+            format!("Here is what the repository holds:\n{names}\nand that is all of it.\n");
+        let whole = names.clone();
+        let on = recoverable(false);
+        let off = EngineOptions {
+            enable_listing_compressor: false,
+            ..recoverable(false)
+        };
+        for (name, content) in [("compound", &compound), ("whole", &whole)] {
+            let (sampled, _) = compress(content, &on);
+            assert!(
+                sampled.contains("entries omitted"),
+                "{name}: the fixture must sample when on"
+            );
+            let (kept, refs) = compress(content, &off);
+            assert!(
+                !kept.contains("entries omitted"),
+                "{name}: sampled with the switch off"
+            );
+            assert!(refs.is_empty() || !kept.contains("ref:k_"), "{name}");
+        }
+    }
+
+    fn names(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("src/module_{i:03}/mod.rs\n"))
+            .collect()
+    }
+
+    fn gated(min_elision_saving_chars: usize) -> EngineOptions {
+        EngineOptions {
+            min_elision_saving_chars,
+            ..recoverable(false)
+        }
+    }
+
+    #[test]
+    fn an_elision_worth_less_than_the_gate_ships_whole() {
+        let small = names(60);
+        let (sampled, refs) = compress(&small, &gated(0));
+        let saved = small.len() - sampled.len();
+        assert!(
+            sampled.contains("ref:k_") && !refs.is_empty() && saved < 4000,
+            "the fixture must elide with a handle and save under the gate: saved {saved}"
+        );
+        let (kept, refs) = compress(&small, &gated(4000));
+        assert_eq!(kept, small, "shipped whole");
+        assert!(refs.is_empty(), "and retained nothing to fetch");
+    }
+
+    #[test]
+    fn an_elision_worth_more_than_the_gate_still_happens() {
+        let large = names(400);
+        let (sampled, refs) = compress(&large, &gated(4000));
+        assert!(large.len() - sampled.len() >= 4000);
+        assert!(sampled.contains("entries omitted") && !refs.is_empty());
+        assert_eq!(
+            sampled,
+            compress(&large, &gated(0)).0,
+            "and is unchanged by it"
+        );
+    }
+
+    #[test]
+    fn the_gate_leaves_compression_without_a_handle_alone() {
+        // Nothing can be fetched through a marker without a handle, so it
+        // invites no round and a small saving from one is still a saving.
+        let lossless = EngineOptions {
+            mode: Mode::Lossless,
+            ..gated(4000)
+        };
+        let small = names(60);
+        let (out, _) = compress(&small, &lossless);
+        let (ungated, _) = compress(
+            &small,
+            &EngineOptions {
+                mode: Mode::Lossless,
+                ..gated(0)
+            },
+        );
+        assert_eq!(out, ungated);
+        let repeated = "connection refused\n".repeat(60);
+        let (folded, refs) = compress(&repeated, &gated(4000));
+        assert!(
+            folded.len() < repeated.len() && !folded.contains("ref:k_") && refs.is_empty(),
+            "the fixture must fold without a handle: {folded}"
+        );
+        assert_eq!(folded, compress(&repeated, &gated(0)).0);
+    }
+
+    /// The 89-task run's failure: a disassembly reached the plain-text fold,
+    /// came back as `movss xmm10,DWORD PTR [rsp+0x90] [×46 similar …]`, and the
+    /// agent paged the listing by hand instead. It ships whole now, with code
+    /// elision on or off.
+    #[test]
+    fn a_disassembly_ships_whole() {
+        let registers = [
+            "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+        ];
+        let mut lines = vec!["00000000004021a0 <sphere_intersect>:".to_string()];
+        for i in 0..120 {
+            let reg = registers[i % registers.len()];
+            lines.push(match i % 5 {
+                0 => format!("movss  {reg},DWORD PTR [rsp+0x{:x}]", 0x60 + 4 * i),
+                1 => format!("mulss  {reg},xmm{}", (i + 3) % 8),
+                2 => format!("addss  xmm{},{reg}", (i + 5) % 8),
+                3 => "pxor   xmm3,xmm3".to_string(),
+                _ => format!("movaps xmm{},{reg}", (i + 1) % 8),
+            });
+        }
+        lines.push("ret".to_string());
+        let content = lines.join("\n");
+        for enable_code_aware in [true, false] {
+            let opts = EngineOptions {
+                mode: Mode::Recoverable,
+                enable_code_aware,
+                ..Default::default()
+            };
+            let mut refs = opts.collector();
+            let mut applied = Vec::new();
+            let ctx = Context::for_role("tool");
+            let (out, _) =
+                compress_content(&content, "tool", &opts, None, &mut refs, &ctx, &mut applied);
+            assert_eq!(out, content, "code-aware {enable_code_aware}");
+            assert!(refs.is_empty());
+        }
+    }
+
+    /// `ls && cat interp.py`: the listing used to make the grammar fail on the
+    /// first line and the whole payload ship at 0%.
+    #[test]
+    fn source_behind_a_listing_is_compressed_and_the_listing_kept_verbatim() {
+        let lead_in = "interp.py\ntest\n01-factorial.scm\n02-fibonacci.scm\nREADME.md\n";
+        let mut source = String::from("#!/usr/bin/env python3\nimport sys\n\n");
+        for f in 0..12 {
+            source.push_str(&format!("def handler_{f}(env, args):\n"));
+            for line in 0..30 {
+                source.push_str(&format!(
+                    "    value_{line} = env.lookup(args[{line}]) + {f}\n"
+                ));
+            }
+            source.push_str("    return value_0\n\n");
+        }
+        let content = format!("{lead_in}{source}");
+        let opts = EngineOptions {
+            mode: Mode::Recoverable,
+            ..Default::default()
+        };
+        let mut refs = opts.collector();
+        let mut applied = Vec::new();
+        let ctx = Context::for_role("tool");
+        let (out, kind) =
+            compress_content(&content, "tool", &opts, None, &mut refs, &ctx, &mut applied);
+        assert_eq!(kind, Some(Kind::SourceCode));
+        assert!(out.starts_with(lead_in), "the listing is untouched");
+        assert!(
+            out.len() < content.len() / 2,
+            "the bodies go: {}",
+            out.len()
+        );
+        assert!(
+            out.contains("def handler_11(env, args):"),
+            "every signature stays"
+        );
+        assert!(!refs.is_empty(), "and what left is retrievable");
+    }
+
+    /// Turning code-aware compression off turns it off on every path that
+    /// reaches the code compressor, not only whole-payload routing.
+    #[test]
+    fn code_elision_off_means_off_behind_a_listing_and_across_files() {
+        let mut source = String::from("#!/usr/bin/env python3\nimport sys\n\n");
+        for f in 0..6 {
+            source.push_str(&format!("def handler_{f}(env, args):\n"));
+            for line in 0..30 {
+                source.push_str(&format!(
+                    "    value_{line} = env.lookup(args[{line}]) + {f}\n"
+                ));
+            }
+            source.push_str("    return value_0\n\n");
+        }
+        let content = format!("interp.py\nREADME.md\n{source}");
+        let opts = EngineOptions {
+            mode: Mode::Recoverable,
+            enable_code_aware: false,
+            ..Default::default()
+        };
+        let mut refs = opts.collector();
+        let mut applied = Vec::new();
+        let ctx = Context::for_role("tool");
+        let (out, _) =
+            compress_content(&content, "tool", &opts, None, &mut refs, &ctx, &mut applied);
+        assert!(
+            !out.contains("body lines omitted"),
+            "no body is elided: {}",
+            &out[..out.len().min(300)]
+        );
+    }
+
+    /// `cat baseline.py ext.c wrapper.py`: each file goes to its own grammar,
+    /// and a file that cannot be compressed is kept byte for byte.
+    #[test]
+    fn concatenated_files_are_compressed_one_grammar_at_a_time() {
+        let body = |name: &str| -> String {
+            let mut out = format!("def {name}(weights, cov):\n");
+            for line in 0..30 {
+                out.push_str(&format!(
+                    "    total_{line} = {name}_weights[{line}] * cov[{line}][{line}]\n"
+                ));
+            }
+            out.push_str("    return total_0\n\n");
+            out
+        };
+        let baseline = format!(
+            "import math\n\n{}{}print(risk_a([1], [[1]]))",
+            body("risk_a"),
+            body("risk_b")
+        );
+        let ext = "/*\n * extension\n */\n#include <math.h>\nstatic double half(double w) {\n    return w / 2;\n}\n";
+        let wrapper = format!(
+            "\"\"\"wrapper\"\"\"\n\n{}{}",
+            body("call_a"),
+            body("call_b")
+        );
+        let content = format!("{baseline}{ext}{wrapper}");
+        let opts = EngineOptions {
+            mode: Mode::Recoverable,
+            ..Default::default()
+        };
+        let mut refs = opts.collector();
+        let mut applied = Vec::new();
+        let ctx = Context::for_role("tool");
+        let (out, kind) =
+            compress_content(&content, "tool", &opts, None, &mut refs, &ctx, &mut applied);
+        assert_eq!(kind, Some(Kind::SourceCode));
+        assert!(
+            out.contains(ext),
+            "the file that did not compress is untouched"
+        );
+        for name in ["def risk_a(", "def risk_b(", "def call_a(", "def call_b("] {
+            assert!(out.contains(name), "every signature stays: {name}");
+        }
+        assert!(
+            out.len() < content.len() / 2,
+            "the Python bodies go: {}",
+            out.len()
+        );
+        assert_eq!(refs.len(), 4, "one retrievable fragment per elided body");
+    }
+}
+
 #[cfg(test)]
 mod longline_tests {
     use super::*;
@@ -1502,6 +2030,9 @@ mod gutter_tests {
         out
     }
 
+    // The code compressor is what reaches the body; without the grammars there
+    // is nothing for the lifted column to hand it to.
+    #[cfg(feature = "code-aware")]
     #[test]
     fn a_numbered_source_file_compresses_once_the_column_is_off() {
         let src = numbered_source();

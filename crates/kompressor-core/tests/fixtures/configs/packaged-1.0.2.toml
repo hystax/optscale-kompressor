@@ -1,0 +1,63 @@
+# kompressor — system service configuration.
+#
+# Installed to /etc/kompressor/config.toml and marked a conffile, so a package
+# upgrade will not overwrite your edits.
+#
+# Mode 0644: readable by everyone. Nothing here is a credential — every upstream
+# sets `forward_auth = true`, so the caller's own key is forwarded and none is
+# stored. IF YOU ADD A SECRET HERE — an `[auth]` token, or an upstream key with
+# forward_auth = false — tighten the file at the same time:
+#   chown root:kompressor /etc/kompressor/config.toml && chmod 0640 /etc/kompressor/config.toml
+# The service account is in that group, so it keeps working.
+#
+# The loader does NOT expand `$HOME` or `~`, and a system service has no useful
+# home anyway: it runs as the unprivileged `kompressor` user with
+# StateDirectory=kompressor, which systemd creates and owns at
+# /var/lib/kompressor. Those are the paths below. A path spelled
+# `$HOME/.local/share/...` would be taken literally and create a directory
+# called `$HOME` under the service's working directory.
+#
+# /etc is not on the loader's search path (KOMPRESSOR_CONFIG, ./kompressor.toml,
+# then XDG), so the unit passes --config explicitly.
+
+[server]
+listen = "127.0.0.1:8817"
+
+[engine]
+mode = "recoverable"
+# The 64 KiB default drops recoverability on exactly the payloads worth
+# compressing: a fold or an elision over that size keeps no fragment.
+max_ref_bytes = 1048576
+
+[refs]
+backend = "sqlite"
+path = "/var/lib/kompressor/refs.db"
+
+[stats]
+enabled = true
+path = "/var/lib/kompressor/stats.db"
+
+[log]
+level = "info"
+format = "json"
+
+[[proxy.upstreams]]
+name = "openai"
+path_prefix = "/v1"
+base_url = "https://api.openai.com"
+api_family = "openai"
+forward_auth = true
+
+# Where the same mount goes when the caller pays by subscription.
+[proxy.upstreams.subscription]
+base_url = "https://chatgpt.com"
+rewrite_prefix = "/backend-api/codex"
+
+# Explicit ChatGPT route for desktop clients; avoids user-agent classification.
+[[proxy.upstreams]]
+name = "codex-desktop-chatgpt"
+path_prefix = "/backend-api/codex"
+base_url = "https://chatgpt.com"
+strip_prefix = false
+api_family = "openai"
+forward_auth = true

@@ -155,6 +155,7 @@ pub fn fold_suffix(
     folded: &[&str],
     refs: &mut RefCollector,
     always_handle: bool,
+    marks_variants: bool,
 ) -> Option<String> {
     use crate::text::join_lines;
 
@@ -166,7 +167,19 @@ pub fn fold_suffix(
         return bare();
     }
     match refs.stash(&join_lines(folded)) {
-        Some(id) => Some(format!(" [×{count} ref:{id}]")),
+        // A repeat and a group of variants reach this line by different roads
+        // and must not arrive wearing the same marker. `[×N ref:…]` is
+        // documented to the model as "a line that repeated", so a model that
+        // reads it over lines which merely *shared a template* is told the
+        // handle holds more of what it can already see, and has no reason to
+        // fetch it. Measured on eight distinct attachment headings folded to
+        // `## warmup_1.py … [×8 ref:…]`: the differing seven were retained and
+        // retrievable, and the task still lost the instruction to read them.
+        //
+        // The distinction is already computed. Saying it costs one word and
+        // borrows the vocabulary §7.4 uses when no fragment exists at all.
+        Some(id) if identical || !marks_variants => Some(format!(" [×{count} ref:{id}]")),
+        Some(id) => Some(format!(" [×{count} similar ref:{id}]")),
         // Identical repeats reconstruct from the count whether or not a
         // fragment could be stored, so the opt-in degrades rather than refuses.
         None if identical => {
@@ -250,7 +263,7 @@ mod tests {
     fn a_fold_of_identical_lines_mints_no_handle() {
         let mut refs = RefCollector::new(1024);
         assert_eq!(
-            fold_suffix("same", &["same", "same"], &mut refs, false),
+            fold_suffix("same", &["same", "same"], &mut refs, false, true),
             Some(" [×3]".to_string())
         );
         assert!(
@@ -262,7 +275,7 @@ mod tests {
     #[test]
     fn the_opt_in_restores_a_handle_on_an_identical_repeat() {
         let mut refs = RefCollector::new(1024);
-        let suffix = fold_suffix("same", &["same", "same"], &mut refs, true).expect("stored");
+        let suffix = fold_suffix("same", &["same", "same"], &mut refs, true, true).expect("stored");
         assert!(suffix.starts_with(" [×3 ref:k_"), "got {suffix:?}");
         assert_eq!(refs.pairs()[0].1, "same\nsame");
     }
@@ -270,9 +283,18 @@ mod tests {
     #[test]
     fn a_fold_of_lines_that_differ_keeps_its_handle() {
         let mut refs = RefCollector::new(1024);
-        let suffix =
-            fold_suffix("took 1ms", &["took 2ms", "took 3ms"], &mut refs, false).expect("stored");
-        assert!(suffix.starts_with(" [×3 ref:k_"), "got {suffix:?}");
+        let suffix = fold_suffix(
+            "took 1ms",
+            &["took 2ms", "took 3ms"],
+            &mut refs,
+            false,
+            true,
+        )
+        .expect("stored");
+        assert!(
+            suffix.starts_with(" [×3 similar ref:k_"),
+            "lines that differ must not be announced as a repeat: {suffix:?}"
+        );
         assert_eq!(refs.pairs().len(), 1);
         assert_eq!(refs.pairs()[0].1, "took 2ms\ntook 3ms");
     }
@@ -289,10 +311,55 @@ mod tests {
     /// It says what left instead of inventing a repeat, which keeps the
     /// compression: refusing the fold outright costs 4.02pp of aggressive
     /// coverage on the shipped corpus, this costs 0.16pp.
+    /// The incident this wording exists for.
+    ///
+    /// Eight attachment headings differing only in a digit template to one key,
+    /// fold to the first of them, and used to ship as `[×8 ref:…]` — which the
+    /// tool description defines as "a line that repeated". The other seven were
+    /// retained and retrievable, and the model had no reason to fetch them: it
+    /// had been told they were copies of a line it could already read. The task
+    /// lost a step as a result.
+    #[test]
+    fn a_fold_over_variants_is_not_announced_as_a_repeat() {
+        let mut refs = RefCollector::new(4096);
+        let suffix = fold_suffix(
+            "## warmup_1.py: /tmp/kd/warmup_1.py",
+            &[
+                "## warmup_2.py: /tmp/kd/warmup_2.py",
+                "## warmup_3.py: /tmp/kd/warmup_3.py",
+            ],
+            &mut refs,
+            false,
+            true,
+        )
+        .expect("stored");
+        assert!(
+            suffix.contains("similar"),
+            "a model told these repeated will not retrieve them: {suffix:?}"
+        );
+        // The handle still has to be there and still has to hold the variants:
+        // the wording changes what the model believes, not what it can reach.
+        assert!(suffix.contains("ref:k_"), "got {suffix:?}");
+        assert_eq!(
+            refs.pairs()[0].1,
+            "## warmup_2.py: /tmp/kd/warmup_2.py\n## warmup_3.py: /tmp/kd/warmup_3.py"
+        );
+    }
+
+    /// An exact repeat keeps the older, shorter wording: it is true there, and
+    /// a model that fetches a handle holding copies of a visible line is paying
+    /// for nothing.
+    #[test]
+    fn an_exact_repeat_is_still_announced_as_one() {
+        let mut refs = RefCollector::new(4096);
+        let suffix = fold_suffix("same", &["same", "same"], &mut refs, true, true).expect("stored");
+        assert!(!suffix.contains("similar"), "got {suffix:?}");
+    }
+
     #[test]
     fn a_mode_that_retains_nothing_describes_the_removal_rather_than_faking_a_repeat() {
         let mut off = RefCollector::disabled();
-        let suffix = fold_suffix("took 1ms", &["took 2ms", "took 3ms"], &mut off, false)
+        let suffix = fold_suffix("took 1ms", &["took 2ms", "took 3ms"], &mut off, false, true)
             .expect("the removal is real and describable");
         assert!(
             !suffix.contains("[×"),
@@ -305,12 +372,12 @@ mod tests {
         // they still fold — that is the whole contract of the lossy modes and
         // it is not what was wrong.
         assert_eq!(
-            fold_suffix("same", &["same", "same"], &mut off, false),
+            fold_suffix("same", &["same", "same"], &mut off, false, true),
             Some(" [×3]".to_string())
         );
         // …including when the opt-in asks for a handle the mode cannot mint.
         assert_eq!(
-            fold_suffix("same", &["same", "same"], &mut off, true),
+            fold_suffix("same", &["same", "same"], &mut off, true, true),
             Some(" [×3]".to_string())
         );
     }
@@ -322,7 +389,13 @@ mod tests {
         // never happened.
         let mut refs = RefCollector::new(8);
         assert_eq!(
-            fold_suffix("took 1ms", &["took 2ms", "took 3ms"], &mut refs, false),
+            fold_suffix(
+                "took 1ms",
+                &["took 2ms", "took 3ms"],
+                &mut refs,
+                false,
+                true
+            ),
             None
         );
         assert!(refs.pairs().is_empty());
@@ -330,7 +403,7 @@ mod tests {
         // Identical lines are reconstructible from the count, so the same
         // refusal does not apply to them.
         assert_eq!(
-            fold_suffix("same", &["same", "same"], &mut refs, false),
+            fold_suffix("same", &["same", "same"], &mut refs, false, true),
             Some(" [×3]".to_string())
         );
     }
@@ -344,7 +417,7 @@ mod tests {
         // exactly that, with `took 1ms [×3]` against a line occurring once.
         let mut refs = RefCollector::disabled();
         assert_eq!(
-            fold_suffix("same", &["same", "same"], &mut refs, false),
+            fold_suffix("same", &["same", "same"], &mut refs, false, true),
             Some(" [×3]".to_string())
         );
     }
@@ -355,11 +428,11 @@ mod tests {
         assert!(has_marker(&omission_marker("match", 3, "x", &mut refs, "")));
         assert!(has_marker(&omission_marker("log", 3, "x", &mut refs, "")));
         assert!(has_marker(
-            &fold_suffix("x", &["y", "z"], &mut refs, false).unwrap()
+            &fold_suffix("x", &["y", "z"], &mut refs, false, true).unwrap()
         ));
         // the handle-free shape is still a marker: `[×` is what `MARKERS` names
         assert!(has_marker(
-            &fold_suffix("x", &["x", "x"], &mut refs, false).unwrap()
+            &fold_suffix("x", &["x", "x"], &mut refs, false, true).unwrap()
         ));
         assert!(has_marker(&format!(
             "head…[+12 chars{}]",

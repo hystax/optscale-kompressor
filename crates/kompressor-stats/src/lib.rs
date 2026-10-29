@@ -221,6 +221,7 @@ mod tests {
             completion_tokens: Some(180),
             cache_read_tokens: Some(3_000),
             cache_write_tokens: None,
+            cache_write_1h_tokens: None,
             shadow_prompt_tokens: Some(9_000),
             conversation: None,
             retrieve_rounds: 2,
@@ -228,6 +229,7 @@ mod tests {
             upstream_ms: Some(812.5),
             total_ms: Some(840.0),
             error: None,
+            keep_warm: false,
         })
     }
 
@@ -865,6 +867,31 @@ mod tests {
     }
 
     #[test]
+    fn a_keep_warm_ping_is_written_as_one() {
+        let harness = Harness::new();
+        let ping = match proxy(T0 + 1, "acme", "req-1.keepwarm1") {
+            Event::ProxyRequest(mut row) => {
+                row.keep_warm = true;
+                Event::ProxyRequest(row)
+            }
+            other => other,
+        };
+        harness.write(vec![proxy(T0, "acme", "req-1"), ping]);
+        let conn = rusqlite::Connection::open(harness.path()).unwrap();
+        let flags: Vec<(String, i64)> = conn
+            .prepare("SELECT request_id, keep_warm FROM proxy_requests ORDER BY time_ms")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            flags,
+            vec![("req-1".to_string(), 0), ("req-1.keepwarm1".to_string(), 1)]
+        );
+    }
+
+    #[test]
     fn request_joins_optimization_retrieval_and_proxy_rows_on_request_id() {
         let harness = Harness::new();
         harness.write(vec![
@@ -1034,6 +1061,8 @@ mod tests {
                      ALTER TABLE retrieval_events DROP COLUMN withheld;
                      ALTER TABLE proxy_requests DROP COLUMN rolled_up;
                      ALTER TABLE proxy_requests DROP COLUMN strip_usage;
+                     ALTER TABLE proxy_requests DROP COLUMN cache_write_1h_tokens;
+                     ALTER TABLE proxy_requests DROP COLUMN keep_warm;
                      PRAGMA user_version = 5;",
                 )
                 .unwrap();
@@ -1076,6 +1105,8 @@ mod tests {
                 ALTER TABLE retrieval_events DROP COLUMN withheld;
                 ALTER TABLE proxy_requests DROP COLUMN rolled_up;
                 ALTER TABLE proxy_requests DROP COLUMN strip_usage;
+                ALTER TABLE proxy_requests DROP COLUMN cache_write_1h_tokens;
+                ALTER TABLE proxy_requests DROP COLUMN keep_warm;
                 PRAGMA user_version = 5;",
                 )
                 .unwrap();
