@@ -24,11 +24,12 @@
 //!
 //! And after one that stopped on `end_turn` while the conversation has a
 //! background task running — one Claude Code reported starting ("running in
-//! background with ID: …", or "moved to the background (ID: …)") and has not
-//! yet reported on (`<task-id>…</task-id>` in its notification). The model is
+//! background with ID: …", "moved to the background (ID: …)", or a `Monitor`
+//! watch, "Monitor started (task …") and has not yet reported on
+//! (`<task-id>…</task-id>` in its notification). The model is
 //! woken when the job ends, so the client will most likely be back; but an
 //! agent can also give its final answer with a job still running, and then no
-//! request ever comes. Those waits get their own, lower cap,
+//! request ever comes. Those waits get their own cap,
 //! [`ProxyConfig::cache_keep_warm_background_pings`]. In the second keep-warm
 //! run they were 13 of the 30 pauses past five minutes; any other `end_turn`
 //! may be the last turn the conversation has, and is not kept warm.
@@ -151,11 +152,19 @@ impl Ping {
     }
 }
 
-/// What Claude Code says when a command starts in the background, or is moved
-/// there after outliving its timeout. The task id follows.
+/// What Claude Code says when a command starts in the background, is moved
+/// there after outliving its timeout, or when its `Monitor` tool starts a
+/// watch. The task id follows.
+///
+/// The `Monitor` one was missing, and a watch is a background wait like any
+/// other: the model ends its turn and is woken by the watch's event. Measured
+/// on the 89-task run of 2026-10-30 (`14-37-11`): winning-avg-corewars armed a
+/// watch, ended its turn, and the event came 420 s later with no ping sent —
+/// 50,616 tokens written again at the one-hour price.
 const BACKGROUND_STARTED: &[&str] = &[
     "running in background with ID: ",
     "moved to the background (ID: ",
+    "Monitor started (task ",
 ];
 /// The tag a task notification names its task with, which it sends however
 /// the task ended: completed, failed or stopped.
@@ -511,6 +520,23 @@ mod tests {
             background_task_running(&body),
             "boc9wtynk has not been reported"
         );
+    }
+
+    #[test]
+    fn a_monitor_watch_is_running_until_its_first_event() {
+        let started = json!([
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Monitor",
+                "input": {"description": "parameter search completion", "timeout_ms": 600000,
+                    "command": "until [ -s /tmp/w/out.txt ]; do sleep 5; done"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1",
+                "content": "Monitor started (task b166z0pbd, expires in 10m unless the source ends first; you get one notice at expiry \u{2014} re-arm if you still need the watch). You will be notified on each event."}]},
+        ]);
+        assert!(background_task_running(&with_messages(started.clone())));
+
+        let mut reported = started.as_array().unwrap().clone();
+        reported.push(json!({"role": "user", "content":
+            "<system-reminder>\n<task-notification>\n<task-id>b166z0pbd</task-id>\n<summary>Monitor event: \"parameter search completion\"</summary>"}));
+        assert!(!background_task_running(&with_messages(json!(reported))));
     }
 
     #[test]

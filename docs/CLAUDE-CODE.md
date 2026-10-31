@@ -141,7 +141,11 @@ cache untouched.
 
 `proxy.frozen_prefix = "first_seen"` freezes only as far as the provider's cache
 reached when the proxy first saw the conversation, so the tail — in no cache
-entry yet — becomes compressible without invalidating anything. The prize grows
+entry yet — becomes compressible without invalidating anything. That includes
+the final message Claude Code marks with `cache_control`: it is compressed the
+turn it arrives, so the cached form is the one every later turn sends (until
+1.5.8 it went out whole and was compressed a turn later, re-writing what had just
+been cached). The prize grows
 with session length, because a frozen tail token is re-read on every later turn:
 
 | | 20-turn Sonnet | 70-turn Opus |
@@ -446,8 +450,9 @@ keeps the cache entry alive through those pauses instead of paying for them.
 With `proxy.cache_keep_warm = true`, after a response that stopped on
 `tool_use` the proxy re-sends that request with `max_tokens: 1` every 270
 seconds until Claude Code's next request arrives, at most 11 times; after an
-`end_turn` while a background task Claude Code started is still running, at
-most 4 times (`proxy.cache_keep_warm_background_pings`, 0 to turn that off).
+`end_turn` while a background task or `Monitor` watch Claude Code started is
+still running, also at most 11 times (`proxy.cache_keep_warm_background_pings`,
+0 to turn that off).
 Each ping costs the conversation at the cache-read price plus one output token,
 and is recorded as its own `proxy_requests` row with `keep_warm = 1`. Simulated
 over the request logs of seven 89-task runs, it would have saved $1.84–$3.00 a

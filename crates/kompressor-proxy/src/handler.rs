@@ -851,6 +851,18 @@ async fn prepare_inner(
         }),
     );
 
+    // Before the token gate, not after it: a turn whose only new content is
+    // the marked final message measures as nothing while that message is
+    // pinned, goes out whole, and is compressed the turn after — the very
+    // rewrite this exists to prevent. Read without recording, because the
+    // floor is set by the first request that gets past the gate.
+    if proxy.frozen_prefix == FrozenPrefix::FirstSeen
+        && let Some(held) = conversation.and_then(|key| state.prefixes.held_floor(key))
+        && held < walk.frozen_message_count
+    {
+        thaw_the_uncached_tail(&mut walk, held);
+    }
+
     let before = compressible_tokens(&walk);
     if before < proxy.min_tokens {
         tracing::debug!(
@@ -1090,6 +1102,54 @@ async fn prepare_inner(
         Err(error) => {
             state.failopen.record(Stage::Discarded, &error);
             Prepared::passthrough(body, stream, model)
+        }
+    }
+}
+
+/// Let the engine reach the messages `first_seen` says the provider has not
+/// cached yet, cache breakpoint or not.
+///
+/// The floor moves `frozen` below the client's marker, but on Anthropic the
+/// marker protects at three levels — the frozen count, the message's
+/// `cache_control` flag and the slot — and lowering the count alone left the
+/// other two holding. Claude Code marks its final message, so every new message
+/// went out whole on the turn it arrived and was compressed on the next, once
+/// the marker had moved on: a rewrite of bytes the provider had just cached.
+/// One turn of that costs the newest entry; a run of them — a `Monitor` watch
+/// delivering an event a turn — leaves every later entry holding a version of
+/// some message that no longer goes out, so the read stays pinned to the last
+/// entry before the run until the provider's 20-block lookback cannot reach it.
+/// Measured on the 89-task run of 2026-10-30 (`14-37-11`): schemelike read
+/// 62,020 tokens on twelve consecutive turns while writing 265 to 1,470, then
+/// 13,687 and wrote 49,938; across the run 134,355 tokens were re-written one
+/// turn after they were cached, and the off-mode control re-wrote none.
+///
+/// Compressed on arrival, a message is cached in the form every later turn
+/// sends, so nothing is rewritten. Only `WhileCached` protection lifts: a
+/// signature or a citation still pins its block.
+fn thaw_the_uncached_tail(walk: &mut kompressor_wire::Walk, frozen: usize) {
+    use kompressor_engine::messages::{MessageContent, Protection};
+    for message in walk.messages.iter_mut().skip(frozen) {
+        message.meta.cache_control = false;
+        if let MessageContent::Blocks(slots) = &mut message.content {
+            for slot in slots
+                .iter_mut()
+                .filter(|slot| slot.protection == Protection::WhileCached)
+            {
+                slot.protected = false;
+            }
+        }
+    }
+    let messages = &walk.messages;
+    for origin in walk.origins.iter_mut().filter(|o| o.message >= frozen) {
+        let lifted = match messages.get(origin.message).map(|m| &m.content) {
+            Some(MessageContent::Blocks(slots)) => slots
+                .get(origin.slot)
+                .is_some_and(|slot| slot.protection == Protection::WhileCached),
+            _ => false,
+        };
+        if lifted {
+            origin.protected = false;
         }
     }
 }

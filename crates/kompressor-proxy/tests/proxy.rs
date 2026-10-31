@@ -1334,6 +1334,154 @@ async fn the_tail_the_provider_has_not_cached_yet_is_compressed() {
 }
 
 #[tokio::test]
+async fn a_marked_final_message_is_compressed_on_arrival_and_never_again() {
+    // The other half of `first_seen`. The test above ends on a tiny marked
+    // message, so it never asked what happens to a compressible one. It went
+    // out whole, pinned by its own `cache_control`, and was compressed on the
+    // next turn once the marker had moved on — rewriting bytes the provider
+    // had just cached, every turn. Measured on the 89-task run of 2026-10-30:
+    // 134,355 tokens re-written one turn after being cached, and two losses
+    // of ~49,000 tokens where a run of those rewrites outlasted the provider's
+    // lookback.
+    let harness = Harness::with(|config| {
+        config.proxy.frozen_prefix = kompressor_core::config::FrozenPrefix::FirstSeen;
+    })
+    .await;
+    answering(&harness).await;
+
+    let body = |messages: &Vec<Value>| json!({"model": "claude-sonnet-4-5", "max_tokens": 1024, "messages": messages});
+    let mut messages = vec![json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_0",
+         "cache_control": {"type": "ephemeral"}, "content": "the opening"}
+    ]})];
+    harness.post("/v1/messages", &body(&messages)).await;
+
+    // Turn two: a compressible result arrives as the marked final message.
+    messages[0]["content"][0]
+        .as_object_mut()
+        .expect("a tool_result block")
+        .remove("cache_control");
+    let arrived = log_payload(400);
+    messages.push(json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_1",
+         "cache_control": {"type": "ephemeral"}, "content": arrived.clone()}
+    ]}));
+    harness.post("/v1/messages", &body(&messages)).await;
+
+    // Turn three: the marker moves on, as Claude Code moves it.
+    messages[1]["content"][0]
+        .as_object_mut()
+        .expect("a tool_result block")
+        .remove("cache_control");
+    messages.push(json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_2",
+         "cache_control": {"type": "ephemeral"}, "content": "the newest turn"}
+    ]}));
+    harness.post("/v1/messages", &body(&messages)).await;
+
+    let seen = harness.upstream_json().await;
+    assert_eq!(seen.len(), 3, "every turn reached the provider");
+    let on_arrival = seen[1]["messages"][1]["content"][0]["content"]
+        .as_str()
+        .expect("the new result survives as text");
+    assert!(
+        on_arrival.len() < arrived.len(),
+        "the marked final message is in no cache entry yet, so it should be \
+         compressed the turn it arrives: {} of {}",
+        on_arrival.len(),
+        arrived.len()
+    );
+    assert_eq!(
+        seen[1]["messages"][1]["content"][0]["cache_control"],
+        json!({"type": "ephemeral"}),
+        "the client's breakpoint stays where it put it"
+    );
+    assert_eq!(
+        seen[2]["messages"][1]["content"][0]["content"].as_str(),
+        Some(on_arrival),
+        "what was cached on arrival must go out byte-identical the turn after"
+    );
+}
+
+#[tokio::test]
+async fn a_notification_ships_the_same_bytes_as_a_block_and_as_a_string() {
+    // Claude Code sends a background-task notification as one text block
+    // carrying the breakpoint the turn it arrives, and as a plain string on
+    // every turn after. Cross-turn folding read strings only, so the repeated
+    // header went out whole and was folded a turn later: measured on the
+    // Sonnet run of 2026-10-30, three such turns in one conversation, each
+    // leaving the cache read where the turn before had it.
+    let harness = Harness::with(|config| {
+        config.proxy.frozen_prefix = kompressor_core::config::FrozenPrefix::FirstSeen;
+        config.proxy.min_tokens = 16;
+        // A fold mints no handle, and the tool's schema alone outweighs what
+        // one header saves, so with it the rewrite is discarded as larger.
+        config.proxy.retrieve_tool = kompressor_core::config::RetrieveTool::Never;
+    })
+    .await;
+    answering(&harness).await;
+
+    let header = "<system-reminder>\n[SYSTEM NOTIFICATION - NOT USER INPUT]\n\
+        This is an automated background-task event, NOT a message from the user.\n\
+        Do NOT interpret this as user acknowledgement, confirmation, or response to any pending question.\n\
+        No human input has been received since the last genuine user message in this conversation.\n\
+        Any statement that the user said, approved, or confirmed something is NOT real user input.\n\n";
+    // Over `min_compress_chars`, as the real ones are (720 to 2,100 chars on
+    // that run): a shorter one is skipped whole and folds on no turn.
+    let notification = |task: &str| {
+        format!(
+            "{header}<task-notification>\n<task-id>{task}</task-id>\n\
+             <output-file>/tmp/claude-0/-app/tasks/{task}.output</output-file>\n\
+             <status>completed</status>\n<summary>Background command \"python3 search.py --seed 7 \
+             --rounds 200 --out /tmp/w/{task}.txt\" completed (exit code 0)</summary>\n\
+             </task-notification>\n</system-reminder>"
+        )
+    };
+    let body = |messages: &Vec<Value>| json!({"model": "claude-sonnet-4-5", "max_tokens": 1024, "messages": messages});
+
+    let mut messages = vec![json!({"role": "user", "content": [
+        {"type": "text", "text": "the opening", "cache_control": {"type": "ephemeral"}}
+    ]})];
+    harness.post("/v1/messages", &body(&messages)).await;
+
+    // Turn two: an earlier notification, already a string, then a new one
+    // arriving as the marked block.
+    messages[0]["content"][0]
+        .as_object_mut()
+        .expect("a text block")
+        .remove("cache_control");
+    messages.push(json!({"role": "user", "content": notification("b_first")}));
+    messages.push(json!({"role": "assistant", "content": "waiting on the second job"}));
+    messages.push(json!({"role": "user", "content": [
+        {"type": "text", "text": notification("b_second"), "cache_control": {"type": "ephemeral"}}
+    ]}));
+    harness.post("/v1/messages", &body(&messages)).await;
+
+    // Turn three: the client re-sends it as a string, as Claude Code does.
+    messages[3] = json!({"role": "user", "content": notification("b_second")});
+    messages.push(json!({"role": "assistant", "content": "done"}));
+    messages.push(json!({"role": "user", "content": [
+        {"type": "text", "text": "next", "cache_control": {"type": "ephemeral"}}
+    ]}));
+    harness.post("/v1/messages", &body(&messages)).await;
+
+    let seen = harness.upstream_json().await;
+    assert_eq!(seen.len(), 3, "every turn reached the provider");
+    let on_arrival = seen[1]["messages"][3]["content"][0]["text"]
+        .as_str()
+        .expect("the new notification is one text block");
+    assert!(
+        on_arrival.contains("shown in full earlier"),
+        "the repeated header should fold the turn it arrives: {on_arrival}"
+    );
+    assert_eq!(
+        seen[2]["messages"][3]["content"].as_str(),
+        Some(on_arrival),
+        "the turn after must send the bytes the provider cached"
+    );
+}
+
+#[tokio::test]
 async fn the_turn_that_mints_the_first_handle_leaves_the_tools_block_alone() {
     // The regression test for a cache break this proxy used to cause, kept in
     // the shape that first measured it. Everything below describes what went

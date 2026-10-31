@@ -459,11 +459,22 @@ pub struct ProxyConfig {
     /// Those waits are kept warm too, while the conversation has a background
     /// task it has started and not yet been told has finished. In the second
     /// keep-warm run they were 13 of 30 pauses past five minutes, every one a
-    /// miss. The cap is lower than [`Self::cache_keep_warm_max_pings`] because
-    /// this wait can be a dead end: an agent that gives its final answer with a
-    /// job still running never sends another request, and 0–4 conversations a
-    /// run did. Four pings, about 20 minutes, covered 45 of the 48 such waits
-    /// past 270 s across four 89-task runs.
+    /// miss.
+    ///
+    /// This wait can be a dead end: an agent that gives its final answer with
+    /// a job still running never sends another request, and 0–4 conversations
+    /// a run did. That was the reason for a lower cap, four pings (about 20
+    /// minutes), and it priced the wrong way round. A ping costs 0.1x the
+    /// prefix; the wait it fails to bridge is re-written at 2x, because
+    /// `cache_ttl = "adaptive"` moves the conversation to one-hour entries on
+    /// that very request — so one bridged wait pays for about 19 pings, and a
+    /// dead end at 11 costs at most seven more than one at 4. Measured on the
+    /// 89-task run of 2026-10-30 (`14-37-11`): three background waits of 26,
+    /// 43 and 60 minutes outran four pings and re-wrote 97,535 tokens at the
+    /// one-hour price, about $0.76, where the pings to bridge them would have
+    /// cost about $0.12; trailing pings after a conversation's last request
+    /// came to $0.03–$0.11 a run across the three final runs. Now the same 11
+    /// as [`Self::cache_keep_warm_max_pings`], which also caps it.
     pub cache_keep_warm_background_pings: u32,
     /// How many retrieve rounds may be **answered** in one request.
     ///
@@ -815,7 +826,7 @@ impl Default for ProxyConfig {
             cache_keep_warm: false,
             cache_keep_warm_interval: Duration::from_secs(270),
             cache_keep_warm_max_pings: 11,
-            cache_keep_warm_background_pings: 4,
+            cache_keep_warm_background_pings: 11,
             retrieve_execution: RetrieveExecution::Server,
             retrieve_max_rounds: 3,
             retrieve_max_tokens_per_request: 16_384,
@@ -1711,7 +1722,7 @@ mod tests {
             Duration::from_secs(240)
         );
         assert_eq!(config.proxy.cache_keep_warm_max_pings, 5);
-        assert_eq!(config.proxy.cache_keep_warm_background_pings, 4);
+        assert_eq!(config.proxy.cache_keep_warm_background_pings, 11);
         config.apply_env(&[(
             "KOMPRESSOR__PROXY__CACHE_KEEP_WARM_BACKGROUND_PINGS".into(),
             "0".into(),

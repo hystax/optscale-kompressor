@@ -950,6 +950,16 @@ impl PrefixTracker {
         Some(newest)
     }
 
+    /// The floor [`Self::floor`] holds for this conversation, without filing
+    /// one. `None` until a request has set it, and on a poisoned lock.
+    pub fn held_floor(&self, fingerprint: u64) -> Option<usize> {
+        self.seen
+            .lock()
+            .ok()?
+            .get(&fingerprint)
+            .and_then(|entry| entry.floor)
+    }
+
     /// A poisoned lock answers with `observed`, which is the current behaviour
     /// and cannot be wrong.
     pub fn floor(&self, fingerprint: u64, observed: usize) -> usize {
