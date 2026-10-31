@@ -23,7 +23,9 @@ use serde_json::{Value, json};
 use tracing::Instrument;
 
 use kompressor_core::auth::{Credentials, Identity};
-use kompressor_core::config::{FrozenPrefix, ProxyConfig, RetrieveExecution, RetrieveTool};
+use kompressor_core::config::{
+    CacheTtl, FrozenPrefix, ProxyConfig, RetrieveExecution, RetrieveTool,
+};
 use kompressor_core::{AppCore, RequestInfo};
 use kompressor_engine::estimate_tokens;
 use kompressor_engine::messages::{Message, PrefixCache};
@@ -97,7 +99,12 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         // headers, and once the socket is open there are no headers left to
         // read. The tenant and the mode belong to the session, not to a frame.
         let identity = resolve_identity(&state, &parts.headers);
-        let mode = resolve_mode(&state, &parts.headers, &identity);
+        let mode = resolve_mode(
+            &state,
+            &parts.headers,
+            &identity,
+            detect_family(&route.path).map(ApiFamily::provider),
+        );
         let provider = upstream.name.clone();
         let mut parts = parts;
         return match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
@@ -175,20 +182,24 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     // from one the engine declined.
     let decoded = body.clone();
 
+    let family = if upstream.api_family.eq_ignore_ascii_case("passthrough") {
+        None
+    } else {
+        detect_family(&route.path)
+    };
     let identity = resolve_identity(&state, &parts.headers);
-    let mode = resolve_mode(&state, &parts.headers, &identity);
+    let mode = resolve_mode(
+        &state,
+        &parts.headers,
+        &identity,
+        family.map(ApiFamily::provider),
+    );
     tracing::debug!(
         tenant = %identity.tenant.as_str(),
         upstream = %upstream.name,
         mode = mode.as_str(),
         "routing"
     );
-
-    let family = if upstream.api_family.eq_ignore_ascii_case("passthrough") {
-        None
-    } else {
-        detect_family(&route.path)
-    };
     let prepared = prepare(
         &state,
         &identity,
@@ -202,6 +213,13 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     )
     .await;
 
+    // The client is back in this conversation, so whatever was keeping its
+    // cache warm has done its job. Cancelled before this request is sent, so a
+    // ping cannot race the request it was waiting for.
+    if let Some(conversation) = prepared.prefix {
+        state.keepwarm.cancel(conversation);
+    }
+
     // Both bodies, before either is re-encoded, when a capture is asked for.
     // Which byte changed is the one question the aggregates cannot answer, and
     // whether it changed on the way in or on the way out is what says who
@@ -214,6 +232,16 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
 
     let upstream_headers =
         headers::upstream_headers(&parts.headers, upstream, &request_id, auth_mode);
+    let keep_warm = keep_warm_for(
+        &state,
+        family,
+        &prepared,
+        &route.url,
+        &upstream_headers,
+        &request_id,
+        &identity,
+        route.origin(),
+    );
     // What actually goes out. Unchanged means unchanged: the bytes that
     // arrived, in the coding they arrived in. Only a body this proxy rewrote
     // is re-encoded, and if that fails the original ships rather than a body
@@ -287,7 +315,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         proxy.retrieve_max_tokens_per_request,
     );
 
-    let recorder = Recorder::new(
+    let mut recorder = Recorder::new(
         &state,
         &identity,
         &request_id,
@@ -297,6 +325,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         // Taken before `outbound` is moved into whichever path sends it.
         outbound.waited(),
     );
+    recorder.keep_warm = keep_warm;
 
     if prepared.stream {
         stream_response(
@@ -329,6 +358,75 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     }
 }
 
+/// The keep-warm ping this request would leave behind, if its conversation is
+/// one to keep warm. Whether it is armed is decided when the response ends,
+/// on how the model stopped. See [`crate::keepwarm`].
+#[allow(clippy::too_many_arguments)]
+fn keep_warm_for(
+    state: &ProxyState,
+    family: Option<ApiFamily>,
+    prepared: &Prepared,
+    url: &str,
+    upstream_headers: &HeaderMap,
+    request_id: &str,
+    identity: &Identity,
+    upstream: &str,
+) -> Option<KeepWarmPlan> {
+    if family != Some(ApiFamily::AnthropicMessages) || prepared.one_hour {
+        return None;
+    }
+    let proxy = &state.core.config_for(Some("anthropic")).proxy;
+    if !proxy.cache_keep_warm {
+        return None;
+    }
+    let conversation = prepared.prefix?;
+    let parsed;
+    let sent = match prepared.json.as_ref() {
+        Some(value) => value,
+        None => {
+            parsed = serde_json::from_slice::<Value>(&prepared.body).ok()?;
+            &parsed
+        }
+    };
+    let ping = crate::keepwarm::Ping::for_request(
+        sent,
+        url,
+        upstream_headers,
+        request_id,
+        identity.tenant.as_str(),
+        prepared.model.clone(),
+        upstream,
+        conversation,
+    )?;
+    let background = (proxy.cache_keep_warm_background_pings > 0
+        && crate::keepwarm::background_task_running(sent))
+    .then(|| crate::keepwarm::Schedule {
+        interval: proxy.cache_keep_warm_interval,
+        max_pings: proxy
+            .cache_keep_warm_background_pings
+            .min(proxy.cache_keep_warm_max_pings),
+    });
+    Some(KeepWarmPlan {
+        state: state.clone(),
+        ping,
+        schedule: crate::keepwarm::Schedule {
+            interval: proxy.cache_keep_warm_interval,
+            max_pings: proxy.cache_keep_warm_max_pings,
+        },
+        background,
+    })
+}
+
+/// A ping ready to arm, held by the [`Recorder`] until the response ends.
+pub(crate) struct KeepWarmPlan {
+    state: ProxyState,
+    ping: crate::keepwarm::Ping,
+    schedule: crate::keepwarm::Schedule,
+    /// The schedule for an `end_turn` while a background task runs, or `None`
+    /// when there is no such task (or that case is turned off).
+    background: Option<crate::keepwarm::Schedule>,
+}
+
 /// What the compression stage decided to send.
 struct Prepared {
     /// The bytes that go upstream.
@@ -349,6 +447,9 @@ struct Prepared {
     /// provider reports can be filed against it for next turn. `None` when
     /// nothing was frozen — there is no prefix to have an opinion about.
     prefix: Option<u64>,
+    /// The request asked for one-hour cache entries, which outlast any pause a
+    /// keep-warm ping would bridge.
+    one_hour: bool,
 }
 
 impl Prepared {
@@ -356,6 +457,7 @@ impl Prepared {
     fn passthrough(body: Bytes, stream: bool, model: Option<String>) -> Prepared {
         Prepared {
             prefix: None,
+            one_hour: false,
             body,
             json: None,
             saved_tokens: 0,
@@ -459,6 +561,7 @@ fn passthrough_with_stable_tools(
         // Stamped by `prepare`, which computes it for every request however
         // this one turned out.
         prefix: None,
+        one_hour: false,
     }
 }
 
@@ -531,13 +634,15 @@ fn prefix_identity(
     state: &ProxyState,
     identity: &Identity,
     family: Option<ApiFamily>,
-    mode: ProxyMode,
     body: &Bytes,
     provider: &str,
 ) -> Option<u64> {
-    if mode.is_off() {
-        return None;
-    }
+    // Identified with compression off too. The control arm of a comparison has
+    // to be observed the way the treated arm is: without a conversation its
+    // rows filed no conversation, its cache-read drops went untracked — an
+    // off run reported zero cache loss over 992 requests — and `cache_ttl =
+    // "adaptive"` could never switch there. Reading the body is all this does;
+    // what is forwarded is decided elsewhere.
     let family = family?;
     let value: Value = serde_json::from_slice(body).ok()?;
     let walk = walker_for(family).walk(&value)?;
@@ -580,7 +685,20 @@ async fn prepare(
     request_id: &str,
     provider: &str,
 ) -> Prepared {
-    let fingerprint = prefix_identity(state, identity, family, mode, &body, provider);
+    let fingerprint = prefix_identity(state, identity, family, &body, provider);
+    // Decided once, here: under `adaptive` the question itself moves the
+    // conversation's state. Anthropic only; the TTL is its field.
+    let long_ttl = family == Some(ApiFamily::AnthropicMessages)
+        && match state
+            .core
+            .config_for(family.map(ApiFamily::provider))
+            .proxy
+            .cache_ttl
+        {
+            CacheTtl::Default => false,
+            CacheTtl::OneHour => true,
+            CacheTtl::Adaptive => fingerprint.is_some_and(|key| state.prefixes.long_ttl(key)),
+        };
     let mut prepared = prepare_inner(
         state,
         identity,
@@ -592,12 +710,43 @@ async fn prepare(
         request_id,
         provider,
         fingerprint,
+        long_ttl,
     )
     .await;
     if prepared.prefix.is_none() {
         prepared.prefix = fingerprint;
     }
+    // After every way `prepare_inner` can decline, for the reason the identity
+    // is stamped here: under the default marker floor Claude Code freezes its
+    // whole conversation, so nearly every request is a passthrough, and a TTL
+    // applied only to compressed bodies would almost never reach the provider.
+    if long_ttl {
+        extend_cache_ttl(&mut prepared);
+        prepared.one_hour = true;
+    }
     prepared
+}
+
+/// Ask for one-hour cache entries on whatever `prepared` will send.
+///
+/// A passthrough body is parsed for it and re-serialized. That changes JSON
+/// bytes, never the prompt: the provider keys its cache on the rendered prompt,
+/// and `serde_json` here keeps key order and numbers exact. A body that does
+/// not parse, or carries no marker, goes out as it was.
+fn extend_cache_ttl(prepared: &mut Prepared) {
+    let mut parsed = None;
+    let value = match prepared.json.as_mut() {
+        Some(value) => value,
+        None => match serde_json::from_slice::<Value>(&prepared.body) {
+            Ok(value) => parsed.insert(value),
+            Err(_) => return,
+        },
+    };
+    if crate::cachettl::extend_cache_ttl(value) > 0
+        && let Ok(out) = serde_json::to_vec(value)
+    {
+        prepared.body = Bytes::from(out);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -612,8 +761,12 @@ async fn prepare_inner(
     request_id: &str,
     provider: &str,
     conversation: Option<u64>,
+    // Whether this request will ask for one-hour cache entries, decided before
+    // compression so a promotion is priced at the write it will cost.
+    long_ttl: bool,
 ) -> Prepared {
-    let config = state.core.config();
+    // This provider's settings: `proxy.providers` applied over the defaults.
+    let config = state.core.config_for(family.map(ApiFamily::provider));
     let proxy = &config.proxy;
     let Some(family) = family else {
         let stream = unparsed_asks_to_stream(&body, request_headers);
@@ -621,7 +774,19 @@ async fn prepare_inner(
     };
     if mode.is_off() || !proxy.enabled || method != Method::POST || !is_json(request_headers) {
         let stream = unparsed_asks_to_stream(&body, request_headers);
-        return Prepared::passthrough(body, stream, None);
+        // The model still goes on the row, so the control arm can be priced
+        // per model like the treated one; the body is forwarded untouched.
+        let model = mode
+            .is_off()
+            .then(|| serde_json::from_slice::<Value>(&body).ok())
+            .flatten()
+            .and_then(|value| {
+                value
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        return Prepared::passthrough(body, stream, model);
     }
 
     let Ok(mut value) = serde_json::from_slice::<Value>(&body) else {
@@ -653,8 +818,9 @@ async fn prepare_inner(
     // has to decide whether to offer the retrieve tool, and that decision is the
     // engine's effective mode rather than the proxy's patch -- offering it on
     // some turns of a conversation and not others is what moves the prefix.
-    let options = state.core.options_for(
+    let options = state.core.options_for_provider(
         identity,
+        Some(family.provider()),
         Some(&EngineOptionsPatch {
             mode: mode.engine_mode(),
             // The proxy's own knob can withhold the read lifecycle but never
@@ -684,6 +850,18 @@ async fn prepare_inner(
             ..Default::default()
         }),
     );
+
+    // Before the token gate, not after it: a turn whose only new content is
+    // the marked final message measures as nothing while that message is
+    // pinned, goes out whole, and is compressed the turn after — the very
+    // rewrite this exists to prevent. Read without recording, because the
+    // floor is set by the first request that gets past the gate.
+    if proxy.frozen_prefix == FrozenPrefix::FirstSeen
+        && let Some(held) = conversation.and_then(|key| state.prefixes.held_floor(key))
+        && held < walk.frozen_message_count
+    {
+        thaw_the_uncached_tail(&mut walk, held);
+    }
 
     let before = compressible_tokens(&walk);
     if before < proxy.min_tokens {
@@ -781,7 +959,7 @@ async fn prepare_inner(
     // Counts beside the ids: the engine prices a promotion's prefix rewrite
     // against how often the fragment would otherwise be fetched again, and this
     // is the only place that number is known.
-    let fetches = state.prefixes.retrieved_with_counts(conversation);
+    let fetches = state.prefixes.demand(conversation);
     let mut keep_inline: Vec<RefId> = fetches.iter().map(|(id, _)| *id).collect();
     for id in wanted_fragments(state, identity, conversation, &walk.messages) {
         if !keep_inline.contains(&id) {
@@ -822,6 +1000,18 @@ async fn prepare_inner(
         fetches,
         // Measured from what this provider has actually reported, not assumed.
         state.prefixes.cache_hit_per_mille(),
+        outside_tokens(&value),
+        // At the TTL this request will ask for: a rewrite under one-hour
+        // entries is written at 2x, not 1.25x.
+        Some(
+            state
+                .prefixes
+                .promotion_pricing(crate::prefixcache::CachePrices::for_model(
+                    family,
+                    model.as_deref(),
+                    long_ttl,
+                )),
+        ),
         conversation,
         proxy.compress_timeout,
     )
@@ -906,11 +1096,60 @@ async fn prepare_inner(
                 strip_usage,
                 model,
                 prefix: fingerprint,
+                one_hour: false,
             }
         }
         Err(error) => {
             state.failopen.record(Stage::Discarded, &error);
             Prepared::passthrough(body, stream, model)
+        }
+    }
+}
+
+/// Let the engine reach the messages `first_seen` says the provider has not
+/// cached yet, cache breakpoint or not.
+///
+/// The floor moves `frozen` below the client's marker, but on Anthropic the
+/// marker protects at three levels — the frozen count, the message's
+/// `cache_control` flag and the slot — and lowering the count alone left the
+/// other two holding. Claude Code marks its final message, so every new message
+/// went out whole on the turn it arrived and was compressed on the next, once
+/// the marker had moved on: a rewrite of bytes the provider had just cached.
+/// One turn of that costs the newest entry; a run of them — a `Monitor` watch
+/// delivering an event a turn — leaves every later entry holding a version of
+/// some message that no longer goes out, so the read stays pinned to the last
+/// entry before the run until the provider's 20-block lookback cannot reach it.
+/// Measured on the 89-task run of 2026-10-30 (`14-37-11`): schemelike read
+/// 62,020 tokens on twelve consecutive turns while writing 265 to 1,470, then
+/// 13,687 and wrote 49,938; across the run 134,355 tokens were re-written one
+/// turn after they were cached, and the off-mode control re-wrote none.
+///
+/// Compressed on arrival, a message is cached in the form every later turn
+/// sends, so nothing is rewritten. Only `WhileCached` protection lifts: a
+/// signature or a citation still pins its block.
+fn thaw_the_uncached_tail(walk: &mut kompressor_wire::Walk, frozen: usize) {
+    use kompressor_engine::messages::{MessageContent, Protection};
+    for message in walk.messages.iter_mut().skip(frozen) {
+        message.meta.cache_control = false;
+        if let MessageContent::Blocks(slots) = &mut message.content {
+            for slot in slots
+                .iter_mut()
+                .filter(|slot| slot.protection == Protection::WhileCached)
+            {
+                slot.protected = false;
+            }
+        }
+    }
+    let messages = &walk.messages;
+    for origin in walk.origins.iter_mut().filter(|o| o.message >= frozen) {
+        let lifted = match messages.get(origin.message).map(|m| &m.content) {
+            Some(MessageContent::Blocks(slots)) => slots
+                .get(origin.slot)
+                .is_some_and(|slot| slot.protection == Protection::WhileCached),
+            _ => false,
+        };
+        if lifted {
+            origin.protected = false;
         }
     }
 }
@@ -921,6 +1160,22 @@ async fn prepare_inner(
 /// forwarded. The blocking task is left to finish on its own — it cannot be
 /// cancelled, and abandoning it is cheaper than making every request wait for a
 /// pathological payload.
+/// The prompt a request carries outside its messages — system prompt,
+/// instructions, tool schemas — in estimated tokens.
+///
+/// Every retrieve round re-sends it, so the engine prices a round with it. On
+/// Claude Code it is ~13,600 tokens before the first message, and leaving it out
+/// made a 23,000-token prompt read as 9,347: a fragment fetched in three
+/// consecutive requests was refused twice for a rewrite it would have repaid.
+fn outside_tokens(body: &Value) -> u32 {
+    ["system", "instructions", "tools"]
+        .iter()
+        .filter_map(|key| body.get(*key))
+        .filter(|value| !value.is_null())
+        .map(|value| estimate_tokens(&value.to_string(), "system"))
+        .fold(0, u32::saturating_add)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn compress_with_deadline(
     state: &ProxyState,
@@ -943,6 +1198,10 @@ pub(crate) async fn compress_with_deadline(
     keep_inline: Vec<RefId>,
     fetches: Vec<(RefId, u32)>,
     cache_hit_per_mille: u32,
+    // What the provider bills outside the messages; see `outside_tokens`.
+    outside_tokens: u32,
+    // The provider's prices for a promotion; `None` prices it from the rate.
+    cache_pricing: Option<kompressor_engine::messages::CachePricing>,
     // Which conversation to pin a promotion against. `None` for a transport
     // with no conversation of its own, which then keeps nothing pinned.
     conversation: Option<u64>,
@@ -973,6 +1232,8 @@ pub(crate) async fn compress_with_deadline(
             &keep_inline,
             &fetches,
             cache_hit_per_mille,
+            outside_tokens,
+            cache_pricing,
         );
         (
             core, identity, options, request_id, model, provider, messages, computed,
@@ -1489,9 +1750,11 @@ fn wanted_fragments(
     wanted
 }
 
-/// The request's mode: its own header, then the tenant's, then the deployment's.
+/// The request's mode: its own header, then the tenant's, then the provider's
+/// (`proxy.providers`), then the deployment's.
 ///
-/// `proxy.compress = false` is checked before any of them: it is the
+/// `proxy.compress = false` — the deployment's, or the provider's — is checked
+/// before any of them: it is the
 /// deployment saying it does not compress, and a switch a client header can
 /// turn back on is not one.
 ///
@@ -1509,8 +1772,10 @@ pub(crate) fn resolve_mode(
     state: &ProxyState,
     headers: &HeaderMap,
     identity: &Identity,
+    provider: Option<&str>,
 ) -> ProxyMode {
-    let proxy = &state.core.config().proxy;
+    let config = state.core.config_for(provider);
+    let proxy = &config.proxy;
     if !proxy.compress || !proxy.enabled {
         return ProxyMode::Off;
     }
@@ -1524,7 +1789,7 @@ pub(crate) fn resolve_mode(
     if let Some(mode) = identity.mode {
         return ProxyMode::On(mode);
     }
-    ProxyMode::On(state.core.config().engine.mode)
+    ProxyMode::On(config.engine.mode)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1568,6 +1833,12 @@ async fn buffered_response(
         prepared.saved_tokens,
         relayed.rounds,
     );
+    let mut recorder = recorder;
+    if family == Some(ApiFamily::AnthropicMessages) {
+        recorder.stop_reason = serde_json::from_slice::<Value>(&relayed.body)
+            .ok()
+            .and_then(|body| body.get("stop_reason")?.as_str().map(str::to_string));
+    }
     recorder.finish(
         Some(relayed.status.as_u16()),
         relayed.rounds,
@@ -1664,8 +1935,10 @@ async fn stream_response(
     };
 
     let (tx, rx) = tokio::sync::mpsc::channel::<ClientChunk>(32);
+    let mut recorder = recorder;
     tokio::spawn(async move {
         let outcome = relay.run(upstream, tx).await;
+        recorder.stop_reason = outcome.stop_reason.clone();
         // A stream the client walked out on still gets a row, and the row says
         // so. Without the note it is a healthy 200 carrying usage for tokens
         // that reached nobody, which is worse than no row at all: it is a row
@@ -1673,7 +1946,10 @@ async fn stream_response(
         let failure = if outcome.client_gone {
             Some("client disconnected before the stream completed".to_string())
         } else if outcome.upstream_error {
-            Some("upstream stream ended early".to_string())
+            outcome
+                .error_detail
+                .clone()
+                .or_else(|| Some("upstream stream ended early".to_string()))
         } else {
             None
         };
@@ -1750,6 +2026,11 @@ pub(crate) struct Recorder {
     /// Provider wait, accumulated by the `Outbound` this request sends through.
     /// Shared rather than copied so the retrieve loop's extra rounds are in it.
     waited: Arc<AtomicU64>,
+    /// The keep-warm ping to arm if the response stops on `tool_use`, or on
+    /// `end_turn` with a background task running.
+    pub(crate) keep_warm: Option<KeepWarmPlan>,
+    /// How the model stopped, where the path that relayed it could tell.
+    pub(crate) stop_reason: Option<String>,
 }
 
 impl Recorder {
@@ -1790,6 +2071,7 @@ impl Recorder {
             completion_tokens: None,
             cache_read_tokens: None,
             cache_write_tokens: None,
+            cache_write_1h_tokens: None,
             shadow_prompt_tokens: None,
             // Hex rather than the raw u64: SQLite integers are signed, so
             // half the fingerprint space would be written as a negative
@@ -1801,6 +2083,7 @@ impl Recorder {
             upstream_ms: None,
             total_ms: None,
             error: None,
+            keep_warm: false,
         };
         Recorder {
             core: state.core.clone(),
@@ -1808,7 +2091,42 @@ impl Recorder {
             waited,
             prefixes: state.prefixes.clone(),
             prefix: prepared.prefix,
+            keep_warm: None,
+            stop_reason: None,
         }
+    }
+
+    /// Arm the keep-warm ping if this request left the client owing the model
+    /// a tool result, which is the one case where its next request is sure to
+    /// come and to extend this conversation.
+    fn arm_keep_warm(&mut self, started: Instant) {
+        let Some(plan) = self.keep_warm.take() else {
+            return;
+        };
+        let succeeded = self.event.error.is_none()
+            && self
+                .event
+                .status
+                .is_some_and(|status| (200..300).contains(&status));
+        let prompt = self
+            .event
+            .prompt_tokens
+            .unwrap_or(0)
+            .saturating_add(self.event.cache_read_tokens.unwrap_or(0))
+            .saturating_add(self.event.cache_write_tokens.unwrap_or(0));
+        if !succeeded || prompt < crate::keepwarm::MIN_PREFIX_TOKENS {
+            return;
+        }
+        let schedule = match self.stop_reason.as_deref() {
+            Some("tool_use") => plan.schedule,
+            Some("end_turn") => match plan.background {
+                Some(schedule) => schedule,
+                None => return,
+            },
+            _ => return,
+        };
+        let keepwarm = plan.state.keepwarm.clone();
+        keepwarm.arm(plan.state, plan.ping, schedule, started);
     }
 
     fn finish(
@@ -1842,18 +2160,46 @@ impl Recorder {
                         .map(|tokens| tokens as u32)
                 });
             self.event.cache_write_tokens = billed(usage, &["cache_creation_input_tokens"]);
+            // The TTL split, which prices the write: 1.25x input for five-minute
+            // entries, 2x for one-hour ones.
+            self.event.cache_write_1h_tokens = usage
+                .pointer("/cache_creation/ephemeral_1h_input_tokens")
+                .and_then(Value::as_u64)
+                .map(|tokens| tokens as u32);
         }
         // Filed only when this request actually froze a prefix. `None` for
         // cache reads means the response carried no usage at all, which is not
         // evidence either way and is stored as such.
         if let Some(prefix) = self.prefix {
-            self.prefixes.record(
-                prefix,
-                self.event.cache_read_tokens,
-                self.event.prompt_tokens,
-                rounds,
-            );
+            // Anthropic reports `input_tokens` as the uncached remainder, with
+            // reads and writes beside it; OpenAI's `prompt_tokens` already
+            // includes its cached part. The tracker needs the whole prompt
+            // either way, and the event keeps the provider's own figure.
+            let anthropic = usage.is_some_and(|usage| {
+                usage.get("cache_read_input_tokens").is_some()
+                    || usage.get("cache_creation_input_tokens").is_some()
+            });
+            let written = self.event.cache_write_tokens.unwrap_or(0);
+            let prompt = if anthropic {
+                self.event.prompt_tokens.map(|uncached| {
+                    uncached
+                        .saturating_add(self.event.cache_read_tokens.unwrap_or(0))
+                        .saturating_add(written)
+                })
+            } else {
+                self.event.prompt_tokens
+            };
+            self.prefixes
+                .record(prefix, self.event.cache_read_tokens, prompt, rounds);
+            if anthropic
+                && written > 0
+                && self.event.cache_read_tokens.is_some()
+                && prompt.is_some_and(|prompt| prompt > 0)
+            {
+                self.prefixes.record_cache_writes(written);
+            }
         }
+        self.arm_keep_warm(started);
         self.core.stats().send(Event::ProxyRequest(self.event));
     }
 }
@@ -1869,6 +2215,21 @@ fn billed(usage: &Value, keys: &[&str]) -> Option<u32> {
 mod tests {
     use super::{RefId, inline_set_under_ceiling};
     use kompressor_engine::refs::ref_for;
+
+    #[test]
+    fn the_prompt_outside_the_messages_is_its_system_prompt_and_tools() {
+        let messages_only = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+        assert_eq!(super::outside_tokens(&messages_only), 0);
+        let full = serde_json::json!({
+            "system": [{"type": "text", "text": "You are a coding agent. ".repeat(100)}],
+            "tools": [{"name": "Bash", "description": "Run a command. ".repeat(50), "input_schema": {}}],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let outside = super::outside_tokens(&full);
+        assert!(outside > 500, "{outside}");
+        let without_tools = serde_json::json!({"system": full["system"].clone(), "messages": []});
+        assert!(super::outside_tokens(&without_tools) < outside);
+    }
 
     fn priced(sizes: &[u32]) -> Vec<(RefId, u32)> {
         sizes
@@ -2046,7 +2407,6 @@ mod tests {
     #[test]
     fn identical_openings_do_not_share_prefix_state_across_tenants_or_models() {
         use kompressor_core::Config;
-        use kompressor_engine::Mode;
         use kompressor_store::memory::MemoryRefStore;
         use kompressor_store::types::Tenant;
 
@@ -2075,7 +2435,6 @@ mod tests {
                 &state,
                 identity,
                 Some(ApiFamily::OpenAiChat),
-                ProxyMode::On(Mode::Recoverable),
                 &body(model),
                 provider,
             )
@@ -2118,6 +2477,63 @@ mod tests {
                 "turn {turn} changed identity"
             );
         }
+    }
+
+    #[test]
+    fn identical_openings_that_part_are_two_conversations() {
+        // Three attempts of one Harbor task open byte-identically. Filed as
+        // one conversation, the later attempts inherited the first one's
+        // cache-lifetime flag and wrote one-hour entries from their first
+        // request.
+        let tracker = prefixcache::PrefixTracker::new(Duration::ZERO);
+        let identify = |texts: &[String]| {
+            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            tracker.identify(&prefixcache::identity_chain(&refs))
+        };
+        let attempt = |name: &str, turns: usize| {
+            let mut texts = vec!["preamble".to_string(), "the task".to_string()];
+            for turn in 0..turns {
+                texts.push(format!("{name} call {turn}"));
+                texts.push(format!("{name} result {turn}"));
+            }
+            texts
+        };
+
+        let first = identify(&attempt("a", 0));
+        assert_eq!(identify(&attempt("a", 4)), first);
+        // Its opening alone cannot be told apart, and nothing has parted yet.
+        assert_eq!(identify(&attempt("b", 0)), first);
+
+        let second = identify(&attempt("b", 1));
+        assert_ne!(second, first, "a departure is another conversation");
+        for turns in 2..6 {
+            assert_eq!(identify(&attempt("b", turns)), second, "turn {turns}");
+            assert_eq!(identify(&attempt("a", turns + 4)), first, "turn {turns}");
+        }
+        let third = identify(&attempt("c", 1));
+        assert!(third != first && third != second);
+    }
+
+    #[test]
+    fn a_rewritten_tail_is_still_the_same_conversation() {
+        // The one rewrite measured in 958 requests reached two messages back.
+        let tracker = prefixcache::PrefixTracker::new(Duration::ZERO);
+        let identify = |texts: &[&str]| tracker.identify(&prefixcache::identity_chain(texts));
+        let id = identify(&["preamble", "task"]);
+        assert_eq!(
+            identify(&["preamble", "task", "call", "result", "reminder"]),
+            id
+        );
+        assert_eq!(
+            identify(&["preamble", "task", "call", "retried", "reminder"]),
+            id
+        );
+        assert_eq!(
+            identify(&["preamble", "task", "call", "retried", "reminder", "next"]),
+            id
+        );
+        // A replay of an earlier turn is not a departure either.
+        assert_eq!(identify(&["preamble", "task", "call"]), id);
     }
 
     #[test]

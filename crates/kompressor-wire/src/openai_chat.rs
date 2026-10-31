@@ -39,7 +39,15 @@ impl Walker for OpenAiChatWalker {
             // reason about; the caller relays the request rather than guessing
             let message = message.as_object()?;
             let role = message.get("role")?.as_str()?;
-            let meta = meta_for(message, role, &calls);
+            let mut meta = meta_for(message, role, &calls);
+            // Billed, never readable: the arguments of the calls an assistant
+            // turn made. Counted for promotion pricing only.
+            meta.unseen_tokens = message
+                .get("tool_calls")
+                .filter(|calls| !calls.is_null())
+                .map_or(0, |calls| {
+                    kompressor_engine::estimate_tokens(&calls.to_string(), "tool")
+                });
             let here = SlotPath::root().key("messages").index(index);
 
             match message.get("content") {

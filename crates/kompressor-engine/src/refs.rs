@@ -155,6 +155,8 @@ pub fn refs_in(content: &str) -> Vec<RefId> {
 #[derive(Clone, Debug)]
 pub struct RefCollector {
     enabled: bool,
+    /// Source bodies that a selective anti-re-elision pass must preserve.
+    inline_code: HashSet<RefId>,
     max_ref_bytes: usize,
     pairs: Vec<(RefId, String)>,
     seen: HashSet<RefId>,
@@ -168,6 +170,11 @@ pub struct RefCollector {
     /// fragment limit cost this payload anything", whether that cost was the
     /// whole compression or one fold group that stayed inline.
     oversized_refusals: usize,
+    /// Payloads shipped whole by `min_elision_saving_chars`. Sticky like
+    /// `oversized_refusals`, and for the same reason: the gate rolls back
+    /// everything the payload stashed, so nothing else is left to say why it
+    /// went out uncompressed.
+    gated: usize,
 }
 
 /// A point to roll a collector back to.
@@ -189,11 +196,13 @@ impl RefCollector {
     pub fn new(max_ref_bytes: usize) -> Self {
         RefCollector {
             enabled: true,
+            inline_code: HashSet::new(),
             max_ref_bytes,
             pairs: Vec::new(),
             seen: HashSet::new(),
             oversized_attempts: 0,
             oversized_refusals: 0,
+            gated: 0,
         }
     }
 
@@ -201,12 +210,23 @@ impl RefCollector {
     pub fn disabled() -> Self {
         RefCollector {
             enabled: false,
+            inline_code: HashSet::new(),
             max_ref_bytes: 0,
             pairs: Vec::new(),
             seen: HashSet::new(),
             oversized_attempts: 0,
             oversized_refusals: 0,
+            gated: 0,
         }
+    }
+
+    pub(crate) fn preserve_code(&mut self, ids: &[RefId]) {
+        self.inline_code.extend(ids.iter().copied());
+    }
+
+    #[cfg(feature = "code-aware")]
+    pub(crate) fn code_is_preserved(&self, fragment: &str) -> bool {
+        !self.inline_code.is_empty() && self.inline_code.contains(&ref_for(fragment))
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -277,6 +297,15 @@ impl RefCollector {
         self.oversized_refusals += other.oversized_refusals;
     }
 
+    /// Payloads `min_elision_saving_chars` has shipped whole so far.
+    pub fn gated(&self) -> usize {
+        self.gated
+    }
+
+    pub(crate) fn note_gated(&mut self) {
+        self.gated += 1;
+    }
+
     pub fn forgive_oversized(&mut self) {
         self.oversized_attempts = self.oversized_attempts.saturating_sub(1);
     }
@@ -303,11 +332,13 @@ impl RefCollector {
     pub fn scratch(&self) -> RefCollector {
         RefCollector {
             enabled: self.enabled,
+            inline_code: self.inline_code.clone(),
             max_ref_bytes: self.max_ref_bytes,
             pairs: Vec::new(),
             seen: HashSet::new(),
             oversized_attempts: 0,
             oversized_refusals: 0,
+            gated: 0,
         }
     }
 
@@ -318,6 +349,7 @@ impl RefCollector {
     pub fn adopt(&mut self, other: RefCollector) {
         self.oversized_attempts += other.oversized_attempts;
         self.oversized_refusals += other.oversized_refusals;
+        self.gated += other.gated;
         for (_, fragment) in other.pairs {
             self.stash(&fragment);
         }

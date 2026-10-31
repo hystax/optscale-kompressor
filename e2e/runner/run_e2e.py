@@ -974,6 +974,133 @@ def declines_are_honest() -> None:
         check(False, "unstructured prose reaches the provider", "nothing recorded")
 
 
+def keepwarm_body(tag: str, stop: str, background: str | None = None) -> dict:
+    """An Anthropic conversation the mock answers as a cached one (`KEEPWARM:`).
+
+    `background` is `None` for no background task, `"running"` for one Claude
+    Code reported starting, and `"reported"` for one whose notification came.
+    `tag` keeps each check's conversation its own.
+    """
+    messages = [
+        {"role": "user", "content": f"keep-warm check {tag}: build the project."},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_0", "name": "bash", "input": {"command": "make"}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_0", "content": "ok"}]},
+    ]
+    if background:
+        messages += [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_bg", "name": "bash",
+                 "input": {"command": "make train", "run_in_background": True}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_bg",
+                 "content": "Command running in background with ID: bkw0001. "
+                            "You will be notified when it completes."}]},
+        ]
+    if background == "reported":
+        messages.append({"role": "user", "content": [{"type": "text", "text":
+            "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n"
+            "<task-id>bkw0001</task-id>\n<status>completed</status>"}]})
+    return {
+        "model": "claude-opus-5-5",
+        "max_tokens": 4096,
+        "system": [{"type": "text", "text": f"KEEPWARM:{stop}",
+                    "cache_control": {"type": "ephemeral"}}],
+        "messages": messages,
+    }
+
+
+def pings_seen() -> list[dict]:
+    pings = []
+    for request in recorded():
+        if not request["path"].endswith("/messages"):
+            continue
+        try:
+            body = json.loads(request["body"])
+        except ValueError:
+            continue
+        if body.get("max_tokens") == 1:
+            pings.append({"body": body, "headers": request["headers"]})
+    return pings
+
+
+def keep_warm() -> None:
+    """The proxy keeps a waiting conversation's provider cache alive.
+
+    Interval 2s, at most 3 pings, at most 2 for a background wait — set in
+    `kompressor.toml` so the suite can watch the rule work in seconds. Every
+    case is asserted on what the provider received.
+    """
+    print("\n== keep-warm")
+    interval = 2.0
+
+    # 1. A tool_use stop: pinged with the request the provider cached, to the cap.
+    reset_provider()
+    sent = keepwarm_body("tool-use", "tool_use")
+    status, _, _ = post(f"{PROXY}/v1/messages", sent)
+    check(status == 200, "[keep-warm] a tool_use turn is relayed", f"status {status}")
+    time.sleep(interval * 3 + 3)
+    pings = pings_seen()
+    check(len(pings) == 3, "[keep-warm] it is pinged every interval, up to the cap",
+          f"{len(pings)} pings")
+    forwarded = next(
+        (json.loads(r["body"]) for r in recorded()
+         if r["path"].endswith("/messages") and json.loads(r["body"]).get("max_tokens") != 1),
+        None,
+    )
+    if pings and forwarded:
+        expected = dict(forwarded, max_tokens=1, stream=False)
+        check(pings[0]["body"] == expected,
+              "[keep-warm] a ping is the forwarded request with only max_tokens and stream changed",
+              json.dumps(pings[0]["body"])[:300])
+        ids = [p["headers"].get("x-request-id", "") for p in pings]
+        check(all(re.search(rf"\.keepwarm{n + 1}$", i) for n, i in enumerate(ids)),
+              "[keep-warm] each ping carries its own numbered request id", str(ids))
+
+    # 2. A turn that ended, with nothing running: never pinged.
+    reset_provider()
+    post(f"{PROXY}/v1/messages", keepwarm_body("end-turn", "end_turn"))
+    time.sleep(interval * 2 + 2)
+    check(not pings_seen(), "[keep-warm] an ended turn with nothing running is not pinged",
+          f"{len(pings_seen())} pings")
+
+    # 3. A turn that ended while a background task runs: pinged, to its own cap.
+    reset_provider()
+    post(f"{PROXY}/v1/messages", keepwarm_body("background", "end_turn", "running"))
+    time.sleep(interval * 3 + 3)
+    check(len(pings_seen()) == 2,
+          "[keep-warm] an ended turn with a background task running is pinged, to the background cap",
+          f"{len(pings_seen())} pings")
+
+    # 4. The same once the task is reported: not pinged.
+    reset_provider()
+    post(f"{PROXY}/v1/messages", keepwarm_body("reported", "end_turn", "reported"))
+    time.sleep(interval * 2 + 2)
+    check(not pings_seen(), "[keep-warm] a background task already reported keeps nothing warm",
+          f"{len(pings_seen())} pings")
+
+    # 5. The client's next request cancels the timer before it is sent.
+    reset_provider()
+    first = keepwarm_body("cancel", "tool_use")
+    post(f"{PROXY}/v1/messages", first)
+    time.sleep(interval + 1)
+    before = len(pings_seen())
+    following = json.loads(json.dumps(first))
+    following["system"][0]["text"] = "KEEPWARM:end_turn"
+    following["messages"] += [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_kw", "name": "bash", "input": {"command": "make"}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_kw", "content": "built"}]},
+    ]
+    post(f"{PROXY}/v1/messages", following)
+    time.sleep(interval * 2 + 2)
+    check(before == 1 and len(pings_seen()) == 1,
+          "[keep-warm] the client's next request stops the pings",
+          f"{before} before, {len(pings_seen())} after")
+
+
 def efficiency(floors: dict) -> None:
     """Compression per detected type, through the HTTP surface, in every mode.
 
@@ -1101,6 +1228,7 @@ def main() -> int:
     json_behind_a_harness_frame_is_still_json()
     cross_turn_fold_needs_no_handle()
     declines_are_honest()
+    keep_warm()
     efficiency(floors)
 
     for note in notes:

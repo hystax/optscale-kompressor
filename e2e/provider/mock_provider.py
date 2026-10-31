@@ -132,6 +132,39 @@ def _anthropic_answer(text: str = "done") -> dict:
     }
 
 
+# A request carrying this marker belongs to the keep-warm check, and is
+# answered as a conversation with a cached prefix: `KEEPWARM:<stop_reason>`
+# chooses how the turn ends, and the usage is large enough to arm a timer.
+KEEPWARM = re.compile(rb"KEEPWARM:(tool_use|end_turn)")
+
+
+def _keepwarm_answer(body: bytes) -> dict | None:
+    found = KEEPWARM.search(body)
+    if not found:
+        return None
+    compact = body.replace(b" ", b"")
+    if b'"max_tokens":1,' in compact or b'"max_tokens":1}' in compact:
+        # A ping: the prefix is read back, one token comes out, nothing is written.
+        return {
+            "id": "msg_ping", "type": "message", "role": "assistant",
+            "stop_reason": "max_tokens", "content": [{"type": "text", "text": "o"}],
+            "usage": {"input_tokens": 3, "cache_read_input_tokens": 4000,
+                      "cache_creation_input_tokens": 0, "output_tokens": 1},
+        }
+    stop = found.group(1).decode()
+    content = (
+        [{"type": "tool_use", "id": "toolu_kw", "name": "bash", "input": {"command": "make"}}]
+        if stop == "tool_use"
+        else [{"type": "text", "text": "Waiting on the build."}]
+    )
+    return {
+        "id": "msg_kw", "type": "message", "role": "assistant", "stop_reason": stop,
+        "content": content,
+        "usage": {"input_tokens": 3, "cache_read_input_tokens": 4000,
+                  "cache_creation_input_tokens": 200, "output_tokens": 20},
+    }
+
+
 def _responses_tool_call(handle: str) -> dict:
     return {
         "id": "resp_tool",
@@ -364,7 +397,10 @@ class Handler(BaseHTTPRequestHandler):
         streaming = b'"stream":true' in body.replace(b" ", b"")
 
         if self.path.endswith("/messages"):
-            if streaming:
+            keepwarm = _keepwarm_answer(body)
+            if keepwarm is not None:
+                self._send(200, json.dumps(keepwarm).encode(), "application/json")
+            elif streaming:
                 self._send(200, _anthropic_stream(handle), "text/event-stream")
             else:
                 payload = _anthropic_tool_call(handle) if handle else _anthropic_answer()

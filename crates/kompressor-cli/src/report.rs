@@ -58,6 +58,9 @@ impl ReportData {
     }
 }
 
+/// The version of the binary rendering the page.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Render the page.
 pub fn render(data: &ReportData) -> String {
     let s = &data.summary;
@@ -85,11 +88,17 @@ pub fn render(data: &ReportData) -> String {
     out.push_str(&format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
+         <meta name=\"generator\" content=\"kompressor {VERSION}\">\n\
          <title>kompressor — compression report</title>\n<style>{CSS}</style>\n</head>\n<body>\n"
     ));
+    // The build that drew the page, not the one that recorded the numbers: a
+    // database outlives upgrades, so a report can describe traffic an older
+    // version compressed. Said here so a page passed around can be traced to
+    // the code that rendered it.
     out.push_str(&format!(
         "<header>\n<h1>kompressor</h1>\n\
-         <p class=\"sub\">tenant <b>{tenant}</b> · window {window} · generated {}</p>\n</header>\n",
+         <p class=\"sub\">tenant <b>{tenant}</b> · window {window} · generated {} \
+         by kompressor {VERSION}</p>\n</header>\n",
         stamp(data.generated_ms)
     ));
 
@@ -513,6 +522,22 @@ mod tests {
     #[test]
     fn markup_from_the_engine_is_escaped() {
         assert_eq!(escape("a<b>&\"c\""), "a&lt;b&gt;&amp;&quot;c&quot;");
+    }
+
+    #[test]
+    fn the_page_names_the_version_that_rendered_it() {
+        let out = page(1_000, 0);
+        let version = env!("CARGO_PKG_VERSION");
+        assert!(
+            out.contains(&format!("by kompressor {version}</p>")),
+            "in the header line"
+        );
+        assert!(
+            out.contains(&format!(
+                "<meta name=\"generator\" content=\"kompressor {version}\">"
+            )),
+            "and in the document's metadata"
+        );
     }
 
     #[test]

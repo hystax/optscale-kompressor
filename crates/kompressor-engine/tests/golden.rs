@@ -79,6 +79,38 @@ fn load() -> Vec<Record> {
         .records
 }
 
+/// Why plain text moved when the text fold stopped reaching across a payload.
+const TEXT_FOLDS_IN_PLACE: &str = "Plain text folded by a value-normalised \
+     template wherever it recurred, so the first occurrence absorbed every later \
+     one and the lines between closed up. Most of what that removed was source \
+     the detector did not name (R, Python, Redcode, Makefiles) and tables whose \
+     rows are the data. It folds only runs of consecutive lines now, four or \
+     more unless identical, and keeps the rest where it stood. On an 89-task \
+     run the tasks that saw the wide fold took 17.5% more agent steps than the \
+     uncompressed run.";
+
+/// Why disassembly moved when the detector learned to recognise it.
+const DISASSEMBLY_SHIPS_WHOLE: &str = "Disassembly. The vectors were recorded \
+     by a detector that read `objdump` rows as a listing, which samples away the \
+     middle of a function, or as text, which folds similar instructions into \
+     one. It is source with no grammar now and ships whole: on a measured run an \
+     agent paged a folded disassembly by hand, 40 steps against 12.";
+
+/// Why payloads moved when the segmenter stopped sampling instructions and
+/// line-numbered reads.
+const SEGMENTER_KEEPS_ORDER: &str = "The segmenter sampled these as dump rows. \
+     An instruction is no longer a row to it (`objdump` prints an address in \
+     front of each, which read as an offset), and a payload numbered like a \
+     file read is not offered to it at all. On the fixed 89-task run the \
+     segmenter's sampled disassembly was fetched back six times. Disassembly \
+     now ships whole, MIPS included (its raw bytes print as one word and its \
+     registers without `$`), as does disassembly sitting beside a table in \
+     one payload; a list of mnemonics keeps the entries that are \
+     instructions in their own right. A `readelf` symbol table and a pickle \
+     disassembly carry increasing row numbers that read as a gutter, so they \
+     take the whole-message route: the first comes out smaller as a listing, \
+     the second ships whole.";
+
 /// Payloads where the engine deliberately and verifiably differs from the
 /// vectors, and why.
 ///
@@ -92,6 +124,42 @@ fn load() -> Vec<Record> {
 /// mode's own policy rather than a compressor's output: exempting all three
 /// would hide a real regression behind a deliberate one.
 const KNOWN_DELTAS: &[(&str, &str, &str)] = &[
+    ("08c92201eb649bc8", "*", SEGMENTER_KEEPS_ORDER),
+    ("1050dae918634df1", "*", SEGMENTER_KEEPS_ORDER),
+    ("f152552d55d43587", "*", SEGMENTER_KEEPS_ORDER),
+    ("21688442b10fb59f", "*", SEGMENTER_KEEPS_ORDER),
+    ("48bedede9df6b003", "*", SEGMENTER_KEEPS_ORDER),
+    ("92b3b888230d1d58", "*", SEGMENTER_KEEPS_ORDER),
+    ("a89003688d70ff7a", "*", SEGMENTER_KEEPS_ORDER),
+    ("dd9ba3749d237e37", "*", SEGMENTER_KEEPS_ORDER),
+    ("160dd5259e439aff", "*", TEXT_FOLDS_IN_PLACE),
+    ("266c00367241a1ae", "*", TEXT_FOLDS_IN_PLACE),
+    ("3a36adcff8882d24", "*", TEXT_FOLDS_IN_PLACE),
+    ("6a99b022637d93d7", "*", TEXT_FOLDS_IN_PLACE),
+    ("721a060c70b6abf8", "*", TEXT_FOLDS_IN_PLACE),
+    ("83ed7d4590189696", "*", TEXT_FOLDS_IN_PLACE),
+    ("996f12cf7bfa28d5", "*", TEXT_FOLDS_IN_PLACE),
+    ("ab854401ccaf555c", "*", TEXT_FOLDS_IN_PLACE),
+    ("af315d3ade85dc6f", "*", TEXT_FOLDS_IN_PLACE),
+    ("bceda9507f8558ba", "*", TEXT_FOLDS_IN_PLACE),
+    ("d1dc8cfbf82ebdc5", "*", TEXT_FOLDS_IN_PLACE),
+    ("e08cec1e48ccc8d9", "*", TEXT_FOLDS_IN_PLACE),
+    ("e253da890aaa86c4", "*", TEXT_FOLDS_IN_PLACE),
+    ("edd95442fd9778ef", "*", TEXT_FOLDS_IN_PLACE),
+    ("f77897c833d80e11", "*", TEXT_FOLDS_IN_PLACE),
+    ("dae24a04ef823b86", "*", DISASSEMBLY_SHIPS_WHOLE),
+    (
+        "97cf0b663b3a8011",
+        "*",
+        "`ls && cat algo.py`: three file names and then the source. The vectors \
+         were recorded by an engine whose grammar failed on the first file name, \
+         so the code compressor declined and the payload shipped whole at 1,249 \
+         characters. This one sets the lead-in aside verbatim — frame and \
+         listing byte for byte — and compresses the source behind it as the \
+         Python it is, eliding `map`'s 34-line body. Every mode moved because \
+         the recorded options run code elision in all three. On the Claude \
+         Code replay corpus the same shape was the largest single loss.",
+    ),
     (
         "77084080070a4e1d",
         "*",
@@ -344,9 +412,19 @@ const KNOWN_DELTAS: &[(&str, &str, &str)] = &[
 /// questions: that one is about the bytes a payload compresses to, this one is
 /// about the name the detector gives it, and a change to the name that leaves
 /// the bytes alone has to be explainable in exactly one of them.
-const KNOWN_DETECTION_DELTAS: &[(&str, &str)] = &[(
-    "d0175da218a5e184",
-    "A JSON document behind a harness frame. The vectors were recorded by a \
+const KNOWN_DETECTION_DELTAS: &[(&str, &str)] = &[
+    ("08c92201eb649bc8", DISASSEMBLY_SHIPS_WHOLE),
+    ("1050dae918634df1", DISASSEMBLY_SHIPS_WHOLE),
+    ("ca0536e8b53a396f", DISASSEMBLY_SHIPS_WHOLE),
+    ("f152552d55d43587", DISASSEMBLY_SHIPS_WHOLE),
+    ("17b15ad93c8d6a74", DISASSEMBLY_SHIPS_WHOLE),
+    ("21e8d47881da76c9", DISASSEMBLY_SHIPS_WHOLE),
+    ("48bedede9df6b003", DISASSEMBLY_SHIPS_WHOLE),
+    ("dae24a04ef823b86", DISASSEMBLY_SHIPS_WHOLE),
+    ("dd9ba3749d237e37", DISASSEMBLY_SHIPS_WHOLE),
+    (
+        "d0175da218a5e184",
+        "A JSON document behind a harness frame. The vectors were recorded by a \
      detector that ran the JSON test on the framed bytes, where it gives up on \
      the first byte — a payload that opens `Chunk ID:` does not open `{`. So a \
      valid document was classified `text`. It is `json_array` now, which is \
@@ -354,7 +432,8 @@ const KNOWN_DETECTION_DELTAS: &[(&str, &str)] = &[(
      bytes are unchanged, here and across the corpus, because the mixed \
      segmenter was already finding the JSON span inside it — this is the \
      detector telling the truth rather than a compressor doing more.",
-)];
+    ),
+];
 
 fn known_detection_delta(content_id: &str) -> Option<&'static str> {
     KNOWN_DETECTION_DELTAS
@@ -386,6 +465,8 @@ fn recorded_options(mode: Mode) -> EngineOptions {
         enable_fold_fallback: false,
         // off by default anyway; named so the harness states what it assumes
         enable_preamble_aware_detection: false,
+        // a fold over variants was announced as a plain repeat
+        fold_marks_variants: false,
         // the line-number column was classified along with the content
         enable_line_gutter: false,
         // there was no last-resort clip for over-long lines

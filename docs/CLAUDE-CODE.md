@@ -21,6 +21,7 @@ login (`oauth-2025-04-20`), model `claude-opus-5[1m]`, OptScale Kompressor in
 - [Verify it for yourself](#verify-it-for-yourself)
 - [Reading the outcome field](#reading-the-outcome-field)
 - [What the proxy changes about your request](#what-the-proxy-changes-about-your-request)
+- [What compression costs, measured](#what-compression-costs-measured)
 - [When wrapping Claude Code is still worth it](#when-wrapping-claude-code-is-still-worth-it)
 
 ## What a wrapped session actually does
@@ -140,7 +141,11 @@ cache untouched.
 
 `proxy.frozen_prefix = "first_seen"` freezes only as far as the provider's cache
 reached when the proxy first saw the conversation, so the tail — in no cache
-entry yet — becomes compressible without invalidating anything. The prize grows
+entry yet — becomes compressible without invalidating anything. That includes
+the final message Claude Code marks with `cache_control`: it is compressed the
+turn it arrives, so the cached form is the one every later turn sends (until
+1.5.8 it went out whole and was compressed a turn later, re-writing what had just
+been cached). The prize grows
 with session length, because a frozen tail token is re-read on every later turn:
 
 | | 20-turn Sonnet | 70-turn Opus |
@@ -368,6 +373,99 @@ Verified against Claude Code 2.1.278:
 (see [`headers`](../crates/kompressor-proxy/src/headers.rs)). Closing it means
 teaching the client to decompress and then stripping `content-encoding` from
 what is relayed onward, which is a real change rather than a header tweak.
+
+## What compression costs, measured
+
+Measured 2026-10-25 on two 89-task Harbor runs of Claude Code on Claude Opus
+5.5 with one binary: `proxy.frozen_prefix = "first_seen"` against compression
+off (`proxy.compress = false`). Both solved 79 of 89. Scored task by task on the
+proxy's own bill with `scripts/harbor/panel-score.py`, which prices every
+upstream request at its model's rates — Harbor's own cost missed requests
+outside the agent's trajectory and moved the comparison by nine points on its
+own:
+
+| Compressed vs off | Change | 95% CI over tasks |
+|---|---|---|
+| Cost per agent step | +0.9% | −3.6% .. +5.8% |
+| Cost per trial | +9.0% | +0.4% .. +18.8% |
+| Cost per solved task | +7.9% | −11.4% .. +29.1% |
+
+Three facts account for it:
+
+- **Re-sent history is already cheap.** About 93% of the billed prompt was cache
+  reads, and Claude Opus 5.5 reads at $0.20 against $4.00 input. Compression
+  saved about 8% of input on an ordinary request, roughly $1.70 over the run.
+- **A retrieval round is an extra answer.** The model writes the retrieve call
+  and answers again after the hidden round, so a request with one cost about
+  $0.046 more than an ordinary one, mostly output: about $3.30 over 70 such
+  requests. Elided code bodies were fetched back 57% of the time, other elided
+  text 14%.
+- **Most lost cache is expiry, not rewriting.** 92% of the cache-read drops
+  followed a pause past Anthropic's five-minute entry lifetime, while the agent
+  waited on a build or a test run.
+
+Two settings act on those. Measured together on the same 89 tasks, they came to
+**+0.2% per step** against compression off (95% CI −4.6% .. +5.6%), with 6% more
+agent steps. That run found two faults, both fixed since: plain text folded
+similar lines from anywhere in a payload into one, and tasks where that
+happened took 17.5% more steps; and the adaptive TTL switched one request late,
+so every switching conversation wrote its prefix twice. The two settings:
+`engine.enable_code_aware = false` stops eliding function bodies (removal on
+the replay corpus falls from 48.8% to 43.3%, and the fetches that cost more
+than they saved go with it), and `proxy.cache_ttl = "adaptive"` asks for
+one-hour cache entries in a conversation once it has paused past five minutes,
+which is estimated at 5.6% off the compressed run. Both apply with compression off as
+well (the proxy follows the conversation in either mode); `"1h"` costs more than
+it saves on runs without long pauses.
+
+A third setting acts on the fetches that remain. `engine.min_elision_saving_chars
+= 4000` ships a tool result whole when compressing it would leave a handle but
+save fewer than 4,000 characters. Re-sent at cache-read prices, such a result
+saves less than the one fetch it invites, and it invites one often: across ten
+recoverable runs, tool results saving under 4,000 characters were fetched back
+30% of the time. Replaying all ten runs' tool outputs through the current
+engine, the gate removes 39% of the fetch rounds that would still happen (167
+to 102) and gives up a third of an already small removal value ($2.13 to $1.36
+over the ten runs), about $1.20 ahead at $0.03 a round and still ahead at $0.02.
+Markers without a handle are not gated.
+
+The packaged configurations (`/etc/kompressor/config.toml` on Linux,
+`~/.config/kompressor/config.toml` on macOS) ship these four settings, and
+`retrieve_tool = "always"`, under `[proxy.providers.anthropic]`, with Codex on
+the deployment defaults. An
+install that already has a config keeps it: dpkg leaves an edited conffile in
+place beside a `.dpkg-dist` copy, and the macOS installer never overwrites one.
+To set them by hand for Claude traffic only, leaving any OpenAI clients of the
+same proxy on the defaults, scope them to the provider (DESIGN §12.11):
+
+```bash
+export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__ENGINE__ENABLE_CODE_AWARE=false
+export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__ENGINE__MIN_ELISION_SAVING_CHARS=4000
+export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__CACHE_TTL=adaptive
+export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__FROZEN_PREFIX=first_seen
+```
+
+A fifth setting, **off by default and not in the packaged configurations**,
+keeps the cache entry alive through those pauses instead of paying for them.
+With `proxy.cache_keep_warm = true`, after a response that stopped on
+`tool_use` the proxy re-sends that request with `max_tokens: 1` every 270
+seconds until Claude Code's next request arrives, at most 11 times; after an
+`end_turn` while a background task or `Monitor` watch Claude Code started is
+still running, also at most 11 times (`proxy.cache_keep_warm_background_pings`,
+0 to turn that off).
+Each ping costs the conversation at the cache-read price plus one output token,
+and is recorded as its own `proxy_requests` row with `keep_warm = 1`. Simulated
+over the request logs of seven 89-task runs, it would have saved $1.84–$3.00 a
+run (5–9%) after $0.34–$0.58 of pings, which is more than compression saves on
+the same runs. Measured live on one 89-task run, it cut cache-write spend per
+agent step by 20% and cache-loss turns from 13 to 2, for 25 pings costing
+$0.15. It is off because it is the one thing the proxy does that no client
+asked for, using the client's credentials while the client is busy elsewhere
+(DESIGN §12.10):
+
+```bash
+export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__CACHE_KEEP_WARM=true
+```
 
 ## When wrapping Claude Code is still worth it
 

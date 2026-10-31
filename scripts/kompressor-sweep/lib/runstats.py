@@ -1,9 +1,10 @@
 """Summarise one stage's compression, from the rows that stage wrote.
 
-    python3 runstats.py <stats.db> <since_ms> [label]
+    python3 runstats.py <stats.db> <since_ms> [label] [--proxy-only]
 
 Scoped by wall-clock rather than by row id: a reset restarts the ids and every
 figure would silently read as zero.
+Use --proxy-only to exclude local compression-premise checks from live totals.
 """
 import sqlite3
 import sys
@@ -11,14 +12,15 @@ from collections import Counter
 import json
 
 db, since = sys.argv[1], int(sys.argv[2])
+surface_filter = " and surface='proxy'" if "--proxy-only" in sys.argv else ""
 conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-row = conn.execute("""
+row = conn.execute(f"""
     select count(*), coalesce(sum(tokens_in),0), coalesce(sum(tokens_out),0),
            coalesce(sum(chars_in),0), coalesce(sum(chars_out),0),
            coalesce(sum(messages_compressed),0), coalesce(sum(messages_total),0),
            coalesce(sum(refs_emitted),0), coalesce(sum(ref_bytes_emitted),0),
            coalesce(sum(engine_ms),0.0)
-    from optimization_events where time_ms >= ?""", (since,)).fetchone()
+    from optimization_events where time_ms >= ?{surface_filter}""", (since,)).fetchone()
 (reqs, ti, to, ci, co, mc, mt, refs, refb, ms) = row
 
 if not reqs:
@@ -27,7 +29,7 @@ if not reqs:
 
 types = Counter()
 for (blob,) in conn.execute(
-        "select content_types from optimization_events where time_ms >= ?", (since,)):
+        f"select content_types from optimization_events where time_ms >= ?{surface_filter}", (since,)):
     try:
         for k, v in json.loads(blob).items():
             types[k] += v
