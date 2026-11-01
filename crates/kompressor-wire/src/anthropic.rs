@@ -116,6 +116,8 @@ impl Walker for AnthropicMessagesWalker {
                         ),
                         cache_breakpoint: marker.is_some(),
                         unseen_tokens: unseen_tokens(blocks),
+                        one_text_block: matches!(blocks.as_slice(), [only]
+                            if only.get("type").and_then(Value::as_str) == Some("text")),
                     };
                     builder.push_blocks(role, meta, slots);
                 }
