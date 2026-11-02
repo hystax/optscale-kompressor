@@ -1261,6 +1261,41 @@ async fn a_cold_prefix_is_compressed_even_where_cache_control_pinned_it() {
 }
 
 #[tokio::test]
+async fn a_miss_the_provider_wrote_back_keeps_the_freeze() {
+    // The same three turns as above, except the miss on turn two also wrote
+    // the prefix back, as Anthropic does whenever `cache_control` asks it to.
+    // The provider then holds exactly what turn two sent, so turn three must
+    // send it again: lifting the freeze would rewrite the entry just paid for.
+    let harness = Harness::new().await;
+    answering_warm_then_missing(&harness, 22_363).await;
+
+    let body = json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 1024,
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_0",
+                 "cache_control": {"type": "ephemeral"}, "content": log_payload(400)}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1",
+                 "content": log_payload(400)}
+            ]}
+        ]
+    });
+    harness.post("/v1/messages", &body).await;
+    harness.post("/v1/messages", &body).await;
+    harness.post("/v1/messages", &body).await;
+
+    let seen = harness.upstream_json().await;
+    assert_eq!(seen.len(), 3, "all three turns reached the provider");
+    assert_eq!(
+        seen[2]["messages"][0], seen[1]["messages"][0],
+        "the prefix the miss wrote back must go out unchanged"
+    );
+}
+
+#[tokio::test]
 async fn the_tail_the_provider_has_not_cached_yet_is_compressed() {
     // `FrozenPrefix::FirstSeen`, end to end.
     //
@@ -2007,9 +2042,15 @@ async fn the_marker_rule_still_freezes_the_whole_conversation() {
 /// created. A lapse is a prefix that *was* served and now is not, and only that
 /// sequence produces `PrefixCache::Cold`.
 async fn answering_warm_then_without_cache(harness: &Harness) {
+    answering_warm_then_missing(harness, 0).await;
+}
+
+/// Served from cache once, then never again, each miss writing `written`
+/// tokens back — the provider re-creating the entry it just missed.
+async fn answering_warm_then_missing(harness: &Harness, written: u32) {
     use wiremock::matchers::method;
     use wiremock::{Mock, ResponseTemplate};
-    let usage = |read: u32| {
+    let usage = |read: u32, written: u32| {
         ResponseTemplate::new(200).set_body_json(json!({
             "id": "msg_1",
             "type": "message",
@@ -2017,17 +2058,17 @@ async fn answering_warm_then_without_cache(harness: &Harness) {
             "content": [{"type": "text", "text": "ok"}],
             "usage": {"input_tokens": 1000, "output_tokens": 2,
                       "cache_read_input_tokens": read,
-                      "cache_creation_input_tokens": 0}
+                      "cache_creation_input_tokens": written}
         }))
     };
     // Mounted first and capped, so it answers the opening turn only.
     Mock::given(method("POST"))
-        .respond_with(usage(41_116))
+        .respond_with(usage(41_116, 0))
         .up_to_n_times(1)
         .mount(&harness.server)
         .await;
     Mock::given(method("POST"))
-        .respond_with(usage(0))
+        .respond_with(usage(0, written))
         .mount(&harness.server)
         .await;
 }
