@@ -24,6 +24,11 @@ use wiremock::Mock;
 use wiremock::matchers::any;
 
 const MODEL: &str = "claude-opus-5-5";
+/// What the shipped settings saved on [`CAPTURE`] when it was committed, as
+/// 1.5.14: a loss, because the retrieve tool's definition, sent on every
+/// request, outweighs what compression removes from this traffic. A change
+/// that does better moves this up.
+const SAVED_AT_COMMIT: f64 = -0.0102;
 
 /// The configuration a package installs, so the test measures what ships.
 /// Environment overrides apply on top, as they do in a deployment, which is
@@ -460,28 +465,30 @@ fn the_simulator_does_not_cache_a_short_prefix() {
     assert_eq!(sim.bill(&request).read, 0);
 }
 
-/// Replays a captured run's client requests through both arms.
-///
-/// Point `KOMPRESSOR_REPLAY_BODIES` at a run's `kompressor-bodies.jsonl` (the
-/// `KOMPRESSOR_BODY_CAPTURE` file) and run with `--ignored --nocapture`. The
-/// simulated clock follows the capture's timestamps, so real pauses expire
-/// real entries; the proxy's own clock does not, so its adaptive one-hour TTL,
-/// which switches on a pause it has to see, never switches here. Any
-/// `KOMPRESSOR__…` override in the environment applies to the proxied arm,
-/// which is how to price an experimental setting against the shipped one:
-///
-/// ```bash
-/// KOMPRESSOR_REPLAY_BODIES=runs/…/kompressor-bodies.jsonl \
-/// KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__ENGINE__MIN_ELISION_SAVING_CHARS=2000 \
-/// cargo test -p kompressor-proxy --test cachesavings -- --ignored --nocapture
-/// ```
-#[tokio::test]
-#[ignore = "needs KOMPRESSOR_REPLAY_BODIES pointing at a captured run"]
-async fn a_captured_run_replayed_through_both_arms() {
-    let path = std::env::var("KOMPRESSOR_REPLAY_BODIES")
-        .expect("set KOMPRESSOR_REPLAY_BODIES to a kompressor-bodies.jsonl");
-    let text = std::fs::read_to_string(&path).expect("the capture reads");
-    let mut requests: Vec<(u64, Value)> = Vec::new();
+/// The committed capture: a few whole conversations from the 89-task 1.5.12
+/// Opus run (2026-11-01 13-41-26), client side only. Claude Code's system
+/// prompt and tool descriptions are replaced with filler of the same length,
+/// identical on every request, and `metadata` is dropped: the proxy compresses
+/// none of them, so the cache sees exactly what it saw. Task text and tool
+/// output are as captured. Built by `scripts/bench/extract-cache-capture.py`.
+const CAPTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../fixtures/claude-capture.jsonl.gz"
+);
+
+/// Client Messages requests from a body capture, `.gz` or plain, each with
+/// its capture time and the conversation it belongs to when the capture says.
+fn captured_requests(path: &str) -> Vec<(u64, String, Value)> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let mut text = String::new();
+    if path.ends_with(".gz") {
+        flate2::read::GzDecoder::new(file).read_to_string(&mut text)
+    } else {
+        std::io::BufReader::new(file).read_to_string(&mut text)
+    }
+    .unwrap_or_else(|e| panic!("{path}: {e}"));
+    let mut requests = Vec::new();
     for line in text.lines() {
         let Ok(record) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -499,17 +506,44 @@ async fn a_captured_run_replayed_through_both_arms() {
         }
         // The simulator answers in one piece; streaming changes nothing cached.
         body["stream"] = json!(false);
-        requests.push((record["at_ms"].as_u64().unwrap_or(0), body));
+        let conversation = record["conversation"].as_str().unwrap_or("").to_string();
+        requests.push((record["at_ms"].as_u64().unwrap_or(0), conversation, body));
     }
     assert!(
         !requests.is_empty(),
         "no client Messages requests in {path}"
     );
+    requests
+}
+
+/// Replays a captured run's client requests through both arms.
+///
+/// Plays the committed [`CAPTURE`] and gates on it, so a change that makes
+/// real Claude traffic cost more on the input side fails `make test`. Point
+/// `KOMPRESSOR_REPLAY_BODIES` at another run's `kompressor-bodies.jsonl` (the
+/// `KOMPRESSOR_BODY_CAPTURE` file) to price that one instead, reported and not
+/// gated; `KOMPRESSOR_REPLAY_DETAIL=1` adds a row per conversation.
+///
+/// The simulated clock follows the capture's timestamps, so real pauses expire
+/// real entries; the proxy's own clock does not, so its adaptive one-hour TTL,
+/// which switches on a pause it has to see, never switches here. Any
+/// `KOMPRESSOR__…` override in the environment applies to the proxied arm,
+/// which is how to price an experimental setting against the shipped one:
+///
+/// ```bash
+/// KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__ENGINE__MIN_ELISION_SAVING_CHARS=2000 \
+/// make test-cache-replay BODIES=runs/…/kompressor-bodies.jsonl
+/// ```
+#[tokio::test]
+async fn a_captured_run_replayed_through_both_arms() {
+    let chosen = std::env::var("KOMPRESSOR_REPLAY_BODIES").ok();
+    let path = chosen.clone().unwrap_or_else(|| CAPTURE.to_string());
+    let requests = captured_requests(&path);
 
     let direct = CacheSim::new();
     let proxied = CacheSim::new();
     let harness = proxy_in_front_of(&proxied).await;
-    for (at, body) in &requests {
+    for (at, _, body) in &requests {
         direct.at_ms(*at);
         proxied.at_ms(*at);
         direct.bill(body);
@@ -525,5 +559,41 @@ async fn a_captured_run_replayed_through_both_arms() {
         "{} client requests from {path}; the retrieve tool was offered on {offered}",
         requests.len()
     );
-    report(&direct.ledger(), &proxied.ledger());
+    let (direct_log, proxied_log) = (direct.log(), proxied.log());
+    assert_eq!(
+        proxied_log.len(),
+        requests.len(),
+        "one upstream call per request: the simulator never asks for a retrieval"
+    );
+    if std::env::var_os("KOMPRESSOR_REPLAY_DETAIL").is_some() {
+        let mut each: std::collections::BTreeMap<&str, (Ledger, Ledger)> = Default::default();
+        for (i, (_, conversation, _)) in requests.iter().enumerate() {
+            let entry = each.entry(conversation).or_default();
+            entry.0.add(&direct_log[i].0, &direct_log[i].1);
+            entry.1.add(&proxied_log[i].0, &proxied_log[i].1);
+        }
+        for (conversation, (d, p)) in &each {
+            eprintln!(
+                "{conversation:<12} {:>3} req  direct ${:.4}  proxied ${:.4}  saving {:>6.2}%",
+                d.requests,
+                d.dollars,
+                p.dollars,
+                (1.0 - p.dollars / d.dollars) * 100.0
+            );
+        }
+    }
+    let saved = report(&direct.ledger(), &proxied.ledger());
+    if chosen.is_some() {
+        return;
+    }
+    // Deterministic — same bytes, same estimator — so the quarter point of
+    // tolerance is room for a deliberate trade, not for noise. A change that
+    // improves on the recorded figure should record the new one.
+    assert!(
+        saved >= SAVED_AT_COMMIT - 0.0025,
+        "the shipped settings now cost more on the committed Claude capture: \
+         {:.2}% saved, recorded {:.2}%",
+        saved * 100.0,
+        SAVED_AT_COMMIT * 100.0
+    );
 }
