@@ -347,4 +347,14 @@ pub trait RefStore: Send + Sync {
     /// own: `GET /v1/stats/store` authenticated the caller, scoped the tenant,
     /// and then reported every tenant's rows and bytes to it.
     fn stats_for(&self, tenant: &Tenant) -> Result<StoreStats, StoreError>;
+
+    /// The listing side of this store, when it has one.
+    ///
+    /// An accessor rather than methods of this trait, so the point-lookup
+    /// contract stays what every caller on the request path sees, and walking
+    /// the table takes a deliberate step only the ref browser makes. `None`,
+    /// the default, is a store that cannot be browsed.
+    fn browser(&self) -> Option<&dyn crate::browse::RefBrowse> {
+        None
+    }
 }

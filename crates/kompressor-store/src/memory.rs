@@ -6,6 +6,7 @@
 //! service sees none of these rows, and a restart between the compression that
 //! minted a handle and the retrieval that asks for it answers `Miss`.
 
+use crate::browse::{self, BrowseOrder, BrowsePage, BrowseQuery, RefBrowse, RefDetail, RefSummary};
 use crate::clock::Clock;
 use crate::types::{
     Lookup, PutMeta, RefRecord, RefStore, StoreError, StoreStats, Tenant, is_expired,
@@ -228,6 +229,124 @@ impl RefStore for MemoryRefStore {
 
     fn stats_for(&self, tenant: &Tenant) -> Result<StoreStats, StoreError> {
         self.tally(Some(tenant.0.as_str()))
+    }
+
+    fn browser(&self) -> Option<&dyn RefBrowse> {
+        Some(self)
+    }
+}
+
+impl RefBrowse for MemoryRefStore {
+    fn browse(&self, tenant: &Tenant, query: &BrowseQuery) -> Result<BrowsePage, StoreError> {
+        let now = self.clock.now();
+        let needle = query.needle();
+        let entries = self.entries.lock();
+        let mut kinds = std::collections::BTreeMap::<String, u64>::new();
+        let mut matched: Vec<RefDetail> = Vec::new();
+        for ((owner, _), entry) in entries.iter() {
+            if owner != tenant.as_str() {
+                continue;
+            }
+            let detail = RefDetail::new(entry.record.clone(), entry.max_lifetime_seconds, now);
+            if detail.expired && !query.include_expired {
+                continue;
+            }
+            *kinds.entry(detail.record.kind.clone()).or_insert(0) += 1;
+            if browse::matches(&detail.record, query, needle.as_deref()) {
+                matched.push(detail);
+            }
+        }
+        drop(entries);
+
+        // The same orders, tie-broken on the handle, as the SQLite statement.
+        let key = |d: &RefDetail| d.record.id.body().to_owned();
+        match query.order {
+            BrowseOrder::Newest => matched.sort_by(|a, b| {
+                b.record
+                    .created_at
+                    .cmp(&a.record.created_at)
+                    .then_with(|| key(a).cmp(&key(b)))
+            }),
+            BrowseOrder::Oldest => matched.sort_by(|a, b| {
+                a.record
+                    .created_at
+                    .cmp(&b.record.created_at)
+                    .then_with(|| key(a).cmp(&key(b)))
+            }),
+            BrowseOrder::RecentlyUsed => matched.sort_by(|a, b| {
+                b.record
+                    .last_accessed
+                    .cmp(&a.record.last_accessed)
+                    .then_with(|| key(a).cmp(&key(b)))
+            }),
+            BrowseOrder::Largest => matched.sort_by(|a, b| {
+                b.record
+                    .bytes()
+                    .cmp(&a.record.bytes())
+                    .then_with(|| key(a).cmp(&key(b)))
+            }),
+            BrowseOrder::ExpiringSoon => matched.sort_by(|a, b| {
+                a.expires_at
+                    .cmp(&b.expires_at)
+                    .then_with(|| key(a).cmp(&key(b)))
+            }),
+        }
+
+        let total = matched.len() as u64;
+        let chars = query.preview_limit();
+        let entries = matched
+            .into_iter()
+            .skip(query.offset)
+            .take(query.page_limit())
+            .map(|detail| summarize(detail, query.text_needle().as_deref(), chars))
+            .collect();
+        Ok(BrowsePage {
+            total,
+            entries,
+            kinds: kinds.into_iter().collect(),
+        })
+    }
+
+    fn inspect(&self, tenant: &Tenant, id: &RefId) -> Result<Option<RefDetail>, StoreError> {
+        let now = self.clock.now();
+        let entries = self.entries.lock();
+        Ok(entries
+            .get(&(tenant.0.clone(), *id))
+            .map(|entry| RefDetail::new(entry.record.clone(), entry.max_lifetime_seconds, now)))
+    }
+
+    fn remove(&self, tenant: &Tenant, ids: &[RefId]) -> Result<usize, StoreError> {
+        let mut entries = self.entries.lock();
+        Ok(ids
+            .iter()
+            .filter(|id| entries.remove(&(tenant.0.clone(), **id)).is_some())
+            .count())
+    }
+}
+
+/// A page row from a full entry, previewing around `needle` when it is in
+/// the text.
+pub(crate) fn summarize(
+    detail: RefDetail,
+    needle: Option<&str>,
+    preview_chars: usize,
+) -> RefSummary {
+    let (preview, preview_start, truncated) =
+        browse::snippet(&detail.record.fragment, needle, preview_chars);
+    RefSummary {
+        bytes: detail.record.bytes(),
+        id: detail.record.id,
+        kind: detail.record.kind,
+        request_id: detail.record.request_id,
+        created_at: detail.record.created_at,
+        last_accessed: detail.record.last_accessed,
+        ttl_seconds: detail.record.ttl_seconds,
+        max_lifetime_seconds: detail.max_lifetime_seconds,
+        expires_at: detail.expires_at,
+        expired: detail.expired,
+        preview,
+        preview_start,
+        truncated,
     }
 }
 

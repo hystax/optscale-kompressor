@@ -410,6 +410,7 @@ are in [docs/charts/](docs/charts/).
 | LLM proxy  | `kompressor serve --proxy`: OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, and a WebSocket relay                                                            |
 | HTTP API   | `POST /v1/compress`, `/v1/compress/raw`, `/v1/retrieve`, `/v1/detect`; `GET /v1/stats/*`, `/healthz`, `/readyz`, `/metrics`                                                 |
 | Live stats | `GET /v1/stats/live`: JSON, or a self-refreshing dashboard in a browser; on its own port with `server.stats_listen`                                                       |
+| Ref store  | `GET /v1/refs`: search, inspect and delete stored fragments, as JSON or a page; off unless `refs.browse = true`                                                           |
 | MCP server | `kompressor serve --mcp` (streamable HTTP): `optscale_kompressor_retrieve`, `optscale_kompressor_compress`, `optscale_kompressor_compress_raw`, `optscale_kompressor_stats` |
 | CLI        | `kompressor compress`, `retrieve`, `detect`, `stats`, `bench`, `check-config`                                                                                               |
 | Library    | the `kompressor-engine` crate: compress a string or a conversation, no I/O                                                                                                  |
@@ -481,7 +482,7 @@ Good first issues are labelled
 | `make harbor-gates` | every live-agent benchmark gate, with no provider spend                                        |
 
 
-`cargo test --workspace` runs **1,371 tests** across ten crates; clippy and rustfmt
+`cargo test --workspace` runs **1,403 tests** across ten crates; clippy and rustfmt
 are clean. `make bench-save` and `make golden` move what the tests compare against,
 so both ask before they run.
 

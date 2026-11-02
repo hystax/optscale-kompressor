@@ -40,6 +40,7 @@ pub mod wire;
 mod api;
 pub mod live;
 mod ops;
+pub mod refs;
 mod stats_api;
 
 pub use api::api_router;

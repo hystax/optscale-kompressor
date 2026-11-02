@@ -13,13 +13,15 @@
 //! patterns, different retention, and only this one holds payload bytes, so
 //! only this one has to be placed with care.
 
+use crate::browse::{BrowseOrder, BrowsePage, BrowseQuery, RefBrowse, RefDetail, RefSummary};
 use crate::clock::Clock;
 use crate::types::{
     Lookup, PutMeta, RefRecord, RefStore, StoreError, StoreStats, Tenant, expires_at, is_expired,
 };
 use kompressor_engine::refs::RefId;
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::types::Value;
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use std::path::Path;
 
 /// The default size cap on live fragments.
@@ -135,6 +137,17 @@ WHERE last_accessed + ttl_seconds >= ?1 AND created_at + max_lifetime >= ?1
 const SQL_STATS_FOR_TENANT: &str = "
 SELECT count(*), coalesce(sum(bytes), 0), min(created_at) FROM refs
 WHERE tenant = ?2 AND last_accessed + ttl_seconds >= ?1 AND created_at + max_lifetime >= ?1
+";
+
+/// The row the browser reads: [`SQL_GET`] plus the handle, with the fragment
+/// cut to a preview so a page never pulls whole fragments. `{head}` and
+/// `{start}` are the preview and the characters before it.
+const SQL_BROWSE_COLUMNS: &str = "ref, {head}, {start}, bytes, kind, request_id, \
+     created_at, last_accessed, ttl_seconds, max_lifetime";
+
+const SQL_INSPECT: &str = "
+SELECT fragment, kind, request_id, created_at, last_accessed, ttl_seconds, max_lifetime
+FROM refs WHERE tenant = ?1 AND ref = ?2
 ";
 
 /// Knobs that are not the file path.
@@ -483,6 +496,300 @@ impl RefStore for SqliteRefStore {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
         Ok(into_stats(row))
+    }
+
+    fn browser(&self) -> Option<&dyn RefBrowse> {
+        Some(self)
+    }
+}
+
+/// A `WHERE` clause and the values it binds, built one filter at a time.
+struct Filter {
+    clause: String,
+    values: Vec<Value>,
+}
+
+impl Filter {
+    fn new(tenant: &Tenant) -> Filter {
+        Filter {
+            clause: "tenant = ?1".to_owned(),
+            values: vec![Value::Text(tenant.0.clone())],
+        }
+    }
+
+    /// Append `condition`, which numbers its placeholders from the index it
+    /// is handed, and the values they bind in that order.
+    fn and(&mut self, condition: impl FnOnce(usize) -> String, values: Vec<Value>) {
+        let next = self.values.len() + 1;
+        self.clause.push_str(" AND ");
+        self.clause.push_str(&condition(next));
+        self.values.extend(values);
+    }
+
+    fn live(&mut self, now: i64) {
+        self.and(
+            |n| {
+                format!("last_accessed + ttl_seconds >= ?{n} AND created_at + max_lifetime >= ?{n}")
+            },
+            vec![Value::Integer(now)],
+        );
+    }
+}
+
+impl RefBrowse for SqliteRefStore {
+    fn browse(&self, tenant: &Tenant, query: &BrowseQuery) -> Result<BrowsePage, StoreError> {
+        let now = clamp_i64(self.clock.now());
+        let mut scope = Filter::new(tenant);
+        if !query.include_expired {
+            scope.live(now);
+        }
+
+        let mut filter = Filter {
+            clause: scope.clause.clone(),
+            values: scope.values.clone(),
+        };
+        if let Some(kind) = &query.kind {
+            filter.and(|n| format!("kind = ?{n}"), vec![Value::Text(kind.clone())]);
+        }
+        if let Some(request_id) = &query.request_id {
+            filter.and(
+                |n| format!("request_id = ?{n}"),
+                vec![Value::Text(request_id.clone())],
+            );
+        }
+        if let Some(id) = query.exact_handle() {
+            filter.and(
+                |n| format!("ref = ?{n}"),
+                vec![Value::Text(id.body().to_owned())],
+            );
+        } else if let Some(needle) = query.needle() {
+            // `lower()` folds ASCII only, which is what the memory backend's
+            // matcher does too. A handle that cannot match passes `NULL`, and
+            // `instr` of `NULL` is never positive.
+            let handle = query.handle_needle().map_or(Value::Null, Value::Text);
+            filter.and(
+                |n| {
+                    format!(
+                        "(instr(lower(CAST(fragment AS TEXT)), ?{n}) > 0 \
+                          OR instr(lower(ref), ?{h}) > 0 \
+                          OR instr(lower(coalesce(request_id, '')), ?{n}) > 0)",
+                        h = n + 1
+                    )
+                },
+                vec![Value::Text(needle), handle],
+            );
+        }
+
+        // Every order ends on the handle, as eviction does, so a page boundary
+        // inside a batch written in one second is stable across requests.
+        let order = match query.order {
+            BrowseOrder::Newest => "created_at DESC, ref ASC",
+            BrowseOrder::Oldest => "created_at ASC, ref ASC",
+            BrowseOrder::RecentlyUsed => "last_accessed DESC, ref ASC",
+            BrowseOrder::Largest => "bytes DESC, ref ASC",
+            BrowseOrder::ExpiringSoon => {
+                "min(last_accessed + ttl_seconds, created_at + max_lifetime) ASC, ref ASC"
+            }
+        };
+
+        let chars = query.preview_limit();
+        let conn = self.conn.lock();
+
+        let total: i64 = conn.query_row(
+            &format!("SELECT count(*) FROM refs WHERE {}", filter.clause),
+            params_from_iter(filter.values.iter()),
+            |row| row.get(0),
+        )?;
+
+        let kinds = {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT kind, count(*) FROM refs WHERE {} GROUP BY kind ORDER BY kind",
+                scope.clause
+            ))?;
+            let rows = stmt.query_map(params_from_iter(scope.values.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut values = filter.values;
+        let mut bind = |value: Value| {
+            values.push(value);
+            values.len()
+        };
+        let needle = query.text_needle();
+        let (head, start) = match &needle {
+            // A window around the first match. Over TEXT, `instr` and `substr`
+            // count characters, and `lower()` folds ASCII only, which keeps
+            // the folded copy's positions the original's. No match in the
+            // text — the hit was the handle or the request — starts at 1.
+            Some(needle) => {
+                let n = bind(Value::Text(needle.clone()));
+                let lead = bind(Value::Integer(crate::browse::lead_in(chars) as i64));
+                // One character more than shown, so a cut is detectable.
+                let take = bind(Value::Integer(chars as i64 + 1));
+                let at = format!("instr(lower(CAST(fragment AS TEXT)), ?{n})");
+                (
+                    format!(
+                        "CAST(substr(CAST(fragment AS TEXT), max(1, {at} - ?{lead}), ?{take}) AS BLOB)"
+                    ),
+                    format!("max(0, {at} - 1 - ?{lead})"),
+                )
+            }
+            // Four bytes a character is the most UTF-8 can spend, so this
+            // byte prefix always holds `chars` characters when there are any.
+            None => {
+                let take = bind(Value::Integer(chars.saturating_mul(4) as i64));
+                (format!("substr(fragment, 1, ?{take})"), "0".to_owned())
+            }
+        };
+        let limit = bind(Value::Integer(query.page_limit() as i64));
+        let offset = bind(Value::Integer(query.offset.min(i64::MAX as usize) as i64));
+        let sql = format!(
+            "SELECT {} FROM refs WHERE {} ORDER BY {order} LIMIT ?{limit} OFFSET ?{offset}",
+            SQL_BROWSE_COLUMNS
+                .replace("{head}", &head)
+                .replace("{start}", &start),
+            filter.clause,
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(values.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+            ))
+        })?;
+        let mut entries = Vec::new();
+        for row in rows {
+            let (handle, head, start, bytes, kind, request_id, created, accessed, ttl, lifetime) =
+                row?;
+            // A row whose handle does not parse was not written by this engine;
+            // listing it would offer a handle nothing can open.
+            let Some(id) = RefId::parse(&handle) else {
+                continue;
+            };
+            let bytes = bytes.max(0) as u64;
+            let head = utf8_prefix(&head);
+            let (preview, cut) = crate::browse::preview(&head, chars);
+            let detail = RefDetail::new(
+                RefRecord {
+                    id,
+                    fragment: String::new(),
+                    kind,
+                    request_id,
+                    created_at: created.max(0) as u64,
+                    last_accessed: accessed.max(0) as u64,
+                    ttl_seconds: ttl.max(0) as u64,
+                },
+                lifetime.max(0) as u64,
+                now.max(0) as u64,
+            );
+            entries.push(RefSummary {
+                id,
+                kind: detail.record.kind,
+                request_id: detail.record.request_id,
+                bytes,
+                created_at: detail.record.created_at,
+                last_accessed: detail.record.last_accessed,
+                ttl_seconds: detail.record.ttl_seconds,
+                max_lifetime_seconds: detail.max_lifetime_seconds,
+                expires_at: detail.expires_at,
+                expired: detail.expired,
+                // A match window read one character past what it shows; a
+                // prefix read a byte count, which the fragment may outrun.
+                truncated: cut || (needle.is_none() && (head.len() as u64) < bytes),
+                preview_start: start.max(0) as u64,
+                preview,
+            });
+        }
+
+        Ok(BrowsePage {
+            total: total.max(0) as u64,
+            entries,
+            kinds,
+        })
+    }
+
+    fn inspect(&self, tenant: &Tenant, id: &RefId) -> Result<Option<RefDetail>, StoreError> {
+        let now = self.clock.now();
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(SQL_INSPECT)?;
+        let row = stmt
+            .query_row(params![tenant.as_str(), id.body()], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
+            .optional()?;
+        let Some((fragment, kind, request_id, created, accessed, ttl, lifetime)) = row else {
+            return Ok(None);
+        };
+        // Lossy rather than `CorruptRow`: the operator looking at a damaged
+        // row is the one person who should still be able to see it.
+        let fragment = match String::from_utf8(fragment) {
+            Ok(text) => text,
+            Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+        };
+        Ok(Some(RefDetail::new(
+            RefRecord {
+                id: *id,
+                fragment,
+                kind,
+                request_id,
+                created_at: created.max(0) as u64,
+                last_accessed: accessed.max(0) as u64,
+                ttl_seconds: ttl.max(0) as u64,
+            },
+            lifetime.max(0) as u64,
+            now,
+        )))
+    }
+
+    fn remove(&self, tenant: &Tenant, ids: &[RefId]) -> Result<usize, StoreError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let mut removed = 0;
+        {
+            let mut stmt = tx.prepare_cached(SQL_DELETE_ONE)?;
+            for id in ids {
+                removed += stmt.execute(params![tenant.as_str(), id.body()])?;
+            }
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+}
+
+/// The longest valid UTF-8 prefix of `bytes`. A byte-counted `substr` can end
+/// inside a character; the partial character is dropped, never repaired.
+fn utf8_prefix(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_owned(),
+        Err(error) if error.valid_up_to() > 0 || error.error_len().is_none() => {
+            String::from_utf8_lossy(&bytes[..error.valid_up_to()]).into_owned()
+        }
+        Err(_) => String::from_utf8_lossy(bytes).into_owned(),
     }
 }
 

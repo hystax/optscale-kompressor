@@ -61,6 +61,7 @@ input { font: inherit; padding: 4px 8px; border: 1px solid var(--line); border-r
     <h1>Kompressor live</h1>
     <span class="meta"><span id="status-dot" class="dot"></span><span id="status">connecting…</span></span>
     <div class="controls" id="windows"></div>
+    <a id="refs-link" href="#" hidden>Ref store</a>
     <button id="pause" aria-pressed="false">Pause</button>
   </header>
 
@@ -326,6 +327,12 @@ $("key-form").addEventListener("submit", (event) => {
 });
 document.addEventListener("visibilitychange", () => { if (!document.hidden && !state.paused) { clearTimeout(state.timer); poll(); } });
 
+// The ref browser sits beside this page: at /refs on the statistics
+// listener, and as the sibling of /stats/live under a version prefix.
+if (SETTINGS.refs) {
+  $("refs-link").href = location.pathname === "/" ? "/refs" : location.pathname.replace(/stats\/live\/?$/, "refs");
+  $("refs-link").hidden = false;
+}
 windows();
 poll();
 </script>

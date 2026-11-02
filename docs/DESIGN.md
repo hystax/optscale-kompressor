@@ -1162,6 +1162,10 @@ CREATE INDEX IF NOT EXISTS refs_expiry ON refs (last_accessed);   -- lazy purge 
 
 - `MemoryRefStore`: `DashMap<(Tenant, RefId), RefRecord>` with the same TTL semantics; test default and `--ephemeral` mode.
 - `CachedRefStore`: the write-through wrapper described in §8.2, composed in front of either of the above.
+
+### 8.3.1 Browsing
+
+`RefStore` stays point-lookup only: nothing on the request path walks the table. Listing is a separate trait, `RefBrowse` (`browse`, `inspect`, `remove`), reached through `RefStore::browser()` — `None` by default, implemented by both backends, and by `CachedRefStore` exactly when its inner store is, so that a removal clears the cached copy as well as the row. A browse is tenant-scoped like everything else; it orders by `newest`, `oldest`, `recent` (last access), `largest` or `expiring`, always tie-broken on the handle so a page boundary inside a same-second batch is stable; it searches the fragment, the handle and the request id case-insensitively (ASCII folding, which is what SQLite's `lower()` does, so both backends agree); and SQLite reads only a `substr` of each fragment for the preview — its start, or under a search a window that begins a quarter of the preview before the first match in the text (`preview_start` says how many characters were skipped). None of it touches an entry or lazily deletes an expired one: looking is not using, and a browser that kept fragments alive would change the retention it reports on. `inspect` reads an expired row that is still on disk, lossily if it is not UTF-8, since the operator looking at a damaged row is the one person who should still see it.
 - **No Redis backend is built.** `RefsBackend` has exactly two variants, `sqlite` and `memory`. `KOMPRESSOR_REDIS_URL` is still recognised by the environment reader so an operator migrating from a Redis-backed deployment gets a warning ("this build stores fragments in sqlite") rather than silence, but it selects nothing.
 
 ### 8.4 TTL refresh for protected markers
@@ -1326,6 +1330,9 @@ prefix answers 404 rather than an empty report — an empty report would read as
 | `GET /v1/stats/requests?request_id=` | one request's economy row plus its events |
 | `GET /v1/stats/store` | live refs/bytes, oldest, purge counters |
 | `GET /v1/stats/live?window&recent&tenant&format&refresh` | a live snapshot ending now: totals, 1m/5m/15m rates, a timeline, upstream status/cache/latency percentiles, by provider/model/type, skip reasons, retrievals, the latest requests, and process info (version, uptime, dropped events). JSON, or a self-refreshing HTML dashboard for `?format=html` or a browser's `Accept` |
+| `GET /v1/refs?q&kind&request_id&expired&order&offset&limit&preview&tenant&format` | the ref browser (§8.3.1): one page of the tenant's fragments with a preview each, the match total, a count per kind and what the tenant holds live. JSON, or a page for `?format=html` or a browser's `Accept`. Off — 404 — unless `refs.browse = true` |
+| `GET /v1/refs/{handle}?history&tenant` | one fragment in full, read without touching it, with its retention and every recorded ask for it (`retrieval_events`) |
+| `DELETE /v1/refs/{handle}?tenant` | remove a fragment from the store and the recent-write cache; a later retrieval is a miss |
 | `GET /metrics` | Prometheus (§15) |
 
 Responses are JSON; `?format=csv` on the tabular ones. The same queries back `kompressor stats …` on the CLI (direct SQLite, no server needed).
@@ -1341,6 +1348,15 @@ listener runs whatever surfaces were selected, so `serve --proxy` has one too.
 The HTML shell is served without credentials because it holds no data; with
 `auth.mode = "api_keys"` its polls send a key the viewer types in, kept in the
 tab's `sessionStorage`.
+
+The ref browser follows the same shape: `/v1/refs` is JSON or a page, the page
+fetches the JSON with the key from the same `sessionStorage` entry, and the
+statistics listener serves it at `/refs` beside the dashboard, which links to
+it when browsing is on. It is off by default because it changes who can read a
+fragment: without it, reading one back needs its unguessable handle; with it,
+any credential for a tenant can list that tenant's fragments. Deleting is
+allowed to the same caller — the tenant's own data, and a model that asks for a
+deleted handle gets the miss it already handles.
 
 ## 10. `kompressor-server`: HTTP compression API
 
@@ -2175,6 +2191,7 @@ path    = "./data/refs.db"
 recent_cache_entries = 4096         # write-through cache
 purge_interval = "1m"
 max_bytes = 1073741824              # bytes, not "1GiB"
+browse = false                      # serve /v1/refs (§10.1); fragments can hold secrets
 
 [stats]
 enabled = true

@@ -242,6 +242,36 @@ pub struct ProviderCoverage {
     pub ratio: f64,
 }
 
+/// Everything recorded about the asks for one handle.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RefHistory {
+    /// Times it was asked for and the store was read.
+    pub retrievals: u64,
+    /// Times it was there.
+    pub hits: u64,
+    /// Times the budget refused it without reading the store.
+    pub withheld: u64,
+    /// Tokens it re-injected in total.
+    pub returned_tokens: i64,
+    pub first_ms: Option<i64>,
+    pub last_ms: Option<i64>,
+    /// The latest asks, newest first, withheld ones included.
+    pub recent: Vec<RefAsk>,
+}
+
+/// One ask for a handle.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RefAsk {
+    pub time_ms: i64,
+    pub request_id: Option<String>,
+    pub surface: String,
+    pub found: bool,
+    pub expired: bool,
+    pub ranged: bool,
+    pub withheld: bool,
+    pub returned_tokens: i64,
+}
+
 /// One frequently-asked handle.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RefCount {
@@ -875,6 +905,82 @@ impl StatsReader {
             retrieved_tokens,
             top_refs,
         })
+    }
+
+    /// Every recorded ask for one handle, `recent` of them listed.
+    ///
+    /// `handle` is the bare handle body. The `ref` column holds whatever the
+    /// caller asked with, so the three spellings a model uses — bare, `k_`
+    /// and the marker's `ref:k_` — are all matched.
+    pub fn ref_history(
+        &self,
+        tenant: &str,
+        handle: &str,
+        recent: usize,
+    ) -> Result<RefHistory, StatsError> {
+        let (served, withheld_sum) = (self.served(), self.withheld_sum());
+        let prefixed = format!("k_{handle}");
+        let marker = format!("ref:k_{handle}");
+        let spellings = (tenant, handle, prefixed.as_str(), marker.as_str());
+        let mut history = self.conn.query_row(
+            &format!(
+                "SELECT COALESCE(SUM(CASE WHEN {served} THEN 1 ELSE 0 END),0),
+                        COALESCE(SUM(CASE WHEN {served} THEN found ELSE 0 END),0),
+                        {withheld_sum},
+                        COALESCE(SUM(CASE WHEN {served} AND found = 1
+                                          THEN returned_tokens ELSE 0 END),0),
+                        MIN(time_ms), MAX(time_ms)
+                 FROM retrieval_events
+                 WHERE tenant = ?1 AND \"ref\" IN (?2, ?3, ?4)"
+            ),
+            spellings,
+            |row| {
+                Ok(RefHistory {
+                    retrievals: row.get::<_, i64>(0)?.max(0) as u64,
+                    hits: row.get::<_, i64>(1)?.max(0) as u64,
+                    withheld: row.get::<_, i64>(2)?.max(0) as u64,
+                    returned_tokens: row.get(3)?,
+                    first_ms: row.get(4)?,
+                    last_ms: row.get(5)?,
+                    recent: Vec::new(),
+                })
+            },
+        )?;
+
+        let withheld = if self.has_withheld { "withheld" } else { "0" };
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT time_ms, request_id, surface, found, expired, ranged, {withheld},
+                    returned_tokens
+             FROM retrieval_events
+             WHERE tenant = ?1 AND \"ref\" IN (?2, ?3, ?4)
+             ORDER BY time_ms DESC, id DESC
+             LIMIT ?5"
+        ))?;
+        let rows = stmt.query_map(
+            (
+                tenant,
+                handle,
+                prefixed.as_str(),
+                marker.as_str(),
+                recent as i64,
+            ),
+            |row| {
+                Ok(RefAsk {
+                    time_ms: row.get(0)?,
+                    request_id: row.get(1)?,
+                    surface: row.get(2)?,
+                    found: row.get::<_, i64>(3)? != 0,
+                    expired: row.get::<_, i64>(4)? != 0,
+                    ranged: row.get::<_, i64>(5)? != 0,
+                    withheld: row.get::<_, i64>(6)? != 0,
+                    returned_tokens: row.get(7)?,
+                })
+            },
+        )?;
+        for row in rows {
+            history.recent.push(row?);
+        }
+        Ok(history)
     }
 
     /// One request, joined across compression, retrieval and proxy rows.

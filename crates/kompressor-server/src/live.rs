@@ -124,7 +124,7 @@ impl LiveQuery {
 
 /// A browser asks for `text/html` ahead of anything else; `curl` and API
 /// clients send `*/*` or `application/json`, and get JSON.
-fn prefers_html(headers: &HeaderMap) -> bool {
+pub(crate) fn prefers_html(headers: &HeaderMap) -> bool {
     let Some(accept) = headers
         .get(header::ACCEPT)
         .and_then(|value| value.to_str().ok())
@@ -214,11 +214,14 @@ pub(crate) fn live_routes() -> Router<Arc<ServerState>> {
 }
 
 /// Everything the dedicated statistics listener serves: the page at `/`, the
-/// versioned live routes, and the probes.
+/// ref browser at `/refs`, the versioned live and ref routes, and the probes.
 pub fn stats_listener_router(state: Arc<ServerState>) -> Router {
-    let routes = live_routes().with_state(state.clone());
+    let routes = live_routes()
+        .merge(crate::refs::refs_routes())
+        .with_state(state.clone());
     let router = Router::new()
         .route("/", get(page_at_root))
+        .route("/refs", get(crate::refs::page_on_stats_listener))
         .with_state(state.clone())
         .nest("/v1", routes.clone())
         .nest("/v2", routes)
@@ -271,7 +274,8 @@ async fn respond(
     // header to a navigation, so the shell is served to anyone and the data
     // arrives only once the poll presents a key — see `PAGE`.
     if format == Format::Html {
-        return Ok(page(&label, recent, refresh, endpoint));
+        let refs = state.core.config().refs.browse;
+        return Ok(page(&label, recent, refresh, endpoint, refs));
     }
 
     let identity = authenticate(&state, &headers)?;
@@ -315,14 +319,16 @@ fn server_info(state: &ServerState) -> ServerInfo {
     }
 }
 
-fn page(window: &str, recent: usize, refresh: u32, endpoint: &str) -> Response {
-    // The three values reach the page as one JSON object, so nothing a caller
+fn page(window: &str, recent: usize, refresh: u32, endpoint: &str, refs: bool) -> Response {
+    // The values reach the page as one JSON object, so nothing a caller
     // put in the query string is ever spliced into markup or script as text.
     let settings = serde_json::json!({
         "window": window,
         "recent": recent,
         "refresh": refresh,
         "endpoint": endpoint,
+        // Whether to link the ref browser; it 404s when browsing is off.
+        "refs": refs,
     })
     .to_string()
     .replace('<', "\\u003c");
@@ -406,7 +412,7 @@ mod tests {
     #[test]
     fn query_text_reaches_the_page_only_inside_escaped_json() {
         let hostile = "</script><script>alert(1)</script>";
-        let response = page(hostile, 5, 2, "");
+        let response = page(hostile, 5, 2, "", false);
         let body = futures_body(response);
         assert!(
             !body.contains("</script><script>"),

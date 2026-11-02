@@ -167,6 +167,15 @@ pub struct RefsConfig {
     #[serde(with = "humantime_serde")]
     pub purge_interval: Duration,
     pub max_bytes: u64,
+    /// Serve the ref browser: `/v1/refs`, which lists, shows and deletes
+    /// stored fragments for the caller's tenant.
+    ///
+    /// Off by default. Fragments are tool output — a `.env` read, a cloud
+    /// API response — and until this is on, reading one back needs its
+    /// unguessable handle. With it on, any credential for a tenant can list
+    /// that tenant's fragments, and with `auth.mode = "none"` anyone who can
+    /// reach the listener can.
+    pub browse: bool,
 }
 
 impl Default for RefsConfig {
@@ -177,6 +186,7 @@ impl Default for RefsConfig {
             recent_cache_entries: 4096,
             purge_interval: Duration::from_secs(60),
             max_bytes: 1024 * 1024 * 1024,
+            browse: false,
         }
     }
 }
@@ -1065,6 +1075,9 @@ impl Config {
                 "backend" if value.eq_ignore_ascii_case("memory") => {
                     self.refs.backend = RefsBackend::Memory;
                 }
+                "browse" => {
+                    self.refs.browse = parse_bool_setting("refs.browse", value, self.refs.browse)
+                }
                 _ => {}
             },
             "stats" => match field {
@@ -1937,5 +1950,15 @@ mod tests {
             "0.0.0.0:9000".into(),
         )]);
         assert_eq!(config.server.stats_listen, "0.0.0.0:9000");
+    }
+
+    #[test]
+    fn the_ref_browser_is_off_until_a_file_or_the_environment_turns_it_on() {
+        assert!(!Config::default().refs.browse);
+        let from_file: Config = toml::from_str("[refs]\nbrowse = true\n").expect("parses");
+        assert!(from_file.refs.browse);
+        let mut config = Config::default();
+        config.apply_env(&[("KOMPRESSOR__REFS__BROWSE".into(), "true".into())]);
+        assert!(config.refs.browse);
     }
 }

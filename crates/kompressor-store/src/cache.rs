@@ -17,6 +17,7 @@
 //! one deadline a read is not allowed to extend; covering the write gap needs
 //! no such guess, because the writer supplied the whole policy.
 
+use crate::browse::{BrowsePage, BrowseQuery, RefBrowse, RefDetail};
 use crate::clock::Clock;
 use crate::types::{
     Lookup, PutMeta, RefRecord, RefStore, StoreError, StoreStats, Tenant, is_expired,
@@ -315,6 +316,44 @@ impl<S: RefStore> RefStore for CachedRefStore<S> {
         // Same reasoning as `stats`: the inner store is the only count that is
         // not double counting the cache's own copies.
         self.inner.stats_for(tenant)
+    }
+
+    fn browser(&self) -> Option<&dyn RefBrowse> {
+        // Browsable exactly when the inner store is. The wrapper itself is
+        // what is handed out, so a removal also drops the cached copy.
+        self.inner.browser().map(|_| self as &dyn RefBrowse)
+    }
+}
+
+/// Reads go to the inner store, the only one holding every row; the cache is
+/// a subset of it, written through. A removal clears both layers, or the
+/// deleted fragment would stay servable for the rest of the cache window.
+impl<S: RefStore> RefBrowse for CachedRefStore<S> {
+    fn browse(&self, tenant: &Tenant, query: &BrowseQuery) -> Result<BrowsePage, StoreError> {
+        match self.inner.browser() {
+            Some(inner) => inner.browse(tenant, query),
+            None => Ok(BrowsePage::default()),
+        }
+    }
+
+    fn inspect(&self, tenant: &Tenant, id: &RefId) -> Result<Option<RefDetail>, StoreError> {
+        match self.inner.browser() {
+            Some(inner) => inner.inspect(tenant, id),
+            None => Ok(None),
+        }
+    }
+
+    fn remove(&self, tenant: &Tenant, ids: &[RefId]) -> Result<usize, StoreError> {
+        {
+            let mut state = self.state.lock();
+            for id in ids {
+                state.entries.remove(&(tenant.0.clone(), *id));
+            }
+        }
+        match self.inner.browser() {
+            Some(inner) => inner.remove(tenant, ids),
+            None => Ok(0),
+        }
     }
 }
 
@@ -659,6 +698,28 @@ mod tests {
             Lookup::Miss,
             "and the cache must not go on serving it"
         );
+    }
+
+    #[test]
+    fn removing_through_the_cache_stops_the_cached_copy_being_served() {
+        let store = CachedRefStore::new(MemoryRefStore::new());
+        let fragment = "a secret that should not have been stored";
+        let id = ref_for(fragment);
+        store
+            .put_many(&tenant("t"), &[(id, fragment.to_owned())], &meta())
+            .unwrap();
+        assert_eq!(store.cached_len(), 1);
+
+        let browser = store.browser().expect("browsable through the cache");
+        assert_eq!(browser.remove(&tenant("t"), &[id]).unwrap(), 1);
+        assert_eq!(store.cached_len(), 0);
+        assert_eq!(store.get(&tenant("t"), &id, false).unwrap(), Lookup::Miss);
+    }
+
+    #[test]
+    fn a_cache_over_an_unbrowsable_store_is_not_browsable() {
+        let store = CachedRefStore::new(StalledStore::default());
+        assert!(store.browser().is_none());
     }
 
     #[test]

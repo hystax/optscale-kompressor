@@ -256,6 +256,7 @@ $ curl -s localhost:8817/v1/retrieve -H 'content-type: application/json' \
 | `POST /v1/detect` | classify a payload without compressing it |
 | `GET /v1/stats/summary` `by_type` `histogram` `requests` `retrievals` `store` | the same reports as `kompressor stats` — mounted only when `stats.enabled` (the default); with statistics off the whole prefix 404s |
 | `GET /v1/stats/live` | live statistics: JSON, or a dashboard that refreshes itself when opened in a browser (`?format=html`) |
+| `GET /v1/refs` | the ref browser: the fragments recoverable compression stored, searchable, as JSON or a page — off unless `refs.browse = true` |
 | `GET /healthz` `/readyz` `/metrics` | liveness, readiness, Prometheus |
 
 `/v2` is served as an alias of `/v1` so a client pinned to either keeps working.
@@ -277,6 +278,34 @@ The listener serves only the dashboard, the JSON and the probes, and it runs
 whatever surfaces `serve` was started with — so a proxy-only service has a
 dashboard too. Leave `stats_listen` empty to serve `/v1/stats/live` only on the
 API listener. `KOMPRESSOR__SERVER__STATS_LISTEN` sets it from the environment.
+
+### Browsing the ref store
+
+Recoverable compression keeps what it elided behind a handle. To see what is
+there — what the proxy took out of a session, whether a secret ended up in a
+fragment — turn the ref browser on:
+
+```toml
+[refs]
+browse = true
+```
+
+Then open `/v1/refs` on the API listener, or `http://127.0.0.1:8818/refs` on
+the statistics listener, for a page that lists the fragments newest first, with
+search over their text, handles and request ids, filters by kind, and each
+fragment in full with every time a model asked for it. JSON is the same path:
+
+```bash
+curl -s 'http://127.0.0.1:8080/v1/refs?q=AWS_SECRET&order=largest&limit=20'
+curl -s 'http://127.0.0.1:8080/v1/refs/k_AbC123dEf456'
+curl -s -X DELETE 'http://127.0.0.1:8080/v1/refs/k_AbC123dEf456'
+```
+
+Looking is not using: nothing here restarts a fragment's idle window or counts
+as a retrieval. A key sees only its own tenant's fragments. Fragments are tool
+output, so the browser is off by default — with it on and `auth.mode = "none"`,
+anyone who can reach the listener can read them. `KOMPRESSOR__REFS__BROWSE=true`
+sets it from the environment.
 
 ---
 

@@ -22,6 +22,10 @@ max_ref_bytes = 1048576
 [refs]
 backend = "sqlite"
 path = "@STATE@/refs.db"
+# The ref browser — /v1/refs, and /refs on server.stats_listen — lists, shows
+# and deletes stored fragments. Fragments are tool output and can hold secrets,
+# so it is off unless turned on here.
+# browse = true
 
 [stats]
 enabled = true

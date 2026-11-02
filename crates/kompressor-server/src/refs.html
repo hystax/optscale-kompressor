@@ -1,0 +1,566 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kompressor refs</title>
+<style>
+:root {
+  --bg: #f7f8fa; --panel: #ffffff; --ink: #172033; --muted: #5b6475; --line: #e3e6ec;
+  --accent: #3b6fd8; --hit: #fff1b8; --good: #1f8a4c; --warn: #b26a00; --bad: #c0392b; --sel: #eef3fd;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #11151c; --panel: #171c25; --ink: #e6e9ef; --muted: #98a2b3; --line: #2a3140;
+    --accent: #6d9bff; --hit: #5a4a12; --good: #4cc27f; --warn: #e0a440; --bad: #ef6b5b; --sel: #1f2838;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1200px; margin: 0 auto; padding: 20px 16px 48px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; margin-bottom: 16px; }
+h1 { font-size: 20px; margin: 0; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; }
+a { color: var(--accent); }
+.meta { color: var(--muted); font-size: 13px; }
+.controls { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+button, select { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+button:disabled { opacity: .45; cursor: default; }
+button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+button.danger { color: var(--bad); border-color: var(--bad); }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: var(--muted); margin-right: 6px; }
+.dot.ok { background: var(--good); } .dot.err { background: var(--bad); }
+.banner { padding: 10px 12px; border-radius: 8px; margin-bottom: 14px; border: 1px solid var(--warn); color: var(--warn); display: none; }
+.banner.show { display: block; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px; }
+.tile, section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+.tile { padding: 12px 14px; }
+.tile .label { color: var(--muted); font-size: 12px; }
+.tile .value { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.tile .sub { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+section { padding: 14px; margin-bottom: 14px; overflow-x: auto; }
+.filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+.filters input[type="search"] { flex: 1 1 260px; }
+.filters label { color: var(--muted); font-size: 13px; display: inline-flex; gap: 6px; align-items: center; }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; vertical-align: top; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+td.num, th.num { text-align: right; }
+td.preview { white-space: normal; overflow-wrap: anywhere; min-width: 240px; color: var(--muted); }
+code, pre, td.mono, td.preview { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+tbody tr.row { cursor: pointer; }
+tbody tr.row:hover, tbody tr.row:focus { background: var(--sel); outline: none; }
+tbody tr.row[aria-selected="true"] { background: var(--sel); box-shadow: inset 3px 0 0 var(--accent); }
+.expired { color: var(--bad); }
+.soon { color: var(--warn); }
+mark { background: var(--hit); color: inherit; border-radius: 2px; }
+.empty { color: var(--muted); padding: 6px 8px; }
+.pager { display: flex; gap: 8px; align-items: center; margin-top: 10px; color: var(--muted); font-size: 13px; }
+.pager .grow { flex: 1; }
+#detail { display: none; }
+#detail.show { display: block; }
+.detail-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+.detail-head code { font-size: 15px; font-weight: 600; }
+.detail-head .controls { margin-left: auto; }
+.kv { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 6px 16px; margin-bottom: 12px; }
+.kv div { font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.kv span { display: block; color: var(--muted); font-size: 12px; }
+pre { position: relative; margin: 0; padding: 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  max-height: 60vh; overflow: auto; white-space: pre; tab-size: 4; }
+pre.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
+form.key { display: none; gap: 6px; margin-top: 8px; }
+form.key.show { display: flex; }
+input { font: inherit; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); min-width: 0; }
+form.key input { flex: 1; }
+.note { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Kompressor refs</h1>
+    <span class="meta"><span id="status-dot" class="dot"></span><span id="status">connecting…</span></span>
+    <div class="controls">
+      <a id="live-link" href="#">Live stats</a>
+      <button id="pause" aria-pressed="false" title="Re-list automatically">Pause</button>
+    </div>
+  </header>
+
+  <div class="banner" id="banner" role="status">
+    <span id="banner-text"></span>
+    <form class="key" id="key-form">
+      <input id="key" type="password" autocomplete="off" placeholder="API key">
+      <button type="submit">Use key</button>
+    </form>
+  </div>
+
+  <div class="tiles" id="tiles"></div>
+
+  <section aria-labelledby="list-title">
+    <h2 id="list-title">Stored fragments</h2>
+    <form class="filters" id="filters" role="search">
+      <label class="sr" for="q">Search</label>
+      <input id="q" type="search" placeholder="Search fragment text, handle or request id" autocomplete="off" spellcheck="false">
+      <label>Kind <select id="kind"><option value="">all</option></select></label>
+      <label>Order
+        <select id="order">
+          <option value="newest">newest</option>
+          <option value="oldest">oldest</option>
+          <option value="recent">last used</option>
+          <option value="largest">largest</option>
+          <option value="expiring">expiring soonest</option>
+        </select>
+      </label>
+      <label>Per page
+        <select id="limit"><option>25</option><option selected>50</option><option>100</option><option>200</option></select>
+      </label>
+      <label><input id="expired" type="checkbox"> expired</label>
+    </form>
+    <div id="list"></div>
+    <div class="pager">
+      <button id="prev" type="button">← Prev</button>
+      <button id="next" type="button">Next →</button>
+      <span id="range" class="grow"></span>
+    </div>
+  </section>
+
+  <section id="detail" aria-labelledby="detail-handle">
+    <div class="detail-head">
+      <code id="detail-handle"></code>
+      <span id="detail-state" class="meta"></span>
+      <div class="controls">
+        <button id="copy-handle" type="button">Copy marker</button>
+        <button id="copy-fragment" type="button">Copy text</button>
+        <button id="download" type="button">Download</button>
+        <button id="pretty" type="button" aria-pressed="false">Pretty JSON</button>
+        <button id="wrap" type="button" aria-pressed="false">Wrap</button>
+        <button id="delete" type="button" class="danger">Delete</button>
+        <button id="close" type="button" aria-label="Close">✕</button>
+      </div>
+    </div>
+    <div class="kv" id="detail-meta"></div>
+    <pre id="fragment" tabindex="0"></pre>
+    <p class="note" id="fragment-note"></p>
+    <h2 style="margin-top:16px">Retrievals</h2>
+    <div id="history"></div>
+  </section>
+
+  <p class="meta" id="footer"></p>
+</main>
+<script>
+"use strict";
+const SETTINGS = /*SETTINGS*/{};
+const ORDERS = ["newest", "oldest", "recent", "largest", "expiring"];
+const LIMITS = [25, 50, 100, 200];
+const MARK_LIMIT = 500;
+const params = new URLSearchParams(location.search);
+const state = {
+  endpoint: SETTINGS.endpoint || location.pathname.replace(/\/+$/, ""),
+  refresh: Math.max(1, SETTINGS.refresh || 5),
+  tenant: params.get("tenant") || "",
+  q: params.get("q") || "",
+  kind: params.get("kind") || "",
+  order: ORDERS.includes(params.get("order")) ? params.get("order") : "newest",
+  limit: LIMITS.includes(Number(params.get("limit"))) ? Number(params.get("limit")) : 50,
+  expired: params.get("expired") === "true",
+  offset: Math.max(0, Number(params.get("offset")) || 0),
+  selected: decodeURIComponent(location.hash.slice(1)) || "",
+  detail: null,
+  pretty: false,
+  wrap: false,
+  paused: false,
+  timer: null,
+  seq: 0,
+  last: null,
+};
+const $ = (id) => document.getElementById(id);
+const nf = new Intl.NumberFormat();
+const num = (v) => (v === null || v === undefined) ? "–" : nf.format(Math.round(v));
+const size = (b) => b < 1024 ? b + " B" : b < 1048576 ? (b / 1024).toFixed(1) + " KiB" : (b / 1048576).toFixed(2) + " MiB";
+const span = (s) => { s = Math.abs(s); return s < 120 ? s + "s" : s < 7200 ? Math.round(s / 60) + "m" : s < 172800 ? Math.round(s / 3600) + "h" : Math.round(s / 86400) + "d"; };
+const ago = (t, now) => t ? span(now - t) + " ago" : "–";
+const stamp = (t) => t ? new Date(t * 1000).toLocaleString() : "–";
+const BIG = 4e18; // a TTL of "forever" clamps to i64::MAX
+
+function el(tag, text, cls) {
+  const node = document.createElement(tag);
+  if (text !== undefined && text !== null) node.textContent = String(text);
+  if (cls) node.className = cls;
+  return node;
+}
+
+// Append `text` to `host`, wrapping case-insensitive matches of `needle` in
+// <mark>. Only text nodes are created, so fragment bytes never become markup.
+function highlight(host, text, needle) {
+  host.replaceChildren();
+  if (!needle) { host.append(document.createTextNode(text)); return; }
+  const hay = text.toLowerCase(), n = needle.toLowerCase();
+  let at = 0, marks = 0;
+  for (;;) {
+    const i = marks < MARK_LIMIT ? hay.indexOf(n, at) : -1;
+    if (i < 0) break;
+    if (i > at) host.append(document.createTextNode(text.slice(at, i)));
+    host.append(el("mark", text.slice(i, i + n.length)));
+    at = i + n.length;
+    marks++;
+  }
+  host.append(document.createTextNode(text.slice(at)));
+}
+
+function expiry(e, now) {
+  if (e.expired) return ["expired " + span(now - e.expires_at) + " ago", "expired"];
+  if (e.expires_at > BIG) return ["never", ""];
+  const left = e.expires_at - now;
+  return ["in " + span(left), left < 300 ? "soon" : ""];
+}
+
+function storedKey() {
+  try { return sessionStorage.getItem("kompressor-key") || ""; } catch (_) { return ""; }
+}
+
+function setStatus(ok, text) {
+  $("status-dot").className = "dot " + (ok ? "ok" : "err");
+  $("status").textContent = text;
+}
+
+function showBanner(text, needKey) {
+  $("banner-text").textContent = text;
+  $("banner").classList.toggle("show", !!text);
+  $("key-form").classList.toggle("show", !!needKey);
+}
+
+async function call(path, query, method) {
+  const url = new URL(state.endpoint + path, location.origin);
+  const search = new URLSearchParams(query || {});
+  if (state.tenant) search.set("tenant", state.tenant);
+  url.search = search.toString();
+  const headers = { accept: "application/json" };
+  const key = storedKey();
+  if (key) headers["x-kompressor-key"] = key;
+  const response = await fetch(url, { method: method || "GET", headers, cache: "no-store" });
+  let body = null;
+  try { body = await response.json(); } catch (_) {}
+  if (response.status === 401 || response.status === 403) {
+    setStatus(false, "needs a key");
+    showBanner(response.status === 401 ? "This deployment requires an API key." : "That key may not browse this tenant's fragments.", true);
+    throw new Error("auth");
+  }
+  if (!response.ok) {
+    const message = (body && body.error && body.error.message) || ("HTTP " + response.status);
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
+  }
+  return body;
+}
+
+function listQuery() {
+  const q = { format: "json", order: state.order, limit: String(state.limit), offset: String(state.offset) };
+  if (state.q.trim()) q.q = state.q.trim();
+  if (state.kind) q.kind = state.kind;
+  if (state.expired) q.expired = "true";
+  return q;
+}
+
+function syncUrl() {
+  const p = new URLSearchParams();
+  if (state.tenant) p.set("tenant", state.tenant);
+  if (state.q.trim()) p.set("q", state.q.trim());
+  if (state.kind) p.set("kind", state.kind);
+  if (state.order !== "newest") p.set("order", state.order);
+  if (state.limit !== 50) p.set("limit", String(state.limit));
+  if (state.expired) p.set("expired", "true");
+  if (state.offset) p.set("offset", String(state.offset));
+  const search = p.toString();
+  const hash = state.selected ? "#" + encodeURIComponent(state.selected) : "";
+  history.replaceState(null, "", location.pathname + (search ? "?" + search : "") + hash);
+}
+
+async function load() {
+  const seq = ++state.seq;
+  clearTimeout(state.timer);
+  try {
+    const page = await call("", listQuery());
+    if (seq !== state.seq) return; // a newer filter change already asked
+    state.last = page;
+    // A page past the end — rows deleted or expired under us — steps back.
+    if (page.entries.length === 0 && state.offset > 0 && page.total > 0) {
+      state.offset = Math.max(0, Math.floor((page.total - 1) / state.limit) * state.limit);
+      syncUrl();
+      return load();
+    }
+    render(page);
+    showBanner("", false);
+    setStatus(true, state.paused ? "paused" : "live");
+  } catch (error) {
+    if (seq !== state.seq || error.message === "auth") return;
+    if (error.status) {
+      setStatus(false, "error " + error.status);
+      showBanner(error.message, false);
+    } else {
+      setStatus(false, "unreachable — retrying");
+    }
+  } finally {
+    if (seq === state.seq) schedule();
+  }
+}
+
+function schedule() {
+  clearTimeout(state.timer);
+  if (!state.paused && !document.hidden) state.timer = setTimeout(load, state.refresh * 1000);
+}
+
+function tiles(d) {
+  const items = [
+    ["Live fragments", num(d.held.live_refs), "tenant \"" + d.tenant + "\""],
+    ["Held", size(d.held.live_bytes), "fragment bytes"],
+    ["Oldest", d.held.oldest_created_at ? span(d.now - d.held.oldest_created_at) : "–", d.held.oldest_created_at ? stamp(d.held.oldest_created_at) : "store is empty"],
+    ["Matching", num(d.total), (state.q.trim() || state.kind || state.expired) ? "with these filters" : "no filters"],
+  ];
+  const host = $("tiles");
+  host.replaceChildren();
+  for (const [label, value, sub] of items) {
+    const tile = el("div", undefined, "tile");
+    tile.append(el("div", label, "label"), el("div", value, "value"), el("div", sub, "sub"));
+    host.append(tile);
+  }
+}
+
+function kinds(d) {
+  const select = $("kind");
+  const seen = new Set(d.kinds.map((k) => k.kind));
+  // Keep a selected kind listed even after its last row went away.
+  if (state.kind && !seen.has(state.kind)) d.kinds.push({ kind: state.kind, count: 0 });
+  select.replaceChildren(el("option", "all"));
+  select.firstChild.value = "";
+  for (const k of d.kinds) {
+    const option = el("option", k.kind + " (" + num(k.count) + ")");
+    option.value = k.kind;
+    select.append(option);
+  }
+  select.value = state.kind;
+}
+
+function render(d) {
+  tiles(d);
+  kinds(d);
+  const host = $("list");
+  host.replaceChildren();
+  const needle = state.q.trim();
+  if (d.entries.length === 0) {
+    host.append(el("div", d.held.live_refs === 0 && !state.expired ? "The store holds nothing for this tenant." : "No fragment matches.", "empty"));
+  } else {
+    const t = el("table"), head = el("tr");
+    for (const [name, cls] of [["Handle"], ["Kind"], ["Size", "num"], ["Created"], ["Last used"], ["Expires"], ["Request"], ["Preview"]]) head.append(el("th", name, cls || ""));
+    t.append(el("thead")); t.tHead.append(head);
+    const body = el("tbody");
+    for (const e of d.entries) {
+      const tr = el("tr", undefined, "row");
+      tr.tabIndex = 0;
+      tr.setAttribute("aria-selected", String(e.handle === state.selected));
+      tr.dataset.handle = e.handle;
+      const handle = el("td", undefined, "mono");
+      highlight(handle, e.handle, needle.replace(/^ref:/i, ""));
+      const [left, cls] = expiry(e, d.now);
+      const request = el("td", undefined, "mono");
+      highlight(request, e.request_id || "–", needle);
+      const preview = el("td", undefined, "preview");
+      highlight(preview, (e.preview_start ? "… " : "") + e.preview.replace(/\s+/g, " ") + (e.truncated ? " …" : ""), needle);
+      tr.append(handle, el("td", e.kind), el("td", size(e.bytes), "num"), el("td", ago(e.created_at, d.now)),
+        el("td", ago(e.last_accessed, d.now)), el("td", left, cls), request, preview);
+      tr.title = "Created " + stamp(e.created_at);
+      body.append(tr);
+    }
+    t.append(body);
+    host.append(t);
+  }
+  const from = d.total === 0 ? 0 : d.offset + 1, to = d.offset + d.entries.length;
+  $("range").textContent = d.total === 0 ? "" : `${num(from)}–${num(to)} of ${num(d.total)}`;
+  $("prev").disabled = d.offset === 0;
+  $("next").disabled = to >= d.total;
+  $("footer").textContent = `tenant "${d.tenant}" · ${d.order} · updated ${new Date(d.generated_at_ms).toLocaleTimeString()} · every ${state.refresh}s · reading here never extends a fragment's life`;
+}
+
+async function openDetail(handle) {
+  state.selected = handle;
+  syncUrl();
+  for (const tr of document.querySelectorAll("tbody tr.row")) tr.setAttribute("aria-selected", String(tr.dataset.handle === handle));
+  if (!handle) { $("detail").classList.remove("show"); state.detail = null; return; }
+  $("detail").classList.add("show");
+  $("detail-handle").textContent = "ref:" + handle;
+  $("detail-state").textContent = "loading…";
+  try {
+    const d = await call("/" + encodeURIComponent(handle), { history: "50" });
+    if (state.selected !== handle) return;
+    state.detail = d;
+    state.pretty = false;
+    drawDetail();
+  } catch (error) {
+    if (error.message === "auth") return;
+    state.detail = null;
+    $("detail-state").textContent = error.message;
+    $("detail-meta").replaceChildren();
+    $("fragment").textContent = "";
+    $("fragment-note").textContent = "";
+    $("history").replaceChildren();
+  }
+}
+
+function prettyText(d) {
+  try { return JSON.stringify(JSON.parse(d.fragment), null, 2); } catch (_) { return null; }
+}
+
+function drawDetail() {
+  const d = state.detail;
+  if (!d) return;
+  const [left, cls] = expiry(d, d.now);
+  $("detail-state").textContent = d.expired ? "expired — a retrieval would miss" : "live";
+  $("detail-state").className = "meta " + (d.expired ? "expired" : "");
+  const meta = $("detail-meta");
+  meta.replaceChildren();
+  const pairs = [
+    ["Kind", d.kind], ["Size", size(d.bytes) + " · " + num(d.chars) + " chars · " + num(d.lines) + " lines"],
+    ["Request", d.request_id || "–"], ["Created", stamp(d.created_at) + " (" + ago(d.created_at, d.now) + ")"],
+    ["Last used", stamp(d.last_accessed) + " (" + ago(d.last_accessed, d.now) + ")"],
+    ["Expires", left + (d.expires_at > BIG ? "" : " · " + stamp(d.expires_at))],
+    ["Idle window", d.ttl_seconds > BIG ? "none" : span(d.ttl_seconds)],
+    ["Lifetime cap", d.max_lifetime_seconds > BIG ? "none" : span(d.max_lifetime_seconds)],
+  ];
+  for (const [k, v] of pairs) {
+    const cell = el("div", v, k === "Expires" ? cls : "");
+    cell.prepend(el("span", k));
+    meta.append(cell);
+  }
+  const pretty = prettyText(d);
+  $("pretty").disabled = pretty === null;
+  $("pretty").setAttribute("aria-pressed", String(state.pretty && pretty !== null));
+  const shown = state.pretty && pretty !== null ? pretty : d.fragment;
+  highlight($("fragment"), shown, state.q.trim());
+  $("fragment").classList.toggle("wrap", state.wrap);
+  $("wrap").setAttribute("aria-pressed", String(state.wrap));
+  const hits = state.q.trim() ? $("fragment").querySelectorAll("mark").length : 0;
+  // Bring the first match into the fragment's own view, not the page's.
+  const first = $("fragment").querySelector("mark");
+  $("fragment").scrollTop = first ? Math.max(0, first.offsetTop - $("fragment").clientHeight / 3) : 0;
+  $("fragment-note").textContent = hits ? (hits >= MARK_LIMIT ? MARK_LIMIT + "+" : hits) + " match" + (hits === 1 ? "" : "es") + " highlighted" : "";
+
+  const host = $("history");
+  host.replaceChildren();
+  const h = d.retrievals;
+  if (!h) { host.append(el("div", "Statistics are off, so asks are not recorded.", "empty")); return; }
+  if (h.retrievals + h.withheld === 0) { host.append(el("div", "Never asked for.", "empty")); return; }
+  host.append(el("div", `${num(h.retrievals)} asks · ${num(h.hits)} served · ${num(h.withheld)} withheld · ${num(h.returned_tokens)} tokens returned`, "meta"));
+  const t = el("table"), head = el("tr");
+  for (const [name, cls] of [["When"], ["Surface"], ["Outcome"], ["Tokens", "num"], ["Request"]]) head.append(el("th", name, cls || ""));
+  t.append(el("thead")); t.tHead.append(head);
+  const body = el("tbody");
+  for (const a of h.recent) {
+    const outcome = a.withheld ? "withheld" : a.found ? (a.ranged ? "served (range)" : "served") : a.expired ? "expired" : "miss";
+    const tr = el("tr");
+    tr.append(el("td", new Date(a.time_ms).toLocaleString()), el("td", a.surface),
+      el("td", outcome, a.found ? "" : "expired"), el("td", num(a.returned_tokens), "num"), el("td", a.request_id || "–", "mono"));
+    body.append(tr);
+  }
+  t.append(body);
+  host.append(t);
+}
+
+async function copy(text, button) {
+  const label = button.textContent;
+  try { await navigator.clipboard.writeText(text); button.textContent = "Copied"; }
+  catch (_) { button.textContent = "Copy failed"; }
+  setTimeout(() => { button.textContent = label; }, 1200);
+}
+
+function refilter() {
+  state.offset = 0;
+  syncUrl();
+  load();
+}
+
+let typing = null;
+$("q").addEventListener("input", () => {
+  state.q = $("q").value;
+  clearTimeout(typing);
+  typing = setTimeout(() => { refilter(); if (state.detail) drawDetail(); }, 250);
+});
+$("filters").addEventListener("submit", (event) => { event.preventDefault(); clearTimeout(typing); refilter(); });
+$("kind").addEventListener("change", () => { state.kind = $("kind").value; refilter(); });
+$("order").addEventListener("change", () => { state.order = $("order").value; refilter(); });
+$("limit").addEventListener("change", () => { state.limit = Number($("limit").value); refilter(); });
+$("expired").addEventListener("change", () => { state.expired = $("expired").checked; refilter(); });
+$("prev").addEventListener("click", () => { state.offset = Math.max(0, state.offset - state.limit); syncUrl(); load(); });
+$("next").addEventListener("click", () => { state.offset += state.limit; syncUrl(); load(); });
+$("list").addEventListener("click", (event) => {
+  const tr = event.target.closest("tr.row");
+  if (tr && !window.getSelection().toString()) openDetail(tr.dataset.handle);
+});
+$("list").addEventListener("keydown", (event) => {
+  const tr = event.target.closest("tr.row");
+  if (!tr) return;
+  if (event.key === "Enter" || event.key === " ") { event.preventDefault(); openDetail(tr.dataset.handle); }
+  if (event.key === "ArrowDown" && tr.nextElementSibling) { event.preventDefault(); tr.nextElementSibling.focus(); }
+  if (event.key === "ArrowUp" && tr.previousElementSibling) { event.preventDefault(); tr.previousElementSibling.focus(); }
+});
+$("close").addEventListener("click", () => openDetail(""));
+document.addEventListener("keydown", (event) => { if (event.key === "Escape" && state.selected) openDetail(""); });
+$("copy-handle").addEventListener("click", (event) => copy("ref:" + state.selected, event.currentTarget));
+$("copy-fragment").addEventListener("click", (event) => { if (state.detail) copy(state.detail.fragment, event.currentTarget); });
+$("download").addEventListener("click", () => {
+  const d = state.detail;
+  if (!d) return;
+  const blob = new Blob([d.fragment], { type: d.kind === "json" ? "application/json" : "text/plain;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = d.handle + (d.kind === "json" ? ".json" : ".txt");
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+});
+$("pretty").addEventListener("click", () => { state.pretty = !state.pretty; drawDetail(); });
+$("wrap").addEventListener("click", () => { state.wrap = !state.wrap; drawDetail(); });
+$("delete").addEventListener("click", async () => {
+  const handle = state.selected;
+  if (!handle || !confirm("Delete ref:" + handle + "?\n\nA model that asks for it afterwards gets a miss. This cannot be undone.")) return;
+  try {
+    await call("/" + encodeURIComponent(handle), {}, "DELETE");
+    await openDetail("");
+    load();
+  } catch (error) {
+    if (error.message !== "auth") showBanner("Delete failed: " + error.message, false);
+  }
+});
+$("pause").addEventListener("click", () => {
+  state.paused = !state.paused;
+  $("pause").textContent = state.paused ? "Resume" : "Pause";
+  $("pause").setAttribute("aria-pressed", String(state.paused));
+  if (state.paused) { clearTimeout(state.timer); setStatus(true, "paused"); } else { load(); }
+});
+$("key-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  try { sessionStorage.setItem("kompressor-key", $("key").value.trim()); } catch (_) {}
+  $("key").value = "";
+  showBanner("", false);
+  load();
+  if (state.selected) openDetail(state.selected);
+});
+document.addEventListener("visibilitychange", () => { if (!document.hidden && !state.paused) load(); });
+window.addEventListener("hashchange", () => {
+  const handle = decodeURIComponent(location.hash.slice(1));
+  if (handle !== state.selected) openDetail(handle);
+});
+
+// Where the live statistics are: given by the server on the statistics
+// listener, else the sibling of this page under the same version prefix.
+$("live-link").href = SETTINGS.live || location.pathname.replace(/refs\/?$/, "stats/live");
+$("q").value = state.q;
+$("order").value = state.order;
+$("limit").value = String(state.limit);
+$("expired").checked = state.expired;
+load();
+if (state.selected) openDetail(state.selected);
+</script>
+</body>
+</html>
