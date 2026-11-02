@@ -124,6 +124,16 @@ test-matrix: ## Tests with and without the tree-sitter grammars
 	$(CARGO) test --workspace
 	$(CARGO) test --workspace --no-default-features
 
+.PHONY: test-cache
+test-cache: ## Claude cache-cost tests against a simulated provider, with their ledgers
+	$(CARGO) test -p kompressor-proxy --test cachesavings -- --nocapture
+
+.PHONY: test-cache-replay
+test-cache-replay: ## Price a captured run through the proxy: make test-cache-replay BODIES=kompressor-bodies.jsonl
+	@[ -n "$(BODIES)" ] || { echo "set BODIES to a run's kompressor-bodies.jsonl" >&2; exit 2; }
+	KOMPRESSOR_REPLAY_BODIES="$(BODIES)" $(CARGO) test --release -p kompressor-proxy \
+	  --test cachesavings a_captured_run -- --ignored --nocapture
+
 .PHONY: bench
 bench: release ## Replay the committed corpus and gate on the recorded baseline
 	./$(RELEASE_BIN) bench replay --corpus $(CORPUS) --compare $(BASELINE) --check-determinism
