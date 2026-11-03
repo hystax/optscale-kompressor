@@ -66,6 +66,11 @@ const SUBSCRIPTION_AGENTS: &[&str] = &[
     "claude-cli/",
     "claude-code/",
     "codex-cli/",
+    // The interactive codex (`codex_cli_rs` until 0.162, `codex-tui` from
+    // 0.164), and the one inside the VS Code extension.
+    "codex_cli_rs/",
+    "codex-tui/",
+    "codex_vscode/",
     "codex_exec/",
     "cursor/",
     "claude-vscode/",
@@ -93,7 +98,11 @@ pub fn classify(headers: &HeaderMap) -> AuthMode {
     let known_cli = SUBSCRIPTION_AGENTS
         .iter()
         .any(|needle| agent.contains(needle));
-    if known_cli && !carries_api_key(headers) {
+    // Codex on a ChatGPT plan names the account the request bills to, from
+    // whichever of its front ends it runs — including those whose agent string
+    // is not listed above. Nothing paying per token sends it.
+    let chatgpt_account = headers.contains_key("chatgpt-account-id");
+    if (known_cli || chatgpt_account) && !carries_api_key(headers) {
         return AuthMode::Subscription;
     }
 
@@ -188,6 +197,40 @@ mod tests {
             ("x-api-key", "sk-ant-api03-EXAMPLE"),
         ]);
         assert_eq!(classify(&claude_key), AuthMode::Payg);
+    }
+
+    /// The interactive codex on a ChatGPT plan, as its agent strings read in
+    /// 0.162 and 0.164. Neither was listed, so without the account header
+    /// these were OAuth, and went to api.openai.com.
+    #[test]
+    fn the_interactive_codex_on_a_chatgpt_plan_is_a_subscription() {
+        for agent in [
+            "codex_cli_rs/0.162.1 (Windows 10.0.26200; x86_64) WindowsTerminal",
+            "codex-tui/0.164.0 (Windows 10.0.26200; x86_64) unknown (codex-tui; 0.164.0)",
+        ] {
+            let codex = headers(&[("user-agent", agent), ("authorization", "Bearer a.b.c")]);
+            assert_eq!(classify(&codex), AuthMode::Subscription, "{agent}");
+        }
+    }
+
+    /// The account header settles it whatever the agent string says, so a
+    /// Codex front end not listed by name still reaches chatgpt.com. Codex
+    /// 0.164 sends it with the plan's token; an API key in its place is not a
+    /// subscription, account or not.
+    #[test]
+    fn a_chatgpt_account_marks_a_subscription_unless_a_key_is_sent() {
+        let unlisted = headers(&[
+            ("user-agent", "Codex Desktop/26.1021.31345"),
+            ("authorization", "Bearer a.b.c"),
+            ("chatgpt-account-id", "EXAMPLE"),
+        ]);
+        assert_eq!(classify(&unlisted), AuthMode::Subscription);
+
+        let keyed = headers(&[
+            ("authorization", "Bearer sk-proj-EXAMPLE"),
+            ("chatgpt-account-id", "EXAMPLE"),
+        ]);
+        assert_eq!(classify(&keyed), AuthMode::Payg);
     }
 
     #[test]
