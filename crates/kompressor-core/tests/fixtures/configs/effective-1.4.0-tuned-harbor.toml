@@ -1,0 +1,143 @@
+# The effective configuration `kompressor check-config` wrote for an 89-task
+# Harbor run on 1.4.0, before `proxy.providers` existed: every tuned setting
+# is global. Run paths replaced.
+[server]
+listen = "172.17.0.1:8817"
+api_listen = ""
+mcp_listen = ""
+proxy_listen = ""
+max_body_bytes = 67108864
+max_inflight_compressions = 0
+queue_timeout = "2s"
+shutdown_grace = "20s"
+
+[auth]
+mode = "none"
+keys = []
+secret = ""
+
+[engine]
+mode = "recoverable"
+min_compress_chars = 512
+max_array_items = 10
+max_field_chars = 256
+keep_tail_lines = 20
+ref_ttl_seconds = 14400
+ref_max_lifetime_multiplier = 8
+max_ref_bytes = 65536
+enable_smart_crusher = true
+enable_search_compressor = true
+enable_log_compressor = true
+enable_diff_compressor = true
+enable_tabular_compressor = true
+enable_listing_compressor = true
+enable_code_aware = false
+enable_mixed_content = true
+enable_config_compressor = true
+enable_config_sections = true
+enable_nested_routing = true
+enable_redraw_fold = true
+enable_gutter_aware_detection = true
+enable_build_templates = true
+fold_handles_identical_repeats = false
+fold_marks_variants = true
+enable_html_compressor = true
+enable_normalised_text_fold = true
+enable_tabular_ratio = true
+enable_lossy_key_factoring = true
+enable_stale_read = true
+enable_preamble_aware_detection = false
+enable_line_gutter = true
+enable_cross_turn_dedup = true
+max_line_chars = 512
+enable_fold_fallback = true
+strict_lossless = true
+search_max_files = 8
+diff_max_files = 8
+code_max_body_lines = 24
+enable_code_budget = true
+code_budget_min_body_lines = 6
+min_nested_chars = 512
+max_nested_depth = 2
+max_code_bytes = 2097152
+protected_roles = [
+    "assistant",
+    "system",
+    "developer",
+]
+token_guard = "chars"
+
+[refs]
+backend = "sqlite"
+path = "/var/lib/kompressor/harbor-run/kompressor-refs.db"
+recent_cache_entries = 4096
+purge_interval = "1m"
+max_bytes = 1073741824
+
+[stats]
+enabled = true
+path = "/var/lib/kompressor/harbor-run/kompressor-stats.db"
+queue_size = 16384
+flush_interval = "100ms"
+retention_days = 90
+
+[retrieve]
+max_retrieve_chars = 32768
+
+[mcp]
+enabled = true
+path = "/mcp"
+allowed_hosts = []
+max_retrievals_per_minute = 120
+
+[proxy]
+enabled = true
+compress = true
+min_tokens = 512
+compress_timeout = "2s"
+max_body_bytes = 67108864
+upstream_connect_timeout = "10s"
+upstream_read_timeout = "10m"
+retrieve_tool = "always"
+retrieve_execution = "server"
+frozen_prefix = "first_seen"
+cache_ttl = "adaptive"
+retrieve_max_rounds = 3
+retrieve_max_tokens_per_request = 16384
+keep_inline_max_percent = 40
+stream_buffer_bytes = 262144
+stream_buffer_timeout = "0s"
+stream_intercept_bytes = 1048576
+stream_intercept_timeout = "1m 30s"
+stream_keepalive = "10s"
+stream_content_grace_bytes = 8192
+force_usage = true
+stale_read = true
+websocket_relay = true
+prefix_cache_ttl = "0s"
+default_upstream = ""
+allow_insecure_upstream = false
+
+[[proxy.upstreams]]
+name = "anthropic"
+path_prefix = "/v1/messages"
+strip_prefix = false
+base_url = "https://api.anthropic.com"
+api_family = "anthropic"
+forward_auth = true
+
+[proxy.upstreams.headers]
+
+[proxy.intercept]
+intercept_hosts = []
+ca_path = "./data/ca"
+alpn = [
+    "h2",
+    "http/1.1",
+]
+leaf_cache_entries = 64
+
+[log]
+level = "info"
+format = "json"
+payloads = false

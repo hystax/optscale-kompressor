@@ -152,6 +152,86 @@ const LISTING_RATIO: f32 = 0.6;
 /// folded address is useless to an agent reversing a binary.
 static OFFSET_ROW: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\s*[0-9a-f]{3,16}:?\s").unwrap());
 
+/// One line of disassembly or assembler source, with whatever a tool puts in
+/// front of the instruction taken off first: gdb's `=>` cursor, an address
+/// (`401744:`, `0x401136 <+4>:`) and the raw bytes `objdump` prints after it by
+/// default, as byte pairs on x86 and as one 32-bit word on MIPS and ARM. Operands
+/// count MIPS register names without their `$` (`move v0,t4`), as `objdump`
+/// prints them; `at` and `zero` are left out, being English as often as not.
+/// Bytes only after an address: a row of numbers that merely opens with
+/// two hex digits is data, not an encoding.
+/// What is left must be a lowercase mnemonic and operands built only from what
+/// operands are built from.
+static ASM_PREFIX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^\s*(?:=>\s*)?(?:(?:0x)?[0-9a-f]+(?:\s*<[^>]*>)?:\s+(?:(?:(?:[0-9a-f]{2}){1,4}\s)+\s*)?)?")
+        .unwrap()
+});
+static ASM_INSTRUCTION: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^(?:(?:lock|rep[a-z]*|bnd|notrack|data16|cs|ds)\s+)*([a-z][a-z0-9]{1,11}(?:\.[a-z0-9]{1,4})*)(?:\s+([\w%$#\[\]()+\-*,.:<>@!{} ]+?))?\s*(?:[#;].*)?$")
+        .unwrap()
+});
+/// Operands that only an instruction has: a register, an immediate, a memory
+/// reference or a branch target.
+static ASM_OPERAND: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"%[a-z]|\$-?(?:0x)?[0-9a-f]+\b|\$(?:[a-z]{1,2}\d?|\d{1,2})\b|\bPTR\b|\[|#-?(?:0x)?[0-9a-f]+|\b[0-9a-f]+ <|\b(?:[re]?[abcd]x|[re]?[sd]i|[re]?[sb]p|r(?:[89]|1[0-5])[dwb]?|[xyz]mm\d{1,2}|[abcd][lh]|[xwqdsv]\d{1,2}|sp|lr|pc|fp|v[01]|a[0-3]|t\d|s[0-8]|k[01]|gp|ra)\b")
+        .unwrap()
+});
+/// Instructions that take no operands, which the operand test cannot see.
+const ASM_NULLARY: &[&str] = &[
+    "ret",
+    "retq",
+    "retl",
+    "leave",
+    "leaveq",
+    "endbr64",
+    "endbr32",
+    "nop",
+    "nopw",
+    "nopl",
+    "cltq",
+    "cqto",
+    "cltd",
+    "cdq",
+    "cdqe",
+    "cqo",
+    "cwtl",
+    "cbw",
+    "cwde",
+    "syscall",
+    "sysenter",
+    "hlt",
+    "int3",
+    "ud2",
+    "pause",
+    "lfence",
+    "mfence",
+    "sfence",
+    "cpuid",
+    "rdtsc",
+    "eret",
+    "wfi",
+    "vzeroupper",
+    "fldz",
+    "fld1",
+    "fchs",
+    "fabs",
+    "fsqrt",
+    "fwait",
+];
+/// A function header (`0000000000401fd0 <vector_create>:`), a label
+/// (`main:`, `$L2:`, `.LBB0_3:`), a directive (`.frame $sp,72,$31`) or the
+/// banner `objdump` opens with. Part of a listing, not evidence of one.
+static ASM_FRAME: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^\s*(?:[0-9a-f]{4,16} <[^>]+>:|[\w.$@]+:|\.[a-z_]\w*(?:\s.*)?|Disassembly of section .*|.*file format \S+|Dump of assembler code.*|End of assembler dump\.?)\s*$")
+        .unwrap()
+});
+/// Lines a payload must have before it can be called a listing of instructions.
+const ASM_MIN_LINES: usize = 12;
+/// Of its non-blank lines, the share that must be instructions...
+const ASM_INSTRUCTION_RATIO: f32 = 0.5;
+/// ...and the share that must be instructions or their frame.
+const ASM_RATIO: f32 = 0.8;
+
 /// `rg` without `-n` emits `path:matching text`, which `SEARCH` cannot claim for
 /// want of a line number — and those lines all share the path, so they read as
 /// one template with a varying tail. They are not: they are the matches an agent
@@ -206,6 +286,44 @@ static CPP_ONLY: Lazy<Regex> = Lazy::new(|| {
     .unwrap()
 });
 static CLASS_BRACE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^\s*class\s+\w+.*\{").unwrap());
+/// JavaScript's own idiom, which Java has no spelling of. `class X {` sent the
+/// MIPS VM an agent `cat`ted 53 times in one task to the Java grammar, which
+/// found no methods in it and returned all 4,786 characters.
+static JS_ONLY: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(concat!(
+        r"\brequire\(|\bmodule\.exports\b|\bconsole\.log\(|=>",
+        r"|(?m)^\s*(?:const|let)\s+[\w{\[]",
+        r"|(?m)^\s*(?:async\s+)?function\b",
+    ))
+    .unwrap()
+});
+/// Java's, so a JavaScript marker inside a Java file does not move it.
+static JAVA_ONLY: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?m)^\s*(?:public|private|protected)\s|^import java|\bSystem\.out\b").unwrap()
+});
+/// Syntax only Rust has here. A C file read from its middle shows no
+/// `#include`, and `struct ` at line start then sent it to the Rust grammar: the
+/// OCaml runtime's 10,950-character `major_gc.c` came back whole.
+static RUST_ONLY: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(concat!(
+        r"(?m)^\s*(?:pub(?:\([^)]*\))?\s|fn\s|impl\b|mod\s|use\s+\w+::|#!?\[)",
+        r"|\blet\s+(?:mut\s+)?\w+\s*[:=]",
+    ))
+    .unwrap()
+});
+/// C declarations Rust cannot spell.
+static C_DECLARATION: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(concat!(
+        r"(?m)^\s*(?:typedef\s|extern\s|#\s*define\s)",
+        r"|^\s*(?:static\s+|const\s+)*(?:unsigned\s+|signed\s+)?",
+        r"(?:void|int|char|long|short|double|float|size_t|u?int\d+_t|struct\s+\w+)\s*\**\s*\w+\s*[\[(=;]",
+    ))
+    .unwrap()
+});
+/// A line that opens source whatever the language: a shebang, a block
+/// comment, a docstring, a `'use strict'`, an include.
+static CODE_OPENER: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"^\s*(?:#!|/\*|"""|'use strict'|#\s*include\b)"#).unwrap());
 static VAR_NS_USING: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\b(?:var|namespace|using)\b").unwrap());
 
@@ -231,8 +349,10 @@ static CODE_TABLE: Lazy<Vec<(Language, Regex)>> = Lazy::new(|| {
             Regex::new(r"(?m)^(?:export |interface |(?:async )?function |const .+=>)").unwrap(),
         ),
         (
+            // `package name` with nothing after it but a comment: Java's
+            // `package vm;` matched the bare prefix and went to the Go grammar.
             Language::Go,
-            Regex::new(r"(?m)^(?:package |func |import \()").unwrap(),
+            Regex::new(r"(?m)^(?:package \w+[ \t]*(?://.*)?$|func |import \()").unwrap(),
         ),
         (
             Language::Cpp,
@@ -389,6 +509,31 @@ pub fn detect_content_with(content: &str, gutter_aware: bool, tabular_ratio: boo
 
     let lines = split_lines(sample);
 
+    // Before everything that reads lines as rows or as a log. An instruction
+    // stream is code whose order is its meaning: the listing sampler drops its
+    // middle and the plain-text fold merges every `movss` into the first, and
+    // either leaves an agent reversing a binary with nothing it can read. On a
+    // measured run it paged a folded `objdump` through `sed -n` instead of
+    // fetching it, 40 steps against 12 uncompressed. No grammar parses it, so
+    // as source with no language it is declined and shipped whole.
+    if looks_like_assembly(&lines) {
+        let meta = DetectionMeta {
+            assembly: true,
+            ..Default::default()
+        };
+        return Detection::with_meta(ContentType::SourceCode, 0.8, meta);
+    }
+    // Disassembly inside something else — `objdump … ; … | sort | uniq -c` in
+    // one call — is not the whole payload, but it is enough to say the payload
+    // is not *one* table or listing either: claimed as one, it is sampled
+    // through the instructions as readily as through the rows beside them. On
+    // the replay corpus a MIPS function followed by an opcode count went from
+    // 922 characters to 269 that way. As prose, the segmenter takes the rows it
+    // recognises and leaves every instruction where it stood.
+    if has_disassembly_run(&lines) {
+        return Detection::new(ContentType::PlainText, 0.1);
+    }
+
     let diagnostics = DIAGNOSTIC.find_iter(sample).count();
     if diagnostics >= 3 {
         return build(0.9, true, false);
@@ -444,7 +589,9 @@ pub fn detect_content_with(content: &str, gutter_aware: bool, tabular_ratio: boo
         return code(0.7, language);
     }
     if CLASS_BRACE.is_match(sample) {
-        let language = if VAR_NS_USING.is_match(sample) {
+        let language = if JS_ONLY.is_match(sample) && !JAVA_ONLY.is_match(sample) {
+            Language::JavaScript
+        } else if VAR_NS_USING.is_match(sample) {
             Language::CSharp
         } else {
             Language::Java
@@ -453,7 +600,15 @@ pub fn detect_content_with(content: &str, gutter_aware: bool, tabular_ratio: boo
     }
     for (language, pattern) in CODE_TABLE.iter() {
         if pattern.is_match(sample) {
-            return code(0.7, *language);
+            let language = if *language == Language::Rust
+                && !RUST_ONLY.is_match(sample)
+                && C_DECLARATION.is_match(sample)
+            {
+                Language::C
+            } else {
+                *language
+            };
+            return code(0.7, language);
         }
     }
 
@@ -523,6 +678,187 @@ fn build(confidence: f32, diagnostics: bool, untimestamped: bool) -> Detection {
         ..Default::default()
     };
     Detection::with_meta(ContentType::BuildOutput, confidence, meta)
+}
+
+/// Where source code opens in `content`, as a byte offset, when something that
+/// is not code comes first.
+///
+/// Agents read files with compound commands — `ls && cat a.py`, `find . ;
+/// cat x` — and the listing in front makes the grammar fail on the first line,
+/// so the whole payload ships at 0%. On the Claude Code replay corpus that was
+/// the largest single loss: a 621-line interpreter behind 36 file names, sent
+/// 30 times, compressed from 17,577 to 3,223 characters once the names were set
+/// aside.
+///
+/// The opener is the first line any language signature matches, or a shebang
+/// or a block comment. `None` when code opens on the first line, when nothing
+/// opens it, or when the lead-in is more than half the payload — at that point
+/// it is not a lead-in.
+pub(crate) fn code_starts_at(content: &str) -> Option<usize> {
+    let opens = |line: &str| {
+        CODE_OPENER.is_match(line)
+            || CLASS_BRACE.is_match(line)
+            || CODE_TABLE.iter().any(|(_, pattern)| pattern.is_match(line))
+    };
+    let total = content.lines().count();
+    let mut offset = 0;
+    for (lines, line) in content.split_inclusive('\n').enumerate() {
+        if opens(line.trim_end_matches(['\r', '\n'])) {
+            return (lines > 0 && lines * 2 <= total).then_some(offset);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// Which kind of file an opening line belongs to, for telling files apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileFamily {
+    Python,
+    CLike,
+}
+
+/// Lines only a Python file opens with. `class` needs its colon: C++ writes
+/// `class Foo : public Bar {` and is not Python.
+static PY_FILE_LINE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"^(?:"""|import \w|from [\w.]+ import |def \w+\(|class \w+(?:\([^)]*\))?:\s*$)"#)
+        .unwrap()
+});
+/// Lines only a C-family file opens with.
+static C_FILE_LINE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^(?:#\s*(?:include|define)\b|/\*|typedef\s|static\s+\w|package [\w.]+;)").unwrap()
+});
+/// A file opener glued to the end of the previous file, which is what `cat`
+/// produces when a file has no trailing newline: `print(risk)/*`,
+/// `}"""`, `]import numpy`. Quotes are not closers here, so `'import os'` in a
+/// string literal is not a join.
+static GLUED_FILE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"[)\]};](?P<opener>/\*|"""|#!|#\s*include\b|import \w|from [\w.]+ import |def \w+\(|class \w)"#,
+    )
+    .unwrap()
+});
+
+fn file_family(line: &str) -> Option<FileFamily> {
+    if line.starts_with("#!") {
+        return line.contains("python").then_some(FileFamily::Python);
+    }
+    if PY_FILE_LINE.is_match(line) {
+        Some(FileFamily::Python)
+    } else if C_FILE_LINE.is_match(line) {
+        Some(FileFamily::CLike)
+    } else {
+        None
+    }
+}
+
+/// Byte offsets where one file of a `cat a.py b.c c.py` ends and the next
+/// begins. Empty for a single file.
+///
+/// `cat` writes the files back to back with nothing between them, so the
+/// joins have to be read off the content. Two kinds are found: an opener glued
+/// to the previous file's last byte, and an opening line whose language family
+/// differs from the file before it — the moment a Python file gives way to C.
+/// Two Python files joined on a newline are deliberately not split: they
+/// usually still parse as one, and splitting what parses costs nothing but
+/// risk. A shebang always starts a file.
+///
+/// Measured on a Claude Code task that `cat`s five files — Python, C, Python,
+/// Python, Python, three of them glued mid-line — and re-sends the result on
+/// every turn: the C grammar parsed none of it and all 9,871 characters
+/// shipped.
+pub(crate) fn file_joins(content: &str) -> Vec<usize> {
+    let mut joins = Vec::new();
+    let mut family: Option<FileFamily> = None;
+    let mut offset = 0;
+    for line in content.split_inclusive('\n') {
+        let text = line.trim_end_matches(['\r', '\n']);
+        if let Some(glued) = GLUED_FILE
+            .captures(text)
+            .and_then(|found| found.name("opener"))
+        {
+            // The text before the join stays with the file it ends.
+            joins.push(offset + glued.start());
+            family = file_family(glued.as_str()).or(family);
+        } else if offset > 0 && text.starts_with("#!") {
+            joins.push(offset);
+            family = file_family(text);
+        } else if let Some(this) = file_family(text) {
+            if family.is_some_and(|current| current != this) && offset > 0 {
+                joins.push(offset);
+            }
+            family = Some(this);
+        }
+        offset += line.len();
+    }
+    joins.dedup();
+    joins
+}
+
+/// Whether one line is a machine instruction, after any cursor, address and
+/// raw bytes in front of it.
+pub(crate) fn is_instruction_line(line: &str) -> bool {
+    let rest = &line[ASM_PREFIX.find(line).map_or(0, |m| m.end())..];
+    let Some(caps) = ASM_INSTRUCTION.captures(rest) else {
+        return false;
+    };
+    let operands = caps.get(2).map_or("", |m| m.as_str());
+    (operands.is_empty() && ASM_NULLARY.contains(&&caps[1])) || ASM_OPERAND.is_match(operands)
+}
+
+/// A disassembler's function header, `0000000000401fd0 <vector_create>:`.
+static ASM_FUNCTION: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^\s*(?:0x)?[0-9a-f]{4,16} <[^>]+>:\s*$").unwrap());
+
+/// Whether one line belongs to a disassembly: an instruction or a function
+/// header. Labels and directives are left out on purpose: alone on a line,
+/// `name:` is as likely YAML as assembler, and only the payload-wide test can
+/// tell them apart.
+pub(crate) fn is_disassembly_line(line: &str) -> bool {
+    is_instruction_line(line) || ASM_FUNCTION.is_match(line)
+}
+
+/// Whether a payload holds a run of at least [`ASM_MIN_LINES`] consecutive
+/// disassembly lines, most of them instructions (blank lines and `--`
+/// separators do not break a run). A run of function headers alone is a
+/// symbol listing, `grep '>:'` over a dump, and stays one.
+fn has_disassembly_run(lines: &[&str]) -> bool {
+    let (mut run, mut instructions) = (0, 0);
+    for line in lines {
+        if is_blank(line) || line.trim() == "--" {
+            continue;
+        }
+        if is_disassembly_line(line) {
+            run += 1;
+            instructions += usize::from(is_instruction_line(line));
+            if run >= ASM_MIN_LINES && instructions * 2 >= run {
+                return true;
+            }
+        } else {
+            (run, instructions) = (0, 0);
+        }
+    }
+    false
+}
+
+/// Whether a payload is disassembly or assembler source.
+fn looks_like_assembly(lines: &[&str]) -> bool {
+    let body: Vec<&str> = lines.iter().copied().filter(|l| !is_blank(l)).collect();
+    if body.len() < ASM_MIN_LINES {
+        return false;
+    }
+    let mut instructions = 0;
+    let mut framing = 0;
+    for line in &body {
+        if is_instruction_line(line) {
+            instructions += 1;
+        } else if ASM_FRAME.is_match(line) {
+            framing += 1;
+        }
+    }
+    let lines = body.len() as f32;
+    instructions as f32 / lines >= ASM_INSTRUCTION_RATIO
+        && (instructions + framing) as f32 / lines >= ASM_RATIO
 }
 
 fn code(confidence: f32, language: Language) -> Detection {
@@ -911,6 +1247,96 @@ mod tests {
         (detection, strategy)
     }
 
+    /// `class X {` is JavaScript as often as Java in agent traffic, and the
+    /// wrong grammar finds no methods to elide.
+    #[test]
+    fn a_javascript_class_is_not_routed_to_the_java_grammar() {
+        let methods: String = (0..12)
+            .map(|n| format!("  op{n}(rs, rt) {{\n    const v = this.regs[rs] + {n};\n    this.regs[rt] = v;\n  }}\n"))
+            .collect();
+        let js = format!(
+            "const fs = require('fs');\n\nclass MIPSVM {{\n{methods}}}\n\nmodule.exports = MIPSVM;\n"
+        );
+        assert_eq!(routed(&js).0.meta.language, Some(Language::JavaScript));
+        let methods: String = (0..12)
+            .map(|n| format!("  public void op{n}(int rs) {{\n    pc += {n};\n    System.out.println(pc);\n  }}\n"))
+            .collect();
+        let java =
+            format!("package vm;\n\npublic class Machine {{\n  private int pc;\n{methods}}}\n");
+        assert_eq!(routed(&java).0.meta.language, Some(Language::Java));
+    }
+
+    /// A C file read from its middle has no `#include` to settle it, and
+    /// `struct` at line start is Rust's signature too.
+    #[test]
+    fn c_read_from_its_middle_is_not_routed_to_the_rust_grammar() {
+        let functions: String = (0..12)
+            .map(|n| format!("static void mark_slice_{n}(intnat work)\n{{\n  while (work > {n}) {{ work--; }}\n}}\n\n"))
+            .collect();
+        let c = format!(
+            "typedef unsigned int sizeclass;\n\nstruct global_heap_state caml_global_heap_state = {{\n  0 << HEADER_COLOR_SHIFT,\n}};\n\n{functions}"
+        );
+        assert_eq!(routed(&c).0.meta.language, Some(Language::C));
+        let functions: String = (0..12)
+            .map(|n| format!("    fn mark_{n}(&mut self) {{\n        let mut work = {n};\n        work += 1;\n    }}\n"))
+            .collect();
+        let rust = format!("struct Heap {{\n    colour: u8,\n}}\n\nimpl Heap {{\n{functions}}}\n");
+        assert_eq!(routed(&rust).0.meta.language, Some(Language::Rust));
+    }
+
+    #[test]
+    fn code_is_found_behind_a_listing_and_only_behind_a_short_one() {
+        let lead_in = "interp.py\ntest\nREADME.md\n";
+        let source = "#!/usr/bin/env python3\nimport sys\n\ndef main():\n    return 0\n";
+        let both = format!("{lead_in}{source}");
+        assert_eq!(code_starts_at(&both), Some(lead_in.len()));
+        assert_eq!(
+            code_starts_at(source),
+            None,
+            "code on the first line has no lead-in"
+        );
+        let long_lead = format!("{}{source}", "name.txt\n".repeat(20));
+        assert_eq!(
+            code_starts_at(&long_lead),
+            None,
+            "a listing longer than the code is not a lead-in"
+        );
+        assert_eq!(code_starts_at("a\nb\nc\n"), None, "nothing opens");
+    }
+
+    #[test]
+    fn files_concatenated_by_cat_are_split_where_they_join() {
+        let python =
+            "import math\n\ndef risk(w):\n    return math.sqrt(sum(w))\n\nprint(risk([1]))";
+        let c = "/*\n * extension\n */\n#include <math.h>\nstatic double risk(double w) {\n    return sqrt(w);\n}\n";
+        let wrapper = "\"\"\"wrapper\"\"\"\n\ndef call(w):\n    return risk(w)\n";
+        // `cat a.py b.c c.py`: the first file has no trailing newline, so the C
+        // comment is glued to its last line; the third starts on a fresh line.
+        let joined = format!("{python}{c}{wrapper}");
+        assert_eq!(code_starts_at(python), None);
+        assert_eq!(
+            file_joins(&joined),
+            vec![python.len(), python.len() + c.len()],
+            "one glued join, one change of language"
+        );
+
+        let two_pythons = format!("{wrapper}import os\n\ndef other():\n    return os.sep\n");
+        assert!(
+            file_joins(&two_pythons).is_empty(),
+            "same language on a newline: not split"
+        );
+        let cpp = "#include <vector>\nclass Foo : public Bar {\n  int x;\n};\n";
+        assert!(
+            file_joins(cpp).is_empty(),
+            "C++ `class X : Base` is not Python"
+        );
+        let quoted = "#include <stdio.h>\nconst char *s = \"x\";\nputs('import os');\n";
+        assert!(
+            file_joins(quoted).is_empty(),
+            "an opener inside a string is not a join"
+        );
+    }
+
     #[test]
     fn a_crash_inside_a_uniform_stream_goes_to_the_scored_path() {
         // The sampler keeps a fixed head and tail and scores nothing, so a
@@ -968,5 +1394,162 @@ mod tests {
             "a summary of absence is not an event"
         );
         assert_eq!(strategy, Strategy::Listing);
+    }
+
+    /// A function body the way `objdump -d -M intel --no-show-raw-insn`
+    /// prints it, with `address` choosing whether each row keeps its address.
+    fn disassembly(address: bool) -> String {
+        let body = [
+            "endbr64",
+            "sub    rsp,0x78",
+            "mov    rax,rdi",
+            "movss  xmm2,DWORD PTR [rsp+0x8c]",
+            "movq   QWORD PTR [rsp+0x60],xmm0",
+            "movss  xmm10,DWORD PTR [rsp+0x90]",
+            "movaps xmm12,xmm2",
+            "mulss  xmm0,xmm10",
+            "subss  xmm3,xmm5",
+            "addss  xmm12,xmm0",
+            "pxor   xmm3,xmm3",
+            "comiss xmm3,xmm1",
+            "ja     4023a0 <sphere_intersect+0x200>",
+            "call   402020 <vector_dot>",
+            "add    rsp,0x78",
+            "ret",
+        ];
+        let mut out = vec!["00000000004021a0 <sphere_intersect>:".to_string()];
+        for (i, insn) in body.iter().enumerate() {
+            out.push(if address {
+                format!("  {:x}:\t{insn}", 0x4021a0 + 4 * i)
+            } else {
+                insn.to_string()
+            });
+        }
+        out.join("\n")
+    }
+
+    #[test]
+    fn disassembly_is_code_with_or_without_its_addresses() {
+        for address in [false, true] {
+            let found = detect_content(&disassembly(address));
+            assert_eq!(
+                found.content_type,
+                ContentType::SourceCode,
+                "address {address}"
+            );
+            assert!(found.meta.assembly);
+            assert_eq!(found.meta.language, None, "no grammar parses it");
+        }
+    }
+
+    #[test]
+    fn disassembly_in_other_dialects_is_code_too() {
+        let att = (0..16)
+            .map(|i| {
+                format!(
+                    "  {:x}:\t48 89 7d f8          \tmov    %rdi,-0x{:x}(%rbp)",
+                    0x1b4d + 4 * i,
+                    8 + i
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let gdb = (0..16)
+            .map(|i| format!("   0x0000000000401136 <+{i}>:\tpush   %rbp"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mips = ["main:", "\t.frame\t$sp,72,$31", "\t.mask\t0x80010000,-4"]
+            .iter()
+            .map(|l| l.to_string())
+            .chain((0..14).map(|i| format!("\tsw\t$31,{}($sp)", 4 * i)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let numbered = disassembly(true)
+            .lines()
+            .enumerate()
+            .map(|(i, line)| format!("{}: {line}", i + 1))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (name, payload) in [
+            ("att", att),
+            ("gdb", gdb),
+            ("mips", mips),
+            ("numbered", numbered),
+        ] {
+            assert!(detect_content(&payload).meta.assembly, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_table_of_numbers_with_register_shaped_words_is_not_disassembly() {
+        // `48 ` reads as a raw byte and `cx` as a register; neither may make a
+        // row of measurements into an instruction.
+        let rows = (0..20)
+            .map(|i| {
+                format!(
+                    "{} bbox 859 316 45 18 bottom 333 area 469 cx 883.{i}",
+                    40 + i
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!detect_content(&rows).meta.assembly);
+        let symbols = (0..20)
+            .map(|i| format!("0000000000{:x} T handler_{i}", 0x401000 + 16 * i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let found = detect_content(&symbols);
+        assert!(
+            !found.meta.assembly,
+            "an `nm` table lists, it does not execute"
+        );
+    }
+
+    #[test]
+    fn disassembly_beside_a_table_keeps_the_payload_off_the_table_route() {
+        // `objdump -d | grep -A40 '<fopen>'; … | sort | uniq -c` in one call.
+        let mut text: Vec<String> = (0..40)
+            .map(|i| format!("  {:x}:\t01801025 \tmove\tv0,t{}", 0x43a744 + 4 * i, i % 10))
+            .collect();
+        text.push(String::new());
+        text.extend((0..80).map(|i| format!("{:>7} op{i}", 2000 - 20 * i)));
+        let found = detect_content(&text.join("\n"));
+        assert_eq!(found.content_type, ContentType::PlainText);
+
+        // Function headers alone are a symbol listing, not disassembly.
+        let headers: String = (0..60)
+            .map(|i| format!("{:08x} <fn_{i}>:\n", 0x406db4 + 0x40 * i))
+            .collect();
+        assert_ne!(
+            detect_content(&headers).content_type,
+            ContentType::PlainText
+        );
+    }
+
+    #[test]
+    fn single_lines_are_read_as_instructions_only_when_they_are() {
+        for line in [
+            "  401090:\t48 83 ec 08          \tsub    rsp,0x8",
+            "    16c4:\tendbr64",
+            "movss  xmm10,DWORD PTR [rsp+0x90]",
+            "   0x0000000000401136 <+4>:\tpush   %rbp",
+            "ret",
+            "0000000000401fd0 <vector_create>:",
+            "  43a758:\t01801025 \tmove\tv0,t4",
+            "  43a774:\t0000000c \tsyscall",
+            "  400110:\t27bdffe8 \taddiu\tsp,sp,-24",
+        ] {
+            assert!(is_disassembly_line(line), "{line:?}");
+        }
+        for line in [
+            "libmodule_001.so.1",
+            "src/module_001/mod.rs",
+            "40 bbox 859 316 45 18 bottom 333 area 469 cx 883.5",
+            "0000000000401000 T _init",
+            "name: kompressor",
+            "Successfully built pyknotid",
+        ] {
+            assert!(!is_disassembly_line(line), "{line:?}");
+        }
     }
 }

@@ -7,6 +7,8 @@
 
 #![allow(dead_code)]
 
+pub mod cachesim;
+
 use std::sync::Arc;
 use std::time::Duration;
 

@@ -447,6 +447,11 @@ class KompressorRs:
                 problems.append(
                     f'frozen_prefix is not "{frozen_override}" -- the run would measure the '
                     "default instead of the setting it was started for")
+        # Provider-scoped settings, checked the same way: every
+        # KOMPRESSOR__PROXY__PROVIDERS__<NAME>__<SETTING> has to be what the
+        # effective config holds for that provider, or the run measures the
+        # default under the name of the override.
+        problems.extend(provider_override_problems(text, os.environ))
         if self.refs_db not in text or self.stats_db not in text:
             problems.append("refs/stats are not the per-run databases in the dump directory")
         if problems:
@@ -748,12 +753,17 @@ def per_request_rows(stats_db, start_ms, end_ms):
         return []
     con = sqlite3.connect(f"file:{stats_db}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
+    # Schema v11 split the cache write by TTL. A run recorded before it has no
+    # such column, and reads as "no split reported" rather than failing.
+    columns = {row[1] for row in con.execute("PRAGMA table_info(proxy_requests)")}
+    write_1h = ("pr.cache_write_1h_tokens" if "cache_write_1h_tokens" in columns
+                else "NULL AS cache_write_1h_tokens")
     try:
         rows = con.execute(
-            """
+            f"""
             SELECT pr.time_ms, pr.request_id, pr.model, pr.status, pr.stream,
                    pr.prompt_tokens, pr.completion_tokens, pr.cache_read_tokens,
-                   pr.cache_write_tokens,
+                   pr.cache_write_tokens, {write_1h},
                    pr.retrieve_rounds, pr.retrieve_tokens_injected,
                    pr.upstream_ms, pr.total_ms, pr.error,
                    oe.mode, oe.tokens_in, oe.tokens_out, oe.chars_in, oe.chars_out,
@@ -1393,11 +1403,19 @@ def report(cfg, krs, acc, eff, selftest, effective, window):
     # row were taken as tests of `first_seen` and were all `marker`: the env
     # override was a silent no-op, and the only way to tell afterwards was to
     # grep the config dump. The header says what the proxy actually used.
+    # The value this run's provider ran under: `proxy.providers.<provider>`
+    # wins over the deployment's, so reading the first `frozen_prefix` line
+    # reported `marker` on a run that was `first_seen` for every request.
     frozen = re.search(r'^frozen_prefix\s*=\s*"([^"]+)"', effective or "", re.M)
     frozen = frozen.group(1) if frozen else "unknown"
+    scoped = provider_overrides(effective or "").get(cfg.provider, {}).get("frozen_prefix")
+    where = f"  ({cfg.provider} only; the deployment default is {frozen})" if scoped else ""
+    frozen = scoped or frozen
     add(f"  frozen prefix    {frozen}"
         + ("  (default: the client's marker freezes the tail too)"
-           if frozen == "marker" else "  <-- compressing the uncached tail"))
+           if frozen == "marker" else "  <-- compressing the uncached tail") + where)
+    for name, settings in provider_overrides(effective or "").items():
+        add(f"  {name + ' only':16} " + ", ".join(f"{k}={v}" for k, v in settings.items()))
     # The gloss describes what the mode does, so "off" cannot borrow CCR's.
     add(f"  mode             {cfg.mode}" + (
         "  (control arm: forwarded unchanged, measured, never compressed)"
@@ -1593,6 +1611,52 @@ def file_sha256(path):
         return None
 
 
+PROVIDER_ENV = "KOMPRESSOR__PROXY__PROVIDERS__"
+
+
+def provider_overrides(effective: str) -> dict:
+    """`[proxy.providers.*]` from an effective config, flattened per provider:
+    `{"anthropic": {"cache_ttl": "adaptive", "engine.enable_code_aware": False}}`."""
+    import tomllib
+    try:
+        providers = tomllib.loads(effective).get("proxy", {}).get("providers", {})
+    except tomllib.TOMLDecodeError:
+        return {}
+    out = {}
+    for name, settings in providers.items():
+        flat = {}
+        for key, value in settings.items():
+            if isinstance(value, dict):
+                flat.update({f"{key}.{k}": v for k, v in value.items()})
+            else:
+                flat[key] = value
+        out[name] = flat
+    return out
+
+
+def provider_override_problems(effective: str, environ) -> list:
+    """Each provider-scoped override in `environ` the effective config does not hold."""
+    held = provider_overrides(effective)
+    problems = []
+    for key, value in sorted(environ.items()):
+        if not key.startswith(PROVIDER_ENV) or not value:
+            continue
+        name, _, setting = key[len(PROVIDER_ENV):].lower().partition("__")
+        setting = setting.replace("__", ".")
+        got = held.get(name, {}).get(setting)
+        want = value.strip().lower()
+        if got is None or str(got).lower() != want:
+            problems.append(
+                f'{key}="{value}" is not in the effective config (proxy.providers.{name} '
+                f'has {setting} = {got!r}) -- the run would measure the default instead')
+    return problems
+
+
+def is_build_input(path: str) -> bool:
+    """Whether a repository path can change what `cargo build` produces."""
+    return path.startswith("crates/") or path in ("Cargo.toml", "Cargo.lock")
+
+
 def capture_provenance(cfg):
     repo = os.path.dirname(os.path.dirname(os.path.dirname(cfg.kompressor_bin)))
     def git(*args):
@@ -1609,8 +1673,28 @@ def capture_provenance(cfg):
             check=False).stdout.strip().replace("\n", " | ")
     except OSError:
         cfg.kompressor_version = "unknown"
+    # A dirty checkout's commit does not say what the source was. Hash the
+    # uncommitted changes and untracked (non-ignored) files, so two runs with the
+    # same commit and the same hash ran the same source; and say whether any
+    # *build input* is newer than the binary, in which case the binary may not be
+    # built from it -- the one thing an executable hash cannot tell you. Build
+    # inputs only: a doc edited after the build flagged a binary that was
+    # exactly the one built.
+    digest = hashlib.sha256(git("diff", "HEAD", "--binary").encode())
+    untracked = [path for path in git("ls-files", "--others", "--exclude-standard").splitlines() if path]
+    newest_source = 0.0
+    for path in sorted(untracked) + git("diff", "HEAD", "--name-only").splitlines():
+        full = os.path.join(repo, path)
+        if path in untracked:
+            digest.update(path.encode())
+            digest.update((file_sha256(full) or "").encode())
+        if is_build_input(path) and os.path.exists(full):
+            newest_source = max(newest_source, os.path.getmtime(full))
+    binary_mtime = os.path.getmtime(cfg.kompressor_bin) if os.path.exists(cfg.kompressor_bin) else None
     return {"repo": repo, "commit": cfg.kompressor_commit,
             "dirty": cfg.kompressor_dirty, "version": cfg.kompressor_version,
+            "source_diff_sha256": digest.hexdigest() if cfg.kompressor_dirty else None,
+            "binary_older_than_source": bool(binary_mtime and newest_source > binary_mtime),
             "binary_sha256": file_sha256(cfg.kompressor_bin),
             "binary_mtime": dt.datetime.fromtimestamp(
                 os.path.getmtime(cfg.kompressor_bin)).isoformat(timespec="seconds")

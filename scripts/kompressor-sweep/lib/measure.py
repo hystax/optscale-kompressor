@@ -45,7 +45,10 @@ for path in paths:
     rows.append({
         "file": os.path.relpath(path, os.path.commonpath([os.path.dirname(p) for p in paths]))
                 if len(paths) > 1 else os.path.basename(path),
-        "kind": j.get("kind", ""),
+        # `kind` is null, not absent, when nothing shipped: the payload went
+        # out untouched. `.get("kind", "")` passed that null through to the
+        # table, which crashed formatting it.
+        "kind": j.get("kind") or "untouched",
         "language": d.get("language") or "",
         "strategy": d.get("strategy") or "",
         "lines": lines,

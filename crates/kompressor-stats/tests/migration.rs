@@ -262,3 +262,31 @@ fn every_version_in_the_ladder_upgrades_from_where_it_stops() {
         );
     }
 }
+
+#[test]
+fn a_v11_database_gains_keep_warm_and_its_rows_are_client_requests() {
+    // Every row written before keep-warm pings existed was a client request,
+    // so the upgrade must say so: a NULL here would drop them from any count
+    // that filters the pings out with `keep_warm = 0`.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stats.db");
+    database_at(&path, 11);
+    fill_v5(&path);
+
+    let config = StatsConfig::at(&path);
+    drop(StatsWriter::open(&config).unwrap());
+
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(
+        count(&conn, "SELECT * FROM pragma_user_version") as u32,
+        schema::latest_version()
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM proxy_requests WHERE keep_warm = 0"
+        ),
+        4,
+        "rows that predate the column read 0, not NULL"
+    );
+}

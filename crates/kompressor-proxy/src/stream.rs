@@ -74,6 +74,10 @@ pub(crate) struct StreamOutcome {
     pub(crate) rounds: u32,
     pub(crate) injected_tokens: u32,
     pub(crate) usage: Option<Value>,
+    /// Why the model stopped, as the provider said in the round the client
+    /// was given. Anthropic only; what decides whether to keep the
+    /// conversation's cache warm.
+    pub(crate) stop_reason: Option<String>,
     /// The client hung up before the stream finished.
     ///
     /// Recorded because the row is otherwise indistinguishable from a completed
@@ -243,6 +247,7 @@ enum RoundEnd {
     /// The client has the whole answer.
     Finished {
         usage: Value,
+        stop_reason: Option<String>,
     },
     /// The turn was ours; here is what it asked for.
     Intercepted {
@@ -291,8 +296,9 @@ impl StreamRelay {
                     outcome.upstream_error = true;
                     break;
                 }
-                RoundEnd::Finished { usage } => {
+                RoundEnd::Finished { usage, stop_reason } => {
                     turn::add_usage(&mut total, &usage);
+                    outcome.stop_reason = stop_reason;
                     break;
                 }
                 RoundEnd::Intercepted { turn, usage } => (turn, usage),
@@ -402,6 +408,7 @@ impl StreamRelay {
         // Content held so far in this round, bounded by `content_grace`.
         let mut content_bytes = 0usize;
         let mut usage = json!({});
+        let mut stop_reason = None;
         let mut state = State::Buffering;
         if self.log_payloads {
             tracing::debug!(intercept, rounds, "relay round begins");
@@ -540,6 +547,9 @@ impl StreamRelay {
                     // one call, and summing them doubled the whole input side.
                     // Rounds still sum, in the caller.
                     turn::max_usage(&mut usage, &carried);
+                }
+                if let Some(reason) = frame_stop_reason(self.family, &frame) {
+                    stop_reason = Some(reason);
                 }
                 match state {
                     State::Passthrough => {
@@ -762,6 +772,9 @@ impl StreamRelay {
             if let Some(carried) = frame_usage(self.family, &frame) {
                 turn::max_usage(&mut usage, &carried);
             }
+            if let Some(reason) = frame_stop_reason(self.family, &frame) {
+                stop_reason = Some(reason);
+            }
             match state {
                 State::Passthrough => {
                     if !self.emit(tx, &frame, rounds, hidden).await {
@@ -799,7 +812,7 @@ impl StreamRelay {
         ) {
             return RoundEnd::ClientGone;
         }
-        RoundEnd::Finished { usage }
+        RoundEnd::Finished { usage, stop_reason }
     }
 
     /// Execute the turn's retrievals and open the next upstream stream.
@@ -1926,6 +1939,19 @@ fn frame_usage(family: ApiFamily, frame: &SseFrame) -> Option<Value> {
     value.pointer(pointer).cloned()
 }
 
+/// The stop reason an Anthropic `message_delta` carries, as the provider sent
+/// it. Read before any rewrite this relay makes to the frame it forwards.
+fn frame_stop_reason(family: ApiFamily, frame: &SseFrame) -> Option<String> {
+    if family != ApiFamily::AnthropicMessages {
+        return None;
+    }
+    frame
+        .json()?
+        .pointer("/delta/stop_reason")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 /// An OpenAI chunk that carries usage and nothing else.
 ///
 /// This is the extra chunk `stream_options.include_usage` adds. A client that
@@ -1978,6 +2004,23 @@ mod tests {
         let mut turn = StreamTurn::new(family);
         let signals = frames.iter().map(|f| turn.observe(&frame(f)).0).collect();
         (turn, signals)
+    }
+
+    #[test]
+    fn the_stop_reason_is_read_from_an_anthropic_message_delta_only() {
+        let delta = frame(r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#);
+        assert_eq!(
+            frame_stop_reason(ApiFamily::AnthropicMessages, &delta).as_deref(),
+            Some("tool_use")
+        );
+        let start = frame(r#"{"type":"message_start","message":{"stop_reason":null}}"#);
+        assert_eq!(
+            frame_stop_reason(ApiFamily::AnthropicMessages, &start),
+            None
+        );
+        // The same shape on another family is not read: keep-warm is
+        // Anthropic's alone.
+        assert_eq!(frame_stop_reason(ApiFamily::OpenAiChat, &delta), None);
     }
 
     #[test]

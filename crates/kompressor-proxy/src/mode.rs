@@ -12,8 +12,11 @@ use kompressor_engine::Mode;
 /// What the proxy will do with a request's text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProxyMode {
-    /// Forward untouched. Nothing is parsed, nothing is measured, nothing is
-    /// injected.
+    /// Forward the text untouched: nothing is compressed and nothing is
+    /// injected. The proxy still names the conversation and records the model
+    /// and usage, so an off run is a control the compressed one can be scored
+    /// against, and still asks for one-hour cache entries when
+    /// `proxy.cache_ttl` says so.
     Off,
     /// Compress with this engine mode.
     On(Mode),
