@@ -16,7 +16,10 @@ records, each tagged with the conversation it belongs to.
 Claude Code's system prompt and the descriptions in its tool list are its own
 text, not the run's, and the proxy compresses neither. Each is replaced with
 filler of the same length, the same filler wherever the same text appeared, so
-every request caches exactly as it did. `metadata` (a client user id) is
+every request caches exactly as it did. The exception is Claude Code's billing
+header (`x-anthropic-billing-header: cc_version=…`), kept verbatim: it names
+only a client version, and the cache simulator has to recognise it to leave it
+out of the cache key as the provider does. `metadata` (a client user id) is
 dropped; nothing caches on it. Task text and tool output are kept as captured,
 because they are what the proxy compresses.
 
@@ -31,8 +34,9 @@ that with `KOMPRESSOR_REPLAY_DETAIL=1` to see each one's saving, then choose a
 set that keeps the run's overall figure. The committed capture is 31 of the 97
 conversations of the 1.5.12 Opus run of 2026-11-01 (13-41-26): the six where
 compression came out ahead less the one carrying decoy tokens, and the rest
-losing, as nearly all conversations did, together at -1.00% against -1.03%
-for the whole run.
+losing, as nearly all conversations did. Together they come to +0.60% input
+side, against -0.20% for the whole run: a gate on regressions, not an estimate
+of a run's saving.
 """
 import argparse
 import gzip
@@ -103,7 +107,8 @@ def main():
                 body["system"] = filler(body["system"])
             elif isinstance(body.get("system"), list):
                 for part in body["system"]:
-                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    if (isinstance(part, dict) and isinstance(part.get("text"), str)
+                            and not part["text"].startswith("x-anthropic-billing-header:")):
                         part["text"] = filler(part["text"])
             rows.append({"at_ms": record.get("at_ms", 0), "request_id": record.get("request_id", ""),
                          "dir": "client->proxy", "conversation": key,

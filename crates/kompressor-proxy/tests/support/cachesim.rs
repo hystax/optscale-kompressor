@@ -16,6 +16,14 @@
 //! * Everything from there to the last breakpoint is written, each span at the
 //!   lifetime of the breakpoint that closes it, and a hit renews its entry.
 //! * Prefixes shorter than [`MIN_CACHEABLE`] tokens are neither read nor written.
+//! * Claude Code's billing header, a system block reading
+//!   `x-anthropic-billing-header: cc_version=…`, is left out entirely. Its
+//!   suffix changes from session to session, 81 values over the 917 requests
+//!   of one 89-task run, yet every conversation's first request in that run
+//!   read the same 13,658-token prefix of tools and system prompt from an
+//!   entry another trial wrote. The provider does not key the cache on it.
+//!   Counted as content, it kept conversations from sharing that prefix and
+//!   tripled the simulated cache writes.
 //!
 //! Tokens are bytes of canonical JSON over four. That is not Anthropic's
 //! tokenizer, so the dollar figures are estimates; both arms of a comparison are
@@ -328,6 +336,14 @@ fn block(role: &str, value: &Value) -> Block {
     }
 }
 
+/// Claude Code's per-session billing header, which the provider does not
+/// cache on.
+fn is_billing_header(part: &Value) -> bool {
+    part["text"]
+        .as_str()
+        .is_some_and(|text| text.starts_with("x-anthropic-billing-header:"))
+}
+
 fn blocks(body: &Value) -> Vec<Block> {
     let mut out = Vec::new();
     for tool in body["tools"].as_array().into_iter().flatten() {
@@ -335,7 +351,12 @@ fn blocks(body: &Value) -> Vec<Block> {
     }
     match &body["system"] {
         Value::String(text) => out.push(block("system", &json!({"type": "text", "text": text}))),
-        Value::Array(parts) => out.extend(parts.iter().map(|part| block("system", part))),
+        Value::Array(parts) => out.extend(
+            parts
+                .iter()
+                .filter(|part| !is_billing_header(part))
+                .map(|part| block("system", part)),
+        ),
         _ => {}
     }
     for message in body["messages"].as_array().into_iter().flatten() {

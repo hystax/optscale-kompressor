@@ -24,11 +24,13 @@ use wiremock::Mock;
 use wiremock::matchers::any;
 
 const MODEL: &str = "claude-opus-5-5";
-/// What the shipped settings saved on [`CAPTURE`] when it was committed, as
-/// 1.5.14: a loss, because the retrieve tool's definition, sent on every
-/// request, outweighs what compression removes from this traffic. A change
+/// What the shipped settings saved on [`CAPTURE`] as 1.5.14, recorded after the
+/// simulator learned to leave Claude Code's billing header out of the cache
+/// key. Small, because the retrieve tool's definition, sent on every request,
+/// costs about three quarters of what compression removes from this traffic
+/// (measured with `retrieve_tool = "never"` on three 1.5.14 captures). A change
 /// that does better moves this up.
-const SAVED_AT_COMMIT: f64 = -0.0102;
+const SAVED_AT_COMMIT: f64 = 0.0060;
 
 /// The configuration a package installs, so the test measures what ships.
 /// Environment overrides apply on top, as they do in a deployment, which is
@@ -297,9 +299,10 @@ async fn the_shipped_settings_cost_less_than_sending_the_session_direct() {
     // Measured when this test was written: 1.5.14 saves 69.8% of this
     // session's input-side cost. That is a property of the fixture, whose
     // generated output repeats far more than real Bash output does, and not a
-    // forecast: replayed over the 89-task 1.5.12 capture the same settings
-    // came out at -1.0%, because the retrieve tool's definition outweighed
-    // what compression removed. The floor is here to fail a change that stops
+    // forecast: replayed over the 89-task 1.5.12 and 1.5.14 captures the same
+    // settings come out between -0.2% and +0.4%, because the retrieve tool's
+    // definition costs most of what compression removes. The floor is here to
+    // fail a change that stops
     // compressing this output, or starts breaking the cache to do it.
     assert!(
         saved > 0.40,
@@ -454,6 +457,28 @@ fn the_simulator_looks_back_twenty_blocks_and_no_further() {
     // One block nearer and it is found.
     messages.remove(1);
     assert!(sim.bill(&simple(Value::Array(messages))).read > 0);
+}
+
+#[test]
+fn the_simulator_shares_a_prefix_across_billing_headers() {
+    // Two sessions whose only difference is Claude Code's billing header: the
+    // second reads what the first wrote, as the provider does.
+    let sim = CacheSim::new();
+    let session = |header: &str| {
+        json!({"model": MODEL, "max_tokens": 10,
+               "system": [{"type": "text", "text": header},
+                          {"type": "text", "text": big("system"),
+                           "cache_control": {"type": "ephemeral"}}],
+               "messages": [{"role": "user", "content": "go"}]})
+    };
+    let first = sim.bill(&session(
+        "x-anthropic-billing-header: cc_version=2.1.316.777;",
+    ));
+    assert!(first.write_5m > 0);
+    let second = sim.bill(&session(
+        "x-anthropic-billing-header: cc_version=2.1.316.4e7;",
+    ));
+    assert_eq!(second.read, first.frontier);
 }
 
 #[test]
