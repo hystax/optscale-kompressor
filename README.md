@@ -6,25 +6,15 @@
 
 **Deterministic prompt compression for coding agents, in one Rust binary.**
 
-Every step a coding agent takes, it re-sends its entire working history to the
-model: every apt-get log, every compiler warning, every progress bar. On a long
-task the model re-reads the same build output dozens of times, and you pay for
-every read.
+OptScale Kompressor sits between a coding agent and its model provider. It
+removes the repetitive tool output agents re-send on every turn, and on Claude
+Code it keeps the provider's prompt cache alive while tools run. Each feature has
+its own write-up and its own results:
 
-We built OptScale Kompressor to stop that, for many teams and agents at once.
-The same input compresses to the same bytes every turn, so the prompt cache
-keeps working, and every removed detail stays one retrieval away.
-
-On Terminal-Bench 2.1 it takes 22.7% off the real bill. How is it different from
-Headroom, the best-known open-source context compressor, which has grown into a
-platform? Kompressor is deliberately just a compressor, and it saves about twice
-as much.
-
-One rule decides everything else: **the same input compresses to the same bytes,
-every turn.** On agent traffic most input tokens are billed as prompt-cache reads,
-at roughly a tenth of the fresh price — measured at 93.0% of billed prompt on an
-89-task run. A compressor whose output shifts between turns breaks that cache and
-costs more than it saves.
+| Feature | Measured on | Bill vs no compression | Results |
+| --- | --- | --- | --- |
+| [Cache-safe compression of tool output](#feature-cache-safe-compression) | Codex on GPT-5.5 | **−22.7%**, about twice Headroom's savings | [Codex results](#results-codex) |
+| [On Claude Code, the cache is the bill](#feature-claude-code-cache) | Claude Code on Opus 5.5 | **−20%**, with 99% fewer tokens lost to cache expiry | [Claude Code results](#results-claude-code) |
 
 ```bash
 kompressor wrap codex
@@ -39,13 +29,85 @@ kompressor: 26 request(s), 126 message(s) compressed, ~2029706 tokens saved (201
 
 ---
 
+## Features
+
+<a id="feature-cache-safe-compression"></a>
+### Cache-safe compression of tool output
+
+Every step a coding agent takes, it re-sends its entire working history to the
+model: every apt-get log, every compiler warning, every progress bar. On a long
+task the model re-reads the same build output dozens of times, and you pay for
+every read.
+
+We built OptScale Kompressor to stop that, for many teams and agents at once.
+The same input compresses to the same bytes every turn, so the prompt cache
+keeps working, and every removed detail stays one retrieval away.
+
+One rule decides everything else: **the same input compresses to the same bytes,
+every turn.** On agent traffic most input tokens are billed as prompt-cache reads,
+at roughly a tenth of the fresh price — measured at 93.0% of billed prompt on an
+89-task run. A compressor whose output shifts between turns breaks that cache and
+costs more than it saves.
+
+On Terminal-Bench 2.1 with Codex on GPT-5.5 it takes 22.7% off the real bill. How
+is it different from Headroom, the best-known open-source context compressor,
+which has grown into a platform? Kompressor is deliberately just a compressor,
+and it saves about twice as much.
+
+**Results:** [Codex on GPT-5.5](#results-codex) · **Write-up:**
+[Twice the Savings of Headroom on Coding-Agent Traffic](https://optscale.ai/blog/context-compression-coding-agents)
+
+<a id="feature-claude-code-cache"></a>
+### On Claude Code, the cache is the bill
+
+Claude Code marks its conversation with explicit cache breakpoints, so almost
+every request is a long cached prefix plus a short new tail: 92–95% of billed
+prompt tokens are cache reads. On Opus 5.5 a cache read costs $0.20 per million
+tokens and a five-minute cache write $5, 25 times more. A default cache entry
+lives five minutes, and a training run, a full build or a long simulation can
+keep the agent idle for longer. When it comes back, the whole prefix is written
+to the cache again at full price. So on Claude Code the question is less "how
+much can we remove?" and more "how much can we avoid paying twice?".
+
+Kompressor's Anthropic profile answers it in three parts:
+
+- **Compress only the uncached tail.** Messages inside the prefix the provider
+  has already cached stay byte-identical; only the new tail is compressed, the
+  first time it is sent. Elisions under 4,000 characters ship whole, and
+  function-body elision is off for this provider, because a retrieval round on
+  Claude Code re-sends a large prefix.
+- **Keep the cache alive while tools run.** While the agent runs a tool,
+  Kompressor re-sends the last request body every 4.5 minutes with
+  `max_tokens: 1`, so the provider reads the cached prefix and the entry's
+  five-minute clock restarts. Keep-warm stops at the agent's next request, after
+  11 pings (about 50 minutes), at the first failed ping, or if a ping reads no
+  cached tokens. After a conversation's first idle gap longer than five minutes,
+  Kompressor switches it to one-hour cache entries.
+- **Price every decision on the real bill:** per-model cache prices, the system
+  prompt and tool definitions it never compresses, and Anthropic's 20-block cache
+  lookback.
+
+**Results:** [Claude Code on Opus 5.5](#results-claude-code) · **Write-up:**
+[On Claude Code, the Cache Is the Bill](https://optscale.ai/blog/claude-code-prompt-caching) ·
+**Set-up:** [Quick start → Claude Code](#quick-start-claude-code)
+
+---
+
 ## Results
 
 Every figure below is the difference between real provider bills, with the
 prompt-cache discount included. Self-reported savings, which price removed tokens
-at the uncached list rate, are not used. The full write-up, with the task-by-task
-appendix, is
-[Twice the Savings of Headroom on Coding-Agent Traffic](https://optscale.ai/blog/context-compression-coding-agents).
+at the uncached list rate, are not used. Each feature has its own section:
+
+- [Codex on GPT-5.5](#results-codex): cache-safe compression of tool output
+- [Claude Code on Opus 5.5](#results-claude-code): the cache is the bill
+
+<a id="results-codex"></a>
+### Codex on GPT-5.5
+
+**Feature:** [Cache-safe compression of tool output](#feature-cache-safe-compression) ·
+**Full write-up, with the task-by-task appendix:**
+[Twice the Savings of Headroom on Coding-Agent Traffic](https://optscale.ai/blog/context-compression-coding-agents)
 
 **On Terminal-Bench 2.1.** 89 tasks, Codex CLI on GPT-5.5 ($5.00 / $0.50 / $30.00 per million uncached / cached / output tokens), Harbor with 3 concurrent trials. Four arms: no compression; Headroom 0.40 at its defaults, with its ML model; Headroom at its most aggressive setting (retrieval off, a 120-token size floor, at most 8 array items); OptScale Kompressor via OptScale AI. The table is one full run over the 87 tasks every arm completed. Trials that failed agent setup for external reasons are excluded. Cost and token savings are statistically significant; the solve-rate differences are not.
 
@@ -135,6 +197,96 @@ Kompressor removes 2.8× as much as Headroom with its ML model on, and 8.6× as
 much as Headroom without it, in about 1/440 of the time the model needs. Every
 removed detail stays retrievable.
 
+<a id="results-claude-code"></a>
+### Claude Code on Opus 5.5
+
+**Feature:** [On Claude Code, the cache is the bill](#feature-claude-code-cache) ·
+**Full write-up:**
+[On Claude Code, the Cache Is the Bill](https://optscale.ai/blog/claude-code-prompt-caching)
+
+**On Terminal-Bench 2.1.** 89 tasks, Claude Code on Opus 5.5 ($4.00 / $0.20 / $5.00 / $8.00 / $20.00 per million uncached input / cache read / five-minute cache write / one-hour cache write / output tokens). Two arms: no compression, and OptScale Kompressor with the Anthropic profile. The metric is what Anthropic charges: every API request, including keep-warm pings and Claude Code's calls to other models. Harbor's own cost sees only the requests in the agent's trajectory; without compression it reported $32.00 against $35.35 billed. Trials that failed agent setup are excluded.
+
+
+| Per 89-task run                    | No compression | Kompressor         |
+| ---------------------------------- | -------------- | ------------------ |
+| Anthropic API bill                 | $35.35         | **$28.30 (−20%)**  |
+| Tasks solved                       | 89.9%          | 90.6%              |
+| Prompt tokens served from cache    | 92.0%          | **94.8%**          |
+| Cache writes                       | 2.78M tokens   | **1.67M (−40%)**   |
+| Prompt tokens lost to cache expiry | 927K           | **13K (−99%)**     |
+| Output tokens                      | 660K           | 596K               |
+| Agent steps                        | 1,104          | 1,080              |
+
+
+Individual Kompressor runs cost between $27.86 and $28.68 and solved 80–81 tasks.
+
+**Where the money went.** Cache writes account for most of the difference:
+$5.59 of $7.05. The extra spend on pings and one-hour entries comes to under a
+dollar, about a sixth of what the writes saved.
+
+
+| Per run                | No compression | Kompressor | Change     |
+| ---------------------- | -------------- | ---------- | ---------- |
+| Cache writes, 5-minute | $14.16         | $8.57      | **−$5.59** |
+| Cache writes, 1-hour   | —              | $0.14      | +$0.14     |
+| Cache reads            | $7.37          | $6.46      | −$0.91     |
+| Output                 | $13.60         | $12.31     | −$1.29     |
+| Uncached input         | $0.23          | $0.09      | −$0.14     |
+| Keep-warm pings        | —              | $0.73      | +$0.73     |
+| **Total**              | **$35.35**     | **$28.30** | **−$7.05** |
+
+
+**Keep-warm.** Each bridged gap would otherwise have ended in a full rewrite of
+the prefix, which is what the uncompressed agent paid: 927K tokens per run. Net
+of the pings, keep-warm saved about $3.9 per run, roughly 11% of the
+uncompressed bill, on its own. In most runs no turn lost its cache at all.
+
+
+| Keep-warm, per run                                   | Average | Range        |
+| ---------------------------------------------------- | ------- | ------------ |
+| Pings sent                                           | 93      | 73–112       |
+| Idle gaps over five minutes bridged                  | 28      | 22–35        |
+| Prefix tokens kept warm                              | 0.96M   | 0.78M–1.20M  |
+| Cost of the pings                                    | $0.73   | $0.46–0.89   |
+| Rewrites avoided, at $5 instead of $0.20 per million | ~$4.6   | ~$3.7–5.7    |
+
+
+**Reading it honestly.** Agents do not take the same path twice. Four tasks
+account for the whole net difference: `winning-avg-corewars`, `regex-chess`,
+`sam-cell-seg` and `crack-7z-hash`. On the first three, the uncompressed agent
+took a much longer path: 45–72 steps against 19–26. Kompressor was cheaper on 44
+of the 89 tasks. Splitting tasks by whether they wait on long-running tools
+separates the two effects:
+
+
+| Tasks                                                                | Count | Cost     | Median cost per step |
+| -------------------------------------------------------------------- | ----- | -------- | -------------------- |
+| With idle gaps over five minutes (training, builds, long simulations) | 14    | **−34%** | **−20%**             |
+| All others                                                           | 72    | −12%     | +2%                  |
+
+
+Where the cache would expire, keep-warm and the adaptive TTL make each step
+cheaper. On a typical short task a step costs what it did before, and the rest of
+that cohort's saving comes from shorter paths. The mechanism-level estimate,
+which we expect to hold up across repeated measurements, is about 11% from
+keeping the cache alive plus a few percent from compressing the tail.
+
+**What compression still does on Claude Code.**
+
+
+| Per run, average                              | Value                                   |
+| --------------------------------------------- | --------------------------------------- |
+| Tokens removed from the uncached tail         | 348K (4.7–8.0% of what the engine saw)  |
+| Messages protected inside the cached prefix   | ~1,800, about 2.2M tokens               |
+| Elisions with a retrieval handle              | 126                                     |
+| Retrievals the model made                     | 0–2 per run, every one a hit            |
+
+
+Removal is far below the 62.8% in the [Codex replay](#results-codex), by design:
+the engine only sees the uncached tail, skips elisions under 4,000 characters,
+and leaves code bodies alone on this provider. The model almost never needs to
+retrieve anything, so compression adds no retrieval cost of its own.
+
 ---
 
 ## Install
@@ -157,16 +309,9 @@ make release
 ./target/release/kompressor version
 ```
 
-`make all` builds every binary and package this machine can build and collects
-them, with checksums, into `target/dist`. It probes each one first and prints
-what it skipped and the command that would enable it, rather than failing deep
-inside a linker — no single host has a C toolchain for every target.
-
-The individual targets are `make deb`, `make rpm`, `make static` (musl),
-`make docker` and `make macos-pkg-docker`; each says what it needs if a tool is
-missing. `make deb-static` and `make rpm-static` build the same two packages
-from the musl binary, so they depend on no `libc6`/`glibc` and install on
-distributions older than the machine that built them. [docs/QUICKSTART.md](docs/QUICKSTART.md) covers running it as a service,
+`make deb`, `make rpm`, `make static` (musl), `make docker` and
+`make macos-pkg-docker` build packages; each says what it needs if a tool is
+missing. [docs/QUICKSTART.md](docs/QUICKSTART.md) covers running it as a service,
 and [docs/MACOS.md](docs/MACOS.md) covers the macOS paths.
 
 ---
@@ -204,43 +349,52 @@ to set in Cursor's settings; only applies when Cursor uses your own OpenAI key) 
 `cursor-agent` (refused with an explanation: it speaks Connect RPC over protobuf,
 which the proxy cannot read).
 
-### Claude Code — wrapped, and deliberately not compressed
+<a id="quick-start-claude-code"></a>
+### Claude Code
 
-`kompressor wrap claude` runs and forwards Claude Code's requests untouched. That
-is not a gap waiting to be filled: Claude Code marks its final message as a
-prompt-cache breakpoint, which pins the whole conversation, and rewriting any byte
-inside it would invalidate a cache billed at about a tenth of fresh input.
+```bash
+kompressor wrap claude
+```
 
-What the wrap does give it is retrieval. `wrap claude` hands Claude Code the
-retrieve tools as an MCP server it launches itself, so a `ref:k_…` handle resolves
-anywhere in the session rather than only while a request is passing through the
-proxy. Nothing durable is written — no `~/.claude.json`, no `~/.claude/settings.json`
-— so there is no `unwrap` step.
+`wrap claude` uses a kompressor already serving on its port, such as the
+installed service, and otherwise starts one with the first config it finds:
+`$KOMPRESSOR_CONFIG`, `./kompressor.toml`, then
+`~/.config/kompressor/config.toml`. The Anthropic profile comes from that config,
+not from the command. The packaged configuration (`/etc/kompressor/config.toml`
+on Linux, `~/.config/kompressor/config.toml` on macOS) turns on tail-only
+compression and the adaptive one-hour TTL under `[proxy.providers.anthropic]`.
+Keep-warm is off everywhere until you turn it on, because it is the one thing
+the proxy sends that no client asked for:
 
-That paragraph describes the **default**, `proxy.frozen_prefix = "marker"`.
-Setting `first_seen` instead compresses only what the provider has not cached
-yet, and on Anthropic traffic it is the difference between nothing and
-**43.6% removed** over a sixteen-payload session — because Claude Code's
-trailing breakpoint pins the whole conversation under the marker rule, so there
-is nothing left for the engine to touch.
+```toml
+[proxy.providers.anthropic]
+cache_keep_warm = true
+```
 
-It is no longer experimental. Safety is established: excess writes measured 0 on
-10 of 13 runs, every non-zero figure predating the `was_warm` and discard-guard
-fixes, and a 40-turn Opus run held the incremental-cache identity 37 times out of
-37 while removing 33.0% at 96.6% cache reads. It is what the packaged default
-sets for Anthropic clients, and what `docs/CLAUDE-DESKTOP.md` requires.
+With no config file at all, Claude Code traffic runs on the deployment defaults,
+which freeze the whole conversation Claude Code marks and forward it nearly
+untouched. The full profile, set by environment for one session:
 
-The engine default stays `marker`, for one remaining reason and it is not churn:
-on cost, compression has not yet paid on this traffic. Measured 2026-10-25 on
-two 89-task Harbor runs of Claude Code on Claude Opus 5.5, `first_seen` against
-compression off, scored task by task on the proxy's own bill
-(`scripts/harbor/panel-score.py`): **+0.9% per agent step** (95% CI −3.6% to
-+5.8%), +9.0% per trial. Re-sent history is already ~93% cache reads at 0.05x
-input, so removing it saves little, while retrieval rounds — each one an extra
-answer from the model — cost about twice what that saved; elided code bodies were
-fetched back 57% of the time. A paired panel with code-body elision off
-(`engine.enable_code_aware = false`) and `proxy.cache_ttl = "adaptive"` is the
-next measurement. The argument in full: [docs/CLAUDE-CODE.md](docs/CLAUDE-CODE.md).
+```bash
+export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__RETRIEVE_TOOL=always
+export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__FROZEN_PREFIX=first_seen
+export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__CACHE_TTL=adaptive
+export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__CACHE_KEEP_WARM=true
+export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__ENGINE__ENABLE_CODE_AWARE=false
+export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__ENGINE__MIN_ELISION_SAVING_CHARS=4000
+kompressor wrap claude
+```
+
+What Kompressor changes on Claude Code, and why:
+[On Claude Code, the cache is the bill](#feature-claude-code-cache). Measured
+effect: [Claude Code on Opus 5.5](#results-claude-code).
+
+`wrap claude` also hands Claude Code the retrieve tools as an MCP server it
+launches itself, so a `ref:k_…` handle resolves anywhere in the session rather
+than only while a request is passing through the proxy. Nothing durable is
+written — no `~/.claude.json`, no `~/.claude/settings.json` — so there is no
+`unwrap` step. Measurements and the full argument:
+[docs/CLAUDE-CODE.md](docs/CLAUDE-CODE.md).
 
 ### Claude Desktop — intercepted, because it cannot be pointed
 
@@ -262,7 +416,9 @@ alpn = ["h2", "http/1.1"]
 `CONNECT` on that port, TLS terminated for the allow-listed host with a
 certificate minted locally, everything else tunnelled byte for byte. The
 decrypted request is served by the same router the proxy already runs, so no
-mount or handler changes to support it. Point Desktop at it with `HTTPS_PROXY`
+mount or handler changes to support it. The Code tab's traffic is Anthropic
+Messages like the CLI's, so the `[proxy.providers.anthropic]` profile described
+above applies to it unchanged. Point Desktop at it with `HTTPS_PROXY`
 and `NODE_EXTRA_CA_CERTS` in `~/.claude/settings.json`.
 
 The packaged default enables it, so a clean install listens on 8840 and
@@ -416,8 +572,6 @@ against a live agent.
 
 ## Not built yet
 
-- **Claude Code compression** — see [Claude Code](#claude-code--wrapped-and-deliberately-not-compressed)
-for why the default is to forward untouched.
 - **Needle retention**: a measure of whether compression kept what the agent went
 on to use. It is the one quality metric that can fail while every ratio improves.
 - **Redis fragment backend**: needed for several proxies behind one load balancer.

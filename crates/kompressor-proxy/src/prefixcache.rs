@@ -189,6 +189,16 @@ struct Seen {
     /// test run once is the kind that does it again. What `CacheTtl::Adaptive`
     /// reads.
     idled_past_ttl: bool,
+    /// Whether the response behind `cache_read` also wrote to the cache.
+    ///
+    /// A zero read that came with a write is a miss the provider has already
+    /// repaired: it re-created the entry from the bytes this proxy just sent,
+    /// so the next turn is served from cache again — and lifting the freeze
+    /// would rewrite exactly the bytes it is about to read. Only a zero read
+    /// with no write leaves nothing cached to protect. Anthropic reports
+    /// writes; OpenAI does not, so this stays false there and its zero reads
+    /// keep meaning what they did.
+    rewritten: bool,
 }
 
 /// Remembers, per frozen prefix, whether the provider last served it from cache.
@@ -318,10 +328,13 @@ impl CachePrices {
     /// `long_ttl` when this request asks for one-hour cache entries.
     ///
     /// Read prices that differ from the usual tenth are named: Claude Opus 5.5
-    /// reads at $0.20 against $4.00 input, Claude Fable 5.1 and Mythos 5.1 at
-    /// $0.25 against $10.00. Anthropic writes at 1.25x input for five-minute
-    /// entries and 2x for one-hour ones. OpenAI caches without a write charge,
-    /// so a miss there is uncached input.
+    /// reads at $0.20 against $4.00 input, Claude Sonnet 5.5 at $0.10 against
+    /// $2.00, Claude Fable 5.1 and Mythos 5.1 at $0.25 against $10.00. Anthropic
+    /// writes at 1.25x input for five-minute entries and 2x for one-hour ones.
+    /// OpenAI caches without a write charge, so a miss there is uncached input.
+    ///
+    /// A model routed as `anthropic/<id>` is priced as `<id>`: the archive's
+    /// stats carry both spellings of the same models.
     pub fn for_model(family: ApiFamily, model: Option<&str>, long_ttl: bool) -> CachePrices {
         if family != ApiFamily::AnthropicMessages {
             return CachePrices {
@@ -330,7 +343,10 @@ impl CachePrices {
             };
         }
         let model = model.unwrap_or_default();
-        let read_ppm = if model.starts_with("claude-opus-5-5") {
+        let model = model.strip_prefix("anthropic/").unwrap_or(model);
+        let read_ppm = if model.starts_with("claude-opus-5-5")
+            || model.starts_with("claude-sonnet-5-5")
+        {
             50_000
         } else if model.starts_with("claude-fable-5-1") || model.starts_with("claude-mythos-5-1") {
             25_000
@@ -398,8 +414,9 @@ impl PrefixTracker {
         }
         // The provider's own answer, and the only signal that is evidence
         // rather than inference: it was asked to serve this prefix and read
-        // nothing from cache.
-        if entry.cache_read == Some(0) {
+        // nothing from cache — and did not cache it again either. A zero read
+        // beside a write is a lapse already repaired; see `Seen::rewritten`.
+        if entry.cache_read == Some(0) && !entry.rewritten {
             return PrefixCache::Cold;
         }
         if !self.ttl.is_zero() && entry.at.elapsed() > self.ttl {
@@ -468,6 +485,9 @@ impl PrefixTracker {
         let idled_past_ttl = seen
             .get(&fingerprint)
             .is_some_and(|prior| prior.idled_past_ttl);
+        // Like `known`: a usage-less finish says nothing about writes either.
+        let rewritten =
+            cache_read.is_none() && seen.get(&fingerprint).is_some_and(|prior| prior.rewritten);
 
         // Within one conversation the prefix only grows, so the cache read the
         // provider reports should never fall. When it does, something outside
@@ -505,8 +525,19 @@ impl PrefixTracker {
                 was_warm,
                 rounds,
                 idled_past_ttl,
+                rewritten,
             },
         );
+    }
+
+    /// Record that the response just filed by [`PrefixTracker::record`] also
+    /// wrote this prefix to the cache. Called beside it, for the same usage.
+    pub fn record_rewritten(&self, fingerprint: u64) {
+        if let Ok(mut seen) = self.seen.lock()
+            && let Some(entry) = seen.get_mut(&fingerprint)
+        {
+            entry.rewritten = true;
+        }
     }
 }
 
@@ -985,6 +1016,7 @@ impl PrefixTracker {
                 // happened yet, and nothing has been read from cache to drop.
                 rounds: 0,
                 idled_past_ttl: false,
+                rewritten: false,
             },
         );
         observed
@@ -1228,9 +1260,13 @@ mod tests {
             CachePrices::for_model(ApiFamily::AnthropicMessages, Some(model), false).read_ppm
         };
         assert_eq!(read("claude-opus-5-5"), 50_000);
+        assert_eq!(read("claude-sonnet-5-5"), 50_000);
+        assert_eq!(read("anthropic/claude-sonnet-5-5"), 50_000);
         assert_eq!(read("claude-fable-5-1"), 25_000);
         assert_eq!(read("claude-mythos-5-1"), 25_000);
         assert_eq!(read("claude-opus-4-8"), 100_000);
+        assert_eq!(read("claude-opus-5"), 100_000);
+        assert_eq!(read("claude-sonnet-4-5"), 100_000);
         assert_eq!(
             CachePrices::for_model(ApiFamily::AnthropicMessages, None, true).write_ppm,
             2_000_000
@@ -1562,6 +1598,25 @@ mod tests {
             PrefixCache::Cold,
             "a usage-less finish must not erase the provider's answer"
         );
+    }
+
+    #[test]
+    fn a_miss_the_provider_wrote_back_is_not_cold() {
+        // Warm, then a turn that read nothing but re-created the entry: the
+        // provider now holds exactly the bytes that turn sent. Calling the next
+        // turn `Cold` lifts the freeze, rewrites those bytes and pays for the
+        // write a second time.
+        let tracker = PrefixTracker::new(Duration::ZERO);
+        tracker.record(1, Some(41_116), None, 0);
+        tracker.record(1, Some(0), None, 0);
+        tracker.record_rewritten(1);
+        assert_eq!(tracker.state(1), PrefixCache::Warm);
+        // A usage-less finish of the same request keeps that answer.
+        tracker.record(1, None, None, 0);
+        assert_eq!(tracker.state(1), PrefixCache::Warm);
+        // A later zero read with no write is a lapse nothing has repaired.
+        tracker.record(1, Some(0), None, 0);
+        assert_eq!(tracker.state(1), PrefixCache::Cold);
     }
 
     #[test]

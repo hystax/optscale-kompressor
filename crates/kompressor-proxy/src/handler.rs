@@ -2195,6 +2195,9 @@ impl Recorder {
             };
             self.prefixes
                 .record(prefix, self.event.cache_read_tokens, prompt, rounds);
+            if anthropic && written > 0 {
+                self.prefixes.record_rewritten(prefix);
+            }
             if anthropic
                 && written > 0
                 && self.event.cache_read_tokens.is_some()
