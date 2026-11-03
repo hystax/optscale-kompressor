@@ -314,12 +314,25 @@ is safe to run whether or not one is there.
 
 ### What it costs on the subscription path
 
-A ChatGPT-plan session pays a WebSocket handshake it cannot skip:
+A ChatGPT-plan session opens a WebSocket it cannot be told not to:
 `openai_base_url` overrides the built-in provider's URL but cannot disable its
-transport preference, and there is no top-level key that can. Codex tries
-`ws://127.0.0.1:8817/v1/responses` five times — about 13 seconds — before
-falling back to HTTP, once per session. An API-key session goes through the
-provider block, where `supports_websockets = false` removes it entirely.
+transport preference, and there is no top-level key that can. Codex opens
+`ws://127.0.0.1:8817/v1/responses` before trying HTTPS.
+
+**The relay answers it**, and has since 0.14.0 (`proxy.websocket_relay`, on by
+default). The cost is accounting rather than latency: the relay never reads a
+`response.completed`, so a relayed session's token counts are filed null and no
+cost report can price it. The saving is real and uncounted.
+
+Turning the relay off restores the old behaviour, which is the shape this
+section used to describe: five refused handshakes, about 13 seconds of dead air
+on the first request, then a fallback to HTTP. That is a supported choice for an
+operator who would rather have the numbers —
+`KOMPRESSOR__PROXY__WEBSOCKET_RELAY=false` — not a default anyone should meet by
+surprise.
+
+An API-key session goes through the provider block, where
+`supports_websockets = false` removes the attempt entirely.
 
 ## Measuring it
 

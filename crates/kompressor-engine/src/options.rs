@@ -68,6 +68,20 @@ pub struct EngineOptions {
     /// which is the sign of a default in the wrong place.
     pub max_ref_bytes: usize,
 
+    /// In `recoverable` mode, a payload whose compression leaves a handle but
+    /// saves fewer characters than this ships whole instead. 0 turns it off.
+    ///
+    /// A handle is an invitation to fetch, and a fetch is a whole extra model
+    /// round. Where re-sent content is billed as cache reads, a small elision
+    /// saves less than one fetch costs. On Claude Opus 5.5 across ten
+    /// recoverable Harbor runs, tool results that saved under 4,000 characters
+    /// were fetched back 30% of the time: 402 of 535 handle-bearing results
+    /// accounted for 20% of what compression saved and 114 of 265 fetch rounds.
+    /// Shipping those whole came out about $1.3 ahead across the ten runs at
+    /// $0.03 a round, and stayed ahead at $0.02. Markers without a handle are
+    /// not gated: nothing can be fetched through them.
+    pub min_elision_saving_chars: usize,
+
     pub enable_smart_crusher: bool,
     pub enable_search_compressor: bool,
     pub enable_log_compressor: bool,
@@ -77,6 +91,15 @@ pub struct EngineOptions {
     pub enable_code_aware: bool,
     pub enable_mixed_content: bool,
     pub enable_config_compressor: bool,
+    /// Let the segmenter recognise a run of configuration inside a
+    /// heterogeneous body.
+    ///
+    /// Without it the segmenter's vocabulary is diffs, logs, grep hits,
+    /// tables and listings — all line-shaped. Configuration is not, so a
+    /// tool result holding a source file and then a `.cfg` presented as
+    /// one unclassified run, went whole to the detector's single winner,
+    /// and compressed by nothing at all.
+    pub enable_config_sections: bool,
 
     /// Re-detect and route long string values instead of blind-clipping them.
     ///
@@ -124,6 +147,21 @@ pub struct EngineOptions {
     /// *differ* — the normalised identities, where the count cannot give the
     /// values back — keeps its handle either way.
     pub fold_handles_identical_repeats: bool,
+
+    /// Say `similar` in a fold marker whose occurrences differ.
+    ///
+    /// `[×N ref:…]` is documented to a model as "a line that repeated", so over
+    /// lines that merely shared a template it describes the handle as holding
+    /// copies of something already visible — and a model with no reason to
+    /// fetch does not fetch. Measured on eight attachment headings folded to
+    /// one: the seven variants were retained and retrievable, and the task
+    /// still lost the instruction they carried.
+    ///
+    /// On, such a fold reads `[×N similar ref:…]`. The handle, the fragment and
+    /// the compression are identical either way; only what the model is told
+    /// changes. Off restores the older wording, which is what the golden
+    /// vectors were recorded under.
+    pub fold_marks_variants: bool,
 
     /// Compress HTML by folding its repeated lines.
     ///
@@ -327,6 +365,7 @@ impl Default for EngineOptions {
             ref_ttl_seconds: 3600,
             ref_max_lifetime_multiplier: 8,
             max_ref_bytes: 1024 * 1024,
+            min_elision_saving_chars: 0,
             enable_smart_crusher: true,
             enable_search_compressor: true,
             enable_log_compressor: true,
@@ -336,11 +375,13 @@ impl Default for EngineOptions {
             enable_code_aware: true,
             enable_mixed_content: true,
             enable_config_compressor: true,
+            enable_config_sections: true,
             enable_nested_routing: true,
             enable_redraw_fold: true,
             enable_gutter_aware_detection: true,
             enable_build_templates: true,
             fold_handles_identical_repeats: false,
+            fold_marks_variants: true,
             enable_html_compressor: true,
             enable_normalised_text_fold: true,
             enable_tabular_ratio: true,
@@ -443,6 +484,7 @@ pub struct EngineOptionsPatch {
     pub keep_tail_lines: Option<usize>,
     pub ref_ttl_seconds: Option<u64>,
     pub max_ref_bytes: Option<usize>,
+    pub min_elision_saving_chars: Option<usize>,
     pub enable_smart_crusher: Option<bool>,
     pub enable_search_compressor: Option<bool>,
     pub enable_log_compressor: Option<bool>,
@@ -452,11 +494,13 @@ pub struct EngineOptionsPatch {
     pub enable_code_aware: Option<bool>,
     pub enable_mixed_content: Option<bool>,
     pub enable_config_compressor: Option<bool>,
+    pub enable_config_sections: Option<bool>,
     pub enable_nested_routing: Option<bool>,
     pub enable_redraw_fold: Option<bool>,
     pub enable_gutter_aware_detection: Option<bool>,
     pub enable_build_templates: Option<bool>,
     pub fold_handles_identical_repeats: Option<bool>,
+    pub fold_marks_variants: Option<bool>,
     pub enable_html_compressor: Option<bool>,
     pub enable_normalised_text_fold: Option<bool>,
     pub enable_tabular_ratio: Option<bool>,
@@ -492,6 +536,7 @@ impl EngineOptionsPatch {
             keep_tail_lines,
             ref_ttl_seconds,
             max_ref_bytes,
+            min_elision_saving_chars,
             enable_smart_crusher,
             enable_search_compressor,
             enable_log_compressor,
@@ -501,11 +546,13 @@ impl EngineOptionsPatch {
             enable_code_aware,
             enable_mixed_content,
             enable_config_compressor,
+            enable_config_sections,
             enable_nested_routing,
             enable_redraw_fold,
             enable_gutter_aware_detection,
             enable_build_templates,
             fold_handles_identical_repeats,
+            fold_marks_variants,
             enable_html_compressor,
             enable_normalised_text_fold,
             enable_tabular_ratio,

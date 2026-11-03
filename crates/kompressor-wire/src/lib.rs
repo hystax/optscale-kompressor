@@ -68,6 +68,15 @@ pub enum ApiFamily {
 }
 
 impl ApiFamily {
+    /// The provider a request in this family belongs to, as
+    /// `proxy.providers` names it: `anthropic` or `openai`.
+    pub fn provider(self) -> &'static str {
+        match self {
+            ApiFamily::AnthropicMessages => "anthropic",
+            ApiFamily::OpenAiChat | ApiFamily::OpenAiResponses => "openai",
+        }
+    }
+
     /// A stable identifier for logs, metrics and config.
     pub fn as_str(self) -> &'static str {
         match self {

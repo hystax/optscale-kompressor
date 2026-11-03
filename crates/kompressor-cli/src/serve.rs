@@ -107,6 +107,21 @@ fn maintenance(
 /// Order matters, and only in one place: the proxy claims everything no other
 /// surface named, because it has to forward paths this binary has never heard of
 /// to an upstream that has. Merging it first would let it swallow `/v1/compress`.
+/// What the intercept listener serves.
+///
+/// A connection arriving through CONNECT is a proxied request and nothing else:
+/// the client believes it is talking to the provider, so the API and MCP
+/// surfaces have no meaning on it and mounting them would answer paths the
+/// provider also owns.
+fn surfaces_for_intercept(core: &Arc<AppCore>) -> Surfaces {
+    let _ = core;
+    Surfaces {
+        api: false,
+        mcp: false,
+        proxy: true,
+    }
+}
+
 fn compose(core: &Arc<AppCore>, surfaces: Surfaces, client: reqwest::Client) -> Router {
     // The probes go on every listener, whatever it serves. With per-surface
     // addresses a proxy-only listener would otherwise have no `/healthz` at
@@ -265,6 +280,44 @@ pub async fn run(config: Config, surfaces: Surfaces, listen: Option<String>) -> 
                 .await
         });
     }
+    // The intercept listener, for clients that pin their own base URL and so
+    // can never be pointed at the proxy. It serves the same router the ordinary
+    // listeners do -- it only differs in how a connection reaches it -- and it
+    // joins the same JoinSet, so `shutdown_grace` already covers it.
+    let intercept = &core.config().proxy.intercept;
+    if let Some(address) = intercept.listen.clone() {
+        let bound = kompressor_proxy::intercept::Intercept::bind(
+            &address,
+            &intercept.intercept_hosts,
+            &intercept.ca_path,
+            &intercept.alpn,
+            intercept.leaf_cache_entries,
+        )
+        .await
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
+        tracing::info!(
+            address = %bound.address(),
+            hosts = %intercept.intercept_hosts.join(","),
+            ca = %bound.certificate_path().display(),
+            fingerprint = %bound.fingerprint(),
+            "intercepting"
+        );
+        let app = compose(&core, surfaces_for_intercept(&core), client.clone());
+        let mut rx = shutdown_rx.clone();
+        servers.spawn(async move {
+            bound
+                .serve(app, async move {
+                    while !*rx.borrow() {
+                        if rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                })
+                .await;
+            Ok(())
+        });
+    }
+
     let upkeep = maintenance(core.clone(), shutdown_rx);
     let mut serve_error = None;
     tokio::select! {

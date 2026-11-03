@@ -1,0 +1,114 @@
+# kompressor — user service configuration.
+#
+# Written by the macOS package postinstall, which substitutes @STATE@ for a real
+# absolute path. The loader does NOT expand `$HOME` or `~`: a path spelled
+# `$HOME/.local/share/...` is taken literally and creates a directory called
+# `$HOME` next to wherever the process happens to be running. Expansion
+# therefore happens at install time, here, and never in the TOML.
+
+[server]
+listen = "127.0.0.1:8817"
+
+[engine]
+mode = "recoverable"
+# The 64 KiB default drops recoverability on exactly the payloads worth
+# compressing: a fold or an elision over that size keeps no fragment.
+max_ref_bytes = 1048576
+
+[refs]
+backend = "sqlite"
+path = "@STATE@/refs.db"
+
+[stats]
+enabled = true
+path = "@STATE@/stats.db"
+
+[log]
+level = "info"
+format = "json"
+
+[proxy]
+# Anthropic clients pin `cache_control` on the final message, and under the
+# default marker rule that freezes the whole conversation -- nothing is removed.
+# `first_seen` freezes only as far as the provider's cache already reached.
+# It changes what the provider is billed for, so it is named here rather than
+# left to a default.
+frozen_prefix = "first_seen"
+
+# Codex opens ws://.../v1/responses before trying HTTPS, and a ChatGPT-plan
+# session cannot be told not to. Relaying that upgrade is what makes such a
+# session compressible; refusing it costs about thirteen seconds of retries per
+# session and compresses nothing.
+#
+# Written out rather than left to the default, which is `true`: commenting this
+# key out does not disable the relay, it only hides which way it is set.
+websocket_relay = true
+
+# --- Claude Desktop's Code tab ------------------------------------
+# Desktop overwrites ANTHROPIC_BASE_URL when it spawns a session, so there is no
+# base URL to point at this proxy. It does honour HTTPS_PROXY and a custom CA.
+#
+# On by default. Two things happen on first start that are worth knowing about
+# before they happen rather than after:
+#
+#   * a CONNECT proxy listens on the address below. It terminates TLS only for
+#     the hosts named in `intercept_hosts` and copies every other connection
+#     byte for byte without reading it.
+#   * a local certificate authority is generated under `ca_path` if none is
+#     there. The key is written 0600 and never leaves that directory. Nothing
+#     trusts it until you install it somewhere, and a client that has not been
+#     pointed here is unaffected either way.
+#
+# To turn it off, comment out `listen` — the listener is off unless an address
+# is named. Remove the CA directory as well if you had already trusted it.
+# See docs/CLAUDE-DESKTOP.md.
+[proxy.intercept]
+listen = "127.0.0.1:8840"
+intercept_hosts = ["api.anthropic.com"]
+ca_path = "@STATE@/ca"
+# h2 is required: Desktop's client offers only h2 for api.anthropic.com, and a
+# listener advertising http/1.1 alone fails the handshake in a way that looks
+# exactly like an untrusted certificate.
+alpn = ["h2", "http/1.1"]
+
+[[proxy.upstreams]]
+name = "openai"
+path_prefix = "/v1"
+base_url = "https://api.openai.com"
+api_family = "openai"
+forward_auth = true
+
+# Where the same mount goes when the caller pays by subscription.
+[proxy.upstreams.subscription]
+base_url = "https://chatgpt.com"
+rewrite_prefix = "/backend-api/codex"
+
+# Explicit ChatGPT route for desktop clients; avoids user-agent classification.
+[[proxy.upstreams]]
+name = "codex-desktop-chatgpt"
+path_prefix = "/backend-api/codex"
+base_url = "https://chatgpt.com"
+strip_prefix = false
+api_family = "openai"
+forward_auth = true
+
+# --- Anthropic ---------------------------------------------------------------
+# Claude takes the longer prefix, Codex keeps /v1. That way round because
+# `rewrite_prefix` replaces the matched mount prefix: a mount on /v1/responses
+# leaves an empty tail and a subscription request reaches chatgpt.com as
+# /backend-api/codex/ -- a 404 that reads like a broken login.
+[[proxy.upstreams]]
+name = "anthropic"
+path_prefix = "/v1/messages"
+base_url = "https://api.anthropic.com"
+api_family = "anthropic"
+forward_auth = true
+
+# A Claude session also probes /api/hello and signs in through /api/oauth/*.
+# Without this mount it takes a 404 from the proxy mid-session.
+[[proxy.upstreams]]
+name = "anthropic-api"
+path_prefix = "/api"
+base_url = "https://api.anthropic.com"
+api_family = "passthrough"
+forward_auth = true

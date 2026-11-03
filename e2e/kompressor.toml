@@ -24,6 +24,17 @@ level = "warn"
 
 [proxy]
 allow_insecure_upstream = true
+# Keep-warm, at a pace a test can wait for. The production interval is 270s;
+# what the suite checks is the rule, not the clock. Only Anthropic traffic is
+# kept warm, and only a turn that stops on `tool_use` or on `end_turn` with a
+# background task running arms it — which the mock answers only to requests
+# carrying the keep-warm marker, so no other check here can arm a timer.
+cache_keep_warm_interval = "2s"
+cache_keep_warm_max_pings = 3
+cache_keep_warm_background_pings = 2
+
+[proxy.providers.anthropic]
+cache_keep_warm = true
 
 [[proxy.upstreams]]
 name = "anthropic"

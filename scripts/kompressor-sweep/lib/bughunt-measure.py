@@ -69,7 +69,10 @@ for name in sorted(os.listdir(fixtures)):
 
     rows.append({
         "file": name,
-        "kind": j.get("kind", ""),
+        # `kind` is null, not absent, when nothing shipped: the payload went
+        # out untouched. `.get("kind", "")` passed that null through to the
+        # table, which crashed formatting it.
+        "kind": j.get("kind") or "untouched",
         # Two different questions, and conflating them made the table lie.
         #
         # `language` is what the detector routed the payload to, and it is

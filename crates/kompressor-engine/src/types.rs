@@ -235,6 +235,9 @@ pub struct DetectionMeta {
     /// hint it had happened.
     pub error_signal: bool,
     pub language: Option<Language>,
+    /// Disassembly or assembler source: code with no grammar, which nothing
+    /// may fold or sample, the fold fallback included.
+    pub assembly: bool,
     pub flavor: Option<ConfigFlavor>,
     pub skipped_size: bool,
 }

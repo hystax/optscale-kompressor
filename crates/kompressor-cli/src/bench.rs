@@ -46,8 +46,28 @@ pub fn replay_corpus(args: ReplayArgs) -> CliResult {
     // A/B'd against a corpus without rebuilding. Without this the harness ran
     // the compiled-in defaults whatever the environment said, which quietly
     // makes two runs that were meant to differ identical.
-    let config = kompressor_core::Config::load(args.config.as_deref())
-        .map_err(|e| CliError::Usage(e.to_string()))?;
+    //
+    // `--config` only, though: with none given this took `Config::load(None)`,
+    // which falls back to discovery, so the replay ran under whatever
+    // `kompressor.toml` or `~/.config/kompressor/config.toml` the machine
+    // happened to have. That turns the baseline gate into a measurement of the
+    // developer's config rather than of the engine. It is not hypothetical —
+    // one `enable_normalised_text_fold = false` in a personal config moved the
+    // `text` bucket from 61.20% to 14.15% and `make bench` reported it as a
+    // regression in the code, against a baseline recorded without it. The
+    // hermetic CLI tests already pin discovery at an empty directory for the
+    // same reason; the gate itself had no such protection.
+    //
+    // So: an explicit path is read, and nothing else is. No discovery and no
+    // `KOMPRESSOR_*` overlay, because `--save` writes the baseline that
+    // `--compare` checks and both have to mean the same thing on every
+    // machine.
+    let config = match args.config.as_deref() {
+        Some(path) => {
+            kompressor_core::Config::load(Some(path)).map_err(|e| CliError::Usage(e.to_string()))?
+        }
+        None => kompressor_core::Config::default(),
+    };
     let options = EngineOptions {
         mode: args.mode,
         ..config.engine

@@ -189,6 +189,13 @@ diagrams: ## Re-render the charts at a uniform scale (each .drawio.png already h
 
 ##@ Release
 
+# Not the default goal: `.DEFAULT_GOAL := help` above keeps a bare `make`
+# printing the target list, which is what someone arriving at this repo wants.
+# The name is still `all` because that is the one every release script guesses.
+.PHONY: all
+all: ## Every binary and package this machine can build, into target/dist
+	./scripts/build/all.sh
+
 .PHONY: install
 install: release ## Install the binary under PREFIX (default /usr/local)
 	install -Dm755 $(RELEASE_BIN) $(DESTDIR)$(PREFIX)/bin/$(BIN)
@@ -208,11 +215,44 @@ deb: release ## Debian package (needs cargo-deb)
 	$(CARGO) deb -p kompressor-cli --no-build
 	@ls -1 target/debian/*.deb
 
+.PHONY: deb-static
+deb-static: static ## Debian package with no libc6 dependency (musl, needs cargo-deb)
+	@command -v cargo-deb >/dev/null || { echo "cargo-deb is not installed: cargo install cargo-deb"; exit 1; }
+	@mkdir -p target/static
+	cp -f target/$(STATIC_TARGET)/release/$(BIN) target/static/$(BIN)
+	@rm -rf target/debian-static
+	$(CARGO) deb -p kompressor-cli --variant musl --target $(STATIC_TARGET) --no-build \
+		-o target/debian-static
+	@# cargo-deb names the file after the package and version, and both are
+	@# deliberately the same as the glibc package's. That leaves the filename as
+	@# the only thing that can say which libc is inside, so it has to say it:
+	@# downloaded side by side the two are otherwise identical until someone
+	@# reads Depends, and the one that matters is the one you cannot install.
+	@f=$$(ls -1 target/debian-static/*.deb); \
+		mv "$$f" "$${f%_*}-static_$${f##*_}"
+	@ls -1 target/debian-static/*.deb
+	@dpkg-deb -f target/debian-static/*.deb Package Version Depends
+
 .PHONY: rpm
 rpm: release ## RPM package (needs cargo-generate-rpm)
 	@command -v cargo-generate-rpm >/dev/null || { echo "cargo-generate-rpm is not installed: cargo install cargo-generate-rpm"; exit 1; }
 	$(CARGO) generate-rpm -p crates/kompressor-cli
 	@ls -1 target/generate-rpm/*.rpm
+
+.PHONY: rpm-static
+rpm-static: static ## RPM with no glibc dependency (musl, needs cargo-generate-rpm)
+	@command -v cargo-generate-rpm >/dev/null || { echo "cargo-generate-rpm is not installed: cargo install cargo-generate-rpm"; exit 1; }
+	@mkdir -p target/static
+	cp -f target/$(STATIC_TARGET)/release/$(BIN) target/static/$(BIN)
+	@rm -rf target/generate-rpm-static && mkdir -p target/generate-rpm-static
+	$(CARGO) generate-rpm -p crates/kompressor-cli --variant musl \
+		--auto-req disabled -o target/generate-rpm-static
+	@# Same reasoning as deb-static: name and version match the glibc package
+	@# deliberately, so the filename is the only place the difference can show.
+	@f=$$(ls -1 target/generate-rpm-static/*.rpm); \
+		mv "$$f" "$$(echo "$$f" | sed 's/\.\([^.]*\.rpm\)$$/-static.\1/')"
+	@ls -1 target/generate-rpm-static/*.rpm
+	@rpm -qp --requires target/generate-rpm-static/*.rpm 2>/dev/null | grep -v '^rpmlib' || true
 
 .PHONY: macos-pkg-docker
 macos-pkg-docker: ## macOS .pkg built in a container, so the host needs only Docker

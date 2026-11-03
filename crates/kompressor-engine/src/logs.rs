@@ -7,11 +7,13 @@
 //! last `keep_tail_lines` lines are never folded at all: recent context is
 //! disproportionately load-bearing.
 //!
-//! Plain text folds only byte-identical lines (`normalize = false`), and that
-//! floor is not squeamishness. Normalizing a payload whose *identity is its
-//! numbers* deletes it: a directory of dated logs folded to one
-//! `<n>-<n>-<n>_api.log` and lost 20 of 25 distinct dates, and a disassembly
-//! folded to `<n>: <n> <n> …` is nothing an agent can read.
+//! Plain text folds only within a run of consecutive lines
+//! ([`Identity::AdjacentExact`], [`Identity::AdjacentValues`]), and that floor
+//! is not squeamishness. Folding a payload whose *identity is its numbers*, or
+//! whose order is its meaning, deletes it: a directory of dated logs folded to
+//! one `<n>-<n>-<n>_api.log` and lost 20 of 25 distinct dates, and a
+//! disassembly folded to `movss xmm10,… [×46 similar]` is nothing an agent can
+//! read.
 //!
 //! The mode shows through in two places only. A disabled [`RefCollector`]
 //! (aggressive, lossless) makes every marker come out plain, with no branch
@@ -82,6 +84,37 @@ pub enum Identity {
     /// Lines differing only in run-specific values: timestamps, uuids, hex
     /// runs, bare numbers.
     Values,
+    /// [`Values`], folded only within a run of consecutive lines, and only a
+    /// run of at least [`MIN_ADJACENT_RUN`] unless its lines are identical.
+    ///
+    /// What plain text gets. Folding a template wherever it recurs keeps the
+    /// first occurrence and pulls every later one up into it, which is right
+    /// for a progress stream and destroys anything whose *order* is the
+    /// content. Measured on an 89-task run: a disassembly came back as
+    /// `movss xmm10,DWORD PTR [rsp+0x90] [×46 similar ref:…]` — forty-six
+    /// instructions from across a function merged into one line — and the
+    /// agent, rather than fetching, paged the listing through `sed -n` in
+    /// forty-line slices: 40 steps where the uncompressed run took 12. The
+    /// nineteen tasks that saw such a fold took 17.5% more steps than the
+    /// uncompressed run; those where nothing was elided took 3.4% fewer. Most
+    /// of what the wide fold removed from the replay corpus was source the
+    /// detector did not recognise as such — an interpreter's opcode handlers,
+    /// Scheme, COBOL, R — which is code elision by another route.
+    ///
+    /// No scored sampling either: that is a log reading, and this is prose.
+    ///
+    /// [`Values`]: Identity::Values
+    AdjacentValues,
+    /// [`Exact`], folded only within a run of consecutive lines: the exact
+    /// reading that goes with [`AdjacentValues`]. A line repeated far apart —
+    /// the closing brace of every function, the same header in two
+    /// concatenated files — keeps every occurrence where it stood; on a real
+    /// `cat a.c b.c` the global reading pulled the second file's lines into the
+    /// first and left `} [×17]`.
+    ///
+    /// [`Exact`]: Identity::Exact
+    /// [`AdjacentValues`]: Identity::AdjacentValues
+    AdjacentExact,
     /// Also lines differing only in a *name* — a package, a path, an artefact.
     ///
     /// Reserved for build output, where that is the whole shape of the payload:
@@ -105,6 +138,12 @@ pub enum Identity {
 static NAMED_TOKEN: Lazy<Regex> = Lazy::new(|| Regex::new(r"[^\s]*[./:_+~-][^\s]*").unwrap());
 /// Everything the value pass substitutes, so a name test can ignore it.
 static PLACEHOLDER: Lazy<Regex> = Lazy::new(|| Regex::new(r"<(?:ts|uuid|hex|n)>").unwrap());
+
+/// The shortest run of consecutive same-template lines [`Identity::AdjacentValues`]
+/// folds when they are not byte-identical. Two or three similar lines in a row
+/// are what code and instruction streams look like; a progress or retry stream
+/// repeats far longer than that.
+pub const MIN_ADJACENT_RUN: usize = 4;
 
 /// The identity of a line: what is left once its run-specific values are gone.
 fn template(line: &str, identity: Identity) -> String {
@@ -309,7 +348,11 @@ fn fold(
     refs: &mut RefCollector,
     echoed: usize,
 ) -> Option<String> {
-    if identity == Identity::Exact || lines.len() < 50 {
+    if matches!(
+        identity,
+        Identity::Exact | Identity::AdjacentExact | Identity::AdjacentValues
+    ) || lines.len() < 50
+    {
         return fold_templates(lines, opts, identity, refs, echoed);
     }
     let mark = refs.mark();
@@ -404,6 +447,11 @@ fn fold_templates(
     // its occurrences back **where they were**: `out` holds only the first of
     // each, so rebuilding from it alone would move the others up to join it.
     let mut slot_of: Vec<Option<usize>> = Vec::with_capacity(body.len());
+    let adjacent = matches!(identity, Identity::AdjacentValues | Identity::AdjacentExact);
+    // The template of the line before, under `AdjacentValues`: a line that
+    // does not continue its run starts a new one, and nothing earlier can be
+    // joined again.
+    let mut previous: Option<String> = None;
     for &line in body {
         if SECTION.is_match(line) {
             // A separator starts a new document: fold within one, never across.
@@ -415,6 +463,7 @@ fn fold_templates(
             // two as something else and its total came out 1336.00 short. A
             // count says how often a line occurred, never in which document.
             index.clear();
+            previous = None;
             slot_of.push(Some(out.len()));
             out.push(line);
             counts.push(1);
@@ -432,6 +481,7 @@ fn fold_templates(
             // and twelve compiler diagnostics collapsed into one — but value
             // folding could reach it too, with two handles differing only in a
             // digit. Excluded once, here, for both.
+            previous = None;
             slot_of.push(Some(out.len()));
             out.push(line);
             counts.push(1);
@@ -452,9 +502,17 @@ fn fold_templates(
             continue;
         }
         let key = match identity {
-            Identity::Exact => Cow::Borrowed(line),
-            Identity::Values | Identity::ValuesAndNames => Cow::Owned(template(line, identity)),
+            Identity::Exact | Identity::AdjacentExact => Cow::Borrowed(line),
+            Identity::Values | Identity::AdjacentValues | Identity::ValuesAndNames => {
+                Cow::Owned(template(line, identity))
+            }
         };
+        if adjacent {
+            if previous.as_deref() != Some(key.as_ref()) {
+                index.clear();
+            }
+            previous = Some(key.to_string());
+        }
         match index.entry(key) {
             Entry::Vacant(slot) => {
                 slot.insert(out.len());
@@ -508,12 +566,15 @@ fn fold_templates(
         .zip(counts.iter())
         .zip(members.iter())
         .map(|((line, &count), member)| {
-            if count > 1 {
+            let short_run =
+                adjacent && count < MIN_ADJACENT_RUN && member.iter().any(|other| other != line);
+            if count > 1 && !short_run {
                 fold_suffix(
                     line,
                     &member[1..],
                     refs,
                     opts.fold_handles_identical_repeats,
+                    opts.fold_marks_variants,
                 )
             } else {
                 None
@@ -860,7 +921,13 @@ mod tests {
             Identity::Values,
         )
         .expect("folds");
-        assert!(recovered.contains("[×3 ref:k_"), "got {recovered:?}");
+        // ...and so the marker says `similar`, not a bare repeat: the three
+        // timestamps differ, and a model told they repeated has no reason to
+        // reach for the only copy of them.
+        assert!(
+            recovered.contains("[×3 similar ref:k_"),
+            "got {recovered:?}"
+        );
         assert_eq!(refs.len(), 1, "one fragment for the 2nd..Nth occurrences");
         assert_eq!(
             refs.pairs()[0].1,
@@ -1683,5 +1750,98 @@ mod tests {
                 "{line:?} is deliberately not error vocabulary"
             );
         }
+    }
+
+    #[test]
+    fn the_adjacent_reading_folds_a_run_and_nothing_across_it() {
+        let mut lines = vec!["fetching shards".to_string()];
+        for shard in 0..12 {
+            lines.push(format!(
+                "shard {shard} of 12 downloaded in {}ms",
+                100 + shard
+            ));
+        }
+        // the same template again, far from its first run: the second run
+        // folds on its own and does not join the first
+        lines.push("verifying checksums".to_string());
+        for shard in 0..6 {
+            lines.push(format!(
+                "shard {shard} of 12 downloaded in {}ms",
+                900 + shard
+            ));
+        }
+        lines.push("done".to_string());
+        let content = lines.join("\n");
+        let mut refs = recoverable();
+        let out = crush_log(
+            &content,
+            &options(Mode::Recoverable, 0),
+            &ctx(),
+            &mut refs,
+            Identity::AdjacentValues,
+        )
+        .expect("a run of twelve folds");
+        let folded: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            folded.len(),
+            5,
+            "two runs, each folded where it stood: {out}"
+        );
+        assert!(folded[1].starts_with("shard 0 of 12 downloaded in 100ms [×12"));
+        assert_eq!(folded[2], "verifying checksums");
+        assert!(folded[3].starts_with("shard 0 of 12 downloaded in 900ms [×6"));
+        assert_no_orphan_refs(&out, &refs);
+    }
+
+    #[test]
+    fn the_adjacent_reading_keeps_a_short_run_of_similar_lines() {
+        // Three similar lines in a row are what code looks like:
+        // `this.registers[rd] = …` three times over is three statements.
+        let content = "add(rs, rt, rd) {\n\
+                       this.registers[1] = this.registers[2] + this.registers[3];\n\
+                       this.registers[4] = this.registers[5] + this.registers[6];\n\
+                       this.registers[7] = this.registers[8] + this.registers[9];\n\
+                       }\n";
+        let mut refs = recoverable();
+        assert_eq!(
+            crush_log(
+                content,
+                &options(Mode::Recoverable, 0),
+                &ctx(),
+                &mut refs,
+                Identity::AdjacentValues,
+            ),
+            None
+        );
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn the_adjacent_exact_reading_keeps_a_line_repeated_far_apart() {
+        let content = "int left(int x) {\n    return x >> 16;\n}\n\
+                       int right(int x) {\n    return x & 0xffff;\n}\n\
+                       int both(int x) {\n    return left(x) + right(x);\n}\n";
+        let mut refs = recoverable();
+        assert_eq!(
+            crush_log(
+                content,
+                &options(Mode::Recoverable, 0),
+                &ctx(),
+                &mut refs,
+                Identity::AdjacentExact,
+            ),
+            None,
+            "every closing brace stays where it closes"
+        );
+        let repeated = "build ok\nretry\nretry\nretry\nbuild ok\n";
+        let out = crush_log(
+            repeated,
+            &options(Mode::Recoverable, 0),
+            &ctx(),
+            &mut refs,
+            Identity::AdjacentExact,
+        )
+        .expect("a run of identical lines still folds");
+        assert_eq!(out, "build ok\nretry [×3]\nbuild ok");
     }
 }

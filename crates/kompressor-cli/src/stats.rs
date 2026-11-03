@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use kompressor_core::Config;
-use kompressor_stats::{Bucket, StatsReader};
+use kompressor_stats::{Bucket, BucketRow, RetrievalSummary, StatsReader, Summary, TypeCoverage};
 use serde_json::json;
 
 use crate::compress::print_json;
@@ -45,6 +45,200 @@ pub struct StatsArgs {
     pub json: bool,
 }
 
+/// Open the statistics database this machine has, or say precisely why not.
+///
+/// The two failures read very differently to someone holding a config that
+/// clearly names the file, and used to read the same.
+fn open_local(path: &std::path::Path) -> Result<StatsReader, CliError> {
+    if !path.exists() {
+        return Err(CliError::Runtime(format!(
+            "{}: no statistics database. Nothing has recorded yet, or --stats points elsewhere.",
+            path.display()
+        )));
+    }
+    let reader = StatsReader::open(path).map_err(|e| unreadable(path, &e.to_string()))?;
+    // Opening is not proof of reading. SQLite defers the `-shm` mapping a WAL
+    // database needs until the first query, so a reader without write access to
+    // the directory opens happily and fails later with "attempt to write a
+    // readonly database" — too late to choose another source, and attached to
+    // whichever report the caller happened to ask for. One cheap query up front
+    // moves that failure to where it can still be answered.
+    reader
+        .store("")
+        .map_err(|e| unreadable(path, &e.to_string()))?;
+    Ok(reader)
+}
+
+/// The file is there and cannot be read.
+fn unreadable(path: &std::path::Path, because: &str) -> CliError {
+    CliError::Runtime(format!(
+        "{}: {because}. The file exists; on a packaged install it belongs to the \
+         service user and is in WAL mode, where even a read-only connection writes \
+         `-shm`, so another user is refused. Ask the running service instead, or \
+         re-run as the owner.",
+        path.display()
+    ))
+}
+
+/// Where the running service answers, if this configuration starts one.
+///
+/// The API is nested under `/v1`, which is worth knowing: a request to
+/// `/stats/summary` on a listener that also serves the proxy reaches the proxy
+/// catch-all and comes back as "no upstream is configured for this path".
+fn api_base(config: &Config) -> Option<String> {
+    let listen = if !config.server.api_listen.is_empty() {
+        config.server.api_listen.clone()
+    } else {
+        config.server.listen.clone()
+    };
+    (!listen.is_empty()).then(|| format!("http://{listen}/v1"))
+}
+
+/// `{"bucket": "hour", "rows": [...]}`, as the histogram endpoint sends it.
+#[derive(serde::Deserialize)]
+struct Envelope<T> {
+    rows: Vec<T>,
+}
+
+/// `{"types": [...]}`, as the coverage endpoint sends it.
+#[derive(serde::Deserialize)]
+struct Types {
+    types: Vec<TypeCoverage>,
+}
+
+/// A report comes from the file when it can be read, and from the service that
+/// owns it when it cannot.
+enum Source {
+    Local(StatsReader),
+    Remote(String),
+}
+
+impl Source {
+    fn fetch<T: serde::de::DeserializeOwned>(
+        base: &str,
+        endpoint: &str,
+        query: &[(&str, String)],
+    ) -> Result<T, CliError> {
+        // The query is appended by hand: `RequestBuilder::query` needs a reqwest
+        // feature this workspace does not enable, and every value here is a
+        // number or a handle, so the encoding is not the interesting part.
+        let mut url = format!("{base}/stats/{endpoint}");
+        for (i, (key, value)) in query.iter().enumerate() {
+            url.push(if i == 0 { '?' } else { '&' });
+            url.push_str(key);
+            url.push('=');
+            url.push_str(value);
+        }
+        let what = format!("asking {url}");
+        let body = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| CliError::runtime("starting a runtime", e))?
+            .block_on(async {
+                let client = reqwest::Client::new();
+                let response = client.get(&url).send().await?;
+                let status = response.status();
+                let text = response.text().await?;
+                Ok::<_, reqwest::Error>((status, text))
+            })
+            .map_err(|e| CliError::runtime(&what, e))?;
+        let (status, text) = body;
+        if !status.is_success() {
+            return Err(CliError::Runtime(format!(
+                "{what}: HTTP {status}. {}",
+                text.trim()
+            )));
+        }
+        serde_json::from_str(&text).map_err(|e| CliError::runtime(&what, e))
+    }
+
+    fn window(tenant: &str, from: i64, to: i64) -> Vec<(&'static str, String)> {
+        let mut q = vec![("from", from.to_string()), ("to", to.to_string())];
+        if !tenant.is_empty() {
+            q.push(("tenant", tenant.to_string()));
+        }
+        q
+    }
+
+    fn summary(&self, tenant: &str, from: i64, to: i64) -> Result<Summary, CliError> {
+        match self {
+            Source::Local(r) => r
+                .summary(tenant, from, to)
+                .map_err(|e| CliError::runtime("reading the summary", e)),
+            Source::Remote(base) => Self::fetch(base, "summary", &Self::window(tenant, from, to)),
+        }
+    }
+
+    fn histogram(
+        &self,
+        tenant: &str,
+        from: i64,
+        to: i64,
+        bucket: Bucket,
+    ) -> Result<Vec<BucketRow>, CliError> {
+        match self {
+            Source::Local(r) => r
+                .histogram(tenant, from, to, bucket)
+                .map_err(|e| CliError::runtime("reading the histogram", e)),
+            Source::Remote(base) => {
+                let mut q = Self::window(tenant, from, to);
+                q.push((
+                    "bucket",
+                    match bucket {
+                        Bucket::Hour => "hour",
+                        Bucket::Day => "day",
+                    }
+                    .to_string(),
+                ));
+                // `{"bucket": …, "rows": [...]}` from the endpoint, bare rows
+                // from the reader. Unwrap so both feed the same printing.
+                Self::fetch::<Envelope<BucketRow>>(base, "histogram", &q).map(|e| e.rows)
+            }
+        }
+    }
+
+    fn by_type(&self, tenant: &str, from: i64, to: i64) -> Result<Vec<TypeCoverage>, CliError> {
+        match self {
+            Source::Local(r) => r
+                .by_type(tenant, from, to)
+                .map_err(|e| CliError::runtime("reading type coverage", e)),
+            // The endpoint wraps its rows in `{"types": [...]}`; the reader
+            // returns the rows. Unwrap so both hand the printing the same thing.
+            Source::Remote(base) => {
+                Self::fetch::<Types>(base, "by_type", &Self::window(tenant, from, to))
+                    .map(|t| t.types)
+            }
+        }
+    }
+
+    fn retrievals(&self, tenant: &str, from: i64, to: i64) -> Result<RetrievalSummary, CliError> {
+        match self {
+            Source::Local(r) => r
+                .retrievals(tenant, from, to)
+                .map_err(|e| CliError::runtime("reading retrievals", e)),
+            Source::Remote(base) => {
+                Self::fetch(base, "retrievals", &Self::window(tenant, from, to))
+            }
+        }
+    }
+
+    /// Reports the service does not expose over HTTP.
+    ///
+    /// `by-provider` and the HTML page have no endpoint, and the local file is
+    /// the only source for them. Saying which report is unavailable beats a
+    /// generic permission error that does not mention that the others work.
+    fn only_local(&self, report: &str) -> Result<&StatsReader, CliError> {
+        match self {
+            Source::Local(r) => Ok(r),
+            Source::Remote(base) => Err(CliError::Runtime(format!(
+                "{report} is not served over HTTP, and the local database could not be \
+                 read. Run it as the user that owns the file, or use a report the \
+                 service does expose: summary, histogram, by-type, retrievals ({base})."
+            ))),
+        }
+    }
+}
+
 /// Run one statistics report.
 pub fn stats(args: StatsArgs) -> CliResult {
     // The window is parsed before anything is opened, so a misspelled `--from`
@@ -65,30 +259,57 @@ pub fn stats(args: StatsArgs) -> CliResult {
     // command report "no statistics database" against `./data/stats.db` while
     // the running server wrote the path its config named — the one case where
     // this is asked, since a default-configured server is answered by either.
-    let path = match args.stats_path {
-        Some(path) => path,
+    //
+    // The configuration is kept, not just its stats path: when the file cannot
+    // be read, `server.listen` is what makes the running service reachable
+    // instead.
+    let (path, listen) = match args.stats_path {
+        // An explicitly named file is taken literally. Falling back to a
+        // service for a path the caller chose would answer a different question
+        // than the one asked.
+        Some(path) => (path, None),
         None => {
-            Config::load(args.config.as_deref())
-                .map_err(|e| CliError::Usage(e.to_string()))?
-                .stats
-                .path
+            // A packaged install puts its configuration in /etc, which is not on
+            // the loader's search path. Without this, `stats` on such a machine
+            // finds nothing, falls back to built-in defaults, and reports "no
+            // statistics database" against a per-user path the service has
+            // never written to — while the file it was told about fills up a
+            // directory away.
+            //
+            // Only this command looks there, and only when nothing nearer was
+            // found. Putting it in `Config::discover` instead made six hermetic
+            // CLI tests change their output the moment that file existed.
+            let explicit = args.config.clone().or_else(|| {
+                Config::discover()
+                    .is_none()
+                    .then(Config::system_path)
+                    .flatten()
+            });
+            let config =
+                Config::load(explicit.as_deref()).map_err(|e| CliError::Usage(e.to_string()))?;
+            let listen = api_base(&config);
+            (config.stats.path, listen)
         }
     };
-    if !path.exists() {
-        return Err(CliError::Runtime(format!(
-            "{}: no statistics database. Nothing has recorded yet, or --stats points elsewhere.",
-            path.display()
-        )));
-    }
-    let reader = StatsReader::open(&path)
-        .map_err(|e| CliError::runtime(&format!("opening {}", path.display()), e))?;
+
+    let source = match open_local(&path) {
+        Ok(reader) => Source::Local(reader),
+        Err(local) => match listen {
+            // A packaged install puts the database under the service's state
+            // directory, owned by the service user. It is WAL, and a read-only
+            // SQLite connection still has to touch `-shm`, so another user is
+            // refused with "attempt to write a readonly database" even when the
+            // file itself is world-readable. The process that owns it serves the
+            // same reports over HTTP; ask that instead of explaining chmod.
+            Some(base) => Source::Remote(base),
+            None => return Err(local),
+        },
+    };
     let tenant = args.tenant.as_str();
 
     match args.report {
         Report::Summary => {
-            let summary = reader
-                .summary(tenant, from, to)
-                .map_err(|e| CliError::runtime("reading the summary", e))?;
+            let summary = source.summary(tenant, from, to)?;
             if args.json {
                 print_json(&summary)?;
             } else {
@@ -126,7 +347,7 @@ pub fn stats(args: StatsArgs) -> CliResult {
             }
         }
         Report::Histogram { bucket } => {
-            let rows = reader
+            let rows = source
                 .histogram(tenant, from, to, bucket)
                 .map_err(|e| CliError::runtime("reading the histogram", e))?;
             if args.json {
@@ -149,7 +370,7 @@ pub fn stats(args: StatsArgs) -> CliResult {
             }
         }
         Report::ByType => {
-            let rows = reader
+            let rows = source
                 .by_type(tenant, from, to)
                 .map_err(|e| CliError::runtime("reading type coverage", e))?;
             if args.json {
@@ -167,7 +388,8 @@ pub fn stats(args: StatsArgs) -> CliResult {
             }
         }
         Report::ByProvider => {
-            let rows = reader
+            let rows = source
+                .only_local("by-provider")?
                 .by_provider(tenant, from, to)
                 .map_err(|e| CliError::runtime("reading provider coverage", e))?;
             if args.json {
@@ -196,7 +418,7 @@ pub fn stats(args: StatsArgs) -> CliResult {
             }
         }
         Report::Retrievals => {
-            let summary = reader
+            let summary = source
                 .retrievals(tenant, from, to)
                 .map_err(|e| CliError::runtime("reading retrievals", e))?;
             if args.json {
@@ -245,7 +467,8 @@ pub fn stats(args: StatsArgs) -> CliResult {
             }
         }
         Report::Request { id } => {
-            let economy = reader
+            let economy = source
+                .only_local("request")?
                 .request(tenant, &id)
                 .map_err(|e| CliError::runtime("reading the request", e))?;
             match economy {
@@ -296,13 +519,20 @@ pub fn stats(args: StatsArgs) -> CliResult {
                         .into(),
                 ));
             }
-            let data =
-                crate::report::ReportData::gather(&reader, tenant, from, to, bucket, now_ms())
-                    .map_err(|e| CliError::runtime("building the report", e))?;
+            let data = crate::report::ReportData::gather(
+                source.only_local("the HTML report")?,
+                tenant,
+                from,
+                to,
+                bucket,
+                now_ms(),
+            )
+            .map_err(|e| CliError::runtime("building the report", e))?;
             print!("{}", crate::report::render(&data));
         }
         Report::Store => {
-            let sample = reader
+            let sample = source
+                .only_local("store")?
                 .store(tenant)
                 .map_err(|e| CliError::runtime("reading the store sample", e))?;
             match sample {

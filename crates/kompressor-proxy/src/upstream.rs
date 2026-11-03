@@ -131,6 +131,15 @@ impl Outbound {
         }
         let began = Instant::now();
         let result = request.send().await;
+        if let Err(error) = &result {
+            // Display alone drops the nested transport cause. Keep phase and
+            // classification without logging credentials, payloads or URL queries.
+            tracing::warn!(
+                phase = "send", connect = error.is_connect(), timeout = error.is_timeout(),
+                request = error.is_request(), cause = ?std::error::Error::source(error),
+                "upstream request failed"
+            );
+        }
         // Recorded whether or not the provider answered: a request that failed
         // after nine seconds waited nine seconds, and dropping that would make
         // the failures look instant.

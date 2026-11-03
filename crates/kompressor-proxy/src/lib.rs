@@ -64,9 +64,12 @@
 pub mod authmode;
 mod bodycapture;
 pub mod bodycodec;
+mod cachettl;
 pub mod failopen;
 mod handler;
 pub mod headers;
+pub mod intercept;
+pub mod keepwarm;
 pub mod mode;
 mod nonstream;
 mod piggyback;
@@ -101,6 +104,10 @@ pub struct ProxyState {
     /// Shared across requests, which is the whole point: one request's usage is
     /// the next one's evidence.
     pub(crate) prefixes: Arc<prefixcache::PrefixTracker>,
+    /// The keep-warm timers, one per conversation waiting on a tool result.
+    /// Shared for the reason `prefixes` is: one request arms what the next
+    /// request in the conversation cancels.
+    pub(crate) keepwarm: Arc<keepwarm::KeepWarm>,
 }
 
 impl ProxyState {
@@ -120,6 +127,7 @@ impl ProxyState {
             client,
             failopen: Arc::new(FailOpen::default()),
             prefixes: Arc::new(prefixcache::PrefixTracker::new(ttl)),
+            keepwarm: Arc::new(keepwarm::KeepWarm::default()),
         }
     }
 
@@ -132,6 +140,11 @@ impl ProxyState {
     /// Exposed on the same terms as `failopen`: for `/metrics` and for tests.
     pub fn prefixes(&self) -> Arc<prefixcache::PrefixTracker> {
         self.prefixes.clone()
+    }
+
+    /// The keep-warm timers. Exposed on the same terms as `prefixes`.
+    pub fn keepwarm(&self) -> Arc<keepwarm::KeepWarm> {
+        self.keepwarm.clone()
     }
 
     /// The router that serves every proxied path.

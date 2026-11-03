@@ -48,6 +48,12 @@ venv/
 .pytest_cache/
 *.egg-info/
 
+# Claude Desktop compression check: per-run state. The planted token must stay
+# unseen by the session under test, and start-ms only scopes one run's stats.
+# Experiment directories from prepare.py live outside the checkout (/tmp).
+/scripts/claude-desktop-experiment/kd-check/.check/expected-token.txt
+/scripts/claude-desktop-experiment/kd-check/.check/start-ms
+
 # Agent tooling state. Serena writes a per-project symbol cache and config here
 # the first time it activates on the repo; its own .gitignore covers only
 # `cache/` and `project.local.yml`, so `project.yml` would otherwise be
@@ -64,3 +70,10 @@ venv/
 
 # Review output, not part of the project
 findings.md
+
+# Local experiments and working notes. The Claude Desktop experiment kit and
+# the dated investigation write-ups under docs/investigations/ reference local
+# run directories and are not part of the published documentation; nothing
+# committed links to either.
+scripts/claude-desktop-experiment/
+docs/investigations/

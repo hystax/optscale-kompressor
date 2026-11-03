@@ -34,8 +34,9 @@ leaves regardless of how it phrases the rest:
 # What it compares
 
 `tools`, `instructions`/`system` and the conversation separately, because they
-fail for different reasons and the same total hides which. All three identical
-means the provider dropped the prefix and this proxy is not at fault.
+fail for different reasons and the same total hides which. Unchanged captured prefixes suggest a provider/cache cause but do not prove it.
+Ingress is compared before assigning changed content to the proxy; metadata-only
+changes remain unresolved rather than being called compression damage.
 """
 
 from __future__ import annotations
@@ -113,6 +114,78 @@ def direction(before: str, after: str) -> str:
     return f"neither (markers {was} -> {now}); the bytes changed some other way"
 
 
+def normalize_content(value):
+    """Content comparison only; raw differences remain visible in the report.
+
+    Cache metadata and string/text-block representation can affect caching,
+    but neither is evidence that the compressor changed historical content.
+    """
+    if isinstance(value, list):
+        return [normalize_content(item) for item in value]
+    if isinstance(value, dict):
+        result = {key: (item if key in ("input", "arguments") else normalize_content(item))
+                  for key, item in value.items() if key != "cache_control"}
+        if isinstance(result.get("content"), str):
+            result["content"] = [{"type": "text", "text": result["content"]}]
+        return result
+    return value
+
+
+def classify_change(before, after, incoming_before=None, incoming_after=None):
+    """Attribute changed content only when ingress/egress establishes ownership."""
+    a, b = json.loads(before), json.loads(after)
+    ia = json.loads(incoming_before) if incoming_before is not None else None
+    ib = json.loads(incoming_after) if incoming_after is not None else None
+    if split_tools(a.get("tools"))[0] != split_tools(b.get("tools"))[0]:
+        return "PROXY", "retrieve tool changed"
+
+    changes = []
+    missing = object()
+    def compare(old, new, old_in, new_in, label):
+        if old == new:
+            return
+        if normalize_content(old) == normalize_content(new):
+            changes.append(("METADATA", label))
+        elif ia is None or ib is None or old_in is missing or new_in is missing:
+            changes.append(("UNKNOWN", label + " (missing ingress)"))
+        elif normalize_content(old_in) == normalize_content(new_in):
+            changes.append(("PROXY", label))
+        # Normalized, so a breakpoint the proxy moved does not hide that the
+        # client is the one that changed the content.
+        elif (normalize_content(old) == normalize_content(old_in)
+              and normalize_content(new) == normalize_content(new_in)):
+            changes.append(("CLIENT", label))
+        else:
+            changes.append(("UNKNOWN", label + " (client and proxy transformations)"))
+
+    for key in ("system", "instructions"):
+        compare(a.get(key), b.get(key), ia.get(key) if ia else None,
+                ib.get(key) if ib else None, key)
+    compare(split_tools(a.get("tools"))[1], split_tools(b.get("tools"))[1],
+            split_tools(ia.get("tools"))[1] if ia else None,
+            split_tools(ib.get("tools"))[1] if ib else None, "agent tools")
+    am = a.get("input") or a.get("messages") or []
+    bm = b.get("input") or b.get("messages") or []
+    aim = (ia.get("input") or ia.get("messages") or []) if ia else []
+    bim = (ib.get("input") or ib.get("messages") or []) if ib else []
+    # Responses can carry string input rather than message arrays.
+    if not isinstance(am, list) or not isinstance(bm, list):
+        compare(am, bm, aim, bim, "input")
+    else:
+        if len(bm) < len(am):
+            changes.append(("UNKNOWN", "history shortened"))
+        for index, (old, new) in enumerate(zip(am, bm)):
+            compare(old, new,
+                    aim[index] if isinstance(aim, list) and index < len(aim) else missing,
+                    bim[index] if isinstance(bim, list) and index < len(bim) else missing,
+                    f"message {index}")
+    # Do not let a client or metadata change hide a genuine proxy rewrite.
+    for owner in ("PROXY", "UNKNOWN", "CLIENT", "METADATA"):
+        if any(kind == owner for kind, _ in changes):
+            return owner, "; ".join(f"{kind}: {label}" for kind, label in changes)
+    return "PROVIDER_CANDIDATE", "captured prefix unchanged; provider/cache cause unproven"
+
+
 def analyse(run: Path, module) -> int:
     stats, bodies = run / "kompressor-stats.db", run / "kompressor-bodies.jsonl"
     if not stats.exists() or not bodies.exists():
@@ -134,6 +207,7 @@ def analyse(run: Path, module) -> int:
     order = {r["request_id"]: n + 1 for n, r in enumerate(rows)}
 
     out = {}
+    incoming = {}
     for line in open(bodies, encoding="utf-8", errors="replace"):
         try:
             record = json.loads(line)
@@ -142,7 +216,11 @@ def analyse(run: Path, module) -> int:
         # The same file carries the relay's per-frame decisions, which have a
         # `dir` and no `body`.
         if "body" in record and record.get("dir") == "proxy->upstream":
-            out[record["request_id"]] = record["body"]
+            # First round matches the client request's compression decision;
+            # hidden retrieval rounds must not overwrite this capture.
+            out.setdefault(record["request_id"], record["body"])
+        elif "body" in record and record.get("dir") == "client->proxy":
+            incoming.setdefault(record["request_id"], record["body"])
 
     fetched = {}
     events = run / "retrieval_events.json"
@@ -165,15 +243,9 @@ def analyse(run: Path, module) -> int:
             f"\n  {loss['was']:,} -> {loss['now']:,}  lost {loss['lost']:,}"
             f"  gap {loss['gap_ms'] / 1000:.1f}s"
         )
-        before = after = None
-        for row in rows:
-            if row["conversation"] != loss["conversation"] or row["retrieve_rounds"]:
-                continue
-            if row["cache_read_tokens"] == loss["was"]:
-                before = row
-            elif before and row["cache_read_tokens"] == loss["now"] and row["time_ms"] > before["time_ms"]:
-                after = row
-                break
+        by_id = {row["request_id"]: row for row in rows}
+        before = by_id.get(loss.get("before_request_id"))
+        after = by_id.get(loss.get("request_id"))
         if not (before and after and before["request_id"] in out and after["request_id"] in out):
             print("    no body pair captured for this turn; cannot say")
             continue
@@ -191,23 +263,20 @@ def analyse(run: Path, module) -> int:
                 break
         print(f"    messages {len(a_msgs)} -> {len(b_msgs)}, first differing index: {differing}")
 
-        if a_ours == b_ours and a_instr == b_instr and differing is None:
-            # The agent's own tools moving breaks the cache just as surely, and
-            # is just as surely not ours. Named rather than folded into
-            # PROVIDER, because the cost is real and someone comparing two runs
-            # needs to know the client did it.
-            if a_theirs != b_theirs:
-                n_a = len(json.loads(a_theirs)); n_b = len(json.loads(b_theirs))
-                print(f"    -> CLIENT: the agent rewrote its own tools "
-                      f"({n_a} -> {n_b}); ours is unchanged")
-            else:
-                print("    -> PROVIDER: nothing of ours changed; the prefix only grew")
+        owner, reason = classify_change(
+            out[before["request_id"]], out[after["request_id"]],
+            incoming.get(before["request_id"]), incoming.get(after["request_id"]))
+        print(f"    -> {owner}: {reason}")
+        if owner == "METADATA":
+            print("       content unchanged after normalization; metadata/representation "
+                  "and expiry remain candidates, not a proven proxy content rewrite")
+        if owner != "PROXY":
             continue
-
         ours += 1
-        print("    -> OURS")
+        # Show the content rewrite, not an earlier moving cache breakpoint.
+        differing = next((i for i, (old, new) in enumerate(zip(a_msgs, b_msgs))
+                          if normalize_content(old) != normalize_content(new)), None)
         if differing is None:
-            print("       the conversation is a clean prefix; our tool or the instructions moved")
             continue
         was, now = text_of(a_msgs[differing]), text_of(b_msgs[differing])
         print(f"       message {differing}: {len(was):,} -> {len(now):,} chars")
@@ -227,7 +296,7 @@ def main() -> int:
     module = bench()
     ours = sum(analyse(run, module) for run in args.runs)
     if ours:
-        print(f"\n{ours} loss(es) were ours. A demotion is always a bug; a promotion is a priced decision.")
+        print(f"\n{ours} loss(es) contain proxy-owned changes. A demotion is always a bug; a promotion is a priced decision.")
     return 1 if ours else 0
 
 

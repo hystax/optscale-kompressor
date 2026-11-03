@@ -68,6 +68,14 @@ mod imp {
         language: Option<Language>,
     ) -> Option<String> {
         let language = language?;
+        // The switch is honoured here, not only where whole payloads are
+        // routed: the mixed segmenter, the lead-in and multi-file retries all
+        // reach this function directly, and with the check only in routing a
+        // run configured without code elision still elided the bodies inside
+        // every `ls && cat` and fenced block.
+        if !opts.enable_code_aware {
+            return None;
+        }
         // Eliding a function body is not reversible, so this compressor has no
         // business running in `lossless` — the one mode whose promise is that
         // nothing is dropped. With `strict_lossless` off the check is skipped
@@ -483,6 +491,10 @@ mod imp {
             }
             let indent = " ".repeat(column + 4);
             let fragment = join_lines(&lines[start..end]);
+            if refs.code_is_preserved(&fragment) {
+                last_end = Some(end);
+                continue;
+            }
             let marker = code_marker(&name, end - start, &fragment, refs, "#");
             // A filler keeps the definition a definition: a body of nothing but
             // a comment is a syntax error, and the re-parse below would then
@@ -650,6 +662,9 @@ mod imp {
                 continue;
             }
             let hidden = &block[open + 1..close];
+            if refs.code_is_preserved(hidden) {
+                continue;
+            }
             let count = hidden.matches('\n').count() + 1;
             if count <= opts.code_max_body_lines {
                 continue;

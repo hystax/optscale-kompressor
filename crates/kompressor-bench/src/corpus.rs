@@ -60,7 +60,7 @@ pub enum BenchError {
 /// drift apart: growing the fixture without re-recording the baseline against it
 /// fails here rather than quietly comparing against a floor for a corpus that no
 /// longer exists.
-pub const COMMITTED_CORPUS_PAYLOADS: usize = 359;
+pub const COMMITTED_CORPUS_PAYLOADS: usize = 894;
 
 /// One payload as the corpus recorded it.
 #[derive(Clone, Debug)]

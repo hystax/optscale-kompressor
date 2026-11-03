@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Reproduce the codex + kompressor + ChatGPT-subscription compression test.
 #
-#   scripts/kompressor-codex-sweep/run.sh all        # everything: reset, fixtures, sweep, report
-#   scripts/kompressor-codex-sweep/run.sh fixtures   # build the payload tree only (free)
-#   scripts/kompressor-codex-sweep/run.sh sweep      # the paid part: one codex session
-#   scripts/kompressor-codex-sweep/run.sh report     # stats + HTML report + cost estimate
-#   scripts/kompressor-codex-sweep/run.sh analyse    # per-payload engine-direct breakdown (free)
-#   scripts/kompressor-codex-sweep/run.sh retrieval  # paid: does the model fetch back what was elided?
-#   scripts/kompressor-codex-sweep/run.sh bughunt    # paid: code compressor + retrieval, in eight languages
+#   scripts/kompressor-sweep/codex.sh all        # everything: reset, fixtures, sweep, report
+#   scripts/kompressor-sweep/codex.sh fixtures   # build the payload tree only (free)
+#   scripts/kompressor-sweep/codex.sh sweep      # the paid part: one codex session
+#   scripts/kompressor-sweep/codex.sh report     # stats + HTML report + cost estimate
+#   scripts/kompressor-sweep/codex.sh analyse    # per-payload engine-direct breakdown (free)
+#   scripts/kompressor-sweep/codex.sh retrieval  # paid: does the model fetch back what was elided?
+#   scripts/kompressor-sweep/codex.sh bughunt    # paid: code compressor + retrieval, in eight languages
 #
 # `sweep`, `retrieval` and `bughunt` spend ChatGPT-plan quota. Everything else is local.
 #
@@ -33,6 +33,11 @@
 #                           one silently, and the only record is a different
 #                           model name in the verdict.
 set -euo pipefail
+
+# Shared with `claude.sh`: where the payload builders live, and the checks
+# that decide whether a paid run proved anything.
+# shellcheck source=scripts/kompressor-sweep/common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
 KOMPRESSOR_OVERRIDDEN="${KOMPRESSOR:+yes}"
 KOMPRESSOR="${KOMPRESSOR:-$HOME/.local/bin/kompressor}"
@@ -261,7 +266,7 @@ write_default_config() {
   local dir; dir=$(dirname "$CONFIG")
   mkdir -p "$dir" "$(dirname "$REFS")" "$(dirname "$STATS")"
   cat > "$CONFIG" <<EOF
-# Written by kompressor-codex-sweep/run.sh because none existed.
+# Written by kompressor-sweep/codex.sh because none existed.
 # Yours to edit; this script will not overwrite it again.
 
 [server]
@@ -758,10 +763,10 @@ EOF
   say "what the sweep will send"
   local list; list=$(sed -n 's/^[0-9]*\. cat //p' "$PROMPT" | tr '\n' ' ')
   # shellcheck disable=SC2086
-  ( cd "$FIX" && python3 "$SELF_DIR/measure.py" \
+  ( cd "$FIX" && python3 "$SWEEP_LIB/measure.py" \
       "$KOMPRESSOR" "$CONFIG" "$WORK/fixture-languages.json" $list >/dev/null )
-  python3 "$SELF_DIR/bughunt-table.py" "$WORK/fixture-languages.json"
-  python3 "$SELF_DIR/bughunt-table.py" "$WORK/fixture-languages.json" --by-type
+  python3 "$SWEEP_LIB/bughunt-table.py" "$WORK/fixture-languages.json"
+  python3 "$SWEEP_LIB/bughunt-table.py" "$WORK/fixture-languages.json" --by-type
   echo
   echo "  plus: ls -la data/many, grep -rn TODO src, git diff — listing, search and diff,"
   echo "  which have no single file to measure here."
@@ -826,7 +831,7 @@ sweep() {
     verdict sweep INCONCLUSIVE "reason=no session file newer than the stage start"
     return 1
   fi
-  counts=$(python3 "$SELF_DIR/count.py" "$sess")
+  counts=$(python3 "$SWEEP_LIB/count.py" "$sess")
   set -- $counts
   echo "  tool results: $1 carrying $2 chars"
   # Bytes, not call count: under code mode the agent batches several commands
@@ -857,7 +862,7 @@ sweep() {
     return 1
   fi
   say "what the proxy did with it"
-  python3 "$SELF_DIR/runstats.py" "$STATS" "$started"
+  python3 "$SWEEP_LIB/runstats.py" "$STATS" "$started"
   echo "  elapsed         $(( ($(date +%s) - started_s) / 60 ))m $(( ($(date +%s) - started_s) % 60 ))s"
   echo "  transcript      $LOG"
 }
@@ -873,7 +878,7 @@ report() {
   echo; "$KOMPRESSOR" stats retrievals --config "$CONFIG"
 
   say "compression and retrieval, whole store"
-  python3 "$SELF_DIR/runstats.py" "$STATS" 0
+  python3 "$SWEEP_LIB/runstats.py" "$STATS" 0
 
   say "cost estimate"
   sqlite3 -header -csv "$STATS" "
@@ -1031,7 +1036,7 @@ retrieval() {
   local before
   before=$(date +%s%3N)
 
-  python3 "$SELF_DIR/ledger.py" "$dir" "$token"
+  python3 "$SWEEP_LIB/ledger.py" "$dir" "$token"
   # codex truncates a tool result at roughly 40 KB. The fixture is deliberately
   # larger than the token's offset and smaller than nothing in particular: what
   # matters is that the token survives the cut, which is asserted rather than
@@ -1339,7 +1344,7 @@ finish() {
   # they went. Regenerate at the end, with both verdicts and both tables in it —
   # one page that describes the whole run rather than its first two thirds.
   say "paid test results"
-  python3 "$SELF_DIR/verdict.py" "$VERDICTS" --text
+  python3 "$SWEEP_LIB/verdict.py" "$VERDICTS" --text
 
   say "final report"
   write_report
@@ -1363,7 +1368,7 @@ finish() {
 verdict() {
   # Every verdict carries the model and the client that produced it, appended
   # here rather than at each call site so none can be recorded without them.
-  python3 "$SELF_DIR/verdict.py" "$VERDICTS" "$@" \
+  python3 "$SWEEP_LIB/verdict.py" "$VERDICTS" "$@" \
     "model=$(codex_model)" "codex=$(codex_version)" || true
 }
 
@@ -1381,13 +1386,13 @@ write_report() {
     || "$KOMPRESSOR" stats report > "$html" 2>/dev/null \
     || { echo "  could not write $html"; return 1; }
   local pairs=""
-  [ -s "$VERDICTS" ] && pairs="$SELF_DIR/verdict.py $VERDICTS"
+  [ -s "$VERDICTS" ] && pairs="$SWEEP_LIB/verdict.py $VERDICTS"
   [ -s "$WORK/bughunt-languages.json" ] && \
-    pairs="$pairs | $SELF_DIR/bughunt-table.py $WORK/bughunt-languages.json --preset=bughunt"
+    pairs="$pairs | $SWEEP_LIB/bughunt-table.py $WORK/bughunt-languages.json --preset=bughunt"
   [ -s "$WORK/fixture-languages.json" ] && \
-    pairs="$pairs | $SELF_DIR/bughunt-table.py $WORK/fixture-languages.json --preset=fixtures"
+    pairs="$pairs | $SWEEP_LIB/bughunt-table.py $WORK/fixture-languages.json --preset=fixtures"
   # shellcheck disable=SC2086
-  [ -n "$pairs" ] && python3 "$SELF_DIR/bughunt-embed.py" "$html" --pairs ${pairs#| } >/dev/null
+  [ -n "$pairs" ] && python3 "$SWEEP_LIB/bughunt-embed.py" "$html" --pairs ${pairs#| } >/dev/null
   ls -la "$html"
 }
 
@@ -1492,7 +1497,7 @@ bughunt() {
   # transcript in here and the model read it, which handed over every line the
   # compressor had just elided.
   rm -rf "$dir"; mkdir -p "$dir"; rm -f "$log"
-  python3 "$SELF_DIR/bughunt.py" "$dir" >/dev/null
+  python3 "$SWEEP_LIB/bughunt.py" "$dir" >/dev/null
 
   # The shipped budget is three rounds, and a model that fetches one body per
   # round sees three of twelve before being refused — measured twice, both
@@ -1520,7 +1525,7 @@ bughunt() {
   # the premise was checked against, and a table that does not describe what
   # the model was actually given is worse than no table.
   local ok
-  ok=$(python3 "$SELF_DIR/bughunt-measure.py" \
+  ok=$(python3 "$SWEEP_LIB/bughunt-measure.py" \
          "$KOMPRESSOR" "$CONFIG" "$dir" "$langs")
   echo "  $ok language(s) ready"
   if [ "$ok" -lt 2 ]; then
@@ -1558,7 +1563,7 @@ PY
     return 1
   fi
   echo
-  python3 "$SELF_DIR/bughunt-table.py" "$langs"
+  python3 "$SWEEP_LIB/bughunt-table.py" "$langs"
 
   cat > "$prompt" <<'PROMPT_EOF'
 Each file in this directory defines twelve near-identical functions. Exactly
@@ -1776,8 +1781,8 @@ BATCH_EOF
   fi
 
   say "compression by language"
-  python3 "$SELF_DIR/bughunt-table.py" "$langs"
-  python3 "$SELF_DIR/bughunt-table.py" "$langs" --by-type
+  python3 "$SWEEP_LIB/bughunt-table.py" "$langs"
+  python3 "$SWEEP_LIB/bughunt-table.py" "$langs" --by-type
 
   say "html report"
   write_report

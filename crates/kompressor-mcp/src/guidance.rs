@@ -31,7 +31,16 @@ are the marker shapes it appears in:
       A clipped string. The handle holds the characters after the ellipsis.
 
   <line> [\u{d7}37 ref:k_GhI789]
-      A line that repeated. The handle holds the folded occurrences.
+      A line that repeated exactly. The handle holds the folded occurrences, \
+which are copies of the line shown.
+
+  <line> [\u{d7}37 similar ref:k_GhI789]
+      Thirty-seven lines that shared a shape; the one shown is the first. The \
+other thirty-six DIFFER from it and from each other, and the handle is the \
+only place they exist. Read this as an omission, not a repeat: if what \
+distinguished them matters \u{2014} an identifier, a path, a step number, a \
+quantity \u{2014} retrieve before answering. A bare [\u{d7}37] with no handle \
+is the exact-repeat case and needs nothing.
 
   [... 87 log lines omitted [ref:k_\u{2026}]; 3 ERROR, 9 WARN]
       Dropped log, search, diff, table, listing or config lines. The handle \

@@ -30,6 +30,15 @@ pub fn crush_listing(
     ctx: &Context<'_>,
     refs: &mut RefCollector,
 ) -> Option<String> {
+    // The switch is honoured here, not only where whole payloads are routed:
+    // the segmenter samples listing sections inside compound output through
+    // this same function, and with the check only in routing,
+    // `enable_listing_compressor = false` still dropped rows from every
+    // `ls && cat` and every `objdump` section it found. `crush_code` honours
+    // `enable_code_aware` the same way, for the same reason.
+    if !opts.enable_listing_compressor {
+        return None;
+    }
     // Neither the harness frame nor a blank separator is an *entry*, and both
     // were counted as one: a 47-entry dump behind a 5-line frame cleared the
     // 50-entry floor that exists to protect it, and its marker claimed 42

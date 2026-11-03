@@ -579,6 +579,73 @@ fn regression_fixture(dir: &Path) -> (PathBuf, PathBuf) {
     (corpus, baseline)
 }
 
+/// The baseline gate has to measure the engine, not the machine it runs on.
+///
+/// `bench replay` reads `[engine]` so a knob can be A/B'd against the corpus
+/// without rebuilding, and with no `--config` it used to fall back to the same
+/// discovery every other command uses — `$KOMPRESSOR_CONFIG`, then
+/// `./kompressor.toml`, then the XDG path. A developer with
+/// `enable_normalised_text_fold = false` in a personal config therefore ran
+/// `make bench` against a baseline recorded without it and was told the `text`
+/// bucket had regressed from 61.20% to 14.15%, which is a real 47-point
+/// difference in a real measurement and tells you nothing about the code.
+///
+/// A path that does not exist is the sharpest probe available: `discover`
+/// returns `$KOMPRESSOR_CONFIG` whether or not the file is there, precisely so
+/// a typo is reported rather than skipped, so a replay that still consulted
+/// discovery could not possibly succeed here.
+#[test]
+fn bench_replay_ignores_a_discovered_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let (corpus, _) = regression_fixture(dir.path());
+
+    kompressor()
+        .env("KOMPRESSOR_CONFIG", dir.path().join("nothing-here.toml"))
+        .args(["bench", "replay", "--corpus", corpus.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("coverage"));
+}
+
+/// The same, for the search path rather than the variable: a config sitting in
+/// the working directory is not read either. Unparseable on purpose — a replay
+/// that read it would fail, and the point is that it is never opened.
+#[test]
+fn bench_replay_ignores_a_config_in_the_working_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let (corpus, _) = regression_fixture(dir.path());
+    write(dir.path(), "kompressor.toml", "this is not toml {{{");
+
+    kompressor()
+        .current_dir(dir.path())
+        .args(["bench", "replay", "--corpus", corpus.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("coverage"));
+}
+
+/// And the converse, because ignoring discovery would be the wrong fix if it
+/// also ignored the flag: an explicit `--config` is still read, and a bad one
+/// is still an error rather than a silent fall back to the defaults.
+#[test]
+fn bench_replay_still_reads_an_explicit_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let (corpus, _) = regression_fixture(dir.path());
+    let config = write(dir.path(), "broken.toml", "this is not toml {{{");
+
+    kompressor()
+        .args([
+            "bench",
+            "replay",
+            "--corpus",
+            corpus.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+}
+
 #[test]
 fn bench_replay_prints_coverage_claimed_and_billed() {
     let dir = tempfile::tempdir().unwrap();

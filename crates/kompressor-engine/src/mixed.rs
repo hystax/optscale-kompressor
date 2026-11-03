@@ -67,6 +67,27 @@ static NAMED_TAIL: Lazy<Regex> =
 /// `<count>` and `{value}` cells mark a template the caller wants emitted
 /// verbatim.
 static PLACEHOLDER: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)<[a-z_]+>|\{[a-z_]+\}").unwrap());
+/// An INI or TOML section header alone on its line.
+static CONFIG_SECTION: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^\s*\[[A-Za-z_][\w.:-]*\]\s*$").unwrap());
+/// A settings assignment: an unindented lower-case dotted key, then `:` or `=`.
+///
+/// Narrow on purpose, in three ways that each exclude a real false positive
+/// seen while building this. The key may not be indented, which keeps the body
+/// of a function out. It may not be capitalised, which keeps `Note: this
+/// matters` prose and Python's `CONSTANT = 1` out. And it may not contain a
+/// space, which keeps an English sentence with a colon in it out.
+static CONFIG_ASSIGN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^[a-z][a-z0-9_.-]*\s*[:=](?:\s|$)").unwrap());
+
+/// How many assignments stand in for a section header.
+///
+/// A region qualifies on one `[header]`, because nothing but configuration
+/// writes those. Without one it needs a crowd: a handful of `key = value` lines
+/// is what the top of many source files looks like, and reading those as
+/// configuration would hand the segmenter a payload the code compressor
+/// understands far better.
+const CONFIG_MIN_ASSIGNMENTS: usize = 8;
 
 const MIN_SECTION_LINES: usize = 5;
 const ALIGNED_MIN_FIELDS: usize = 3;
@@ -81,6 +102,9 @@ const MAX_JSON_SCAN_ATTEMPTS: usize = 256;
 /// A body that is *entirely* one JSON document or one log is not mixed: the
 /// whole-message route compresses it better and without a second scan.
 pub fn has_mixed_content(content: &str, opts: &EngineOptions) -> bool {
+    if is_a_numbered_read(content) {
+        return false;
+    }
     if FENCE.is_match(content) {
         return true;
     }
@@ -89,12 +113,25 @@ pub fn has_mixed_content(content: &str, opts: &EngineOptions) -> bool {
             return true;
         }
     }
-    for (start, end, _) in plain_sections(content) {
+    for (start, end, _) in plain_sections(content, opts) {
         if !is_blank(&content[..start]) || !is_blank(&content[end..]) {
             return true;
         }
     }
     false
+}
+
+/// Whether `content` is a file read through a line-number gutter — `cat -n`,
+/// `nl`, Claude Code's `Read`.
+///
+/// The segmenter is not for these. Its dump-row rule reads a decimal gutter as
+/// offsets, so a numbered file is one long listing to it and has rows dropped:
+/// sixty Rust functions came back with seven signatures, and a README the
+/// agent had just opened lost 1,831 of its lines. The agent asked for those
+/// lines by number. Whole-message routing lifts the gutter, compresses the body
+/// as what it is, and puts the numbers back (§7.12).
+fn is_a_numbered_read(content: &str) -> bool {
+    crate::gutter::split_line_gutter(content).is_some()
 }
 
 /// Compress only the structured spans of `content`.
@@ -109,6 +146,11 @@ pub fn crush_mixed(
     ctx: &Context<'_>,
     refs: &mut RefCollector,
 ) -> Option<(String, Vec<Kind>)> {
+    // Checked here as well as in `has_mixed_content`: a JSON string field
+    // reaches this directly, and a numbered read inside one is still a read.
+    if is_a_numbered_read(content) {
+        return None;
+    }
     let entry = refs.mark();
     let mut rewrite = Rewrite::default();
 
@@ -150,7 +192,22 @@ pub fn crush_mixed(
     }
 
     if rewrite.is_empty() {
-        for (start, end, kind) in plain_sections(content) {
+        // A configuration span inside a body the detector *already* calls
+        // configuration is not a second reading of the payload — it is the same
+        // compressor, run on slightly fewer bytes. Fifteen recorded payloads
+        // are a harness frame (`Chunk ID:`, `Wall time:`, `Output:`) wrapping a
+        // `.cfg`: whole-message routing has always handled those, and letting
+        // the segmenter claim them changed nothing but the name in the
+        // analytics. Computed once, and only for a body that has such a span.
+        let mut whole_is_config: Option<bool> = None;
+        for (start, end, kind) in plain_sections(content, opts) {
+            if kind == LineKind::Config
+                && *whole_is_config.get_or_insert_with(|| {
+                    detect_content(content).content_type == ContentType::Config
+                })
+            {
+                continue;
+            }
             let body = &content[start..end];
             let mark = refs.mark();
             let (compressed, applied) = crush_section_as(kind, body, opts, ctx, refs);
@@ -282,6 +339,7 @@ fn crush_section_as(
             Some(Kind::Log),
         ),
         LineKind::Diff => (crush_diff(body, opts, ctx, refs), Some(Kind::Diff)),
+        LineKind::Config => (crush_config(body, opts, ctx, refs), Some(Kind::Config)),
         LineKind::Tabular | LineKind::Listing if !worth_sampling(body, opts) => (None, None),
         LineKind::Tabular => (crush_tabular(body, opts, ctx, refs), Some(Kind::Tabular)),
         LineKind::Listing => (crush_listing(body, opts, ctx, refs), Some(Kind::Listing)),
@@ -375,14 +433,15 @@ enum LineKind {
     Search,
     Tabular,
     Listing,
+    Config,
 }
 
 /// Contiguous runs of at least [`MIN_SECTION_LINES`] lines sharing one kind,
 /// as byte ranges into `content` — everything between them is prose and is
 /// never touched.
-fn plain_sections(content: &str) -> Vec<(usize, usize, LineKind)> {
+fn plain_sections(content: &str, opts: &EngineOptions) -> Vec<(usize, usize, LineKind)> {
     let lines = split_lines_keepends(content);
-    let kinds = line_kinds(&lines);
+    let kinds = line_kinds(&lines, opts);
     let mut sections: Vec<(usize, usize, LineKind)> = Vec::new();
     let mut offset = 0usize;
     let mut run_start = 0usize;
@@ -448,11 +507,11 @@ fn trim_trailing_whitespace(content: &str, start: usize, mut end: usize) -> usiz
 /// `crush_diff`, which dropped the surrounding prose. A diff is tracked as a
 /// *region* instead: it opens on a header line and absorbs hunk-body and
 /// extended-header lines until something unrelated ends it.
-fn line_kinds(lines: &[&str]) -> Vec<Option<LineKind>> {
+fn line_kinds(lines: &[&str], opts: &EngineOptions) -> Vec<Option<LineKind>> {
     let mut kinds: Vec<Option<LineKind>> = Vec::with_capacity(lines.len());
     let mut in_diff = false;
     for line in lines {
-        let kind = line_kind(line);
+        let kind = line_kind(line, opts);
         if kind == Some(LineKind::Diff) {
             in_diff = true;
             kinds.push(Some(LineKind::Diff));
@@ -464,10 +523,25 @@ fn line_kinds(lines: &[&str]) -> Vec<Option<LineKind>> {
         }
     }
     mark_aligned_runs(lines, &mut kinds);
+    if opts.enable_config_sections {
+        mark_config_regions(lines, &mut kinds);
+    }
     kinds
 }
 
-fn line_kind(line: &str) -> Option<LineKind> {
+fn line_kind(line: &str, opts: &EngineOptions) -> Option<LineKind> {
+    // Ahead of the `[` guard below, not after it. That guard is there to keep
+    // the opening bracket of a JSON array from classifying as anything, and it
+    // returns on every line starting with `[` — an INI section header
+    // included, which is the one such line that is not JSON at all. Tested
+    // first, the whole of a `.cfg` was invisible to the segmenter: every
+    // `[section]` came back unclassified, the runs between them never reached
+    // the assignment count that stands in for a header, and a 12 KB file
+    // compressed by nothing. The pattern is narrow enough to tell the two
+    // apart: `[1, 2]` does not start with an identifier.
+    if opts.enable_config_sections && CONFIG_SECTION.is_match(line.trim_end()) {
+        return Some(LineKind::Config);
+    }
     let lstripped = line.trim_start();
     if lstripped.starts_with('{') || lstripped.starts_with('[') {
         return None;
@@ -479,6 +553,14 @@ fn line_kind(line: &str) -> Option<LineKind> {
     {
         return Some(LineKind::Diff);
     }
+    // An instruction is not a row. `objdump` prints an address in front of
+    // every one, which reads as a dump offset, and `ret` or `endbr64` alone is
+    // a bare name to the listing test; either way a function got sampled, and
+    // an agent reversing a binary fetched it back four times in one task. Left
+    // unclassified, the lines stay where they are, whatever surrounds them.
+    if crate::detect::is_disassembly_line(line.strip_suffix('\n').unwrap_or(line)) {
+        return None;
+    }
     // Both tests live in the detector: a line must not be able to read as a log
     // to `detect_content` and as a grep hit to the segmenter.
     if looks_like_log_line(line) {
@@ -486,6 +568,13 @@ fn line_kind(line: &str) -> Option<LineKind> {
     }
     if looks_like_search_line(line) {
         return Some(LineKind::Search);
+    }
+    // After the log and grep tests and before the shape ones. A log line that
+    // happens to read `level: info` is a log, and a `[section]` header matches
+    // neither of the shape patterns below, so the order costs nothing and the
+    // precedence is the one that keeps whole-payload logs whole.
+    if opts.enable_config_sections && CONFIG_ASSIGN.is_match(line) {
+        return Some(LineKind::Config);
     }
     // These two patterns end in `$`, which anchors at the very end of the
     // haystack — a trailing newline would be part of the match and defeat them,
@@ -617,6 +706,82 @@ fn promote(lines: &[&str], kinds: &mut [Option<LineKind>], start: usize, end: us
     }
 }
 
+/// Grow each run of configuration anchors over the commentary around it.
+///
+/// A `.cfg` is mostly comments. `[mailman]` and `site_owner: x` classify on
+/// their own; the twenty lines of explanation between them classify as nothing,
+/// and without absorbing those a 278-line file breaks into two-line runs, never
+/// reaches [`MIN_SECTION_LINES`], and forms no section at all. This is the same
+/// shape as the diff-region rule above and exists for the same reason.
+///
+/// Only lines no other kind claimed are absorbed, so a log that happens to
+/// carry `key: value` rows stays a log, and the backward walk stops at the
+/// first line belonging to something else — which is what keeps the region from
+/// eating the tail of the file in front of it.
+fn mark_config_regions(lines: &[&str], kinds: &mut [Option<LineKind>]) {
+    let mut index = 0usize;
+    while index < lines.len() {
+        if kinds[index] != Some(LineKind::Config) {
+            index += 1;
+            continue;
+        }
+        let mut cursor = index;
+        let mut last_anchor = index;
+        let mut headers = 0usize;
+        let mut assignments = 0usize;
+        while cursor < lines.len() {
+            match kinds[cursor] {
+                Some(LineKind::Config) => {
+                    if CONFIG_SECTION.is_match(lines[cursor].trim_end()) {
+                        headers += 1;
+                    } else {
+                        assignments += 1;
+                    }
+                    last_anchor = cursor;
+                    cursor += 1;
+                }
+                None if is_commentary(lines[cursor]) => cursor += 1,
+                _ => break,
+            }
+        }
+        // The commentary after the last setting is claimed too, symmetrically
+        // with the backward walk below. Leaving it out looks tidier — a comment
+        // at the end reads just as well as the preamble of whatever follows —
+        // and it is wrong, because a file that is *nothing but* configuration
+        // then has its closing comments outside the only section, which is
+        // exactly the test `has_mixed_content` uses to decide a body is
+        // heterogeneous. Sixty recorded vectors moved: whole `.cfg` payloads
+        // stopped going to the config compressor and were segmented instead,
+        // one of them 173 characters worse for it.
+        let end = cursor.saturating_sub(1);
+        let mut start = index;
+        while start > 0 && kinds[start - 1].is_none() && is_commentary(lines[start - 1]) {
+            start -= 1;
+        }
+        if headers > 0 || assignments >= CONFIG_MIN_ASSIGNMENTS {
+            for kind in &mut kinds[start..=end] {
+                *kind = Some(LineKind::Config);
+            }
+        } else {
+            // Not configuration after all. Give the anchors back, so a couple of
+            // `key = value` lines in a source file cannot form a five-line run
+            // on their own.
+            for kind in &mut kinds[index..=last_anchor] {
+                if *kind == Some(LineKind::Config) {
+                    *kind = None;
+                }
+            }
+        }
+        index = cursor.max(index + 1);
+    }
+}
+
+/// A line that carries no setting but belongs to the file holding them.
+fn is_commentary(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';')
+}
+
 fn unclassified_runs(kinds: &[Option<LineKind>]) -> Vec<(usize, usize)> {
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut start: Option<usize> = None;
@@ -650,6 +815,98 @@ mod tests {
 
     fn refs() -> RefCollector {
         EngineOptions::default().collector()
+    }
+
+    /// An INI body of `count` settings, with the commentary a real one carries.
+    fn config_block(count: usize) -> String {
+        let mut out = String::from("[mailman]\n");
+        for i in 0..count {
+            out.push_str(&format!(
+                "# Explains what setting {i} is for, at the length these files\n\
+                 # actually run to, which is several lines of prose per key.\n\
+                 setting_{i}: value-{i}\n\n"
+            ));
+        }
+        out
+    }
+
+    /// A source file: top-level constants and a few functions.
+    fn python_block() -> String {
+        let mut out = String::from("import os\nimport sys\n\nDOMAIN = \"local\"\n\n");
+        for i in 0..6 {
+            out.push_str(&format!(
+                "def handler_{i}(request):\n    \"\"\"Handle request {i}.\"\"\"\n\
+                 {}    return None\n\n",
+                "    value = request.get('x')\n".repeat(8)
+            ));
+        }
+        out
+    }
+
+    /// A tool result holding a source file and then a configuration file, with
+    /// nothing between them saying where one ends.
+    ///
+    /// Measured on the payload this came from — `cat eval.py; ls …; cat
+    /// mailman.cfg` in one shell call, 19,141 characters — the whole message
+    /// compressed by **0.0%**. Each half alone compressed: the Python by 55%,
+    /// the configuration by 74%. Neither reading shipped, because the segmenter
+    /// had no kind for either half and whole-message routing handed all 19 KB
+    /// to the Python compressor, which declined.
+    #[test]
+    fn a_config_file_after_a_source_file_is_found_and_compressed() {
+        let content = format!("{}{}", python_block(), config_block(30));
+        let mut refs = refs();
+        let (out, kinds) =
+            crush_mixed(&content, &opts(), &ctx(), &mut refs).expect("the configuration half");
+        assert!(kinds.contains(&Kind::Config), "kinds were {kinds:?}");
+        assert!(
+            chars_len(&out) * 2 < chars_len(&content),
+            "{} -> {}, expected the configuration half to go",
+            chars_len(&content),
+            chars_len(&out)
+        );
+        // The source half is outside every recognised span, so it is still
+        // there byte for byte. That is the segmenter's contract, not an
+        // oversight: whole-message routing is the reading that compresses code.
+        assert!(out.contains("def handler_0(request):"));
+    }
+
+    /// The section header is the one `[`-leading line that is not JSON, and it
+    /// is what a configuration region qualifies on.
+    #[test]
+    fn a_section_header_is_not_mistaken_for_a_json_array() {
+        let lines = split_lines_keepends("[mailman]\n");
+        assert_eq!(line_kinds(&lines, &opts())[0], Some(LineKind::Config));
+        let lines = split_lines_keepends("[1, 2, 3]\n");
+        assert_eq!(line_kinds(&lines, &opts())[0], None);
+    }
+
+    /// Without a header a region needs a crowd, because the top of a source
+    /// file looks like this and the code compressor reads it far better.
+    #[test]
+    fn a_few_assignments_in_a_source_file_are_not_configuration() {
+        let content = format!(
+            "{}\n{}",
+            "retries = 3\ntimeout = 30\nverbose = False\nprefix = '/tmp'\nlimit = 10\n",
+            python_block()
+        );
+        let lines = split_lines_keepends(&content);
+        let kinds = line_kinds(&lines, &opts());
+        assert!(
+            kinds.iter().all(|kind| *kind != Some(LineKind::Config)),
+            "five assignments formed a configuration section"
+        );
+    }
+
+    /// The kill switch returns the pre-feature answer.
+    #[test]
+    fn config_sections_can_be_switched_off() {
+        let content = format!("{}{}", python_block(), config_block(30));
+        let off = EngineOptions {
+            enable_config_sections: false,
+            ..EngineOptions::default()
+        };
+        assert!(crush_mixed(&content, &off, &ctx(), &mut refs()).is_none());
     }
 
     /// 60 timestamped lines, which the log compressor folds into a template.
@@ -813,7 +1070,7 @@ index 1234567..89abcde 100644
 
 Let me know if the bound should be configurable.
 ";
-        let sections = plain_sections(content);
+        let sections = plain_sections(content, &opts());
         assert_eq!(
             sections.len(),
             1,
@@ -837,7 +1094,7 @@ Let me know if the bound should be configurable.
             "$ cd /srv/app\n$ ls -la\ntotal 6132\n{}$ echo done\ndone\n",
             ls_rows(60)
         );
-        let sections = plain_sections(&content);
+        let sections = plain_sections(&content, &opts());
         assert_eq!(sections.len(), 1, "one listing, not one pane: {sections:?}");
         let (start, end, kind) = sections[0];
         assert_eq!(kind, LineKind::Listing);
@@ -865,7 +1122,7 @@ Let me know if the bound should be configurable.
             .map(|i| format!("const value_{i}: number = input + {i};\n"))
             .collect();
         assert!(
-            plain_sections(&content).is_empty(),
+            plain_sections(&content, &opts()).is_empty(),
             "field count alone must not hand a code file to the entry sampler"
         );
     }
@@ -877,7 +1134,7 @@ Let me know if the bound should be configurable.
             .collect();
         assert!(!worth_sampling(&rows, &opts()));
         let content = format!("Fill in one row per reporting period:\n\n{rows}\nThen save it.\n");
-        let sections = plain_sections(&content);
+        let sections = plain_sections(&content, &opts());
         assert_eq!(sections.len(), 1, "it is still recognised as a table");
         assert_eq!(sections[0].2, LineKind::Tabular);
         assert!(
@@ -1004,7 +1261,7 @@ Let me know if the bound should be configurable.
                        2026-01-01T09:00:03 INFO four\n\
                        outro\n";
         assert!(
-            plain_sections(content).is_empty(),
+            plain_sections(content, &opts()).is_empty(),
             "four lines is not a run"
         );
     }
@@ -1012,7 +1269,7 @@ Let me know if the bound should be configurable.
     #[test]
     fn a_section_span_ends_at_its_last_non_blank_byte() {
         let content = format!("intro\n{}\n\n\noutro\n", log_block().trim_end_matches('\n'));
-        let (_, end, _) = plain_sections(&content)[0];
+        let (_, end, _) = plain_sections(&content, &opts())[0];
         assert_eq!(&content[end..end + 4], "\n\n\no");
     }
 
