@@ -34,7 +34,9 @@
 //! woken when the job ends, so the client will most likely be back; but an
 //! agent can also give its final answer with a job still running, and then no
 //! request ever comes. Those waits get their own cap,
-//! [`ProxyConfig::cache_keep_warm_background_pings`]. In the second keep-warm
+//! [`ProxyConfig::cache_keep_warm_background_pings`], and a wait on `Monitor`
+//! watches alone stops at the longest one's stated lifetime ("expires in 10m"),
+//! as a wake's stops at its due time. In the second keep-warm
 //! run they were 13 of the 30 pauses past five minutes; any other `end_turn`
 //! may be the last turn the conversation has, and is not kept warm.
 //!
@@ -180,8 +182,23 @@ impl Ping {
 const BACKGROUND_STARTED: &[&str] = &[
     "running in background with ID: ",
     "moved to the background (ID: ",
-    "Monitor started (task ",
+    WATCH_STARTED,
 ];
+/// How a `Monitor` watch starts, its id following.
+const WATCH_STARTED: &str = "Monitor started (task ";
+/// What a watch says, inside the same parenthesis as its id, about how long it
+/// lives: "Monitor started (task b166z0pbd, expires in 10m unless the source
+/// ends first; …)". A number and a unit, `s`, `m` or `h`.
+///
+/// A wait on watches alone is bounded by it, as a wake is by its due time. A
+/// watch is still running until its expiry notice, so an agent that gives its
+/// final answer with one running is a dead end the pings cannot tell from a
+/// wait. Measured on the 18-trial keep-warm check of 2026-11-04 on 2.0.2
+/// (`08-58-45`): train-fasttext answered with a watch two events in, exited two
+/// seconds later, and five pings went to the finished trial before the run
+/// ended, where the background cap would have allowed eleven. The watch would
+/// have expired within its ten minutes, so three pings were all it could use.
+const WATCH_EXPIRES: &str = "expires in ";
 /// The tag a task notification names its task with.
 const BACKGROUND_REPORTED: (&str, &str) = ("<task-id>", "</task-id>");
 /// Where one task notification ends, so the tags after its `<task-id>` are
@@ -241,15 +258,22 @@ pub(crate) enum Wait {
     /// A `ScheduleWakeup` wake, due this long after it was set, or `None` when
     /// the tool's answer did not say.
     Wake(Option<Duration>),
+    /// Only `Monitor` watches, the longest of which expires this long after it
+    /// started (and any pending wake is due within it), or `None` when one did
+    /// not say.
+    Watch(Option<Duration>),
 }
 
 impl Wait {
     /// How many pings at `interval` this wait can use, at most `cap`. A wake
-    /// is due at a known time; if the client is not back by then it has gone,
-    /// so the pings stop there rather than at the cap.
+    /// is due at a known time, and a watch expires at one; if the client is not
+    /// back by then it has gone, so the pings stop there rather than at the
+    /// cap. A watch's lifetime counts from its start, an earlier request, so
+    /// counting it from now can only allow more pings than it needs, never
+    /// fewer.
     pub(crate) fn max_pings(&self, interval: Duration, cap: u32) -> u32 {
         match self {
-            Wait::Wake(Some(due)) if !interval.is_zero() => {
+            Wait::Wake(Some(due)) | Wait::Watch(Some(due)) if !interval.is_zero() => {
                 let pings = (due.as_secs_f64() / interval.as_secs_f64()).ceil() as u32;
                 pings.max(1).min(cap)
             }
@@ -269,6 +293,7 @@ impl Wait {
 pub(crate) fn background_wait(body: &Value) -> Option<Wait> {
     let mut started = Vec::new();
     let mut reported = Vec::new();
+    let mut watches = HashMap::new();
     let mut wake_pending = false;
     let mut wake_due = None;
     let mut wake_prompt = None;
@@ -303,6 +328,7 @@ pub(crate) fn background_wait(body: &Value) -> Option<Wait> {
             for marker in BACKGROUND_STARTED {
                 started.extend(ids_after(text, marker));
             }
+            watch_lifetimes(text, &mut watches);
             reported.extend(ids_after(text, BACKGROUND_STOPPED));
             let (open, close) = BACKGROUND_REPORTED;
             let mut rest = text;
@@ -320,11 +346,55 @@ pub(crate) fn background_wait(body: &Value) -> Option<Wait> {
             }
         });
     }
-    if started.iter().any(|id| !reported.contains(id)) {
-        Some(Wait::Task)
-    } else {
-        wake_pending.then_some(Wait::Wake(wake_due))
+    let running: Vec<&String> = started.iter().filter(|id| !reported.contains(id)).collect();
+    if running.is_empty() {
+        return wake_pending.then_some(Wait::Wake(wake_due));
     }
+    if running.iter().any(|id| !watches.contains_key(*id)) {
+        return Some(Wait::Task);
+    }
+    // Only watches: the wait lasts as long as the longest of them lives, or a
+    // pending wake, whichever is later. Any one that did not say leaves it open.
+    let mut until = running.iter().try_fold(Duration::ZERO, |longest, id| {
+        watches[*id].map(|life: Duration| longest.max(life))
+    });
+    if wake_pending {
+        until = until.zip(wake_due).map(|(watch, wake)| watch.max(wake));
+    }
+    Some(Wait::Watch(until))
+}
+
+/// Record every watch `text` starts, with the lifetime it states, if it does.
+fn watch_lifetimes(text: &str, watches: &mut HashMap<String, Option<Duration>>) {
+    for (at, _) in text.match_indices(WATCH_STARTED) {
+        let rest = &text[at + WATCH_STARTED.len()..];
+        let id: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        if id.is_empty() {
+            continue;
+        }
+        let clause = &rest[id.len()..];
+        let clause = &clause[..clause.find(')').unwrap_or(clause.len())];
+        let life = clause
+            .find(WATCH_EXPIRES)
+            .and_then(|at| duration_in(&clause[at + WATCH_EXPIRES.len()..]));
+        watches.insert(id, life);
+    }
+}
+
+/// The duration a text starts with: "10m", "90s", "1h".
+fn duration_in(text: &str) -> Option<Duration> {
+    let digits = text.len() - text.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let amount: u64 = text[..digits].parse().ok()?;
+    let seconds = match text[digits..].chars().next()? {
+        's' => amount,
+        'm' => amount.checked_mul(60)?,
+        'h' => amount.checked_mul(3600)?,
+        _ => return None,
+    };
+    Some(Duration::from_secs(seconds))
 }
 
 /// Whether a task notification, from its `<task-id>` on, reports the task's
@@ -739,6 +809,60 @@ mod tests {
     }
 
     #[test]
+    fn a_wait_on_watches_alone_lasts_as_long_as_the_longest_lives() {
+        let started = |text: &str| {
+            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_m",
+                "content": text}]})
+        };
+        let ten = started(
+            "Monitor started (task aaa111, expires in 10m unless the source ends first; you get one notice at expiry \u{2014} re-arm if you still need the watch). You will be notified on each event.",
+        );
+        let one_hour =
+            started("Monitor started (task bbb222, expires in 1h unless the source ends first).");
+        let silent = started("Monitor started (task ccc333). You will be notified on each event.");
+
+        let wait = background_wait(&with_messages(json!([ten.clone()])));
+        assert_eq!(wait, Some(Wait::Watch(Some(Duration::from_secs(600)))));
+        assert_eq!(
+            wait.unwrap().max_pings(Duration::from_secs(270), 11),
+            3,
+            "ten minutes is three pings, not the background cap"
+        );
+        assert_eq!(
+            background_wait(&with_messages(json!([ten.clone(), one_hour]))),
+            Some(Wait::Watch(Some(Duration::from_secs(3600)))),
+            "the longest watch decides"
+        );
+        assert_eq!(
+            background_wait(&with_messages(json!([ten.clone(), silent]))),
+            Some(Wait::Watch(None)),
+            "one that does not say leaves the wait open"
+        );
+        assert_eq!(
+            Wait::Watch(None).max_pings(Duration::from_secs(270), 11),
+            11
+        );
+
+        // A command running beside the watch is a task again: it has no expiry.
+        let command = json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_c",
+            "content": "Command running in background with ID: ddd444."}]});
+        assert_eq!(
+            background_wait(&with_messages(json!([ten, command]))),
+            Some(Wait::Task)
+        );
+    }
+
+    #[test]
+    fn a_watch_lifetime_reads_seconds_minutes_and_hours_and_nothing_else() {
+        assert_eq!(duration_in("90s unless"), Some(Duration::from_secs(90)));
+        assert_eq!(duration_in("10m"), Some(Duration::from_secs(600)));
+        assert_eq!(duration_in("2h;"), Some(Duration::from_secs(7200)));
+        assert_eq!(duration_in("soon"), None);
+        assert_eq!(duration_in("10 minutes"), None);
+        assert_eq!(duration_in("10d"), None);
+    }
+
+    #[test]
     fn a_task_the_model_stops_is_ended_by_the_stop() {
         let started = json!([
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1",
@@ -794,8 +918,8 @@ mod tests {
         ]));
         assert_eq!(
             background_wait(&body),
-            Some(Wait::Task),
-            "bbb222 is still watching"
+            Some(Wait::Watch(Some(Duration::from_secs(600)))),
+            "bbb222 is still watching, for at most its ten minutes"
         );
     }
 

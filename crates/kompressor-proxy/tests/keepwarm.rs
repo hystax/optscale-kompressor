@@ -417,6 +417,41 @@ async fn an_end_turn_with_a_background_task_running_is_kept_warm_under_its_own_c
 }
 
 #[tokio::test]
+async fn an_end_turn_waiting_only_on_a_watch_stops_at_its_expiry() {
+    // A watch says how long it lives. If the agent ended its turn with nothing
+    // but a watch running and has not come back by the time the watch must
+    // have expired, it is not coming back: the pings stop there, not at the
+    // background cap.
+    let harness = Harness::with(|config| {
+        config.proxy.cache_keep_warm = true;
+        config.proxy.cache_keep_warm_interval = INTERVAL;
+        config.proxy.cache_keep_warm_max_pings = 20;
+        config.proxy.cache_keep_warm_background_pings = 20;
+    })
+    .await;
+    answering(&harness, "end_turn", 4000).await;
+    let mut body = conversation(1);
+    let messages = body["messages"].as_array_mut().unwrap();
+    messages.push(json!({"role": "assistant", "content": [
+        {"type": "tool_use", "id": "toolu_m", "name": "Monitor",
+         "input": {"command": "tail -f train.log", "timeout_ms": 1000}}
+    ]}));
+    messages.push(json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_m",
+         "content": "Monitor started (task bwatch01, expires in 1s unless the source ends first). You will be notified on each event."}
+    ]}));
+    harness.post("/v1/messages", &body).await;
+
+    tokio::time::sleep(INTERVAL * 14).await;
+    assert_eq!(
+        pings(&harness).await.len(),
+        7,
+        "one second at 150 ms is seven pings, not the background cap of 20"
+    );
+    assert_eq!(harness.state.keepwarm().armed(), 0);
+}
+
+#[tokio::test]
 async fn an_end_turn_after_the_task_was_reported_is_not_kept_warm() {
     let harness = keeping_background_warm(2).await;
     answering(&harness, "end_turn", 4000).await;
