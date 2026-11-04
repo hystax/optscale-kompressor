@@ -328,6 +328,48 @@ async fn a_conversation_has_one_timer_and_it_pings_the_latest_request() {
     );
 }
 
+#[tokio::test]
+async fn another_conversation_that_opens_the_same_way_leaves_the_timer_alone() {
+    // Two attempts at one task open with the same message, and the proxy files
+    // the second attempt's first request under the first attempt's
+    // conversation until the two diverge. That request must neither cancel the
+    // first attempt's pings nor replace them with its own: it has fewer
+    // messages, so it is not the first attempt coming back.
+    let harness = keeping_warm(20).await;
+    answering(&harness, "tool_use", 4000).await;
+    harness.post("/v1/messages", &conversation(0)).await;
+    harness.post("/v1/messages", &conversation(3)).await;
+    harness.post("/v1/messages", &conversation(0)).await;
+    assert_eq!(harness.state.keepwarm().armed(), 1);
+
+    tokio::time::sleep(INTERVAL * 2 + INTERVAL / 2).await;
+    let pinged: Vec<_> = pings(&harness)
+        .await
+        .iter()
+        .map(|ping| ping["messages"].as_array().map_or(0, Vec::len))
+        .collect();
+    assert!(!pinged.is_empty(), "the first attempt is still kept warm");
+    assert!(
+        pinged.iter().all(|&messages| messages == 7),
+        "every ping is the first attempt's request, not the newcomer's: {pinged:?}"
+    );
+
+    // The first attempt coming back does replace it: what is pinged from then
+    // on is its new request.
+    let before = pings(&harness).await.len();
+    harness.post("/v1/messages", &conversation(4)).await;
+    tokio::time::sleep(INTERVAL * 2 + INTERVAL / 2).await;
+    let after: Vec<_> = pings(&harness).await[before..]
+        .iter()
+        .map(|ping| ping["messages"].as_array().map_or(0, Vec::len))
+        .collect();
+    assert!(!after.is_empty());
+    assert!(
+        after.iter().all(|&messages| messages == 9),
+        "only the first attempt's latest request is pinged: {after:?}"
+    );
+}
+
 /// A conversation whose agent put a job in the background, and — when
 /// `reported` — has since been told it finished.
 fn with_background_task(reported: bool) -> Value {
