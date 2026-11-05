@@ -88,6 +88,16 @@ cache_ttl = "adaptive"
 enable_code_aware = false
 min_elision_saving_chars = 4000
 
+# --- OpenAI: provider-specific settings (DESIGN.md §12.10) -----------------
+# Ask OpenAI to keep a prompt's cache entry for a day instead of minutes. Free
+# to write on gpt-5.5 and earlier; only added on api.openai.com, for the models
+# OpenAI documents it for, and dropped again if the upstream refuses it.
+# Off by default: on archived Codex runs the expiry it prevents was about 0.35%
+# of the bill, and an organization with zero data retention may already be
+# held to in-memory caching.
+# [proxy.providers.openai]
+# prompt_cache_retention = "24h"
+
 # --- Claude Desktop's Code tab: TLS intercept ----------------------------
 # Desktop overwrites ANTHROPIC_BASE_URL when it spawns a session, so there is no
 # base URL to point at this proxy. It does honour HTTPS_PROXY and a custom CA.
