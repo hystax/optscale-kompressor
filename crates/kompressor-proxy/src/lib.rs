@@ -74,6 +74,7 @@ pub mod mode;
 mod nonstream;
 mod piggyback;
 pub mod prefixcache;
+mod retention;
 pub mod retrieve;
 pub mod route;
 pub mod sse;
@@ -108,6 +109,9 @@ pub struct ProxyState {
     /// Shared for the reason `prefixes` is: one request arms what the next
     /// request in the conversation cancels.
     pub(crate) keepwarm: Arc<keepwarm::KeepWarm>,
+    /// The upstreams and models that refused `prompt_cache_retention`, so it
+    /// is not sent there again.
+    pub(crate) retention: Arc<retention::Rejections>,
 }
 
 impl ProxyState {
@@ -128,6 +132,7 @@ impl ProxyState {
             failopen: Arc::new(FailOpen::default()),
             prefixes: Arc::new(prefixcache::PrefixTracker::new(ttl)),
             keepwarm: Arc::new(keepwarm::KeepWarm::default()),
+            retention: Arc::new(retention::Rejections::default()),
         }
     }
 

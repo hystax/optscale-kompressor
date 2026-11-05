@@ -24,7 +24,7 @@ use tracing::Instrument;
 
 use kompressor_core::auth::{Credentials, Identity};
 use kompressor_core::config::{
-    CacheTtl, FrozenPrefix, ProxyConfig, RetrieveExecution, RetrieveTool,
+    CacheTtl, FrozenPrefix, PromptCacheRetention, ProxyConfig, RetrieveExecution, RetrieveTool,
 };
 use kompressor_core::{AppCore, RequestInfo};
 use kompressor_engine::estimate_tokens;
@@ -39,6 +39,7 @@ use crate::bodycodec;
 use crate::failopen::Stage;
 use crate::mode::ProxyMode;
 use crate::prefixcache;
+use crate::retention;
 use crate::retrieve::{Budget, Retriever};
 use crate::stream::{ClientChunk, StreamRelay};
 use crate::upstream::Outbound;
@@ -200,7 +201,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         mode = mode.as_str(),
         "routing"
     );
-    let prepared = prepare(
+    let mut prepared = prepare(
         &state,
         &identity,
         mode,
@@ -212,6 +213,16 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         upstream.name.as_str(),
     )
     .await;
+    // After every rewrite, so it rides on whatever goes out, compressed or
+    // not, and before the capture, so the capture shows it.
+    let retention = ask_for_retention(
+        &state,
+        family,
+        upstream.name.as_str(),
+        route.origin(),
+        auth_mode.is_subscription(),
+        &mut prepared,
+    );
 
     // The client is back in this conversation, so whatever was keeping its
     // cache warm has done its job. Cancelled before this request is sent, so a
@@ -274,6 +285,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         if let Some(json) = prepared.json.clone() {
             outbound = outbound.with_json(json);
         }
+        outbound = outbound.with_retention(retention);
         if !prepared.stream {
             outbound = outbound.with_timeout(proxy.upstream_read_timeout);
         }
@@ -356,6 +368,54 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         )
         .await
     }
+}
+
+/// Ask OpenAI to keep this prompt's cache entry for a day, when
+/// `proxy.prompt_cache_retention = "24h"` and the request is one that field is
+/// known to be understood on. See [`crate::retention`].
+///
+/// Returns what the sender needs to take the field back out should the
+/// upstream refuse it, or `None` when it was not added.
+fn ask_for_retention(
+    state: &ProxyState,
+    family: Option<ApiFamily>,
+    upstream: &str,
+    origin: &str,
+    subscription: bool,
+    prepared: &mut Prepared,
+) -> Option<retention::Guard> {
+    if subscription || !retention::family_supported(family) {
+        return None;
+    }
+    let config = state.core.config_for(family.map(ApiFamily::provider));
+    if config.proxy.prompt_cache_retention != PromptCacheRetention::Extended {
+        return None;
+    }
+    let model = prepared.model.clone()?;
+    if !retention::model_supported(&model)
+        || !retention::upstream_is_openai(upstream, origin)
+        || state.retention.refused(upstream, &model)
+    {
+        return None;
+    }
+    let mut parsed = None;
+    let value = match prepared.json.as_mut() {
+        Some(value) => value,
+        None => parsed.insert(serde_json::from_slice::<Value>(&prepared.body).ok()?),
+    };
+    if !retention::extend(value) {
+        return None;
+    }
+    // As for the Anthropic TTL: re-serializing changes JSON bytes, never the
+    // prompt the provider keys its cache on.
+    prepared.body = Bytes::from(serde_json::to_vec(value).ok()?);
+    tracing::debug!(model = %model, "asked for 24h prompt-cache retention");
+    Some(retention::Guard::new(
+        state.retention.clone(),
+        upstream,
+        &model,
+        config.proxy.max_body_bytes,
+    ))
 }
 
 /// The keep-warm ping this request would leave behind, if its conversation is
