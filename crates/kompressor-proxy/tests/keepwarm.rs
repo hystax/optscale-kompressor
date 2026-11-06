@@ -328,6 +328,48 @@ async fn a_conversation_has_one_timer_and_it_pings_the_latest_request() {
     );
 }
 
+#[tokio::test]
+async fn another_conversation_that_opens_the_same_way_leaves_the_timer_alone() {
+    // Two attempts at one task open with the same message, and the proxy files
+    // the second attempt's first request under the first attempt's
+    // conversation until the two diverge. That request must neither cancel the
+    // first attempt's pings nor replace them with its own: it has fewer
+    // messages, so it is not the first attempt coming back.
+    let harness = keeping_warm(20).await;
+    answering(&harness, "tool_use", 4000).await;
+    harness.post("/v1/messages", &conversation(0)).await;
+    harness.post("/v1/messages", &conversation(3)).await;
+    harness.post("/v1/messages", &conversation(0)).await;
+    assert_eq!(harness.state.keepwarm().armed(), 1);
+
+    tokio::time::sleep(INTERVAL * 2 + INTERVAL / 2).await;
+    let pinged: Vec<_> = pings(&harness)
+        .await
+        .iter()
+        .map(|ping| ping["messages"].as_array().map_or(0, Vec::len))
+        .collect();
+    assert!(!pinged.is_empty(), "the first attempt is still kept warm");
+    assert!(
+        pinged.iter().all(|&messages| messages == 7),
+        "every ping is the first attempt's request, not the newcomer's: {pinged:?}"
+    );
+
+    // The first attempt coming back does replace it: what is pinged from then
+    // on is its new request.
+    let before = pings(&harness).await.len();
+    harness.post("/v1/messages", &conversation(4)).await;
+    tokio::time::sleep(INTERVAL * 2 + INTERVAL / 2).await;
+    let after: Vec<_> = pings(&harness).await[before..]
+        .iter()
+        .map(|ping| ping["messages"].as_array().map_or(0, Vec::len))
+        .collect();
+    assert!(!after.is_empty());
+    assert!(
+        after.iter().all(|&messages| messages == 9),
+        "only the first attempt's latest request is pinged: {after:?}"
+    );
+}
+
 /// A conversation whose agent put a job in the background, and — when
 /// `reported` — has since been told it finished.
 fn with_background_task(reported: bool) -> Value {
@@ -370,6 +412,41 @@ async fn an_end_turn_with_a_background_task_running_is_kept_warm_under_its_own_c
         pings(&harness).await.len(),
         2,
         "the background cap, not the tool_use one"
+    );
+    assert_eq!(harness.state.keepwarm().armed(), 0);
+}
+
+#[tokio::test]
+async fn an_end_turn_waiting_only_on_a_watch_stops_at_its_expiry() {
+    // A watch says how long it lives. If the agent ended its turn with nothing
+    // but a watch running and has not come back by the time the watch must
+    // have expired, it is not coming back: the pings stop there, not at the
+    // background cap.
+    let harness = Harness::with(|config| {
+        config.proxy.cache_keep_warm = true;
+        config.proxy.cache_keep_warm_interval = INTERVAL;
+        config.proxy.cache_keep_warm_max_pings = 20;
+        config.proxy.cache_keep_warm_background_pings = 20;
+    })
+    .await;
+    answering(&harness, "end_turn", 4000).await;
+    let mut body = conversation(1);
+    let messages = body["messages"].as_array_mut().unwrap();
+    messages.push(json!({"role": "assistant", "content": [
+        {"type": "tool_use", "id": "toolu_m", "name": "Monitor",
+         "input": {"command": "tail -f train.log", "timeout_ms": 1000}}
+    ]}));
+    messages.push(json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_m",
+         "content": "Monitor started (task bwatch01, expires in 1s unless the source ends first). You will be notified on each event."}
+    ]}));
+    harness.post("/v1/messages", &body).await;
+
+    tokio::time::sleep(INTERVAL * 14).await;
+    assert_eq!(
+        pings(&harness).await.len(),
+        7,
+        "one second at 150 ms is seven pings, not the background cap of 20"
     );
     assert_eq!(harness.state.keepwarm().armed(), 0);
 }
