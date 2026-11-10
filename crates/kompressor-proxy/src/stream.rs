@@ -104,6 +104,13 @@ pub(crate) struct StreamRelay {
     pub(crate) retriever: Option<Retriever>,
     pub(crate) budget: Budget,
     pub(crate) buffer_limit: usize,
+    /// The bound on the bytes *really* held, in either held state.
+    ///
+    /// In a round that can intercept, `buffer_limit` and `intercept_limit`
+    /// charge a reasoning frame only its text (`Signal::Reasoning`), so on
+    /// their own they no longer bound memory on a turn that reasons at length. This does, at `proxy.max_body_bytes`:
+    /// the most this proxy already accepts holding for one request. 0 disables.
+    pub(crate) hold_ceiling: usize,
     /// How long the relay may hold frames back before giving up on deciding.
     ///
     /// The byte limit above bounds how *much* is held; this bounds how *long*.
@@ -386,6 +393,15 @@ impl StreamRelay {
     /// makes, and it is the better one: losing one interception costs a
     /// retrieval, while losing the client costs the whole request, its tokens,
     /// and a retry.
+    fn over_deciding_limit(&self, charged: usize, held: usize) -> bool {
+        charged > self.buffer_limit || self.over_ceiling(held)
+    }
+
+    /// The hard bound on what is really in memory, whatever it was charged.
+    fn over_ceiling(&self, held: usize) -> bool {
+        self.hold_ceiling > 0 && held > self.hold_ceiling
+    }
+
     fn held_too_long(&self, since: std::time::Instant) -> bool {
         held_too_long(self.buffer_timeout, since.elapsed())
     }
@@ -405,6 +421,11 @@ impl StreamRelay {
         let mut turn = StreamTurn::new(self.family);
         let mut buffered: Vec<Held> = Vec::new();
         let mut buffered_bytes = 0usize;
+        // What the held-bytes bounds are measured against: frame bytes, except
+        // that a reasoning frame is charged its text when interception is
+        // enabled. See `Signal::Reasoning`.
+        // `buffered_bytes` stays the true size, bounded by `hold_ceiling`.
+        let mut charged_bytes = 0usize;
         // Content held so far in this round, bounded by `content_grace`.
         let mut content_bytes = 0usize;
         let mut usage = json!({});
@@ -424,6 +445,8 @@ impl StreamRelay {
         // argument deltas — which name no tool, only an `item_id` — can be
         // dropped with it.
         let mut our_items: Vec<String> = Vec::new();
+        // A Chat call of the client's seen after hand-over; see passthrough.
+        let mut foreign_seen = false;
         let held_since = std::time::Instant::now();
         let mut first_byte: Option<std::time::Instant> = None;
 
@@ -569,13 +592,25 @@ impl StreamRelay {
                             // being dropped whole — the client's call and its
                             // text are in the same bytes.
                             if self.family == ApiFamily::OpenAiChat {
-                                match filter_our_chat_calls(&frame, &mut our_items) {
+                                // The turn stops observing in passthrough, so a
+                                // call of the client's that starts here is known
+                                // only to the filter. Without carrying it, the
+                                // finish-reason rewrite below would tell the
+                                // client its own call never happened.
+                                let mut others = turn.has_foreign_call() || foreign_seen;
+                                let filtered =
+                                    filter_our_chat_calls(&frame, &mut our_items, &mut others);
+                                foreign_seen = others;
+                                if let Some(remain) = elided.as_mut() {
+                                    *remain |= others;
+                                }
+                                match filtered {
                                     ChatFilter::Dropped => {
-                                        elided = Some(turn.has_foreign_call());
+                                        elided = Some(others);
                                         continue;
                                     }
                                     ChatFilter::Rewritten(bytes) => {
-                                        elided = Some(turn.has_foreign_call());
+                                        elided = Some(others);
                                         if !self.emit_rewritten(tx, bytes, rounds, hidden).await {
                                             return RoundEnd::ClientGone;
                                         }
@@ -640,6 +675,10 @@ impl StreamRelay {
                     );
                 }
                 buffered_bytes += frame_len;
+                charged_bytes += match signal {
+                    Signal::Reasoning(text_len) if intercept => text_len,
+                    _ => frame_len,
+                };
                 buffered.push(Held { frame, call });
 
                 let leave = match signal {
@@ -673,28 +712,35 @@ impl StreamRelay {
                             // The text, not the frame that carried it.
                             content_bytes += text_len;
                             content_bytes > self.content_grace
-                                || buffered_bytes > self.buffer_limit
+                                || self.over_deciding_limit(charged_bytes, buffered_bytes)
                                 || self.held_too_long(held_since)
                         }
                         State::Buffering => true,
                         // The turn is already known to be ours. A model
                         // narrating between its own retrieve calls does not
                         // hand it back; the interception bounds still apply.
-                        State::Intercepting => {
-                            self.intercepted_too_long(buffered_bytes, held_since, buffered.len())
-                        }
+                        State::Intercepting => self.intercepted_too_long(
+                            charged_bytes,
+                            buffered_bytes,
+                            held_since,
+                            buffered.len(),
+                        ),
                         State::Passthrough => false,
                     },
                     // Both bounds now apply in either held state. They used to
                     // be gated on `Buffering`, which meant interception — the
                     // state that holds *everything* — was bounded by nothing.
-                    Signal::None => match state {
+                    Signal::None | Signal::Reasoning(_) => match state {
                         State::Buffering => {
-                            buffered_bytes > self.buffer_limit || self.held_too_long(held_since)
+                            self.over_deciding_limit(charged_bytes, buffered_bytes)
+                                || self.held_too_long(held_since)
                         }
-                        State::Intercepting => {
-                            self.intercepted_too_long(buffered_bytes, held_since, buffered.len())
-                        }
+                        State::Intercepting => self.intercepted_too_long(
+                            charged_bytes,
+                            buffered_bytes,
+                            held_since,
+                            buffered.len(),
+                        ),
                         State::Passthrough => false,
                     },
                 };
@@ -729,7 +775,8 @@ impl StreamRelay {
                                         client declared, so the turn is its own",
                                     Signal::Content(_) if content_bytes > self.content_grace =>
                                         "narration passed the content grace",
-                                    Signal::Content(_) if buffered_bytes > self.buffer_limit =>
+                                    Signal::Content(_)
+                                        if self.over_deciding_limit(charged_bytes, buffered_bytes) =>
                                         "the deciding window passed the buffer limit",
                                     Signal::Content(_) => "held too long",
                                     _ => "the turn ended without a retrieve call",
@@ -738,6 +785,7 @@ impl StreamRelay {
                                 "content_bytes": content_bytes,
                                 "content_grace": self.content_grace,
                                 "buffered_bytes": buffered_bytes,
+                                "charged_bytes": charged_bytes,
                                 "buffer_limit": self.buffer_limit,
                             })
                             .to_string(),
@@ -890,13 +938,20 @@ impl StreamRelay {
     /// retrieval does not happen. What it buys is that the failure is ours and
     /// takes ninety seconds, instead of the client's and taking five minutes,
     /// a full retry, and a second five minutes.
-    fn intercepted_too_long(&self, bytes: usize, since: std::time::Instant, frames: usize) -> bool {
+    fn intercepted_too_long(
+        &self,
+        bytes: usize,
+        held: usize,
+        since: std::time::Instant,
+        frames: usize,
+    ) -> bool {
         let (over_bytes, over_time) = intercepted_too_long(
             self.intercept_limit,
             bytes,
             self.intercept_timeout,
             since.elapsed(),
         );
+        let over_bytes = over_bytes || self.over_ceiling(held);
         if over_bytes || over_time {
             tracing::warn!(
                 held_ms = since.elapsed().as_millis() as u64,
@@ -941,8 +996,9 @@ impl StreamRelay {
         // it is the only thing that can split a frame like that.
         if self.family == ApiFamily::OpenAiChat {
             let mut removed_ours = false;
+            let mut others = turn.has_foreign_call();
             for h in held {
-                match filter_our_chat_calls(&h.frame, ours_seen) {
+                match filter_our_chat_calls(&h.frame, ours_seen, &mut others) {
                     ChatFilter::Dropped => {
                         removed_ours = true;
                     }
@@ -952,8 +1008,18 @@ impl StreamRelay {
                             return HandOver::ClientGone;
                         }
                     }
+                    // A held finish frame of its own, after ours was removed,
+                    // must stop saying `tool_calls` just as one relayed later
+                    // would.
                     ChatFilter::Untouched => {
-                        if !self.emit(tx, &h.frame, rounds, hidden).await {
+                        let rewritten = removed_ours
+                            .then(|| scrub(self.family, &h.frame, others))
+                            .flatten();
+                        let sent = match rewritten {
+                            Some(bytes) => self.emit_rewritten(tx, bytes, rounds, hidden).await,
+                            None => self.emit(tx, &h.frame, rounds, hidden).await,
+                        };
+                        if !sent {
                             return HandOver::ClientGone;
                         }
                     }
@@ -1082,7 +1148,19 @@ enum ChatFilter {
 /// `index` afterwards: an argument continuation carries only the index, so the
 /// index has to be remembered the way Responses remembers an item id and
 /// Anthropic a block index.
-fn filter_our_chat_calls(frame: &SseFrame, ours: &mut Vec<String>) -> ChatFilter {
+///
+/// `others_remain` says whether the turn has a call of the client's. It is
+/// updated from this frame, and once ours is removed and none remain, a
+/// `finish_reason: "tool_calls"` in the same frame is rewritten to `stop` here:
+/// several providers send it on the frame carrying the call's last delta, and
+/// that frame is rewritten by this function rather than passing `scrub`. Left
+/// alone it reached opencode as a tool-call step with no tool in it, which
+/// ended the session mid-sweep.
+fn filter_our_chat_calls(
+    frame: &SseFrame,
+    ours: &mut Vec<String>,
+    others_remain: &mut bool,
+) -> ChatFilter {
     let Some(mut value) = frame.json() else {
         return ChatFilter::Untouched;
     };
@@ -1114,10 +1192,21 @@ fn filter_our_chat_calls(frame: &SseFrame, ours: &mut Vec<String>) -> ChatFilter
                     removed = true;
                     return false;
                 }
+                if call
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| !name.is_empty())
+                {
+                    *others_remain = true;
+                }
                 true
             });
             if !calls.is_empty() {
                 anything_left = true;
+            } else if removed && let Some(delta) = delta.as_object_mut() {
+                // An emptied `tool_calls: []` still reads as a call delta.
+                delta.remove("tool_calls");
             }
         }
         // Text, a refusal or a role the client is waiting for keeps the frame
@@ -1138,6 +1227,13 @@ fn filter_our_chat_calls(frame: &SseFrame, ours: &mut Vec<String>) -> ChatFilter
     }
     if !removed {
         return ChatFilter::Untouched;
+    }
+    if !*others_remain {
+        for choice in choices.iter_mut() {
+            if choice.get("finish_reason").and_then(Value::as_str) == Some("tool_calls") {
+                choice["finish_reason"] = Value::String("stop".to_string());
+            }
+        }
     }
     if anything_left {
         ChatFilter::Rewritten(reframe(frame, &value))
@@ -1498,6 +1594,25 @@ enum Signal {
     /// retrievals while the model had plainly asked. Counting what the bound is
     /// named for makes 8 KiB mean 8 KiB of prose again.
     Content(usize),
+    /// Reasoning or thinking the model is doing before it decides.
+    ///
+    /// Not content (see above), and not `None` either, because what it is
+    /// charged against the held-bytes bounds is the *text*, not the frame. The
+    /// same envelope problem `Content` had, at a far worse ratio: an
+    /// OpenRouter-style Chat frame repeats each reasoning token in both
+    /// `reasoning` and `reasoning_details`, under a full id/model/choices
+    /// envelope, so one token of reasoning cost ~340 bytes of the 256 KiB
+    /// deciding window. A live opencode turn on mimo-v2.6-flash reasoned for
+    /// ~2,800 tokens and then asked for twelve retrievals; the window filled
+    /// at ~770, the relay went passthrough, all twelve calls were filtered out
+    /// as ours, and the client got a text-only turn that ended the session.
+    /// The raw bytes are still bounded, by `hold_ceiling`.
+    ///
+    /// Only in a round that can intercept. Without one there is no retrieve
+    /// call to wait for, so the text discount would buy nothing but latency:
+    /// up to 256 KiB of reasoning *text*, tens of megabytes of frames, held
+    /// back from the client. Such a round charges the whole frame, as before.
+    Reasoning(usize),
     /// A call to our tool started.
     RetrieveCall,
     /// A call to something else started.
@@ -1619,18 +1734,39 @@ impl StreamTurn {
         else {
             return Signal::None;
         };
-        for key in ["content", "refusal"] {
-            if let Some(text) = delta
+        // **Calls before text.** Text used to be checked first and returned
+        // early, so a delta carrying both — glm-5.3-flash ends its narration
+        // and opens the retrieve call in one frame, `{"content":" cat):",
+        // "tool_calls":[{…"name":"optscale_kompressor_retrieve"}]}` — read as
+        // `Content`: the call was never seen starting, its arguments were never
+        // recorded, the relay never intercepted, and hand-over stripped the
+        // call from a turn the client then saw end on `tool_calls` with no
+        // tool in it. 14 of 14 failed opencode stages across ten sweeps had
+        // at least one such frame. The calls are always recorded; a call
+        // outranks the text beside it, which interception tolerates anyway.
+        let text = ["content", "refusal"].into_iter().find_map(|key| {
+            delta
                 .get(key)
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty())
-            {
-                return Signal::Content(text.len());
+                .map(str::len)
+        });
+        let calls = delta
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .filter(|calls| !calls.is_empty());
+        let signal = calls.map_or(Signal::None, |calls| self.observe_chat_calls(calls));
+        match (signal, text) {
+            (Signal::None, Some(len)) => Signal::Content(len),
+            (Signal::None, None) if calls.is_none() => {
+                chat_reasoning(delta).map_or(Signal::None, Signal::Reasoning)
             }
+            (signal, _) => signal,
         }
-        let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) else {
-            return Signal::None;
-        };
+    }
+
+    /// Record a Chat delta's calls, and say whether one of them started.
+    fn observe_chat_calls(&mut self, calls: &[Value]) -> Signal {
         // **Foreign-call precedence, not last-one-wins.** A Chat delta may carry
         // several `tool_calls`, and this used to overwrite the signal per entry
         // and report whichever came last. Both orders were then wrong in
@@ -1718,6 +1854,14 @@ impl StreamTurn {
                 }
                 named(&name)
             }
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                Signal::Reasoning(
+                    value
+                        .get("delta")
+                        .and_then(Value::as_str)
+                        .map_or(0, str::len),
+                )
+            }
             "response.function_call_arguments.delta" => {
                 let key = item_key(value, &Value::Null);
                 if let Some(delta) = value.get("delta").and_then(Value::as_str) {
@@ -1786,6 +1930,18 @@ impl StreamTurn {
                         }
                         Signal::None
                     }
+                    Some("thinking_delta") => Signal::Reasoning(
+                        delta
+                            .get("thinking")
+                            .and_then(Value::as_str)
+                            .map_or(0, str::len),
+                    ),
+                    Some("signature_delta") => Signal::Reasoning(
+                        delta
+                            .get("signature")
+                            .and_then(Value::as_str)
+                            .map_or(0, str::len),
+                    ),
                     _ => Signal::None,
                 }
             }
@@ -1879,6 +2035,34 @@ impl StreamTurn {
             }
         }
     }
+}
+
+/// The reasoning text a Chat delta carries, when it carries any.
+///
+/// Chat has no standard field for it, so the dialects seen in the wild:
+/// `reasoning` (OpenRouter, OpenCode Zen/Go), `reasoning_content` (DeepSeek,
+/// vLLM, several Chinese providers) and `reasoning_details` (OpenRouter's
+/// structured copy, which repeats `reasoning` and may be the only one present
+/// for encrypted reasoning). The plain fields are preferred, so a frame that
+/// carries both is charged once, not twice.
+fn chat_reasoning(delta: &Value) -> Option<usize> {
+    for key in ["reasoning", "reasoning_content"] {
+        if let Some(text) = delta
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            return Some(text.len());
+        }
+    }
+    let details = delta.get("reasoning_details").and_then(Value::as_array)?;
+    let len = details
+        .iter()
+        .flat_map(|detail| ["text", "summary", "data"].map(|key| detail.get(key)))
+        .filter_map(|text| text.and_then(Value::as_str))
+        .map(str::len)
+        .sum();
+    (!details.is_empty()).then_some(len)
 }
 
 fn named(name: &str) -> Signal {
@@ -2121,13 +2305,71 @@ mod tests {
         );
         assert_eq!(
             anthropic[..2],
-            [Signal::None, Signal::None],
+            [Signal::None, Signal::Reasoning(2)],
             "a thinking block must not end the buffering window, or a thinking \
              model's retrieve call could never be intercepted"
         );
         // A text block opening carries no text yet, so it contributes nothing
         // to the grace -- the deltas that follow do.
         assert_eq!(anthropic[2], Signal::Content(0));
+    }
+
+    #[test]
+    fn a_call_outranks_the_text_beside_it_and_the_text_still_counts_alone() {
+        let (_, chat) = observe(
+            ApiFamily::OpenAiChat,
+            &[
+                r#"{"choices":[{"delta":{"content":"x","tool_calls":[{"index":0,"id":"a","function":{"name":"optscale_kompressor_retrieve"}}]}}]}"#,
+                r#"{"choices":[{"delta":{"content":"y","tool_calls":[{"index":1,"id":"b","function":{"name":"bash"}}]}}]}"#,
+                r#"{"choices":[{"delta":{"content":"zz","tool_calls":[{"index":1,"function":{"arguments":"{}"}}]}}]}"#,
+            ],
+        );
+        assert_eq!(
+            chat,
+            [Signal::RetrieveCall, Signal::OtherCall, Signal::Content(2)]
+        );
+    }
+
+    #[test]
+    fn reasoning_is_charged_its_text_on_every_family() {
+        let (_, chat) = observe(
+            ApiFamily::OpenAiChat,
+            &[
+                // OpenRouter / OpenCode Go: the token twice, charged once.
+                r#"{"choices":[{"delta":{"content":"","reasoning":"abc","reasoning_details":[{"type":"reasoning.text","text":"abc"}]}}]}"#,
+                r#"{"choices":[{"delta":{"reasoning_content":"hmm"}}]}"#,
+                r#"{"choices":[{"delta":{"reasoning":"abc","tool_calls":[]}}]}"#,
+                r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.encrypted","data":"xyzw"}]}}]}"#,
+                r#"{"choices":[{"delta":{"role":"assistant"}}]}"#,
+            ],
+        );
+        assert_eq!(
+            chat,
+            [
+                Signal::Reasoning(3),
+                Signal::Reasoning(3),
+                Signal::Reasoning(3),
+                Signal::Reasoning(4),
+                Signal::None
+            ]
+        );
+
+        let (_, responses) = observe(
+            ApiFamily::OpenAiResponses,
+            &[r#"{"type":"response.reasoning_summary_text.delta","delta":"hm"}"#],
+        );
+        assert_eq!(responses[0], Signal::Reasoning(2));
+    }
+
+    #[test]
+    fn a_frame_with_a_call_is_a_call_even_if_it_also_reasons() {
+        let (_, chat) = observe(
+            ApiFamily::OpenAiChat,
+            &[
+                r#"{"choices":[{"delta":{"reasoning":"x","tool_calls":[{"index":0,"id":"c","function":{"name":"optscale_kompressor_retrieve","arguments":""}}]}}]}"#,
+            ],
+        );
+        assert_eq!(chat[0], Signal::RetrieveCall);
     }
 
     #[test]
@@ -2737,6 +2979,7 @@ mod completion_tests {
             retriever: None,
             budget: Budget::new(3, 16384),
             buffer_limit: 262144,
+            hold_ceiling: 64 * 1024 * 1024,
             buffer_timeout: Duration::ZERO,
             intercept_limit: 1048576,
             intercept_timeout: Duration::from_secs(90),
@@ -2768,6 +3011,261 @@ mod completion_tests {
             chunks.push(chunk);
         }
         (result, chunks)
+    }
+
+    /// One chunk per frame, as a provider streams them. A single chunk holding
+    /// the whole body would trip the unterminated-event guard instead.
+    fn per_frame(body: &str) -> Vec<reqwest::Result<Bytes>> {
+        body.split_inclusive("\n\n")
+            .map(|frame| Ok(Bytes::from(frame.to_string())))
+            .collect()
+    }
+
+    /// The live failure: mimo-v2.6-flash through OpenCode Go reasoned for
+    /// ~2,800 tokens, one ~340-byte frame each, then asked for twelve
+    /// retrievals. Charged by frame, the reasoning passed the 256 KiB deciding
+    /// window long before the first call, the relay went passthrough, and the
+    /// calls were filtered out of a turn the client then saw end with no call.
+    #[tokio::test]
+    async fn a_long_reasoning_preamble_does_not_cost_the_turn_its_retrieval() {
+        let mut body = String::new();
+        let reasoning = r#"data: {"id":"gen-1794081028-OPVLLOYGiYK3D4vKE2eI","object":"chat.completion.chunk","created":1794081028,"model":"mimo-v2.6-flash","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":"","reasoning":" tok","reasoning_details":[{"type":"reasoning.text","text":" tok","format":"unknown","index":0}]}}]}"#;
+        for _ in 0..3000 {
+            body.push_str(reasoning);
+            body.push_str("\n\n");
+        }
+        assert!(
+            body.len() > 2 * 262144 && body.len() < 1048576 * 2,
+            "the premise: well past the deciding window and the intercept limit as frames"
+        );
+        body.push_str(concat!(
+            r#"data: {"choices":[{"index":0,"finish_reason":null,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"optscale_kompressor_retrieve","arguments":"{\"ref\":\"k_AbC123dEf456\"}"}}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"index":0,"finish_reason":"tool_calls","delta":{}}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        ));
+        let relay = relay(ApiFamily::OpenAiChat);
+        let mut stream: BoxStream<'static, reqwest::Result<Bytes>> =
+            Box::pin(futures_util::stream::iter(per_frame(&body)));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
+        let end = relay
+            .read_round(&mut stream, &tx, 0, &json!({}), true)
+            .await;
+        drop(tx);
+        let mut forwarded = 0usize;
+        while let Some(chunk) = rx.recv().await {
+            if chunk.is_ok_and(|bytes| !bytes.starts_with(b":")) {
+                forwarded += 1;
+            }
+        }
+        assert!(
+            matches!(end, RoundEnd::Intercepted { .. }),
+            "the turn is ours and must be intercepted"
+        );
+        assert_eq!(
+            forwarded, 0,
+            "nothing of an intercepted round reaches the client"
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_without_interception_keeps_the_frame_byte_limit() {
+        for (family, reasoning) in [
+            (
+                ApiFamily::OpenAiChat,
+                "data: {\"choices\":[{\"delta\":{\"reasoning\":\"x\"}}]}\n\n",
+            ),
+            (
+                ApiFamily::OpenAiResponses,
+                "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"x\"}\n\n",
+            ),
+            (
+                ApiFamily::AnthropicMessages,
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"x\"}}\n\n",
+            ),
+        ] {
+            let mut relay = relay(family);
+            relay.buffer_limit = 128;
+            relay.keepalive = Duration::from_secs(60);
+            let body = reasoning.repeat(10);
+            assert!(body.len() > relay.buffer_limit);
+            // Keep the upstream open to verify forwarding before EOF.
+            let mut stream: BoxStream<'static, reqwest::Result<Bytes>> = Box::pin(
+                futures_util::stream::iter(per_frame(&body)).chain(futures_util::stream::pending()),
+            );
+            let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+            let hidden = json!({});
+            tokio::select! {
+                _ = relay.read_round(&mut stream, &tx, 0, &hidden, false) => {
+                    panic!("the upstream is still open");
+                }
+                received = tokio::time::timeout(Duration::from_secs(1), rx.recv()) => {
+                    let bytes = received
+                        .expect("reasoning must be forwarded at the frame byte limit")
+                        .expect("the relay must keep its sender open")
+                        .expect("reasoning must be forwarded successfully");
+                    assert_eq!(bytes.as_ref(), reasoning.as_bytes());
+                }
+            }
+        }
+    }
+
+    /// Two ways a Chat turn can still say `tool_calls` after the relay took
+    /// our call out of it in passthrough: the finish reason arriving in the
+    /// same frame as the call (filtered and rewritten, never scrubbed), and in
+    /// a frame of its own (scrubbed). opencode treats the first as a tool turn
+    /// with no tool to run and ends the session.
+    #[tokio::test]
+    async fn a_passthrough_turn_that_lost_our_call_never_ends_on_tool_calls() {
+        for coalesced in [false, true] {
+            let mut body = String::from(
+                "data: {\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"content\":\"Let me retrieve it:\"}}]}\n\n",
+            );
+            let call = r#"{"index":0,"id":"call_1","type":"function","function":{"name":"optscale_kompressor_retrieve","arguments":"{\"ref\":\"k_AbC123dEf456\"}"}}"#;
+            if coalesced {
+                body.push_str(&format!(
+                    "data: {{\"choices\":[{{\"index\":0,\"finish_reason\":\"tool_calls\",\"delta\":{{\"tool_calls\":[{call}]}}}}]}}\n\n"
+                ));
+            } else {
+                body.push_str(&format!(
+                    "data: {{\"choices\":[{{\"index\":0,\"finish_reason\":null,\"delta\":{{\"tool_calls\":[{call}]}}}}]}}\n\n"
+                ));
+                body.push_str("data: {\"choices\":[{\"index\":0,\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n");
+            }
+            body.push_str("data: [DONE]\n\n");
+            let mut relay = relay(ApiFamily::OpenAiChat);
+            relay.retriever = Some(crate::retrieve::tests::retriever());
+            let mut stream: BoxStream<'static, reqwest::Result<Bytes>> =
+                Box::pin(futures_util::stream::iter(per_frame(&body)));
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            // content_grace is 0 in `relay`, so the first sentence hands the
+            // turn over and the call arrives in passthrough.
+            let _ = relay
+                .read_round(&mut stream, &tx, 0, &json!({}), true)
+                .await;
+            drop(tx);
+            let mut seen = String::new();
+            while let Some(chunk) = rx.recv().await {
+                seen.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+            }
+            assert!(
+                !seen.contains("optscale_kompressor_retrieve"),
+                "coalesced={coalesced}: our call reached the client: {seen}"
+            );
+            assert!(
+                !seen.contains("\"tool_calls\""),
+                "coalesced={coalesced}: the client was told the turn called a tool: {seen}"
+            );
+        }
+    }
+
+    /// The other direction: a call of the client's that starts after the
+    /// hand-over is the client's turn, and must still end on `tool_calls`
+    /// with ours removed from the same frame.
+    #[tokio::test]
+    async fn a_client_call_after_hand_over_keeps_its_tool_calls_ending() {
+        let ours = r#"{"index":0,"id":"call_1","type":"function","function":{"name":"optscale_kompressor_retrieve","arguments":"{}"}}"#;
+        let theirs = r#"{"index":1,"id":"call_2","type":"function","function":{"name":"bash","arguments":"{}"}}"#;
+        let body = format!(
+            "data: {{\"choices\":[{{\"index\":0,\"finish_reason\":null,\"delta\":{{\"content\":\"Two things:\"}}}}]}}\n\n\
+             data: {{\"choices\":[{{\"index\":0,\"finish_reason\":null,\"delta\":{{\"tool_calls\":[{ours}]}}}}]}}\n\n\
+             data: {{\"choices\":[{{\"index\":0,\"finish_reason\":\"tool_calls\",\"delta\":{{\"tool_calls\":[{theirs}]}}}}]}}\n\n\
+             data: [DONE]\n\n"
+        );
+        let mut relay = relay(ApiFamily::OpenAiChat);
+        relay.retriever = Some(crate::retrieve::tests::retriever());
+        let mut stream: BoxStream<'static, reqwest::Result<Bytes>> =
+            Box::pin(futures_util::stream::iter(per_frame(&body)));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let _ = relay
+            .read_round(&mut stream, &tx, 0, &json!({}), true)
+            .await;
+        drop(tx);
+        let mut seen = String::new();
+        while let Some(chunk) = rx.recv().await {
+            seen.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+        }
+        assert!(!seen.contains("optscale_kompressor_retrieve"), "{seen}");
+        assert!(seen.contains("\"bash\""), "{seen}");
+        assert!(seen.contains("\"finish_reason\":\"tool_calls\""), "{seen}");
+    }
+
+    /// The frames glm-5.3-flash sent on a failed sweep, verbatim but for the
+    /// envelope: narration and the opening of our call in one delta, then the
+    /// arguments together with the finish reason.
+    #[tokio::test]
+    async fn a_retrieve_call_sharing_a_frame_with_text_is_still_intercepted() {
+        let body = concat!(
+            r#"data: {"choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":""}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"index":0,"finish_reason":null,"delta":{"content":"I'll fetch it back"}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"index":0,"finish_reason":null,"delta":{"content":" `ledger.py` cat):","tool_calls":[{"index":0,"id":"chatcmpl-tool-a436","type":"function","function":{"name":"optscale_kompressor_retrieve"}}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"index":0,"finish_reason":"tool_calls","delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"ref\": \"k_6gyy63I122i1\"}"}}]}}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut relay = relay(ApiFamily::OpenAiChat);
+        relay.content_grace = 8192;
+        let mut stream: BoxStream<'static, reqwest::Result<Bytes>> =
+            Box::pin(futures_util::stream::iter(per_frame(body)));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let end = relay
+            .read_round(&mut stream, &tx, 0, &json!({}), true)
+            .await;
+        drop(tx);
+        let mut forwarded = 0usize;
+        while let Some(chunk) = rx.recv().await {
+            if chunk.is_ok_and(|bytes| !bytes.starts_with(b":")) {
+                forwarded += 1;
+            }
+        }
+        let RoundEnd::Intercepted { turn, .. } = end else {
+            panic!("the turn is ours and must be intercepted");
+        };
+        let calls = turn.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, RETRIEVE_TOOL_NAME);
+        assert!(
+            calls[0].arguments.to_string().contains("k_6gyy63I122i1"),
+            "the arguments were recorded: {:?}",
+            calls[0].arguments
+        );
+        assert_eq!(forwarded, 0);
+    }
+
+    #[tokio::test]
+    async fn the_hold_ceiling_still_bounds_what_reasoning_really_holds() {
+        let mut body = String::new();
+        let reasoning =
+            r#"data: {"choices":[{"index":0,"finish_reason":null,"delta":{"reasoning":"x"}}]}"#;
+        for _ in 0..200 {
+            body.push_str(reasoning);
+            body.push_str("\n\n");
+        }
+        body.push_str("data: [DONE]\n\n");
+        let mut relay = relay(ApiFamily::OpenAiChat);
+        relay.hold_ceiling = 4096;
+        let mut stream: BoxStream<'static, reqwest::Result<Bytes>> =
+            Box::pin(futures_util::stream::iter(per_frame(&body)));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
+        let end = relay
+            .read_round(&mut stream, &tx, 0, &json!({}), true)
+            .await;
+        drop(tx);
+        let mut forwarded = 0usize;
+        while let Some(chunk) = rx.recv().await {
+            if chunk.is_ok_and(|bytes| !bytes.starts_with(b":")) {
+                forwarded += 1;
+            }
+        }
+        assert!(matches!(end, RoundEnd::Finished { .. }));
+        assert!(
+            forwarded > 0,
+            "past the ceiling the turn is relayed, not held"
+        );
     }
 
     #[tokio::test]
