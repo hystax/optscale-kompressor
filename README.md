@@ -318,7 +318,7 @@ and [docs/MACOS.md](docs/MACOS.md) covers the macOS paths.
 
 ## Quick start
 
-### Codex — the supported path
+### Codex
 
 ```bash
 kompressor wrap codex
