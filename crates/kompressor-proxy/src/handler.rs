@@ -1939,6 +1939,7 @@ async fn stream_response(
         retriever,
         budget,
         buffer_limit: config.proxy.stream_buffer_bytes,
+        hold_ceiling: config.proxy.max_body_bytes,
         buffer_timeout: config.proxy.stream_buffer_timeout,
         intercept_limit: config.proxy.stream_intercept_bytes,
         intercept_timeout: config.proxy.stream_intercept_timeout,
