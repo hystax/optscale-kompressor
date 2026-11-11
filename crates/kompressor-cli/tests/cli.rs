@@ -457,6 +457,7 @@ fn stats_database(dir: &Path) -> PathBuf {
         returned_chars: 2_000,
         returned_tokens: 500,
         withheld: false,
+        range_status: None,
     }));
 
     sink.flush().unwrap();
@@ -644,6 +645,72 @@ fn bench_replay_still_reads_an_explicit_config() {
         ])
         .assert()
         .failure();
+}
+
+/// An explicit `--config` is the whole configuration: the environment cannot
+/// move it. Reproduced in the 2026-11-11 review — `min_compress_chars = 512`
+/// in the file and an ambient `KOMPRESSOR_MIN_COMPRESS_CHARS=1000000` made a
+/// payload that compressed 78.91% report zero eligible payloads, exit 0.
+/// Both spellings are checked, because both reached `Config::load`'s overlay.
+#[test]
+fn bench_replay_with_an_explicit_config_ignores_the_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let (corpus, _) = regression_fixture(dir.path());
+    let config = write(
+        dir.path(),
+        "replay.toml",
+        "[engine]\nmin_compress_chars = 512\n",
+    );
+    let replay = |env: &[(&str, &str)]| {
+        let mut command = kompressor();
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let output = command
+            .args([
+                "bench",
+                "replay",
+                "--json",
+                "--corpus",
+                corpus.to_str().unwrap(),
+                "--config",
+                config.to_str().unwrap(),
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let mut value =
+            serde_json::from_slice::<serde_json::Value>(&output).expect("replay --json is JSON");
+        // wall-clock, and the one field two identical replays disagree on
+        value["baseline"]
+            .as_object_mut()
+            .expect("a baseline object")
+            .remove("timing");
+        value
+    };
+
+    let clean = replay(&[]);
+    assert_eq!(clean["engine"]["min_compress_chars"], 512, "{clean}");
+    assert!(
+        clean["baseline"]["chars_out"].as_u64() < clean["baseline"]["chars_in"].as_u64(),
+        "the fixture compresses under the file's settings: {clean}"
+    );
+    for env in [
+        [("KOMPRESSOR_MIN_COMPRESS_CHARS", "1000000")],
+        [("KOMPRESSOR__ENGINE__MIN_COMPRESS_CHARS", "1000000")],
+    ] {
+        let ambient = replay(&env);
+        assert_eq!(
+            ambient["engine"], clean["engine"],
+            "{env:?} reached the replay"
+        );
+        assert_eq!(
+            ambient["baseline"], clean["baseline"],
+            "{env:?} moved the result"
+        );
+    }
 }
 
 #[test]

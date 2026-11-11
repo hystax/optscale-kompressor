@@ -290,3 +290,66 @@ fn a_v11_database_gains_keep_warm_and_its_rows_are_client_requests() {
         "rows that predate the column read 0, not NULL"
     );
 }
+
+#[test]
+fn a_v12_database_gains_range_status_and_keeps_its_retrievals() {
+    // Rows written before the column existed asked for no status at all, so
+    // they read NULL — the same as a retrieval that sent no range — and the
+    // writer fills the column from then on.
+    use kompressor_stats::events::{Event, RetrievalEvent, Surface};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stats.db");
+    database_at(&path, 12);
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO retrieval_events
+               (time_ms, tenant, request_id, surface, \"ref\", found, expired, ranged,
+                fragment_bytes, fragment_chars, fragment_tokens, returned_chars,
+                returned_tokens, withheld)
+             VALUES (?1, 'acme', 'req-old', 'proxy', 'k_AbC123dEf456', 1, 0, 0,
+                     400, 400, 100, 400, 100, 0)",
+            [T0],
+        )
+        .unwrap();
+    }
+
+    let mut writer = StatsWriter::open(&StatsConfig::at(&path)).unwrap();
+    writer
+        .write_batch(&[Event::Retrieval(RetrievalEvent {
+            time_ms: T0 + 1,
+            tenant: "acme".into(),
+            request_id: Some("req-new".into()),
+            surface: Surface::Proxy,
+            reference: "k_AbC123dEf456".into(),
+            found: true,
+            expired: false,
+            ranged: true,
+            fragment_bytes: 120,
+            fragment_chars: 120,
+            fragment_tokens: 30,
+            returned_chars: 120,
+            returned_tokens: 30,
+            withheld: false,
+            range_status: Some("normalized".into()),
+        })])
+        .unwrap();
+    drop(writer);
+
+    let conn = Connection::open(&path).unwrap();
+    let statuses: Vec<(String, Option<String>)> = conn
+        .prepare("SELECT request_id, range_status FROM retrieval_events ORDER BY time_ms")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        statuses,
+        vec![
+            ("req-old".to_string(), None),
+            ("req-new".to_string(), Some("normalized".to_string())),
+        ]
+    );
+}

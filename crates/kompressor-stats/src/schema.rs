@@ -381,6 +381,12 @@ const V12: &str = r#"
 ALTER TABLE proxy_requests ADD COLUMN keep_warm INTEGER NOT NULL DEFAULT 0;
 "#;
 
+// v13: whether a retrieval's range was read as asked, normalized, salvaged, or
+// unusable (the whole fragment went back). NULL when no range was asked for.
+const V13: &str = r#"
+ALTER TABLE retrieval_events ADD COLUMN range_status TEXT;
+"#;
+
 pub const MIGRATIONS: &[(u32, &str)] = &[
     (1, V1),
     (2, V2),
@@ -394,6 +400,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (10, V10),
     (11, V11),
     (12, V12),
+    (13, V13),
 ];
 
 /// The version a freshly migrated database reports in `PRAGMA user_version`.

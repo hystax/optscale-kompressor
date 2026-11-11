@@ -297,8 +297,12 @@ struct Fetched {
 /// Did the provider serve less of this prefix than it did last turn?
 ///
 /// Within one conversation the prefix only grows, so the reported cache read
-/// should never fall. When it does, something outside this proxy dropped the
-/// prefix and everything after the first missing byte is billed at full price.
+/// should never fall. When it does, the provider served less of it than last
+/// turn. That is an observation, not an attribution or a price: expiry,
+/// eviction, a changed request structure (tools, system, breakpoints) and our
+/// own rewrite all read the same here, and what the missing part costs depends
+/// on whether it was re-written to cache, at which TTL. `cache-loss-diff.py`
+/// and the cache report are what attribute it.
 ///
 /// A retrieve turn is excluded on both sides. It sums usage across its two
 /// upstream calls, so its own figure is inflated and the turn after it appears
@@ -512,8 +516,9 @@ impl PrefixTracker {
                 now,
                 lost = before - now,
                 since_previous_ms = prior.at.elapsed().as_millis() as u64,
-                "the provider served less of this prefix from cache than last turn; \
-                         everything after the first missing byte is billed at full price"
+                "the provider served less of this prefix from cache than last turn \
+                         (observed, not attributed: expiry, eviction, a changed request \
+                         and a rewrite all read the same here)"
             );
         }
         seen.insert(

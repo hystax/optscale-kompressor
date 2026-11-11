@@ -21,13 +21,43 @@ use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router
 
 use crate::guidance::SERVER_INSTRUCTIONS;
 
+/// Run engine work off the runtime, behind the process-wide engine permit.
+///
+/// The permit is [`AppCore::engine_slots`], the one the HTTP API and the proxy
+/// take, so `server.max_inflight_compressions` bounds this surface too. A
+/// caller that cannot get one within `server.queue_timeout` is told so, the
+/// way the API answers 503: the right response is to send the content
+/// uncompressed, not to wait behind an engine already at capacity.
+async fn engine<T, F>(core: &AppCore, work: F) -> Result<T, ErrorData>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let permit = tokio::time::timeout(
+        core.config().server.queue_timeout,
+        core.engine_slots().clone().acquire_owned(),
+    )
+    .await;
+    let Ok(Ok(permit)) = permit else {
+        return Err(ErrorData::internal_error(
+            "the compression engine is at capacity; send the content uncompressed",
+            None,
+        ));
+    };
+    blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+}
+
 /// Run synchronous engine or store work off the runtime.
 ///
 /// The HTTP surface has done this since it had a semaphore; this one called
 /// straight into the engine from an `async fn`, so compression and a SQLite
-/// write ran on a runtime worker and stalled everything else sharing it. It
-/// does not share the API's `server.max_inflight_compressions` permit — that
-/// bound still does not cover this surface, which is worth closing separately.
+/// write ran on a runtime worker and stalled everything else sharing it.
+/// Engine work goes through [`engine`], which adds the shared permit; store
+/// reads (a retrieval, a stats query) come straight here.
 async fn blocking<T, F>(work: F) -> Result<T, ErrorData>
 where
     T: Send + 'static,
@@ -278,7 +308,7 @@ impl KompressorTools {
         let core = self.core.clone();
         let for_engine = identity.clone();
         let engine_options = options.clone();
-        let (mut messages, outcome) = blocking(move || {
+        let (mut messages, outcome) = engine(&self.core, move || {
             let request = RequestInfo {
                 request_id: &request_id,
                 api_family: Some("mcp"),
@@ -345,7 +375,7 @@ impl KompressorTools {
         let content_in = input.content.clone();
         let content_type = input.content_type.map(Into::into);
         let engine_options = options.clone();
-        let (content, outcome) = blocking(move || {
+        let (content, outcome) = engine(&self.core, move || {
             core.compress_raw(
                 &for_engine,
                 &content_in,

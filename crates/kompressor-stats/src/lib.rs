@@ -182,6 +182,7 @@ mod tests {
             returned_chars: u64::from(returned_tokens) * 4,
             returned_tokens,
             withheld: false,
+            range_status: None,
         })
     }
 
@@ -1063,6 +1064,7 @@ mod tests {
                      ALTER TABLE proxy_requests DROP COLUMN strip_usage;
                      ALTER TABLE proxy_requests DROP COLUMN cache_write_1h_tokens;
                      ALTER TABLE proxy_requests DROP COLUMN keep_warm;
+                     ALTER TABLE retrieval_events DROP COLUMN range_status;
                      PRAGMA user_version = 5;",
                 )
                 .unwrap();
@@ -1107,6 +1109,7 @@ mod tests {
                 ALTER TABLE proxy_requests DROP COLUMN strip_usage;
                 ALTER TABLE proxy_requests DROP COLUMN cache_write_1h_tokens;
                 ALTER TABLE proxy_requests DROP COLUMN keep_warm;
+                ALTER TABLE retrieval_events DROP COLUMN range_status;
                 PRAGMA user_version = 5;",
                 )
                 .unwrap();

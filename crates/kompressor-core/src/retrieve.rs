@@ -39,8 +39,26 @@ pub enum RangeParse {
     /// The caller sent several variants; one was chosen. Carries how many were
     /// on offer, for the log line that says so.
     Salvaged { offered: usize },
-    /// Nothing usable. The caller gets the whole fragment, capped.
+    /// The caller sent one window in a shape the schema does not have, but
+    /// which can mean only one thing — `{"lines": 1, "end": 60}`,
+    /// `{"lines": [1, 60]}`, `{"pattern": "error"}` — and it was read as that.
+    Normalized,
+    /// Nothing usable. The caller gets the whole fragment, capped, and is told
+    /// the narrowing failed rather than left to think it asked for everything.
     Unusable,
+}
+
+impl RangeParse {
+    /// The label a response and a retrieval event carry: whether the window
+    /// the caller asked for is the window it got.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RangeParse::Exact => "exact",
+            RangeParse::Salvaged { .. } => "salvaged",
+            RangeParse::Normalized => "normalized",
+            RangeParse::Unusable => "unusable",
+        }
+    }
 }
 
 /// The order a salvage prefers variants in, most specific first.
@@ -78,6 +96,9 @@ impl RetrieveRange {
         let Some(object) = value.as_object() else {
             return (None, RangeParse::Unusable);
         };
+        if let Some(range) = normalize(object) {
+            return (Some(range), RangeParse::Normalized);
+        }
         let offered = object.len();
         let mut substantive: Vec<&str> = Vec::new();
         for name in VARIANTS {
@@ -99,6 +120,81 @@ impl RetrieveRange {
             }
         }
         (None, RangeParse::Unusable)
+    }
+}
+
+/// Read the flat shapes a model sends when it skips the inner object.
+///
+/// Recorded on the 2026-11-10 Harbor run: `{"lines":1,"end":60}`, logged as
+/// unusable and answered with the whole fragment. Each shape accepted here has
+/// exactly one reading — one variant named, its window given as a number plus
+/// a sibling `end`, a two-element array, or an `"a-b"` string; or the one
+/// field of a variant (`pattern`, `pointer`) given without the variant around
+/// it. Anything with two readings stays unusable: `{"lines": 60}` could be the
+/// first sixty lines or line sixty, and a bare `{"start", "end"}` could count
+/// lines or characters.
+fn normalize(object: &serde_json::Map<String, serde_json::Value>) -> Option<RetrieveRange> {
+    use serde_json::Value;
+    let number = |value: &Value| value.as_u64().and_then(|n| usize::try_from(n).ok());
+    let window = |value: &Value, end: Option<&Value>| -> Option<(usize, usize)> {
+        match (value, end) {
+            (Value::Number(_), Some(end)) => Some((number(value)?, number(end)?)),
+            (Value::Array(pair), None) if pair.len() == 2 => {
+                Some((number(&pair[0])?, number(&pair[1])?))
+            }
+            (Value::String(text), None) => {
+                let (start, end) = text.split_once('-')?;
+                Some((start.trim().parse().ok()?, end.trim().parse().ok()?))
+            }
+            _ => None,
+        }
+    };
+    let text = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+
+    let named: Vec<&str> = object
+        .keys()
+        .map(String::as_str)
+        .filter(|key| VARIANTS.contains(key))
+        .collect();
+    let only = |allowed: &[&str]| object.keys().all(|key| allowed.contains(&key.as_str()));
+    match named.as_slice() {
+        [variant] if only(&[variant, "end"]) => {
+            let member = &object[*variant];
+            let end = object.get("end");
+            match *variant {
+                "lines" => window(member, end)
+                    .filter(|(start, end)| *start >= 1 && start <= end)
+                    .map(|(start, end)| RetrieveRange::Lines { start, end }),
+                "chars" => window(member, end)
+                    .filter(|(start, end)| start < end)
+                    .map(|(start, end)| RetrieveRange::Chars { start, end }),
+                "json_pointer" if end.is_none() => {
+                    text(Some(member)).map(|pointer| RetrieveRange::JsonPointer { pointer })
+                }
+                "grep" if end.is_none() => text(Some(member)).map(|pattern| RetrieveRange::Grep {
+                    pattern,
+                    context: default_context(),
+                }),
+                _ => None,
+            }
+        }
+        [] if only(&["pattern", "context"]) => {
+            let pattern = text(object.get("pattern"))?;
+            let context = match object.get("context") {
+                Some(value) => number(value)?,
+                None => default_context(),
+            };
+            Some(RetrieveRange::Grep { pattern, context })
+        }
+        [] if only(&["pointer"]) => {
+            text(object.get("pointer")).map(|pointer| RetrieveRange::JsonPointer { pointer })
+        }
+        _ => None,
     }
 }
 
@@ -511,6 +607,87 @@ mod tests {
             }));
             assert_eq!(range, Some(RetrieveRange::Chars { start: 10, end: 20 }));
             assert_eq!(how, RangeParse::Salvaged { offered: 2 });
+        }
+    }
+
+    /// The argument recorded on the 2026-11-10 Harbor run (`08f3d50`), logged
+    /// as unusable and answered with the whole fragment.
+    #[test]
+    fn the_recorded_flat_line_window_is_read_as_the_window_it_names() {
+        let (range, how) = RetrieveRange::parse_loose(&json!({"lines": 1, "end": 60}));
+        assert_eq!(range, Some(RetrieveRange::Lines { start: 1, end: 60 }));
+        assert_eq!(how, RangeParse::Normalized);
+        assert_eq!(how.as_str(), "normalized");
+    }
+
+    #[test]
+    fn other_shapes_with_one_reading_are_normalized() {
+        for (value, want) in [
+            (
+                json!({"lines": [3, 9]}),
+                RetrieveRange::Lines { start: 3, end: 9 },
+            ),
+            (
+                json!({"lines": "3-9"}),
+                RetrieveRange::Lines { start: 3, end: 9 },
+            ),
+            (
+                json!({"chars": 0, "end": 500}),
+                RetrieveRange::Chars { start: 0, end: 500 },
+            ),
+            (
+                json!({"chars": [10, 20]}),
+                RetrieveRange::Chars { start: 10, end: 20 },
+            ),
+            (
+                json!({"grep": "error"}),
+                RetrieveRange::Grep {
+                    pattern: "error".into(),
+                    context: 2,
+                },
+            ),
+            (
+                json!({"pattern": "error", "context": 0}),
+                RetrieveRange::Grep {
+                    pattern: "error".into(),
+                    context: 0,
+                },
+            ),
+            (
+                json!({"pointer": "/items/0"}),
+                RetrieveRange::JsonPointer {
+                    pointer: "/items/0".into(),
+                },
+            ),
+            (
+                json!({"json_pointer": "/items/0"}),
+                RetrieveRange::JsonPointer {
+                    pointer: "/items/0".into(),
+                },
+            ),
+        ] {
+            let (range, how) = RetrieveRange::parse_loose(&value);
+            assert_eq!(range, Some(want), "{value}");
+            assert_eq!(how, RangeParse::Normalized, "{value}");
+        }
+    }
+
+    /// Two readings is no reading: these stay unusable, and the caller is
+    /// told so, rather than handed whichever window a guess picked.
+    #[test]
+    fn shapes_with_more_than_one_reading_stay_unusable() {
+        for value in [
+            json!({"lines": 60}),                   // the first 60, or line 60?
+            json!({"start": 1, "end": 60}),         // lines or characters?
+            json!({"lines": 1, "end": 60, "x": 1}), // and what is x?
+            json!({"lines": 0, "end": 60}),         // lines count from 1
+            json!({"lines": 60, "end": 1}),         // backwards
+            json!({"chars": 5, "end": 5}),          // empty
+            json!({"grep": ""}),
+            json!({"pointer": ""}),
+        ] {
+            let (range, how) = RetrieveRange::parse_loose(&value);
+            assert_eq!((range, how), (None, RangeParse::Unusable), "{value}");
         }
     }
 

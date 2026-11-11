@@ -528,6 +528,75 @@ def retrieve_loop(
         check(rounds not in (None, "0"), f"[{label}] the round is reported in a header", f"got {rounds!r}")
 
 
+def a_flat_range_is_served_as_the_window_it_names() -> None:
+    """The retrieve argument a model sent on a real Harbor run, through the loop.
+
+    `{"lines": 1, "end": 60}` is not the schema's shape, and the proxy used to
+    log it as unusable and send the whole fragment back. It names one window;
+    the round the provider sees next must carry that window, and say how the
+    range was read. A range with two readings must say the narrowing failed.
+    """
+    print("\nretrieve ranges")
+    for asked, want_status, want_ranged in (
+        ({"lines": 1, "end": 60}, "normalized", True),
+        ({"lines": 60}, "unusable", False),
+    ):
+        reset_provider()
+        label = json.dumps(asked)
+        body = {
+            "model": "claude-x",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": log_payload(tag=f"range-{want_status}")}],
+        }
+        status, _, _ = post(
+            f"{PROXY}/v1/messages",
+            body,
+            {"x-kompressor-mode": "recoverable", "x-e2e-range": json.dumps(asked)},
+        )
+        check(status == 200, f"[{label}] the client gets one answer", f"status {status}")
+        seen = recorded()
+        if not check(len(seen) >= 2, f"[{label}] the loop ran", f"{len(seen)} request(s)"):
+            continue
+        second = json.loads(seen[1]["body"])
+        results = [
+            block
+            for message in second.get("messages", [])
+            if isinstance(message.get("content"), list)
+            for block in message["content"]
+            if block.get("type") == "tool_result"
+        ]
+        if not check(bool(results), f"[{label}] the second round carries a tool result"):
+            continue
+        content = results[-1]["content"]
+        text = content if isinstance(content, str) else "".join(
+            part.get("text", "") for part in content if isinstance(part, dict)
+        )
+        try:
+            answer = json.loads(text)
+        except ValueError:
+            check(False, f"[{label}] the tool result is the retriever's JSON", text[:120])
+            continue
+        check(
+            answer.get("range_status") == want_status,
+            f"[{label}] is reported as {want_status}",
+            f"got {answer.get('range_status')!r}",
+        )
+        check(
+            answer.get("ranged") is want_ranged,
+            f"[{label}] {'narrows' if want_ranged else 'does not pretend to narrow'}",
+            f"ranged {answer.get('ranged')!r}",
+        )
+        if want_ranged:
+            lines = len((answer.get("content") or "").splitlines())
+            check(lines <= 60, f"[{label}] returns at most the 60 lines asked for", f"{lines} lines")
+        else:
+            check(
+                "could not be read" in (answer.get("hint") or ""),
+                f"[{label}] says the narrowing failed",
+                repr(answer.get("hint")),
+            )
+
+
 def retrieve_loops() -> None:
     print("\nretrieve loop")
     # One payload per scenario. A shared one makes every scenario the same
@@ -1219,6 +1288,7 @@ def main() -> int:
     refs_and_retrievals(handles.get("recoverable", []))
     handles_are_never_dangling()
     retrieve_loops()
+    a_flat_range_is_served_as_the_window_it_names()
     a_stream_the_provider_does_not_label_is_still_relayed()
     a_truncated_frame_does_not_defeat_the_parser()
     html_is_compressed_rather_than_waved_through()
