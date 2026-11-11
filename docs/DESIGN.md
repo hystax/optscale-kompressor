@@ -3572,12 +3572,6 @@ ALTER TABLE proxy_requests ADD COLUMN cache_write_1h_tokens INTEGER;
 -- (`proxy.cache_keep_warm`, §12.10). Its usage is real spend, so cost totals
 -- include it; counts of client requests and latency should filter it out.
 ALTER TABLE proxy_requests ADD COLUMN keep_warm INTEGER NOT NULL DEFAULT 0;
-
--- v13: whether a retrieval's range was read as asked (`exact`), salvaged from
--- several variants (`salvaged`), read from a flat shape with one meaning such
--- as {"lines":1,"end":60} (`normalized`), or not narrowable at all
--- (`unusable`, the whole fragment went back). NULL when no range was asked.
-ALTER TABLE retrieval_events ADD COLUMN range_status TEXT;
 ```
 
 ## C. Configuration reference — flat environment mapping

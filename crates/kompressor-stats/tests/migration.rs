@@ -292,64 +292,24 @@ fn a_v11_database_gains_keep_warm_and_its_rows_are_client_requests() {
 }
 
 #[test]
-fn a_v12_database_gains_range_status_and_keeps_its_retrievals() {
-    // Rows written before the column existed asked for no status at all, so
-    // they read NULL — the same as a retrieval that sent no range — and the
-    // writer fills the column from then on.
-    use kompressor_stats::events::{Event, RetrievalEvent, Surface};
-
+fn the_ladder_stops_where_experimental_v2_takes_over() {
+    // `experimental/v2` already owns v13 (request context and daily analysis)
+    // and v14 (retrieval range_status). A v13 assigned here would mean a
+    // different schema under the same number: a database this line stamped
+    // 13 would make that line skip its own v13 and fail on v14 with
+    // "duplicate column range_status", and the server would not start.
+    // Raise this only together with that ladder, never past it on its own.
+    assert_eq!(schema::latest_version(), 12);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("stats.db");
-    database_at(&path, 12);
-    {
-        let conn = Connection::open(&path).unwrap();
-        conn.execute(
-            "INSERT INTO retrieval_events
-               (time_ms, tenant, request_id, surface, \"ref\", found, expired, ranged,
-                fragment_bytes, fragment_chars, fragment_tokens, returned_chars,
-                returned_tokens, withheld)
-             VALUES (?1, 'acme', 'req-old', 'proxy', 'k_AbC123dEf456', 1, 0, 0,
-                     400, 400, 100, 400, 100, 0)",
-            [T0],
+    drop(StatsWriter::open(&StatsConfig::at(&path)).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    let has_status: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('retrieval_events') WHERE name = 'range_status'",
+            [],
+            |row| row.get(0),
         )
         .unwrap();
-    }
-
-    let mut writer = StatsWriter::open(&StatsConfig::at(&path)).unwrap();
-    writer
-        .write_batch(&[Event::Retrieval(RetrievalEvent {
-            time_ms: T0 + 1,
-            tenant: "acme".into(),
-            request_id: Some("req-new".into()),
-            surface: Surface::Proxy,
-            reference: "k_AbC123dEf456".into(),
-            found: true,
-            expired: false,
-            ranged: true,
-            fragment_bytes: 120,
-            fragment_chars: 120,
-            fragment_tokens: 30,
-            returned_chars: 120,
-            returned_tokens: 30,
-            withheld: false,
-            range_status: Some("normalized".into()),
-        })])
-        .unwrap();
-    drop(writer);
-
-    let conn = Connection::open(&path).unwrap();
-    let statuses: Vec<(String, Option<String>)> = conn
-        .prepare("SELECT request_id, range_status FROM retrieval_events ORDER BY time_ms")
-        .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert_eq!(
-        statuses,
-        vec![
-            ("req-old".to_string(), None),
-            ("req-new".to_string(), Some("normalized".to_string())),
-        ]
-    );
+    assert_eq!(has_status, 0, "range_status is v14, not this line's to add");
 }

@@ -251,6 +251,12 @@ pub struct RetrievalEvent {
     /// The split the 2026-11-11 review asked for: a whole-fragment read the
     /// model meant and one whose narrowing failed looked identical before,
     /// and only the second is a cost the tool's guidance can fix.
+    ///
+    /// Not persisted on this line yet: the column is stats schema v14, after
+    /// the v13 that `experimental/v2` already assigned, and it arrives with
+    /// that branch. Claiming v13 here would give one version number two
+    /// schemas, and a database stamped by one line would fail to open on the
+    /// other. Until then the status reaches the model and in-process sinks.
     #[serde(default)]
     pub range_status: Option<String>,
 }

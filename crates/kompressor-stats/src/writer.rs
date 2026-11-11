@@ -300,8 +300,8 @@ fn insert_retrieval(conn: &Connection, e: &RetrievalEvent) -> Result<(), StatsEr
         "INSERT INTO retrieval_events (
             time_ms, tenant, request_id, surface, \"ref\", found, expired, ranged,
             fragment_bytes, fragment_chars, fragment_tokens, returned_chars, returned_tokens,
-            withheld, range_status)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            withheld)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
     )?
     .execute(params![
         e.time_ms,
@@ -318,7 +318,6 @@ fn insert_retrieval(conn: &Connection, e: &RetrievalEvent) -> Result<(), StatsEr
         e.returned_chars as i64,
         i64::from(e.returned_tokens),
         i64::from(e.withheld),
-        e.range_status,
     ])?;
     Ok(())
 }
