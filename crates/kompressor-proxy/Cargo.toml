@@ -44,7 +44,7 @@ zstd = { workspace = true }
 kompressor-store = { path = "../kompressor-store" }
 
 http-body-util = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
 tower = { workspace = true, features = ["util"] }
 # A real HTTP upstream rather than a stubbed client: the header policy, the
 # re-sent rounds of the retrieve loop and the SSE relay are all observable only

@@ -1821,6 +1821,7 @@ async fn buffered_response(
     mode: ProxyMode,
     started: Instant,
 ) -> Response {
+    let path = outbound.path();
     let relayed = match nonstream::run(
         outbound,
         family,
@@ -1832,6 +1833,7 @@ async fn buffered_response(
     {
         Ok(relayed) => relayed,
         Err(error) => {
+            tracing::warn!(request_id = %request_id, %path, %error, "the upstream could not be reached; answered 502");
             recorder.finish(None, 0, 0, None, started, Some(error.to_string()));
             return error_response(
                 StatusCode::BAD_GATEWAY,
@@ -1841,6 +1843,7 @@ async fn buffered_response(
         }
     };
 
+    log_upstream_status(relayed.status, &request_id, &path);
     let mut response_headers = headers::client_headers(&relayed.headers);
     headers::annotate(
         &mut response_headers,
@@ -1883,9 +1886,11 @@ async fn stream_response(
     mode: ProxyMode,
     started: Instant,
 ) -> Response {
+    let path = outbound.path();
     let upstream = match outbound.send().await {
         Ok(response) => response,
         Err(error) => {
+            tracing::warn!(request_id = %request_id, %path, %error, "the upstream could not be reached; answered 502");
             recorder.finish(None, 0, 0, None, started, Some(error.to_string()));
             return error_response(
                 StatusCode::BAD_GATEWAY,
@@ -1896,6 +1901,7 @@ async fn stream_response(
     };
 
     let status = upstream.status();
+    log_upstream_status(status, &request_id, &path);
     let mut response_headers = headers::client_headers(upstream.headers());
     // Rounds are reported as zero on a streamed response and cannot be
     // anything else: the headers go out before the first frame arrives, and a
@@ -2010,6 +2016,21 @@ fn is_event_stream(headers: &HeaderMap, asked_for_stream: bool) -> bool {
     {
         Some(value) => value.contains("event-stream"),
         None => asked_for_stream,
+    }
+}
+
+/// Say when the provider refused a request, at a level the default log keeps.
+///
+/// Refusals are relayed untouched, which is right, but they used to leave no
+/// line at all: a client reporting "authentication failed" pointed at a log
+/// showing nothing, and the log could not say whether the 401 came from the
+/// provider or the request never arrived. The request id joins this line to
+/// the stats row.
+fn log_upstream_status(status: StatusCode, request_id: &str, path: &str) {
+    if status.is_server_error() {
+        tracing::warn!(request_id = %request_id, %path, status = status.as_u16(), "the upstream answered with an error");
+    } else if status.is_client_error() {
+        tracing::info!(request_id = %request_id, %path, status = status.as_u16(), "the upstream refused the request");
     }
 }
 
