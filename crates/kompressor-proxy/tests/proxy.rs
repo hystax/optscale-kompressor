@@ -1439,6 +1439,81 @@ async fn a_marked_final_message_is_compressed_on_arrival_and_never_again() {
 }
 
 #[tokio::test]
+async fn a_conversation_moved_to_a_fallback_model_keeps_its_compression() {
+    // Claude Code answers a refusal by re-sending the same request under a
+    // fallback model and staying there. The model is part of the conversation
+    // identity, so the proxy saw a new conversation, froze it to the client's
+    // marker on first sight, and the tool result the earlier model had been
+    // sent compressed went out whole on every turn after. Measured on
+    // 2026-11-10 (`11-03-18`): dna-insert compressed 3.8–5.2% per attempt
+    // against about 30% before the switch.
+    let harness = Harness::with(|config| {
+        config.proxy.frozen_prefix = kompressor_core::config::FrozenPrefix::FirstSeen;
+    })
+    .await;
+    answering(&harness).await;
+
+    let body = |model: &str, messages: &Vec<Value>| json!({"model": model, "max_tokens": 1024, "messages": messages});
+    let mut messages = vec![json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_0",
+         "cache_control": {"type": "ephemeral"}, "content": "the opening"}
+    ]})];
+    harness
+        .post("/v1/messages", &body("claude-opus-5-5", &messages))
+        .await;
+
+    messages[0]["content"][0]
+        .as_object_mut()
+        .expect("a tool_result block")
+        .remove("cache_control");
+    let arrived = log_payload(400);
+    messages.push(json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_1",
+         "cache_control": {"type": "ephemeral"}, "content": arrived.clone()}
+    ]}));
+    harness
+        .post("/v1/messages", &body("claude-opus-5-5", &messages))
+        .await;
+    // The refused request again, under the fallback model.
+    harness
+        .post("/v1/messages", &body("claude-opus-5", &messages))
+        .await;
+    // And the session carries on there, the marker moving to the newest turn.
+    messages[1]["content"][0]
+        .as_object_mut()
+        .expect("a tool_result block")
+        .remove("cache_control");
+    messages.push(json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_2",
+         "cache_control": {"type": "ephemeral"}, "content": "the newest turn"}
+    ]}));
+    harness
+        .post("/v1/messages", &body("claude-opus-5", &messages))
+        .await;
+
+    let seen = harness.upstream_json().await;
+    assert_eq!(seen.len(), 4, "every request reached the provider");
+    let before = seen[1]["messages"][1]["content"][0]["content"]
+        .as_str()
+        .expect("the result survives as text");
+    assert!(
+        before.len() < arrived.len(),
+        "the earlier model was sent it compressed"
+    );
+    assert_eq!(
+        seen[2]["messages"][1]["content"][0]["content"].as_str(),
+        Some(before),
+        "nothing is cached under the fallback model, so the result should go \
+         out as the earlier model was sent it, not whole"
+    );
+    assert_eq!(
+        seen[3]["messages"][1]["content"][0]["content"].as_str(),
+        Some(before),
+        "and every later turn under the fallback model must send it the same way"
+    );
+}
+
+#[tokio::test]
 async fn a_notification_ships_the_same_bytes_as_a_block_and_as_a_string() {
     // Claude Code sends a background-task notification as one text block
     // carrying the breakpoint the turn it arrives, and as a plain string on

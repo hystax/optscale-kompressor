@@ -666,10 +666,20 @@ fn prefix_identity(
     let fingerprint = state
         .prefixes
         .identify(&prefixcache::identity_chain_in_scope(&refs, &scope))?;
+    // The same history with the model left out, so that a conversation the
+    // client moves to another model is recognised as one this proxy carried;
+    // see `PrefixTracker::floor_for`.
+    let lineage =
+        prefixcache::lineage_key(&refs, identity.tenant.as_str(), provider, family.as_str());
     // Recorded whatever the setting says, so that turning `frozen_prefix` on
     // mid-session finds a watermark describing what the client established
     // rather than whatever this turn happens to mark.
-    state.prefixes.floor(fingerprint, walk.frozen_message_count);
+    state.prefixes.floor_for(
+        fingerprint,
+        walk.frozen_message_count,
+        lineage,
+        walk.model.as_deref().unwrap_or(""),
+    );
     let messages = value
         .get("messages")
         .and_then(Value::as_array)

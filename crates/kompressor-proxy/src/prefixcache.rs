@@ -201,6 +201,14 @@ struct Seen {
     rewritten: bool,
 }
 
+/// Which conversation, under which model, last sent one history.
+#[derive(Clone, Debug)]
+struct Lineage {
+    fingerprint: u64,
+    model: String,
+    at: Instant,
+}
+
 /// Remembers, per frozen prefix, whether the provider last served it from cache.
 #[derive(Debug)]
 pub struct PrefixTracker {
@@ -224,6 +232,11 @@ pub struct PrefixTracker {
     /// Openings already seen, so a later turn is recognised as the same
     /// conversation rather than hashed into a new one.
     ids: Mutex<Identities>,
+    /// The conversation and model that last sent each history, keyed by that
+    /// history's identity chain WITHOUT the model in scope. What
+    /// [`Self::floor_for`] reads to recognise one conversation carried on
+    /// under another model. Bounded like `seen`.
+    lineages: Mutex<HashMap<u64, Lineage>>,
     /// Handles the model has fetched back, per conversation.
     ///
     /// Bounded twice over: at most [`RETRIEVED_PER_CONVERSATION`] handles for
@@ -377,6 +390,7 @@ impl PrefixTracker {
             billed: Mutex::new((0, 0, 0)),
             seen: Mutex::new(HashMap::new()),
             ids: Mutex::new(Identities::default()),
+            lineages: Mutex::new(HashMap::new()),
             retrieved: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
             ttl,
@@ -1022,6 +1036,79 @@ impl PrefixTracker {
         observed
     }
 
+    /// [`Self::floor`], except that a conversation seen for the first time
+    /// under a new model, carrying a history this proxy already sent under
+    /// another one, starts from that conversation's floor instead of the
+    /// client's marker.
+    ///
+    /// `lineage` is the request's identity chain with the model left out of
+    /// scope — the same history under any model hashes alike — and `model`
+    /// the model it asks for.
+    ///
+    /// The marker is the right first floor for a conversation the proxy
+    /// joins: the client may have cached it before anything came through
+    /// here. It is the wrong one for a conversation the proxy has carried all
+    /// along, moved to another model mid-flight. The provider caches per
+    /// model, so nothing is cached under the new one yet and no floor can cost
+    /// a read; freezing to the marker only sends whole, for the rest of the
+    /// session, whatever the earlier model's turns had compressed.
+    ///
+    /// Measured on 2026-11-10 (`11-03-18`): Opus 5.5's safety classifier
+    /// refused the biology tasks and Claude Code carried on under
+    /// `claude-opus-5` (`model_refusal_fallback`, 76 of 192 requests). The
+    /// first request under the fallback was the refused one again, its tool
+    /// result already in it and marked, so the floor froze all four messages;
+    /// every later turn kept that result whole, and dna-insert compressed
+    /// 3.8–5.2% per attempt where the requests before the switch compressed
+    /// about 30%. Starting from the sibling's floor, the result compresses to
+    /// the same bytes the earlier model was sent.
+    ///
+    /// Only a sibling under a DIFFERENT model is taken: two attempts at one
+    /// Harbor task replay each other's opening under the same model, and
+    /// there the marker rule stands.
+    pub fn floor_for(
+        &self,
+        fingerprint: u64,
+        observed: usize,
+        lineage: Option<u64>,
+        model: &str,
+    ) -> usize {
+        let sibling = lineage.and_then(|key| {
+            let mut lineages = self.lineages.lock().ok()?;
+            let before = lineages.get(&key).cloned();
+            if lineages.len() >= REMEMBER
+                && !lineages.contains_key(&key)
+                && let Some(oldest) = lineages
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.at)
+                    .map(|(key, _)| *key)
+            {
+                lineages.remove(&oldest);
+            }
+            lineages.insert(
+                key,
+                Lineage {
+                    fingerprint,
+                    model: model.to_string(),
+                    at: Instant::now(),
+                },
+            );
+            before.filter(|prior| prior.fingerprint != fingerprint && prior.model != model)
+        });
+        let first_sight = self
+            .seen
+            .lock()
+            .map(|seen| !seen.contains_key(&fingerprint))
+            .unwrap_or(false);
+        let seeded = match sibling {
+            Some(prior) if first_sight => self
+                .held_floor(prior.fingerprint)
+                .map_or(observed, |held| held.min(observed)),
+            _ => observed,
+        };
+        self.floor(fingerprint, seeded)
+    }
+
     /// Has the provider ever served this prefix from cache?
     ///
     /// The question a discard has to ask before it throws a rewrite away.
@@ -1112,6 +1199,18 @@ impl PrefixTracker {
 /// that turn one started. Capped at `IDENTITY_DEPTH`.
 pub fn identity_chain(messages: &[&str]) -> Vec<u64> {
     identity_chain_in_scope(messages, &[])
+}
+
+/// The key [`PrefixTracker::floor_for`] files a history under: its whole
+/// identity chain in the conversation's scope minus the model, so the same
+/// history asked of another model hashes alike while another tenant, provider
+/// or API family never does. Named arguments rather than a slice of the
+/// identity scope, so that a component added to that scope cannot quietly
+/// take the model's place here.
+pub fn lineage_key(messages: &[&str], tenant: &str, provider: &str, family: &str) -> Option<u64> {
+    identity_chain_in_scope(messages, &[tenant, provider, family])
+        .last()
+        .copied()
 }
 
 /// A stable identity chain for messages inside one tenant and provider/model
@@ -1770,6 +1869,98 @@ mod tests {
         assert_eq!(tracker.floor(1, 2), 2);
         tracker.record(1, Some(41_116), None, 0);
         assert_eq!(tracker.floor(1, 9), 2, "the response must not reset it");
+    }
+
+    #[test]
+    fn a_history_moved_to_another_model_starts_from_its_floor() {
+        let tracker = PrefixTracker::new(Duration::ZERO);
+        assert_eq!(tracker.floor_for(1, 1, Some(10), "opus-5-5"), 1);
+        assert_eq!(tracker.floor_for(1, 2, Some(20), "opus-5-5"), 1);
+        assert_eq!(
+            tracker.floor_for(2, 2, Some(20), "opus-5"),
+            1,
+            "the same history under a fallback model is the same conversation"
+        );
+        assert_eq!(tracker.floor_for(2, 5, Some(30), "opus-5"), 1);
+    }
+
+    #[test]
+    fn the_same_history_under_the_same_model_keeps_the_marker() {
+        // Two attempts at one Harbor task: one opening, one model, two
+        // conversations. The second may have been cached by the client
+        // before it came through here, so first sight still means the marker.
+        let tracker = PrefixTracker::new(Duration::ZERO);
+        assert_eq!(tracker.floor_for(1, 0, Some(10), "opus-5-5"), 0);
+        assert_eq!(tracker.floor_for(2, 2, Some(10), "opus-5-5"), 2);
+    }
+
+    #[test]
+    fn a_known_conversation_is_not_seeded_from_a_sibling() {
+        // The seed is for first sight only. A conversation with a floor of
+        // its own keeps it: lowering it would rewrite bytes already cached.
+        let tracker = PrefixTracker::new(Duration::ZERO);
+        assert_eq!(tracker.floor_for(1, 0, Some(10), "opus-5-5"), 0);
+        assert_eq!(tracker.floor_for(2, 3, Some(20), "opus-5"), 3);
+        assert_eq!(tracker.floor_for(2, 3, Some(10), "opus-5"), 3);
+    }
+
+    #[test]
+    fn a_seed_never_freezes_more_than_the_client_marked() {
+        // The sibling's floor is an upper bound, not a value: a fallback
+        // request that marks less than it may still have the rest.
+        let tracker = PrefixTracker::new(Duration::ZERO);
+        assert_eq!(tracker.floor_for(1, 3, Some(10), "opus-5-5"), 3);
+        assert_eq!(tracker.floor_for(2, 1, Some(10), "opus-5"), 1);
+    }
+
+    #[test]
+    fn going_back_to_the_first_model_keeps_its_own_floor() {
+        // Back from the fallback: that conversation is known, so it is not
+        // first sight and nothing is seeded from the fallback's floor.
+        let tracker = PrefixTracker::new(Duration::ZERO);
+        assert_eq!(tracker.floor_for(1, 2, Some(10), "opus-5-5"), 2);
+        assert_eq!(tracker.floor_for(2, 0, Some(20), "opus-5"), 0);
+        assert_eq!(tracker.floor_for(1, 4, Some(20), "opus-5-5"), 2);
+    }
+
+    #[test]
+    fn the_lineage_table_is_bounded() {
+        // Keyed by caller-controlled history, so it must not grow with it.
+        let tracker = PrefixTracker::new(Duration::ZERO);
+        for key in 0..(REMEMBER as u64 + 64) {
+            tracker.floor_for(key, 0, Some(key), "opus-5-5");
+        }
+        let held = tracker.lineages.lock().unwrap().len();
+        assert!(held <= REMEMBER, "the table must stay bounded, held {held}");
+    }
+
+    #[test]
+    fn the_lineage_key_ignores_the_model_and_nothing_else() {
+        let history = ["open", "result"];
+        let key = lineage_key(&history, "tenant", "anthropic", "anthropic");
+        assert!(key.is_some());
+        assert_ne!(
+            key,
+            lineage_key(&history, "other", "anthropic", "anthropic"),
+            "another tenant's history must never seed this one"
+        );
+        assert_ne!(key, lineage_key(&history, "tenant", "openai", "anthropic"));
+        assert_ne!(
+            key,
+            lineage_key(&history, "tenant", "anthropic", "openai_chat")
+        );
+        assert_ne!(
+            key,
+            lineage_key(&["open"], "tenant", "anthropic", "anthropic")
+        );
+        assert_eq!(lineage_key(&[], "tenant", "anthropic", "anthropic"), None);
+    }
+
+    #[test]
+    fn no_lineage_is_the_marker_rule() {
+        let tracker = PrefixTracker::new(Duration::ZERO);
+        assert_eq!(tracker.floor_for(1, 4, None, "opus-5-5"), 4);
+        assert_eq!(tracker.floor_for(1, 9, None, "opus-5-5"), 4);
     }
 
     #[test]
