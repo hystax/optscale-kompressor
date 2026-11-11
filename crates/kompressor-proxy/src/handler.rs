@@ -9,6 +9,7 @@
 //! all: a provider that answered is always relayed, status and body, exactly as
 //! it answered.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -24,7 +25,7 @@ use tracing::Instrument;
 
 use kompressor_core::auth::{Credentials, Identity};
 use kompressor_core::config::{
-    CacheTtl, FrozenPrefix, ProxyConfig, RetrieveExecution, RetrieveTool,
+    CacheTtl, FrozenPrefix, ProxyConfig, RetrieveExecution, RetrieveTool, Upstream,
 };
 use kompressor_core::{AppCore, RequestInfo};
 use kompressor_engine::estimate_tokens;
@@ -37,6 +38,7 @@ use kompressor_wire::{ApiFamily, Walk, detect_family, walker_for};
 use crate::bodycapture;
 use crate::bodycodec;
 use crate::failopen::Stage;
+use crate::intercept::InterceptedOrigin;
 use crate::mode::ProxyMode;
 use crate::prefixcache;
 use crate::retrieve::{Budget, Retriever};
@@ -65,16 +67,33 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     let config = state.core.config();
     let proxy = &config.proxy;
 
-    let Some(upstream) = route::match_upstream(proxy, parts.uri.path()) else {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            "no upstream is configured for this path",
-            &request_id,
-        );
-    };
     // Classified before routing, not just before header policy: under a
     // subscription the same path belongs to a different host.
     let auth_mode = crate::authmode::classify(&parts.headers);
+    // A request the intercept decrypted already named its host, and is kept
+    // on it; one sent to this listener directly is routed by path alone. See
+    // `route::match_upstream_for_origin` for what path-only routing did to an
+    // intercepted request.
+    let matched = match parts.extensions.get::<InterceptedOrigin>() {
+        Some(origin) => route::match_upstream_for_origin(
+            proxy,
+            &origin.host,
+            origin.port,
+            parts.uri.path(),
+            auth_mode.is_subscription(),
+        ),
+        None => match route::match_upstream(proxy, parts.uri.path()) {
+            Some(upstream) => Cow::Borrowed(upstream),
+            None => {
+                return error_response(
+                    StatusCode::NOT_FOUND,
+                    "no upstream is configured for this path",
+                    &request_id,
+                );
+            }
+        },
+    };
+    let upstream: &Upstream = &matched;
     let route = route::route_for(
         upstream,
         parts.uri.path(),

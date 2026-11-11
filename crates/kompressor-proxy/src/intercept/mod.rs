@@ -38,6 +38,19 @@ use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
+/// The origin an intercepted request was addressed to, attached to every
+/// request decrypted on that connection.
+///
+/// Taken from the `CONNECT` the client opened with, never from the request's
+/// own headers: it is what the client asked to reach, and the router uses it
+/// to keep the request on that host. A request on the ordinary listener has
+/// none, and is routed by path as before.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterceptedOrigin {
+    pub host: String,
+    pub port: u16,
+}
+
 /// Why the listener could not start. Failures once it is running are logged
 /// per connection and never stop the loop.
 #[derive(Debug, thiserror::Error)]
@@ -236,7 +249,15 @@ async fn handle(
     };
 
     tracing::debug!(host = %target.host, "intercepted");
-    let service = hyper_util::service::TowerToHyperService::new(router);
+    let origin = InterceptedOrigin {
+        host: target.host.clone(),
+        port: target.port,
+    };
+    let tagged = tower::ServiceExt::map_request(router, move |mut request: http::Request<_>| {
+        request.extensions_mut().insert(origin.clone());
+        request
+    });
+    let service = hyper_util::service::TowerToHyperService::new(tagged);
     if let Err(error) = ServerBuilder::new(TokioExecutor::new())
         .serve_connection_with_upgrades(TokioIo::new(tls), service)
         .await
