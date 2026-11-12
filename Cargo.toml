@@ -88,7 +88,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 
 # --- storage ---
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.42", features = ["bundled"] }
 
 # --- cli / config ---
 clap = { version = "4", features = ["derive", "env"] }
