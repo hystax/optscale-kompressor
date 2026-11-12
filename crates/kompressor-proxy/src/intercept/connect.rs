@@ -18,7 +18,12 @@ pub struct Target {
 
 impl fmt::Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.host, self.port)
+        if self.host.contains(':') {
+            // an IPv6 literal, which needs its brackets back to be an authority
+            write!(f, "[{}]:{}", self.host, self.port)
+        } else {
+            write!(f, "{}:{}", self.host, self.port)
+        }
     }
 }
 
@@ -32,6 +37,10 @@ pub enum Refusal {
     BadAuthority,
     /// The client hung up, or sent a header block longer than any real one.
     Unreadable,
+    /// The origin of a tunnelled host could not be reached. Answered before
+    /// the tunnel opens, so the client sees a proxy error instead of a
+    /// handshake that dies after "200 Connection Established".
+    Unreachable,
 }
 
 impl Refusal {
@@ -42,6 +51,7 @@ impl Refusal {
             Refusal::NotConnect => "HTTP/1.1 405 Method Not Allowed\r\n\r\n",
             Refusal::BadAuthority => "HTTP/1.1 400 Bad Request\r\n\r\n",
             Refusal::Unreadable => "HTTP/1.1 400 Bad Request\r\n\r\n",
+            Refusal::Unreachable => "HTTP/1.1 502 Bad Gateway\r\n\r\n",
         }
     }
 }
@@ -164,6 +174,7 @@ mod tests {
         let t = parse_request_line("CONNECT [2001:db8::1]:443 HTTP/1.1").unwrap();
         assert_eq!(t.host, "2001:db8::1");
         assert_eq!(t.port, 443);
+        assert_eq!(t.to_string(), "[2001:db8::1]:443");
     }
 
     #[test]

@@ -38,6 +38,19 @@ use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
+/// The origin an intercepted request was addressed to, attached to every
+/// request decrypted on that connection.
+///
+/// Taken from the `CONNECT` the client opened with, never from the request's
+/// own headers: it is what the client asked to reach, and the router uses it
+/// to keep the request on that host. A request on the ordinary listener has
+/// none, and is routed by path as before.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterceptedOrigin {
+    pub host: String,
+    pub port: u16,
+}
+
 /// Why the listener could not start. Failures once it is running are logged
 /// per connection and never stop the loop.
 #[derive(Debug, thiserror::Error)]
@@ -178,14 +191,26 @@ async fn handle(
         }
     };
 
-    connect::accept(reader.get_mut()).await?;
-
     if !allow.intercepts(&target.host) {
-        let authority = target.to_string();
-        let copied = tunnel::relay(&mut reader, &authority).await?;
+        // Dial before answering. A 200 sent first leaves a failed dial to
+        // surface as a TLS handshake that dies for no stated reason, and the
+        // client reports whatever it was doing at the time: for a token
+        // refresh, "authentication failed".
+        let mut upstream = match tunnel::dial(&target).await {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                tracing::warn!(%target, %error, "could not reach a tunnelled host; answered 502");
+                connect::refuse(reader.get_mut(), &connect::Refusal::Unreachable).await;
+                return Ok(());
+            }
+        };
+        connect::accept(reader.get_mut()).await?;
+        let copied = tunnel::relay(&mut reader, &mut upstream).await?;
         tracing::debug!(host = %target.host, sent = copied.0, received = copied.1, "tunnelled");
         return Ok(());
     }
+
+    connect::accept(reader.get_mut()).await?;
 
     let config = match authority.server_config(&target.host) {
         Ok(config) => config,
@@ -224,7 +249,15 @@ async fn handle(
     };
 
     tracing::debug!(host = %target.host, "intercepted");
-    let service = hyper_util::service::TowerToHyperService::new(router);
+    let origin = InterceptedOrigin {
+        host: target.host.clone(),
+        port: target.port,
+    };
+    let tagged = tower::ServiceExt::map_request(router, move |mut request: http::Request<_>| {
+        request.extensions_mut().insert(origin.clone());
+        request
+    });
+    let service = hyper_util::service::TowerToHyperService::new(tagged);
     if let Err(error) = ServerBuilder::new(TokioExecutor::new())
         .serve_connection_with_upgrades(TokioIo::new(tls), service)
         .await

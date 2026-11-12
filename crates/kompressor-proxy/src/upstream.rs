@@ -44,6 +44,15 @@ pub(crate) struct Outbound {
 }
 
 impl Outbound {
+    /// The path this request is sent to, for log lines. The query is left
+    /// out: it is the client's, and nothing a log reader needs.
+    pub(crate) fn path(&self) -> String {
+        self.url
+            .parse::<http::Uri>()
+            .map(|uri| uri.path().to_string())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn new(
         client: reqwest::Client,
         method: Method,

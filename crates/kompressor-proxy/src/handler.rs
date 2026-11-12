@@ -9,6 +9,7 @@
 //! all: a provider that answered is always relayed, status and body, exactly as
 //! it answered.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -24,7 +25,7 @@ use tracing::Instrument;
 
 use kompressor_core::auth::{Credentials, Identity};
 use kompressor_core::config::{
-    CacheTtl, FrozenPrefix, ProxyConfig, RetrieveExecution, RetrieveTool,
+    CacheTtl, FrozenPrefix, ProxyConfig, RetrieveExecution, RetrieveTool, Upstream,
 };
 use kompressor_core::{AppCore, RequestInfo};
 use kompressor_engine::estimate_tokens;
@@ -37,6 +38,7 @@ use kompressor_wire::{ApiFamily, Walk, detect_family, walker_for};
 use crate::bodycapture;
 use crate::bodycodec;
 use crate::failopen::Stage;
+use crate::intercept::InterceptedOrigin;
 use crate::mode::ProxyMode;
 use crate::prefixcache;
 use crate::retrieve::{Budget, Retriever};
@@ -65,16 +67,33 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     let config = state.core.config();
     let proxy = &config.proxy;
 
-    let Some(upstream) = route::match_upstream(proxy, parts.uri.path()) else {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            "no upstream is configured for this path",
-            &request_id,
-        );
-    };
     // Classified before routing, not just before header policy: under a
     // subscription the same path belongs to a different host.
     let auth_mode = crate::authmode::classify(&parts.headers);
+    // A request the intercept decrypted already named its host, and is kept
+    // on it; one sent to this listener directly is routed by path alone. See
+    // `route::match_upstream_for_origin` for what path-only routing did to an
+    // intercepted request.
+    let matched = match parts.extensions.get::<InterceptedOrigin>() {
+        Some(origin) => route::match_upstream_for_origin(
+            proxy,
+            &origin.host,
+            origin.port,
+            parts.uri.path(),
+            auth_mode.is_subscription(),
+        ),
+        None => match route::match_upstream(proxy, parts.uri.path()) {
+            Some(upstream) => Cow::Borrowed(upstream),
+            None => {
+                return error_response(
+                    StatusCode::NOT_FOUND,
+                    "no upstream is configured for this path",
+                    &request_id,
+                );
+            }
+        },
+    };
+    let upstream: &Upstream = &matched;
     let route = route::route_for(
         upstream,
         parts.uri.path(),
@@ -1821,6 +1840,7 @@ async fn buffered_response(
     mode: ProxyMode,
     started: Instant,
 ) -> Response {
+    let path = outbound.path();
     let relayed = match nonstream::run(
         outbound,
         family,
@@ -1832,6 +1852,7 @@ async fn buffered_response(
     {
         Ok(relayed) => relayed,
         Err(error) => {
+            tracing::warn!(request_id = %request_id, %path, %error, "the upstream could not be reached; answered 502");
             recorder.finish(None, 0, 0, None, started, Some(error.to_string()));
             return error_response(
                 StatusCode::BAD_GATEWAY,
@@ -1841,6 +1862,7 @@ async fn buffered_response(
         }
     };
 
+    log_upstream_status(relayed.status, &request_id, &path);
     let mut response_headers = headers::client_headers(&relayed.headers);
     headers::annotate(
         &mut response_headers,
@@ -1883,9 +1905,11 @@ async fn stream_response(
     mode: ProxyMode,
     started: Instant,
 ) -> Response {
+    let path = outbound.path();
     let upstream = match outbound.send().await {
         Ok(response) => response,
         Err(error) => {
+            tracing::warn!(request_id = %request_id, %path, %error, "the upstream could not be reached; answered 502");
             recorder.finish(None, 0, 0, None, started, Some(error.to_string()));
             return error_response(
                 StatusCode::BAD_GATEWAY,
@@ -1896,6 +1920,7 @@ async fn stream_response(
     };
 
     let status = upstream.status();
+    log_upstream_status(status, &request_id, &path);
     let mut response_headers = headers::client_headers(upstream.headers());
     // Rounds are reported as zero on a streamed response and cannot be
     // anything else: the headers go out before the first frame arrives, and a
@@ -2010,6 +2035,21 @@ fn is_event_stream(headers: &HeaderMap, asked_for_stream: bool) -> bool {
     {
         Some(value) => value.contains("event-stream"),
         None => asked_for_stream,
+    }
+}
+
+/// Say when the provider refused a request, at a level the default log keeps.
+///
+/// Refusals are relayed untouched, which is right, but they used to leave no
+/// line at all: a client reporting "authentication failed" pointed at a log
+/// showing nothing, and the log could not say whether the 401 came from the
+/// provider or the request never arrived. The request id joins this line to
+/// the stats row.
+fn log_upstream_status(status: StatusCode, request_id: &str, path: &str) {
+    if status.is_server_error() {
+        tracing::warn!(request_id = %request_id, %path, status = status.as_u16(), "the upstream answered with an error");
+    } else if status.is_client_error() {
+        tracing::info!(request_id = %request_id, %path, status = status.as_u16(), "the upstream refused the request");
     }
 }
 

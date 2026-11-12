@@ -3,6 +3,8 @@
 //! Routing is by the longest matching path prefix. A catch-all mount therefore
 //! cannot hide a more specific provider just because it appears first.
 
+use std::borrow::Cow;
+
 use kompressor_core::config::{ProxyConfig, SubscriptionUpstream, Upstream};
 
 /// The upstream a request was routed to and the URL it will be sent to.
@@ -43,9 +45,110 @@ impl Route<'_> {
 /// deployment is configured. `default_upstream` is consulted only when no
 /// prefix matched, so a catch-all cannot shadow a specific mount.
 pub fn match_upstream<'a>(config: &'a ProxyConfig, path: &str) -> Option<&'a Upstream> {
-    if let Some(upstream) = config
+    if let Some(upstream) = longest_prefix(config.upstreams.iter(), path) {
+        return Some(upstream);
+    }
+    if config.default_upstream.is_empty() {
+        return None;
+    }
+    config
         .upstreams
         .iter()
+        .find(|upstream| upstream.name == config.default_upstream)
+}
+
+/// Find the upstream for a request the intercept listener decrypted for
+/// `host:port`.
+///
+/// Path-only routing is right for a client that was pointed at the proxy: the
+/// mount *is* the destination. It is wrong for an intercepted one, which
+/// already named its destination in the `CONNECT` and the SNI. With Codex's
+/// `/v1` mount configured, Claude Code's `api.anthropic.com/v1/code/sessions`
+/// matched that mount and went to `chatgpt.com` carrying the Anthropic OAuth
+/// token — a 401 the client reported as "Authentication failed", and a
+/// credential sent to a third party.
+///
+/// So only mounts that would send the request to the host the client asked
+/// for are candidates, judged by where [`route_for`] would actually send it:
+/// under a subscription that is the override's host, not `base_url`. When none
+/// matches the path, the request goes to the host it was meant for, unchanged
+/// and uncompressed. `default_upstream` is not consulted: a catch-all is a
+/// guess about destinations, and an intercepted request has no need of one.
+pub fn match_upstream_for_origin<'a>(
+    config: &'a ProxyConfig,
+    host: &str,
+    port: u16,
+    path: &str,
+    subscription: bool,
+) -> Cow<'a, Upstream> {
+    let on_origin = config
+        .upstreams
+        .iter()
+        .filter(|upstream| sends_to(upstream, subscription, host, port));
+    match longest_prefix(on_origin, path) {
+        Some(upstream) => Cow::Borrowed(upstream),
+        None => Cow::Owned(passthrough_to(host, port)),
+    }
+}
+
+/// Name of the mount an unmatched intercepted request is given, as it appears
+/// in logs and stats rows.
+pub const INTERCEPT_PASSTHROUGH: &str = "intercept-passthrough";
+
+/// The mount an intercepted request falls back to: its own origin, path kept,
+/// credentials forwarded, nothing rewritten.
+fn passthrough_to(host: &str, port: u16) -> Upstream {
+    let authority = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let base_url = if port == 443 {
+        format!("https://{authority}")
+    } else {
+        format!("https://{authority}:{port}")
+    };
+    Upstream {
+        name: INTERCEPT_PASSTHROUGH.to_string(),
+        base_url,
+        api_family: "passthrough".to_string(),
+        forward_auth: true,
+        ..Default::default()
+    }
+}
+
+/// Whether `upstream` would send a request to `host:port`.
+fn sends_to(upstream: &Upstream, subscription: bool, host: &str, port: u16) -> bool {
+    let base = upstream
+        .subscription
+        .as_ref()
+        .filter(|_| subscription)
+        .map(|over| over.base_url.as_str())
+        .unwrap_or(&upstream.base_url);
+    let Ok(uri) = base.parse::<http::Uri>() else {
+        return false;
+    };
+    let Some(base_host) = uri.host() else {
+        return false;
+    };
+    let default_port = match uri.scheme_str() {
+        Some("http") => 80,
+        _ => 443,
+    };
+    base_host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .eq_ignore_ascii_case(host)
+        && uri.port_u16().unwrap_or(default_port) == port
+}
+
+/// The mount with the longest prefix that matches `path`, earliest first on a
+/// tie.
+fn longest_prefix<'a>(
+    upstreams: impl Iterator<Item = &'a Upstream>,
+    path: &str,
+) -> Option<&'a Upstream> {
+    upstreams
         .filter(|upstream| {
             let prefix = mount_prefix(upstream);
             prefix.is_empty()
@@ -61,16 +164,6 @@ pub fn match_upstream<'a>(config: &'a ProxyConfig, path: &str) -> Option<&'a Ups
         // a character the match itself has already declared insignificant.
         .max_by_key(|(index, upstream)| (mount_prefix(upstream).len(), std::cmp::Reverse(*index)))
         .map(|(_, upstream)| upstream)
-    {
-        return Some(upstream);
-    }
-    if config.default_upstream.is_empty() {
-        return None;
-    }
-    config
-        .upstreams
-        .iter()
-        .find(|upstream| upstream.name == config.default_upstream)
 }
 
 /// Build the route for a matched upstream.
@@ -362,5 +455,112 @@ mod tests {
         });
         let route = route_for(&mount, "/v1/responses", None, true);
         assert_eq!(route.url, "https://chatgpt.com/v1/responses");
+    }
+
+    /// The packaged macOS mounts that matter here: Codex owns `/v1`, Claude
+    /// owns `/v1/messages` and `/api`.
+    fn packaged() -> ProxyConfig {
+        let mut openai = upstream("openai", "/v1", false);
+        openai.base_url = "https://api.openai.com".into();
+        openai.subscription = Some(SubscriptionUpstream {
+            base_url: "https://chatgpt.com".into(),
+            rewrite_prefix: "/backend-api/codex".into(),
+        });
+        let mut anthropic = upstream("anthropic", "/v1/messages", false);
+        anthropic.base_url = "https://api.anthropic.com".into();
+        let mut anthropic_api = upstream("anthropic-api", "/api", false);
+        anthropic_api.base_url = "https://api.anthropic.com".into();
+        config(vec![openai, anthropic, anthropic_api], "")
+    }
+
+    #[test]
+    fn an_intercepted_request_never_leaves_for_another_host() {
+        // The reported failure: a Claude Code subscription request to
+        // api.anthropic.com/v1/code/sessions, which path-only routing gave to
+        // the Codex mount and so to chatgpt.com.
+        let config = packaged();
+        assert_eq!(
+            match_upstream(&config, "/v1/code/sessions").map(|u| u.name.as_str()),
+            Some("openai"),
+            "path-only routing is unchanged for clients pointed at the proxy"
+        );
+        let matched =
+            match_upstream_for_origin(&config, "api.anthropic.com", 443, "/v1/code/sessions", true);
+        assert_eq!(matched.name, INTERCEPT_PASSTHROUGH);
+        assert_eq!(matched.api_family, "passthrough");
+        assert!(matched.forward_auth);
+        let route = route_for(&matched, "/v1/code/sessions", Some("limit=1"), true);
+        assert_eq!(
+            route.url,
+            "https://api.anthropic.com/v1/code/sessions?limit=1"
+        );
+    }
+
+    #[test]
+    fn an_intercepted_request_still_takes_a_mount_on_its_own_host() {
+        let config = packaged();
+        for (path, name) in [
+            ("/v1/messages", "anthropic"),
+            ("/v1/messages/count_tokens", "anthropic"),
+            ("/api/oauth/profile", "anthropic-api"),
+        ] {
+            let matched = match_upstream_for_origin(&config, "api.anthropic.com", 443, path, true);
+            assert_eq!(matched.name, name, "{path}");
+            assert!(matches!(matched, Cow::Borrowed(_)), "{path}");
+        }
+    }
+
+    #[test]
+    fn the_host_a_mount_sends_to_depends_on_how_the_caller_pays() {
+        // The Codex mount sends subscription callers to chatgpt.com and API
+        // keys to api.openai.com, so it is chatgpt.com's mount only for the
+        // former.
+        let config = packaged();
+        assert_eq!(
+            match_upstream_for_origin(&config, "chatgpt.com", 443, "/v1/responses", true).name,
+            "openai"
+        );
+        assert_eq!(
+            match_upstream_for_origin(&config, "chatgpt.com", 443, "/v1/responses", false).name,
+            INTERCEPT_PASSTHROUGH
+        );
+        assert_eq!(
+            match_upstream_for_origin(&config, "api.openai.com", 443, "/v1/responses", false).name,
+            "openai"
+        );
+    }
+
+    #[test]
+    fn hosts_compare_without_case_and_ports_must_agree() {
+        let config = packaged();
+        assert_eq!(
+            match_upstream_for_origin(&config, "API.Anthropic.com", 443, "/v1/messages", false)
+                .name,
+            "anthropic"
+        );
+        let other_port =
+            match_upstream_for_origin(&config, "api.anthropic.com", 8443, "/v1/messages", false);
+        assert_eq!(other_port.name, INTERCEPT_PASSTHROUGH);
+        assert_eq!(
+            route_for(&other_port, "/v1/messages", None, false).url,
+            "https://api.anthropic.com:8443/v1/messages"
+        );
+    }
+
+    #[test]
+    fn the_default_upstream_does_not_catch_an_intercepted_request() {
+        let mut config = packaged();
+        config.default_upstream = "openai".into();
+        assert_eq!(
+            match_upstream_for_origin(&config, "api.anthropic.com", 443, "/v1/models", false).name,
+            INTERCEPT_PASSTHROUGH
+        );
+    }
+
+    #[test]
+    fn an_ipv6_origin_gets_its_brackets_back() {
+        let config = packaged();
+        let matched = match_upstream_for_origin(&config, "2001:db8::1", 443, "/x", false);
+        assert_eq!(matched.base_url, "https://[2001:db8::1]");
     }
 }
