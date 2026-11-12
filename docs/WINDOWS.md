@@ -129,8 +129,10 @@ Restart-Service kompressor
 ```
 
 Restarting and stopping need an administrator PowerShell. The configuration,
-`%ProgramData%\kompressor\config.toml`, can be changed only by administrators;
-restart the service to apply an edit, and check it with:
+`%ProgramData%\kompressor\config.toml`, can be changed by administrators and by
+the service account (LocalService), which needs write access to the state
+folder it sits in; ordinary users can read it but not change it. Restart the
+service to apply an edit, and check it with:
 
 ```powershell
 kompressor check-config --config "$env:ProgramData\kompressor\config.toml"

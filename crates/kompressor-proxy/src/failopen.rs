@@ -21,7 +21,13 @@ pub enum Stage {
     Parse,
     /// No walker recognised the body's shape.
     Walk,
-    /// The engine timed out, panicked, or errored.
+    /// No engine permit came free before the compression deadline. The
+    /// process is at its `server.max_inflight_compressions`; this request went
+    /// uncompressed rather than queue behind it.
+    Admission,
+    /// The engine timed out, panicked, or errored — retaining the result in
+    /// the fragment store included, since that is inside the same deadline,
+    /// and so is a task that only started after the deadline had passed.
     Compress,
     /// Compression produced nothing smaller, or nothing at all.
     Discarded,
@@ -38,6 +44,7 @@ impl Stage {
             Stage::Auth => "auth",
             Stage::Parse => "parse",
             Stage::Walk => "walk",
+            Stage::Admission => "admission",
             Stage::Compress => "compress",
             Stage::Discarded => "discarded",
             Stage::Inject => "inject",
@@ -55,6 +62,7 @@ pub struct FailOpen {
     auth: AtomicU64,
     parse: AtomicU64,
     walk: AtomicU64,
+    admission: AtomicU64,
     compress: AtomicU64,
     discarded: AtomicU64,
     inject: AtomicU64,
@@ -78,6 +86,7 @@ impl FailOpen {
             Stage::Auth,
             Stage::Parse,
             Stage::Walk,
+            Stage::Admission,
             Stage::Compress,
             Stage::Discarded,
             Stage::Inject,
@@ -98,6 +107,7 @@ impl FailOpen {
             Stage::Auth => &self.auth,
             Stage::Parse => &self.parse,
             Stage::Walk => &self.walk,
+            Stage::Admission => &self.admission,
             Stage::Compress => &self.compress,
             Stage::Discarded => &self.discarded,
             Stage::Inject => &self.inject,

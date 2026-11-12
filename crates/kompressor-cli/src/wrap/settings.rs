@@ -148,20 +148,46 @@ pub(super) fn sibling(settings: &Path, name: &str) -> PathBuf {
 /// every future wrap in the project.
 pub(super) struct Lock {
     path: PathBuf,
-    held: bool,
 }
 
 const LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
 
+/// How long [`Lock::acquire`] waits for a held lock before giving up.
+///
+/// Longer than [`LOCK_STALE_AFTER`], so a lock left by a session that died
+/// mid-edit is always broken within the wait rather than reported. A live
+/// holder keeps it for one read-modify-write, milliseconds, so the wait is
+/// only ever this long when that holder crashed.
+const LOCK_WAIT: Duration = Duration::from_secs(35);
+
+/// How often `PermissionDenied` is retried before it counts as an error.
+///
+/// On Windows a file that a scanner or indexer has open, or that is being
+/// deleted, refuses `create_new` with access denied for a moment. A directory
+/// that is genuinely read-only still fails, after about a second.
+const DENIED_RETRIES: u32 = 20;
+
 impl Lock {
-    pub(super) fn acquire(path: PathBuf) -> Lock {
-        for _ in 0..100 {
+    pub(super) fn acquire(path: PathBuf) -> Result<Lock, CliError> {
+        Lock::acquire_within(path, LOCK_WAIT)
+    }
+
+    /// [`Lock::acquire`], giving up after `wait`.
+    fn acquire_within(path: PathBuf, wait: Duration) -> Result<Lock, CliError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                CliError::runtime("could not create the settings directory", error)
+            })?;
+        }
+        let started = std::time::Instant::now();
+        let mut denied = 0;
+        loop {
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&path)
             {
-                Ok(_) => return Lock { path, held: true },
+                Ok(_) => return Ok(Lock { path }),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     if let Ok(meta) = std::fs::metadata(&path) {
                         let stale = meta
@@ -170,27 +196,39 @@ impl Lock {
                             .and_then(|m| m.elapsed().ok())
                             .map(|age| age > LOCK_STALE_AFTER)
                             .unwrap_or(false);
-                        if stale {
-                            let _ = std::fs::remove_file(&path);
+                        // Only retried at once when the removal worked. One
+                        // that fails -- on Windows, a file another process
+                        // holds open without delete sharing -- falls through
+                        // to the wait and the deadline below, rather than
+                        // spinning on it for ever.
+                        if stale && std::fs::remove_file(&path).is_ok() {
                             continue;
                         }
                     }
+                    if started.elapsed() > wait {
+                        return Err(CliError::Runtime(format!(
+                            "timed out locking {}",
+                            path.display()
+                        )));
+                    }
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                // A directory we cannot write is degraded, not unusable: the
-                // edit still happens, it is just not serialised against a peer.
-                Err(_) => return Lock { path, held: false },
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::PermissionDenied
+                        && denied < DENIED_RETRIES =>
+                {
+                    denied += 1;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(CliError::runtime("could not lock settings", error)),
             }
         }
-        Lock { path, held: false }
     }
 }
 
 impl Drop for Lock {
     fn drop(&mut self) {
-        if self.held {
-            let _ = std::fs::remove_file(&self.path);
-        }
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -262,7 +300,7 @@ pub(super) fn clear(claim: &mut Claim) {
 /// Returns whether the file was changed, so a caller can stay quiet when there
 /// was nothing to do.
 pub fn claim(target: &Target, key: &str, value: &str) -> Result<bool, CliError> {
-    let _lock = Lock::acquire(target.lock_path());
+    let _lock = Lock::acquire(target.lock_path())?;
     let owners_path = target.owners_path();
     let mut owners = read_owners(&owners_path);
 
@@ -320,7 +358,7 @@ pub enum Released {
 /// `force` is `unwrap`: the user is asking for their settings back, so every
 /// claim is dropped and the restore happens regardless of who else is running.
 pub fn release(target: &Target, key: &str, force: bool) -> Result<Released, CliError> {
-    let _lock = Lock::acquire(target.lock_path());
+    let _lock = Lock::acquire(target.lock_path())?;
     let owners_path = target.owners_path();
     let mut owners = read_owners(&owners_path);
     // One lock covers every key this process holds in the file, so it goes
@@ -403,6 +441,19 @@ mod tests {
             .get(key)?
             .as_str()
             .map(str::to_string)
+    }
+
+    #[test]
+    fn a_first_claim_in_a_new_directory_has_a_liveness_lock() {
+        let scratch = Scratch::new("first-lock");
+        let target = scratch.target();
+        assert!(!target.settings.parent().unwrap().exists());
+        claim(&target, "ANTHROPIC_BASE_URL", "http://127.0.0.1:8817").unwrap();
+        let owners = read_owners(&target.owners_path());
+        let holder = &owners.keys["ANTHROPIC_BASE_URL"].holders[0];
+        assert!(holder.lock.is_some());
+        assert_eq!(holder.proven_alive(), Some(true));
+        release(&target, "ANTHROPIC_BASE_URL", false).unwrap();
     }
 
     #[test]
@@ -655,13 +706,69 @@ mod tests {
     }
 
     #[test]
+    fn a_lock_error_is_reported_before_editing_settings() {
+        let scratch = Scratch::new("lock-error");
+        let path = scratch.0.join("file");
+        std::fs::write(&path, "keep").unwrap();
+        assert!(Lock::acquire(path.join("settings.lock")).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "keep");
+    }
+
+    #[test]
     fn the_lock_is_exclusive_and_self_releasing() {
         let scratch = Scratch::new("lock");
         let path = scratch.0.join("l.lock");
         {
-            let _held = Lock::acquire(path.clone());
+            let _held = Lock::acquire(path.clone()).unwrap();
             assert!(path.exists(), "the lock file is the lock");
         }
         assert!(!path.exists(), "and it is gone once dropped");
+    }
+
+    /// A lock a session left as it crashed, not yet stale when the next wrap
+    /// arrives. That wrap waits it out and breaks it; it used to give up after
+    /// five seconds, and a wrap started within half a minute of a crash
+    /// refused to run.
+    #[test]
+    fn a_crashed_sessions_fresh_lock_is_waited_out_not_reported() {
+        let scratch = Scratch::new("crashed-lock");
+        std::fs::create_dir_all(&scratch.0).unwrap();
+        let path = scratch.0.join("l.lock");
+        let file = std::fs::File::create(&path).unwrap();
+        let almost_stale =
+            std::time::SystemTime::now() - (LOCK_STALE_AFTER - Duration::from_secs(1));
+        file.set_modified(almost_stale).unwrap();
+        drop(file);
+        let begun = std::time::Instant::now();
+        let held = Lock::acquire(path.clone()).expect("the dead lock is broken");
+        assert!(begun.elapsed() < LOCK_WAIT, "{:?}", begun.elapsed());
+        drop(held);
+        assert!(!path.exists());
+    }
+
+    /// A stale lock that cannot be removed -- on Windows, one another process
+    /// holds open without delete sharing; here, a directory -- is reported
+    /// once the wait is up. It used to be retried at once, past the deadline
+    /// check, for ever.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_lock_that_cannot_be_removed_times_out_instead_of_spinning() {
+        let scratch = Scratch::new("stuck-lock");
+        let path = scratch.0.join("l.lock");
+        std::fs::create_dir_all(path.join("inside")).unwrap();
+        let old = std::time::SystemTime::now() - 2 * LOCK_STALE_AFTER;
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let begun = std::time::Instant::now();
+        let result = Lock::acquire_within(path.clone(), Duration::from_millis(300));
+        assert!(result.is_err(), "a lock that cannot be broken is not taken");
+        assert!(
+            begun.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            begun.elapsed()
+        );
+        assert!(path.exists(), "and nothing was removed");
     }
 }

@@ -65,7 +65,7 @@ Agents kompressor wrap knows:
   cursor-agent  Cursor Agent CLI — cannot be compressed (see below)
   cursor        Cursor (GUI editor; base URL set by hand in Settings)
   claude        Claude Code (Anthropic Messages)
-  codex         OpenAI Codex CLI (OpenAI Responses), via its config file
+  codex         OpenAI Codex CLI (OpenAI Responses), via a -c flag or its config file
   opencode      opencode (OpenAI Chat; only for its built-in `openai` provider)
   aider         aider (OpenAI Chat or Anthropic Messages, by model)
 

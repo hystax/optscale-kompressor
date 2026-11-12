@@ -47,6 +47,14 @@ STATS="$WORK/stats.db"
 REFS="$WORK/refs.db"
 PROXY_LOG="$WORK/proxy.log"
 PID_FILE="$WORK/proxy.pid"
+# Claude Code saves a Bash result longer than `bashOutputMaxChars` (default
+# 30,000) to disk and sends the model a 2 KB preview, so the proxy compresses
+# the preview and the payload never reaches it: 12 of 16 sweep reads on
+# 2026-10-30. 128,000 is the most the setting accepts, and the fixtures are
+# built to fit under it with room for the terminal's own additions.
+BASH_OUTPUT_MAX=128000
+FIXTURE_MAX_CHARS="${FIXTURE_MAX_CHARS:-120000}"
+CLAUDE_SETTINGS="{\"bashOutputMaxChars\":$BASH_OUTPUT_MAX}"
 
 say() { printf '\n== %s\n' "$*"; }
 
@@ -76,9 +84,16 @@ claude_env() {
   # that does not mean editing the user's configuration.
   local home=()
   [ -n "${CLAUDE_HOME:-}" ] && home=(CLAUDE_CONFIG_DIR="$CLAUDE_HOME")
+  # The same `env` block may carry HTTPS_PROXY (a kompressor intercept for
+  # Claude Desktop, say), which Claude Code applies to plain-http base URLs
+  # too. A CONNECT-only proxy answers that forward request `405 (no body)` and
+  # the sweep proxy sees nothing. NO_PROXY is not overridden by that block.
+  local no_proxy="127.0.0.1,localhost,::1"
+  [ -n "${NO_PROXY:-}" ] && no_proxy="$no_proxy,$NO_PROXY"
   env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
       -u CLAUDE_CODE_USE_BEDROCK -u CLAUDE_CODE_USE_VERTEX \
       "${home[@]}" \
+      NO_PROXY="$no_proxy" no_proxy="$no_proxy" \
       ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT" ENABLE_TOOL_SEARCH=true "$@"
 }
 
@@ -201,6 +216,21 @@ stop_proxy() {
   fi
 }
 
+# The sweep proxy talks to Anthropic directly. A shell started from Claude Code
+# inherits HTTPS_PROXY from `~/.claude/settings.json`, and following it routes
+# the sweep's upstream through another kompressor's TLS intercept: the proxy
+# rejects that CA as `InvalidCertificate(UnknownIssuer)`, and had it trusted it
+# the run would measure two compressors stacked.
+#
+# `exec`, because callers background this and record `$!` as the proxy's PID: a
+# function run with `&` is a subshell, and without `exec` that PID is the
+# subshell's. `stop_proxy` then kills it and leaves kompressor on the port.
+serve_proxy() {
+  exec env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy \
+      -u ALL_PROXY -u all_proxy \
+      "$KOMPRESSOR" serve --config "$CONFIG"
+}
+
 start_proxy() {
   stop_proxy
   # The sidecars too: a stale `-wal` over a database that was deleted under it
@@ -209,7 +239,7 @@ start_proxy() {
   rm -f "$STATS"* "$REFS"* "$PROXY_LOG"
   write_config
   "$KOMPRESSOR" check-config --config "$CONFIG" >/dev/null || die "the generated config does not load"
-  "$KOMPRESSOR" serve --config "$CONFIG" >"$PROXY_LOG" 2>&1 &
+  serve_proxy >"$PROXY_LOG" 2>&1 &
   echo $! > "$PID_FILE"
   sleep 3
   kill -0 "$(cat "$PID_FILE")" 2>/dev/null || { sed 's/^/    /' "$PROXY_LOG"; die "the proxy did not start"; }
@@ -237,6 +267,13 @@ explain_bypass() {
   local log="$1"
   echo "  VOID — nothing reached the proxy, so this run says nothing about"
   echo "         compression or retrieval."
+  # Claude Code's own words, when it gave up before the first request: an
+  # expired login and a proxy in HTTPS_PROXY answering 405 both looked like
+  # this line alone.
+  local said
+  said="$(grep -aoE '"(result|text)":"(API Error|Failed to authenticate|Invalid API key|Not logged in)[^"]*' "$log" 2>/dev/null \
+    | head -1 | sed -E 's/^"[a-z]+":"//')"
+  [ -n "$said" ] && echo "         Claude Code said: $said"
   if grep -q 'another auth source is set' "$log" 2>/dev/null; then
     echo "         Claude Code reports another auth source taking precedence."
   fi
@@ -312,7 +349,7 @@ stage_fixtures() {
   mkdir -p "$WORK"
   write_config
   KOMPRESSOR="$KOMPRESSOR" SKIP_BUILD=1 WORK="$WORK" CONFIG="$CONFIG" \
-    bash "$codex" fixtures
+    FIXTURE_MAX_CHARS="$FIXTURE_MAX_CHARS" bash "$codex" fixtures
 }
 
 stage_sweep() {
@@ -335,7 +372,7 @@ stage_sweep() {
   local session_status=0
   ( cd "$WORK/fixtures" && claude_env timeout 2400 \
     "$CLAUDE" -p "$(cat "$WORK/prompt.txt")" --permission-mode bypassPermissions \
-      --output-format stream-json --verbose \
+      --output-format stream-json --verbose --settings "$CLAUDE_SETTINGS" \
       "${model[@]}" < /dev/null ) > "$WORK/sweep-out.txt" 2>&1 || session_status=$?
 
   sleep 5
@@ -346,6 +383,14 @@ stage_sweep() {
   fi
   if ! python3 "$SWEEP_LIB/session-status.py" "$WORK/sweep-out.txt" "$session_status"; then
     echo "  ERROR — Claude session did not complete."
+    return 1
+  fi
+  # A preview is what the proxy compressed, so the numbers below would be the
+  # engine's work on 2 KB stubs reported as the sweep.
+  if python3 "$SWEEP_LIB/persisted-output.py" "$WORK/sweep-out.txt"; then
+    echo "  VOID — Claude Code offloaded a fixture read to disk and sent only a preview."
+    echo "         A fixture is over bashOutputMaxChars ($BASH_OUTPUT_MAX); see the breakdown."
+    stop_proxy
     return 1
   fi
   local results chars
@@ -522,7 +567,7 @@ PROMPT_EOF
   local model=(); [ -n "${CLAUDE_SWEEP_MODEL:-}" ] && model=(--model "$CLAUDE_SWEEP_MODEL")
   local session_status=0
   ( cd "$dir" && claude_env timeout 900 "$CLAUDE" -p "$(cat "$dir/prompt.txt")" --permission-mode bypassPermissions \
-      --output-format stream-json --verbose "${model[@]}" < /dev/null ) > "$dir/run.log" 2>&1 || session_status=$?
+      --output-format stream-json --verbose --settings "$CLAUDE_SETTINGS" "${model[@]}" < /dev/null ) > "$dir/run.log" 2>&1 || session_status=$?
   sleep 5
   if ! reached_the_proxy "$before"; then
     explain_bypass "$dir/run.log"; stop_proxy; return 1
@@ -597,7 +642,7 @@ stage_bughunt() {
   stop_proxy
   rm -f "$STATS"* "$REFS"* "$PROXY_LOG"
   "$KOMPRESSOR" check-config --config "$CONFIG" >/dev/null || die "the bughunt config does not load"
-  "$KOMPRESSOR" serve --config "$CONFIG" >"$PROXY_LOG" 2>&1 &
+  serve_proxy >"$PROXY_LOG" 2>&1 &
   echo $! > "$PID_FILE"; sleep 3
   kill -0 "$(cat "$PID_FILE")" 2>/dev/null || { sed 's/^/    /' "$PROXY_LOG"; die "the proxy did not start"; }
 
@@ -657,7 +702,7 @@ PROMPT_EOF
   local model=(); [ -n "${CLAUDE_SWEEP_MODEL:-}" ] && model=(--model "$CLAUDE_SWEEP_MODEL")
   local session_status=0
   ( cd "$dir" && claude_env timeout 1800 "$CLAUDE" -p "$(cat "$WORK/bughunt-prompt.txt")" --permission-mode bypassPermissions \
-      --output-format stream-json --verbose "${model[@]}" < /dev/null ) > "$WORK/bughunt-run.log" 2>&1 || session_status=$?
+      --output-format stream-json --verbose --settings "$CLAUDE_SETTINGS" "${model[@]}" < /dev/null ) > "$WORK/bughunt-run.log" 2>&1 || session_status=$?
   sleep 5
   if ! reached_the_proxy "$before"; then
     explain_bypass "$WORK/bughunt-run.log"; stop_proxy; return 1

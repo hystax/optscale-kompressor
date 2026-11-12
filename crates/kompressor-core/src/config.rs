@@ -48,19 +48,19 @@ pub struct ServerConfig {
     pub max_body_bytes: usize,
     /// 0 means twice the detected parallelism.
     ///
-    /// **It bounds the HTTP API surface and nothing else**, which is narrower
-    /// than the name reads when `serve` is running the proxy and the MCP tool
-    /// server in the same process. `ServerState` owns the only semaphore in the
-    /// workspace; the proxy spawns its engine work directly
-    /// (`handler.rs::compress_with_deadline`) and so does MCP, so a burst on
-    /// either is bounded by tokio's blocking pool rather than by this number.
+    /// Bounds engine work across **every surface in the process** — the HTTP
+    /// API, the proxy and the MCP tool server share one semaphore on
+    /// `AppCore::engine_slots`. Until the 2026-11-11 review it bounded the API
+    /// alone: the proxy and MCP spawned blocking work directly, and a proxy
+    /// timeout does not cancel the task it gave up on, so a burst of large
+    /// histories could queue and run without limit after every caller had
+    /// fallen open.
     ///
-    /// Worth knowing because a compression timeout does not *cancel* the
-    /// blocking task it gave up on: slow proxy requests can each start another,
-    /// fall open after the deadline, and leave the work running while more
-    /// arrives. Closing it means moving admission into shared state every
-    /// surface acquires, and keeping the permit owned until the work actually
-    /// finishes — not merely until the caller stops waiting.
+    /// Each surface keeps the permit inside its blocking task, so it stays
+    /// taken until the work actually ends. A full engine is a fail-open on the
+    /// proxy (counted as `kompressor_proxy_failopen_total{stage="admission"}`;
+    /// the wait counts against `proxy.compress_timeout`), a 503 on the API and
+    /// a tool error on MCP, the last two after `queue_timeout`.
     pub max_inflight_compressions: usize,
     #[serde(with = "humantime_serde")]
     pub queue_timeout: Duration,
@@ -158,6 +158,12 @@ pub struct RefsConfig {
     pub backend: RefsBackend,
     pub path: PathBuf,
     pub recent_cache_entries: usize,
+    /// Fragment bytes the recent-write cache may hold, beside its entry cap.
+    ///
+    /// The entry cap alone bounds nothing in bytes: 4,096 entries at the
+    /// default 1 MiB `max_ref_bytes` is 4 GiB. Whichever bound binds first
+    /// evicts; a fragment larger than this is written through uncached.
+    pub recent_cache_bytes: usize,
     #[serde(with = "humantime_serde")]
     pub purge_interval: Duration,
     pub max_bytes: u64,
@@ -169,6 +175,7 @@ impl Default for RefsConfig {
             backend: RefsBackend::Sqlite,
             path: PathBuf::from("./data/refs.db"),
             recent_cache_entries: 4096,
+            recent_cache_bytes: 64 * 1024 * 1024,
             purge_interval: Duration::from_secs(60),
             max_bytes: 1024 * 1024 * 1024,
         }
@@ -334,6 +341,33 @@ pub enum CacheTtl {
     Adaptive,
 }
 
+/// How long OpenAI should keep the prompt-cache entries a request writes.
+///
+/// OpenAI caches every prompt of 1,024 tokens or more without being asked and
+/// bills nothing to write it. How long an entry lives is the request's
+/// `prompt_cache_retention`: `in_memory`, typically five to ten minutes idle,
+/// or `24h`, around 30 minutes and up to a day. Which one a request gets when
+/// it names neither depends on the organization (zero-data-retention
+/// organizations get `in_memory`), and Codex names neither.
+///
+/// Measured over 12,114 archived Codex requests on gpt-5.5 (2026-09-18 to
+/// 10-31), turns that followed more than five minutes idle failed to read back
+/// 46–76% of their cached prefix: the in-memory lifetime, not a day. Those
+/// losses came to about 0.35% of the Codex bill, because Codex seldom idles,
+/// so this is a small, free saving rather than the large one keep-warm is on
+/// Anthropic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheRetention {
+    /// The client's request goes out as written. The shipped default.
+    #[default]
+    Default,
+    /// Ask for `24h` retention where the client named none, on the models
+    /// OpenAI documents it for. Free to write on those models.
+    #[serde(rename = "24h")]
+    Extended,
+}
+
 /// Where the frozen prefix ends: what the client says, or what the provider
 /// has actually cached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -416,6 +450,16 @@ pub struct ProxyConfig {
     pub frozen_prefix: FrozenPrefix,
     /// The cache TTL Anthropic requests ask for. See [`CacheTtl`].
     pub cache_ttl: CacheTtl,
+    /// The prompt-cache retention OpenAI requests ask for. See
+    /// [`PromptCacheRetention`].
+    ///
+    /// Applied only to Chat Completions and Responses requests through the
+    /// `openai` upstream (or any upstream on `api.openai.com`), never on its
+    /// ChatGPT-subscription route, never to a request that names a retention
+    /// of its own, and only for the models OpenAI documents `24h` for. A 400
+    /// that names the field is answered by sending the request again without
+    /// it, and the field is not added again for that upstream and model.
+    pub prompt_cache_retention: PromptCacheRetention,
     /// Keep an Anthropic conversation's cached prefix alive while the client
     /// is busy running a tool. **Off by default.**
     ///
@@ -437,7 +481,11 @@ pub struct ProxyConfig {
     /// Measured live on one such run: cache-write spend per agent step −20% and
     /// cache-loss turns 13 → 2, for 25 pings costing $0.15.
     ///
-    /// Anthropic only: OpenAI does not bill cache writes. Not armed for a
+    /// Anthropic only. OpenAI does not bill cache writes on the models Codex
+    /// runs, and Codex seldom idles past five minutes: on archived Codex runs
+    /// the expiry a ping could prevent came to about 0.35% of the bill, less
+    /// than the pings' output tokens would cost. There the lever is
+    /// [`Self::prompt_cache_retention`]. Not armed for a
     /// request that asked for one-hour entries, which do not need it, nor for
     /// one whose `thinking` has a token budget, since `max_tokens` cannot go
     /// below the budget without changing the cache key.
@@ -730,6 +778,8 @@ pub struct ProviderOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_ttl: Option<CacheTtl>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_retention: Option<PromptCacheRetention>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_keep_warm: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_read: Option<bool>,
@@ -759,6 +809,7 @@ impl ProviderOverrides {
             retrieve_tool,
             frozen_prefix,
             cache_ttl,
+            prompt_cache_retention,
             cache_keep_warm,
             stale_read
         );
@@ -823,6 +874,7 @@ impl Default for ProxyConfig {
             retrieve_tool: RetrieveTool::Auto,
             frozen_prefix: FrozenPrefix::Marker,
             cache_ttl: CacheTtl::Default,
+            prompt_cache_retention: PromptCacheRetention::Default,
             cache_keep_warm: false,
             cache_keep_warm_interval: Duration::from_secs(270),
             cache_keep_warm_max_pings: 11,
@@ -1057,21 +1109,50 @@ impl Config {
         Ok(config)
     }
 
+    /// Read exactly one file: no discovery and no `KOMPRESSOR_*` overlay.
+    ///
+    /// For a measurement that has to mean the same on every machine — `bench
+    /// replay --config`, whose `--save` writes the baseline `--compare` checks.
+    /// [`Config::load`] overlays the process environment whatever path it is
+    /// given, so an ambient `KOMPRESSOR_MIN_COMPRESS_CHARS=1000000` turned a
+    /// replay that removed 78.91% of a captured payload into one that found
+    /// nothing eligible, and still exited 0.
+    pub fn load_file(path: &std::path::Path) -> Result<Config, ConfigError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| ConfigError::Read(path.display().to_string(), e))?;
+        let config: Config =
+            toml::from_str(&text).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        config.validate()?;
+        Ok(config)
+    }
+
     /// Overlay environment variables. Split out from [`Config::load`] so it can
     /// be tested without touching the process environment.
+    ///
+    /// The structured form wins where both spellings name one setting, and it
+    /// wins whatever order the variables arrive in. That takes two passes:
+    /// every flat `KOMPRESSOR_<FIELD>` first, then every structured
+    /// `KOMPRESSOR__SECTION__KEY`. One pass in arrival order let whichever came
+    /// *later* in the process environment win — `KOMPRESSOR__ENGINE__MAX_ARRAY_ITEMS=7`
+    /// then `KOMPRESSOR_MAX_ARRAY_ITEMS=25` resolved to 25, the reverse to 7,
+    /// and `check-config` accepted both without a word.
+    ///
+    /// Within one spelling the later variable wins, as it always did. A
+    /// structured value the setting cannot parse is ignored where its parser
+    /// ignores it, which leaves the flat value (or the file's) in force rather
+    /// than the default.
     pub fn apply_env(&mut self, vars: &[(String, String)]) {
-        for (key, value) in vars {
-            if value.is_empty() {
-                continue;
-            }
-            let Some(rest) = key.strip_prefix("KOMPRESSOR_") else {
-                continue;
-            };
-            // the structured form wins where both spellings exist
+        let named = || {
+            vars.iter()
+                .filter(|(_, value)| !value.is_empty())
+                .filter_map(|(key, value)| Some((key.strip_prefix("KOMPRESSOR_")?, value)))
+        };
+        for (rest, value) in named().filter(|(rest, _)| !rest.starts_with('_')) {
+            self.apply_flat(rest, value);
+        }
+        for (rest, value) in named() {
             if let Some(rest) = rest.strip_prefix('_') {
                 self.apply_structured(rest, value);
-            } else {
-                self.apply_flat(rest, value);
             }
         }
     }
@@ -1088,6 +1169,18 @@ impl Config {
                 "api_listen" => self.server.api_listen = value.to_string(),
                 "mcp_listen" => self.server.mcp_listen = value.to_string(),
                 "proxy_listen" => self.server.proxy_listen = value.to_string(),
+                // The engine permit every surface shares, proxy included, so
+                // it is worth setting per deployment without a file.
+                "max_inflight_compressions" => {
+                    if let Ok(v) = value.parse() {
+                        self.server.max_inflight_compressions = v;
+                    }
+                }
+                "queue_timeout" => {
+                    if let Some(d) = parse_duration(value) {
+                        self.server.queue_timeout = d;
+                    }
+                }
                 _ => {}
             },
             "auth" => match field {
@@ -1103,6 +1196,11 @@ impl Config {
                 "path" => self.refs.path = PathBuf::from(value),
                 "backend" if value.eq_ignore_ascii_case("memory") => {
                     self.refs.backend = RefsBackend::Memory;
+                }
+                "recent_cache_bytes" => {
+                    if let Ok(bytes) = value.parse() {
+                        self.refs.recent_cache_bytes = bytes;
+                    }
                 }
                 _ => {}
             },
@@ -1290,6 +1388,14 @@ impl Config {
                     "1h" => CacheTtl::OneHour,
                     "adaptive" => CacheTtl::Adaptive,
                     _ => self.proxy.cache_ttl,
+                };
+            }
+            "prompt_cache_retention" => {
+                // A typo leaves the setting alone, as `cache_ttl` does.
+                self.proxy.prompt_cache_retention = match value.to_ascii_lowercase().as_str() {
+                    "default" => PromptCacheRetention::Default,
+                    "24h" => PromptCacheRetention::Extended,
+                    _ => self.proxy.prompt_cache_retention,
                 };
             }
             "cache_keep_warm" => {
@@ -1811,6 +1917,47 @@ mod tests {
     }
 
     #[test]
+    fn prompt_cache_retention_is_off_by_default_and_set_per_provider_or_from_the_environment() {
+        let mut config = Config::default();
+        assert_eq!(
+            config.proxy.prompt_cache_retention,
+            PromptCacheRetention::Default
+        );
+        config.apply_env(&[(
+            "KOMPRESSOR__PROXY__PROMPT_CACHE_RETENTION".into(),
+            "24h".into(),
+        )]);
+        assert_eq!(
+            config.proxy.prompt_cache_retention,
+            PromptCacheRetention::Extended
+        );
+        // A typo changes nothing: it is what the provider is asked to store.
+        config.apply_env(&[(
+            "KOMPRESSOR__PROXY__PROMPT_CACHE_RETENTION".into(),
+            "1d".into(),
+        )]);
+        assert_eq!(
+            config.proxy.prompt_cache_retention,
+            PromptCacheRetention::Extended
+        );
+
+        let parsed: Config =
+            toml::from_str("[proxy.providers.openai]\nprompt_cache_retention = \"24h\"\n")
+                .expect("parses");
+        assert_eq!(
+            parsed.proxy.prompt_cache_retention,
+            PromptCacheRetention::Default
+        );
+        let openai = parsed.for_provider("openai").expect("openai has overrides");
+        assert_eq!(
+            openai.proxy.prompt_cache_retention,
+            PromptCacheRetention::Extended
+        );
+        assert!(parsed.for_provider("anthropic").is_none());
+        assert!(toml::from_str::<Config>("[proxy]\nprompt_cache_retention = \"12h\"\n").is_err());
+    }
+
+    #[test]
     fn the_cache_ttl_setting_can_be_set_from_the_environment_and_a_typo_changes_nothing() {
         let mut config = Config::default();
         assert_eq!(config.proxy.cache_ttl, CacheTtl::Default);
@@ -1957,6 +2104,79 @@ mod tests {
             "a plugin knob, not an engine one"
         );
         assert_eq!(config.proxy.compress_timeout, Duration::from_secs(5));
+    }
+
+    /// Reproduced in the 2026-11-11 review through `check-config`: the flat
+    /// spelling set *after* the structured one won. Both orders are checked,
+    /// because one favourable ordering is all a single-pass overlay needs to
+    /// pass.
+    #[test]
+    fn the_structured_spelling_wins_in_either_order() {
+        let structured = (
+            "KOMPRESSOR__ENGINE__MAX_ARRAY_ITEMS".to_string(),
+            "7".to_string(),
+        );
+        let flat = ("KOMPRESSOR_MAX_ARRAY_ITEMS".to_string(), "25".to_string());
+        for vars in [
+            vec![structured.clone(), flat.clone()],
+            vec![flat.clone(), structured.clone()],
+        ] {
+            let mut config = Config::default();
+            config.apply_env(&vars);
+            assert_eq!(config.engine.max_array_items, 7, "order {vars:?}");
+        }
+
+        // The same holds for a setting that lives outside the engine section.
+        let structured = (
+            "KOMPRESSOR__PROXY__MIN_TOKENS".to_string(),
+            "300".to_string(),
+        );
+        let flat = ("KOMPRESSOR_MIN_TOKENS".to_string(), "900".to_string());
+        for vars in [
+            vec![structured.clone(), flat.clone()],
+            vec![flat.clone(), structured.clone()],
+        ] {
+            let mut config = Config::default();
+            config.apply_env(&vars);
+            assert_eq!(config.proxy.min_tokens, 300, "order {vars:?}");
+        }
+    }
+
+    /// The shared engine permit is set per deployment as often as any listen
+    /// address, now that it bounds the proxy too.
+    #[test]
+    fn the_engine_permit_is_reachable_from_the_environment() {
+        let mut config = Config::default();
+        config.apply_env(&[
+            (
+                "KOMPRESSOR__SERVER__MAX_INFLIGHT_COMPRESSIONS".into(),
+                "1".into(),
+            ),
+            ("KOMPRESSOR__SERVER__QUEUE_TIMEOUT".into(), "250ms".into()),
+        ]);
+        assert_eq!(config.server.max_inflight_compressions, 1);
+        assert_eq!(config.server.inflight_limit(), 1);
+        assert_eq!(config.server.queue_timeout, Duration::from_millis(250));
+        config.apply_env(&[(
+            "KOMPRESSOR__SERVER__MAX_INFLIGHT_COMPRESSIONS".into(),
+            "lots".into(),
+        )]);
+        assert_eq!(
+            config.server.max_inflight_compressions, 1,
+            "unreadable: ignored"
+        );
+    }
+
+    /// A structured value its setting cannot read leaves the flat one in
+    /// force, rather than reverting the setting to its default.
+    #[test]
+    fn an_unreadable_structured_value_leaves_the_flat_one_in_force() {
+        let mut config = Config::default();
+        config.apply_env(&[
+            ("KOMPRESSOR__ENGINE__MAX_ARRAY_ITEMS".into(), "many".into()),
+            ("KOMPRESSOR_MAX_ARRAY_ITEMS".into(), "25".into()),
+        ]);
+        assert_eq!(config.engine.max_array_items, 25);
     }
 
     #[test]

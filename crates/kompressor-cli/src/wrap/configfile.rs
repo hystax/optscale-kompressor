@@ -223,28 +223,31 @@ impl Target {
             .collect()
     }
 
-    /// Comment out the user's own assignment of any key we are about to write.
-    ///
-    /// Only the region before the first table header is touched, for the same
-    /// reason [`declares_key`] only reads it: a key of the same name inside a
-    /// table is a different key.
+    /// Comment out complete top-level assignments using the parser's byte spans.
+    /// Every physical line of a multiline value needs its own comment prefix.
     fn disable_collisions(&self, body: &str) -> String {
-        let keys: Vec<&str> = self.head.iter().map(|(key, _)| key.as_str()).collect();
-        if keys.is_empty() {
+        type Entries =
+            std::collections::BTreeMap<toml::Spanned<String>, toml::Spanned<toml::Value>>;
+        let Ok(entries) = toml::from_str::<Entries>(body) else {
             return body.to_string();
-        }
+        };
+        let ranges: Vec<_> = entries
+            .iter()
+            .filter(|(key, _)| self.head.iter().any(|(name, _)| name == key.get_ref()))
+            .map(|(key, value)| key.span().start..value.span().end)
+            .collect();
         let mut out = String::with_capacity(body.len());
-        let mut in_tables = false;
-        // Each line with its own ending, so a CRLF file stays CRLF.
+        let mut offset = 0;
         for line in body.split_inclusive('\n') {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with('[') {
-                in_tables = true;
-            }
-            if !in_tables && keys.iter().any(|key| assigns(trimmed, key)) {
+            let end = offset + line.len();
+            if ranges
+                .iter()
+                .any(|range| offset < range.end && end > range.start)
+            {
                 out.push_str(DISABLED);
             }
             out.push_str(line);
+            offset = end;
         }
         out
     }
@@ -309,17 +312,14 @@ fn quoted(value: &str) -> String {
 /// Only the region before the first table header counts: `model_provider`
 /// inside `[some.table]` is a different key that happens to share a name.
 fn declares_key(content: &str, key: &str) -> bool {
-    content
-        .lines()
-        .map(str::trim)
-        .take_while(|line| !line.starts_with('['))
-        .any(|line| assigns(line, key))
+    toml::from_str::<toml::Table>(content).is_ok_and(|table| table.contains_key(key))
 }
 
 /// Whether one line assigns `key`.
 ///
 /// A line already carrying the [`DISABLED`] prefix is a comment and assigns
 /// nothing, which is what makes claiming the file twice idempotent.
+#[cfg(test)]
 fn assigns(line: &str, key: &str) -> bool {
     line.strip_prefix(key)
         .map(|rest| rest.trim_start().starts_with('='))
@@ -384,12 +384,25 @@ pub enum Claimed {
 
 /// Inject the block, recording this process as an owner.
 pub fn claim(target: &Target) -> Result<Claimed, CliError> {
-    let _lock = Lock::acquire(target.lock_path());
+    let _lock = Lock::acquire(target.lock_path())?;
     let owners_path = target.owners_path();
     let mut owners = read_owners(&owners_path);
 
-    let current = std::fs::read_to_string(&target.path).unwrap_or_default();
+    let mut claim = owners.keys.remove(CLAIM_KEY).unwrap_or_default();
+    let had_holders = !claim.holders.is_empty();
+    sweep(&mut claim, &owners_path);
+    if had_holders && claim.holders.is_empty() {
+        restore(target, &claim)?;
+    }
+    let current = match std::fs::read_to_string(&target.path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(CliError::runtime("could not read configuration", error)),
+    };
     let existed = target.path.exists();
+    let next = injected_content(target, &current);
+    toml::from_str::<toml::Table>(&next)
+        .map_err(|error| CliError::runtime("could not prepare wrapped configuration", error))?;
 
     // A key the file already sets is commented out for the duration rather
     // than refused. Refusing was the first answer and it was the wrong one: it
@@ -406,17 +419,13 @@ pub fn claim(target: &Target) -> Result<Claimed, CliError> {
         );
     }
 
-    let mut claim = owners.keys.remove(CLAIM_KEY).unwrap_or_default();
-    sweep(&mut claim, &owners_path);
     // Recorded once, by the first live claimant: a later session must restore
     // what was there before any of us, not the injected state it walked in on.
     if claim.holders.is_empty() {
-        claim.original = existed.then(|| current.clone());
+        claim.original = existed.then(|| reinstate(&strip_blocks(&current)));
     }
     claim.holders.retain(|h| h.pid != std::process::id());
     claim.holders.push(Holder::me(&target.path));
-
-    let next = injected_content(target, &current);
 
     let changed = next != current;
     if changed {
@@ -475,7 +484,7 @@ enum Release {
 }
 
 fn release_as(target: &Target, how: Release) -> Result<Released, CliError> {
-    let _lock = Lock::acquire(target.lock_path());
+    let _lock = Lock::acquire(target.lock_path())?;
     let owners_path = target.owners_path();
     let mut owners = read_owners(&owners_path);
     if how != Release::Stale {
@@ -662,6 +671,65 @@ mod tests {
             ])
         );
         assert_eq!(codex_flags_for(9131, CodexAuth::ApiKey), None);
+    }
+
+    #[test]
+    fn quoted_and_multiline_assignments_are_overridden_and_restored() {
+        for (index, original) in [
+            "\"model_provider\" = \"mine\"\n",
+            "model_provider = \"\"\"\nmine\"\"\"\n",
+            "instructions = \"\"\"\nmodel_provider = example\n[example]\n\"\"\"\nmodel_provider = 'mine'\n",
+        ].iter().enumerate() {
+            let scratch = Scratch::new(&format!("toml-spans-{index}"));
+            scratch.write(original);
+            let target = scratch.target(9240);
+            let before: toml::Table = toml::from_str(original).unwrap();
+            claim(&target).unwrap();
+            let during: toml::Table = toml::from_str(&scratch.read()).unwrap();
+            assert_eq!(during["model_provider"].as_str(), Some("kompressor"));
+            assert_eq!(during.get("instructions"), before.get("instructions"));
+            release(&target, false).unwrap();
+            assert_eq!(scratch.read(), *original);
+        }
+    }
+
+    #[test]
+    fn a_new_session_restores_the_original_after_a_crashed_session() {
+        let scratch = Scratch::new("crashed-reclaim");
+        let original = "model_provider = 'mine'\n";
+        scratch.write(original);
+        let target = scratch.target(9241);
+        claim(&target).unwrap();
+        let_go(&target.path);
+        claim(&target).unwrap();
+        release(&target, false).unwrap();
+        assert_eq!(scratch.read(), original);
+    }
+
+    #[test]
+    fn a_new_session_does_not_restore_an_orphaned_proxy_block() {
+        let scratch = Scratch::new("orphan-reclaim");
+        let original = "model_provider = 'mine'\n";
+        scratch.write(original);
+        let target = scratch.target(9243);
+        claim(&target).unwrap();
+        let_go(&target.path);
+        std::fs::remove_file(target.owners_path()).unwrap();
+        claim(&target).unwrap();
+        release(&target, false).unwrap();
+        assert_eq!(scratch.read().trim(), original.trim());
+        assert!(!scratch.read().contains(BEGIN));
+    }
+
+    #[test]
+    fn an_invalid_injection_leaves_the_configuration_untouched() {
+        let scratch = Scratch::new("existing-provider");
+        let original = "[model_providers.kompressor]\nname = 'my provider'\n";
+        scratch.write(original);
+        let target = scratch.target(9242);
+        assert!(claim(&target).is_err());
+        assert_eq!(scratch.read(), original);
+        assert!(!target.owners_path().exists());
     }
 
     #[test]

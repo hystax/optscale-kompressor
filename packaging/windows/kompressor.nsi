@@ -72,6 +72,7 @@ Var PrevDir
 Var CheckSystem
 Var RadioRemove
 Var FinishText
+Var KeepService  ; "1" when uninstall could not remove the service
 
 !define MUI_ABORTWARNING
 Page custom ModePage ModeLeave
@@ -391,6 +392,13 @@ Function CheckNotRunning
         Return
     ${EndIf}
     MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "$INSTDIR\kompressor.exe cannot be replaced: it is running, or another program has it open. Stop kompressor (close the wrap or serve that runs it, or: Get-Process kompressor | Stop-Process) and retry." /SD IDCANCEL IDRETRY retry
+    ; The Section stopped the service to replace the exe. Nothing was replaced,
+    ; so the old version is started again rather than left stopped.
+    ${If} $SystemMode == 1
+    ${AndIf} ${FileExists} "${SERVICE}"
+        nsExec::ExecToLog /OEM '"${SERVICE}" start'
+        Pop $2
+    ${EndIf}
     Abort "kompressor.exe is in use"
 FunctionEnd
 
@@ -683,6 +691,18 @@ Section "Uninstall"
     ${If} $SystemMode == 1
         nsExec::ExecToLog /OEM '"${SERVICE}" uninstall'
         Pop $0
+        ; A service left registered would point at a deleted exe and fail at
+        ; every boot, and block a reinstall. Fall back on sc.exe, and if the
+        ; service is still there (the Services console holds it "marked for
+        ; deletion"), keep its wrapper so it can still be removed.
+        ${If} $0 != 0
+            nsExec::ExecToLog /OEM '"$SYSDIR\sc.exe" delete kompressor'
+            Pop $0
+        ${EndIf}
+        ${If} $0 != 0
+            StrCpy $KeepService 1
+            MessageBox MB_OK|MB_ICONEXCLAMATION "The kompressor service could not be removed (close the Services console, or reboot), then run: sc.exe delete kompressor" /SD IDOK
+        ${EndIf}
         !insertmacro EditPath "remove" "${SYSTEM_ENV}"
         DeleteRegKey HKLM "${UNINST}"
         DetailPrint "kept configuration and data: $APPDATA\${APP}"
@@ -690,8 +710,10 @@ Section "Uninstall"
         !insertmacro EditPath "remove" "${USER_ENV}"
         DeleteRegKey HKCU "${UNINST}"
     ${EndIf}
-    Delete "$INSTDIR\kompressor-service.exe"
-    Delete "$INSTDIR\kompressor-service.xml"
+    ${If} $KeepService != 1
+        Delete "$INSTDIR\kompressor-service.exe"
+        Delete "$INSTDIR\kompressor-service.xml"
+    ${EndIf}
     Delete "$INSTDIR\config.toml.in"
     RMDir /r "$INSTDIR\doc"
     Delete "$INSTDIR\uninstall.exe"

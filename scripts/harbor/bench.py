@@ -832,9 +832,16 @@ def retrieval_rows(stats_db, start_ms, end_ms):
             "SELECT COUNT(*) FROM pragma_table_info('retrieval_events') "
             "WHERE name = 'withheld'").fetchone()[0])
         withheld = "withheld" if has_withheld else "0 AS withheld"
+        # `range_status` is schema v14: whether the window asked for is the
+        # window served (exact / normalized / salvaged / unusable).
+        has_status = bool(con.execute(
+            "SELECT COUNT(*) FROM pragma_table_info('retrieval_events') "
+            "WHERE name = 'range_status'").fetchone()[0])
+        status = "range_status" if has_status else "NULL AS range_status"
         rows = con.execute(
             "SELECT time_ms, request_id, ref, found, expired, ranged, "
-            f"fragment_chars, fragment_tokens, returned_chars, returned_tokens, {withheld} "
+            f"fragment_chars, fragment_tokens, returned_chars, returned_tokens, {withheld}, "
+            f"{status} "
             "FROM retrieval_events WHERE time_ms BETWEEN ? AND ? ORDER BY time_ms",
             (start_ms, end_ms)).fetchall()
     except sqlite3.Error:
@@ -1076,6 +1083,17 @@ def efficiency(rows, retrievals, abandoned=(), provider="openai"):
     # `tokens_in` still counts it, because the engine did look at those tokens;
     # only the output is held to what actually left the machine.
     discarded = [r for r in compressed if (r.get("outcome") or "") == "discarded"]
+    # What the engine looked at is not what it changed. The 2026-11-11 review
+    # found four smoke runs reporting 8-17 `requests_compressed` with
+    # tokens_in == tokens_out on every row and no ref emitted: the field
+    # counted participation. So participation, change and reduction are three
+    # numbers, each over the rewrites that were actually forwarded.
+    accepted = [r for r in compressed if (r.get("outcome") or "") != "discarded"]
+    changed = [r for r in accepted
+               if (r.get("tokens_out"), r.get("chars_out"))
+               != (r.get("tokens_in"), r.get("chars_in"))]
+    token_reduced = [r for r in accepted
+                     if (r.get("tokens_out") or 0) < (r.get("tokens_in") or 0)]
     discarded_tokens = sum((r["tokens_in"] or 0) - (r["tokens_out"] or 0) for r in discarded)
     tokens_in = sum(r["tokens_in"] or 0 for r in compressed)
     tokens_out = sum(
@@ -1214,6 +1232,14 @@ def efficiency(rows, retrievals, abandoned=(), provider="openai"):
         "requests_abandoned_no_row": len(abandoned),
         "requests_abandoned_with_row": len(walked_out),
         "requests_attempted": len(rows) + len(abandoned),
+        # Rows the engine wrote: it looked at the request, whatever it did.
+        "requests_processed": len(compressed),
+        # Forwarded with different content than arrived.
+        "requests_changed": len(changed),
+        # Forwarded with fewer estimated tokens than arrived.
+        "requests_token_reduced": len(token_reduced),
+        # DEPRECATED alias of `requests_processed`, kept for ab.py and older
+        # readers of the summary JSON. It never meant "compressed".
         "requests_compressed": len(compressed),
         "requests_discarded": len(discarded),
         "discarded_tokens": discarded_tokens,
@@ -1223,6 +1249,8 @@ def efficiency(rows, retrievals, abandoned=(), provider="openai"):
         "skipped_tokens_by_reason": _skip_reasons(compressed, "skipped_tokens_by_reason"),
         "conversations": len({r["conversation"] for r in rows if r.get("conversation")}),
         "retrieval_withheld_rounds": withheld_rounds,
+        "retrieval_range_status": _counts(r.get("range_status") for r in retrievals
+                                          if r.get("range_status")),
         "requests_answered_nothing": len(answered_nothing),
         "requests_answered_nothing_streamed": sum(
             1 for r in answered_nothing if r.get("stream")),
@@ -1319,13 +1347,25 @@ def validity_flags(eff, acc, selftest, mode="recoverable"):
                      "whatever this run measured, it was not compression")
     elif mode == "off":
         # A control arm that compressed something would be the broken one.
-        if eff["requests_compressed"]:
+        processed = eff.get("requests_processed", eff["requests_compressed"])
+        if processed:
             flags.append(
-                f"CONTROL ARM COMPRESSED: {eff['requests_compressed']} request(s) "
+                f"CONTROL ARM COMPRESSED: {processed} request(s) "
                 "went through the engine -- this is not a baseline")
-    elif eff["requests_compressed"] == 0:
-        flags.append("NO COMPRESSION: every request was relayed unparsed "
-                     "(check api_family on the upstream mount)")
+    elif eff.get("requests_processed", eff["requests_compressed"]) == 0:
+        # Absence of engine rows has several causes, and only one of them is a
+        # walker that did not recognise the body: traffic under the size gate,
+        # a setup failure before the agent ran, a preflight-only trial.
+        flags.append("NO COMPRESSION: no request reached the engine -- relayed "
+                     "unparsed, under the size gate, or the trial never got past "
+                     "setup (check api_family on the mount and the trial's errors)")
+    elif eff.get("requests_token_reduced") == 0:
+        # The coverage assertion, separate from transport: a run can pass its
+        # task with every request through the engine and none smaller.
+        flags.append(
+            f"NO COMPRESSION: {eff['requests_processed']} request(s) went through "
+            "the engine and none came out smaller -- a transport pass, not a "
+            "compression one")
     elif (eff["reduction_pct"] or 0) < 0.01:
         flags.append(f"NEAR-ZERO COMPRESSION: {fmt_pct(eff['reduction_pct'])} of "
                      "compressible tokens removed")
@@ -1449,7 +1489,9 @@ def report(cfg, krs, acc, eff, selftest, effective, window):
     add(f"  proxy requests   {eff['requests']:,} completed"
         + (f", {eff['requests_abandoned']:,} abandoned mid-stream"
            if eff.get("requests_abandoned") else "")
-        + f"  ({eff['requests_compressed']:,} went through the engine)")
+        + f"  ({eff.get('requests_processed', eff['requests_compressed']):,} went "
+        f"through the engine, {eff.get('requests_changed', 0):,} changed, "
+        f"{eff.get('requests_token_reduced', 0):,} smaller)")
     add(f"  compressible     {eff['tokens_in']:,} tokens -> {eff['tokens_out']:,}")
     add(f"  removed          {eff['saved_gross']:,} tokens "
         f"({fmt_pct(eff['reduction_pct']) if eff['reduction_pct'] is not None else 'n/a'} "
@@ -1540,6 +1582,13 @@ def report(cfg, krs, acc, eff, selftest, effective, window):
     add(f"  retrievals       {eff['retrievals']:,} "
         f"({eff['retrieval_hits']:,} hits, {eff['retrieval_ranged']:,} narrowed) "
         f"over {eff['retrieve_rounds']:,} rounds")
+    # Whether the window asked for is the window served (schema v14). Shown
+    # only when a range was asked for; "unusable" is a narrowing that failed
+    # and came back whole, which "narrowed" above does not count.
+    statuses = eff.get("retrieval_range_status") or {}
+    if statuses:
+        add("  ranges asked     " + ", ".join(
+            f"{count:,} {name}" for name, count in sorted(statuses.items())))
     # Only where it applies, like the cache-write line above: on a run the
     # budget never bound, a "0 withheld" line invites the reader to wonder what
     # it is for. Where it is non-zero it is the one place that budget is
@@ -2105,9 +2154,36 @@ def self_test():
     compressed_control = efficiency(
         [row(prompt=1000, completion=50) for _ in range(4)], [])
     compressed_control["requests_compressed"] = 3
+    compressed_control["requests_processed"] = 3
     check("a control arm that compressed is flagged",
           len([f for f in validity_flags(compressed_control, {"counts": (1, 1)}, {}, "off")
                if "CONTROL ARM COMPRESSED" in f]), 1)
+
+    # The review's smoke runs: every request through the engine, none smaller.
+    # Transport passes; the separate coverage flag fires, and says which.
+    def engine_row(tokens_in, tokens_out, outcome=None):
+        made = row(prompt=1000, completion=50)
+        made.update(tokens_in=tokens_in, tokens_out=tokens_out,
+                    chars_in=tokens_in * 4, chars_out=tokens_out * 4, outcome=outcome)
+        return made
+    idle = efficiency([engine_row(900, 900) for _ in range(12)], [])
+    check("a zero-saving run counts what the engine looked at",
+          (idle["requests_processed"], idle["requests_changed"],
+           idle["requests_token_reduced"], idle["requests_compressed"]),
+          (12, 0, 0, 12))
+    idle_flags = validity_flags(idle, {"counts": (1, 1)}, {}, "recoverable")
+    check("and is a transport pass", [f for f in idle_flags if "TRAFFIC" in f], [])
+    check("but fails the coverage flag, by name",
+          [f for f in idle_flags if "none came out smaller" in f] != [], True)
+    # A discarded rewrite changed nothing that left the machine.
+    mixed = efficiency([engine_row(900, 900), engine_row(900, 400),
+                        engine_row(900, 300, outcome="discarded")], [])
+    check("only forwarded rewrites count as changed or smaller",
+          (mixed["requests_processed"], mixed["requests_changed"],
+           mixed["requests_token_reduced"]), (3, 1, 1))
+    check("and a run with one real saving raises no coverage flag",
+          [f for f in validity_flags(mixed, {"counts": (1, 1)}, {}, "recoverable")
+           if "NO COMPRESSION" in f], [])
 
     off_engine, off_proxy = control_arm("off")
     on_engine, on_proxy = control_arm("recoverable")

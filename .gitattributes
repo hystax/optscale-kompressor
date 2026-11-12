@@ -8,3 +8,8 @@ Dockerfile* text eol=lf
 packaging/debian/postinst           text eol=lf
 packaging/debian/postrm             text eol=lf
 packaging/macos/scripts/postinstall text eol=lf
+
+# Test fixtures and vectors compared byte for byte: never converted to CRLF by
+# a Windows checkout with core.autocrlf, or the comparison tests fail there.
+fixtures/**              -text
+**/tests/fixtures/**     -text

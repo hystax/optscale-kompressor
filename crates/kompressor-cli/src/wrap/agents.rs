@@ -288,7 +288,7 @@ pub const AGENTS: &[Agent] = &[
     Agent {
         name: "codex",
         binary: "codex",
-        about: "OpenAI Codex CLI (OpenAI Responses), via its config file",
+        about: "OpenAI Codex CLI (OpenAI Responses), via a -c flag or its config file",
         // Deliberately empty. Codex ignores OPENAI_BASE_URL — measured on
         // 0.155.1, where a wrapped session sent every request straight to the
         // provider — and setting a variable nothing reads is how this command

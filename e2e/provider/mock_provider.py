@@ -108,14 +108,19 @@ def _chat_answer(text: str = "done") -> dict:
     }
 
 
-def _anthropic_tool_call(handle: str) -> dict:
+def _anthropic_tool_call(handle: str, range_: dict | None = None) -> dict:
+    # `range_` is what the client asked the mock to send, verbatim: the shapes
+    # a real model sends are not always the schema's, and the proxy's answer
+    # to a malformed one is what `a_flat_range_is_served_as_the_window_it_names`
+    # checks.
+    arguments = {"ref": handle} if range_ is None else {"ref": handle, "range": range_}
     return {
         "id": "msg_tool",
         "type": "message",
         "role": "assistant",
         "stop_reason": "tool_use",
         "content": [
-            {"type": "tool_use", "id": "toolu_1", "name": "optscale_kompressor_retrieve", "input": {"ref": handle}}
+            {"type": "tool_use", "id": "toolu_1", "name": "optscale_kompressor_retrieve", "input": arguments}
         ],
         "usage": {"input_tokens": 1000, "output_tokens": 20},
     }
@@ -403,7 +408,9 @@ class Handler(BaseHTTPRequestHandler):
             elif streaming:
                 self._send(200, _anthropic_stream(handle), "text/event-stream")
             else:
-                payload = _anthropic_tool_call(handle) if handle else _anthropic_answer()
+                asked = self.headers.get("x-e2e-range")
+                range_ = json.loads(asked) if asked else None
+                payload = _anthropic_tool_call(handle, range_) if handle else _anthropic_answer()
                 self._send(200, json.dumps(payload).encode(), "application/json")
         elif self.path.endswith("/responses"):
             if streaming:

@@ -42,11 +42,24 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 KOMPRESSOR_OVERRIDDEN="${KOMPRESSOR:+yes}"
 KOMPRESSOR="${KOMPRESSOR:-$HOME/.local/bin/kompressor}"
 CODEX="${CODEX:-$HOME/.local/bin/codex}"
-CONFIG="${CONFIG:-$HOME/.config/kompressor/config.toml}"
-STATS="${STATS:-$HOME/.local/share/kompressor/stats.db}"
-REFS="${REFS:-$HOME/.local/share/kompressor/refs.db}"
 WORK="${WORK:-$HOME/.cache/kompressor-sweep}"
+# All under $WORK, none on kompressor's default paths. ~/.config/kompressor is
+# on every kompressor's search path, the packaged one's included, so a sweep
+# config there redirects a plain `kompressor stats` or `kompressor wrap` from
+# the shell; and the default stats and refs databases are what any config-less
+# `wrap` writes, which would land in these measurements.
+CONFIG="${CONFIG:-$WORK/config.toml}"
+STATS="${STATS:-$WORK/stats.db}"
+REFS="${REFS:-$WORK/refs.db}"
 PORT="${PORT:-8817}"
+# Codex runs from a home of the sweep's own, not from ~/.codex. The real one is
+# shared with Codex Desktop: `wrap` repoints its `openai_base_url` for a whole
+# stage, so a Desktop thread started meanwhile talks to this proxy, lands in
+# these stats, and writes a session `newest_session` may pick instead of ours.
+# Only the login is borrowed, by symlink; see `seed_codex_home`.
+USER_CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+CODEX_HOME="${SWEEP_CODEX_HOME:-$WORK/codex-home}"
+export CODEX_HOME
 # Relay codex's websocket instead of letting it fall back to HTTPS.
 #
 # Off by default *here*, which since the proxy's own default moved to on is no
@@ -106,7 +119,7 @@ VERDICTS="$WORK/verdicts.json"
 # the run. An empty result is the honest answer and every caller checks for it.
 newest_session() {
   local newest="" f since="${1:-}"
-  for f in "$HOME"/.codex/sessions/*/*/*/*.jsonl; do
+  for f in "$CODEX_HOME"/sessions/*/*/*/*.jsonl; do
     [ -e "$f" ] || continue
     if [ -n "$since" ] && [ ! "$f" -nt "$since" ]; then continue; fi
     if [ -z "$newest" ] || [ "$f" -nt "$newest" ]; then newest="$f"; fi
@@ -160,9 +173,54 @@ codex_version() { "$CODEX" --version 2>/dev/null | awk '{print $NF}'; }
 # model at setup labelled a whole sweep with last night's model — `gpt-6-sol`
 # in the banner, `gpt-6-astra` in both verdicts of the same output, measured
 # 2026-09-29.
-codex_model_pinned() {
-  sed -nE 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"?([^"#]+)"?.*/\1/p' \
-    "$HOME/.codex/config.toml" 2>/dev/null | head -1 | tr -d '[:space:]'
+codex_model_pinned() { codex_user_setting model; }
+
+# A top-level setting of the user's own codex config, empty when unset.
+codex_user_setting() {
+  sed -nE "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\"?([^\"#]+)\"?.*/\\1/p" \
+    "$USER_CODEX_HOME/config.toml" 2>/dev/null | head -1 | tr -d '[:space:]'
+}
+
+# Lay out the sweep's codex home: the user's login, linked rather than copied,
+# and a config written fresh every run.
+#
+# Linked because a ChatGPT login rotates its refresh token: a copy that
+# refreshes invalidates the original and signs Codex Desktop out, and the other
+# way round. codex rewrites auth.json in place, which a link follows; should a
+# build ever replace the file instead, `reconcile_codex_auth` hands the newer
+# token back on exit.
+#
+# The config carries only what decides a measurement. The user's plugins and
+# MCP servers stay out: each adds tool schemas to every request, and Desktop
+# installs and updates them between runs.
+seed_codex_home() {
+  mkdir -p "$CODEX_HOME"
+  chmod 700 "$CODEX_HOME"
+  reconcile_codex_auth
+  ln -sfn "$USER_CODEX_HOME/auth.json" "$CODEX_HOME/auth.json"
+  trap reconcile_codex_auth EXIT
+  local effort d
+  effort="$(codex_user_setting model_reasoning_effort)"
+  {
+    echo "# Written by codex.sh on every run (seed_codex_home); edits are lost."
+    echo 'cli_auth_credentials_store = "file"'
+    [ -n "$effort" ] && echo "model_reasoning_effort = \"$effort\""
+    for d in "$FIX" "$WORK/retrieval" "$WORK/bughunt"; do
+      printf '\n[projects."%s"]\ntrust_level = "trusted"\n' "$d"
+    done
+  } > "$CODEX_HOME/config.toml"
+  echo "  codex home: $CODEX_HOME (login linked from $USER_CODEX_HOME)"
+}
+
+# If codex replaced the linked auth.json with a file of its own, the newer of
+# the two holds the live refresh token: give it back to the user's home.
+reconcile_codex_auth() {
+  local ours="$CODEX_HOME/auth.json" theirs="$USER_CODEX_HOME/auth.json"
+  [ -f "$ours" ] && [ ! -L "$ours" ] || return 0
+  if [ "$ours" -nt "$theirs" ]; then
+    cp "$ours" "$theirs" && echo "  codex login refreshed during the run; copied back to $theirs"
+  fi
+  rm -f "$ours"
 }
 
 # The model every paid stage asks for, and the arguments that ask for it.
@@ -219,9 +277,8 @@ agent_failed() {
     verdict "$stage" INCONCLUSIVE "reason=codex ran and exited $status"
   else
     echo "  the agent never started: \`kompressor wrap codex\` exited $status"
-    echo "  wrap edits ~/.codex/config.toml before launching anything and refuses"
-    echo "  when a key it needs is already assigned -- \`openai_base_url\`, set for"
-    echo "  the desktop app, is the usual one."
+    echo "  wrap edits $CODEX_HOME/config.toml before launching anything; its"
+    echo "  banner below says what it could not do."
     tail -6 "$log" | sed 's/^/    /'
     echo "  no quota was spent and nothing was measured."
     verdict "$stage" INCONCLUSIVE "reason=wrap could not configure codex"
@@ -364,7 +421,7 @@ build_kompressor() {
 # --------------------------------------------------------------------- setup
 setup() {
   say "setup"
-  mkdir -p "$WORK" "$(dirname "$STATS")" "$HOME/.local/bin"
+  mkdir -p "$WORK" "$CODEX_HOME" "$(dirname "$STATS")" "$HOME/.local/bin"
   # codex is not on PATH when it comes from the ChatGPT desktop app
   [ -e "$CODEX" ] || ln -sf /usr/lib/chatgpt/resources/codex "$CODEX"
   build_kompressor
@@ -375,7 +432,7 @@ setup() {
   # Only the pinned value is knowable here; codex records the model when it
   # runs, and the verdicts below name the one that actually answered.
   if [ -n "$SWEEP_MODEL" ]; then
-    local source="pinned in ~/.codex/config.toml"
+    local source="pinned in $USER_CODEX_HOME/config.toml"
     if [ -n "${KOMPRESSOR_SWEEP_MODEL:-}" ]; then
       source="KOMPRESSOR_SWEEP_MODEL"
     fi
@@ -395,14 +452,15 @@ setup() {
   # codex's login lives here. Without it `wrap` reads no `auth_mode`, falls back
   # to the API-key block, and codex refuses with `Missing environment variable:
   # OPENAI_API_KEY` — which reads like a kompressor fault and is not one.
-  if [ ! -f "$HOME/.codex/auth.json" ]; then
-    echo "no ~/.codex/auth.json — codex is not logged in."
+  if [ ! -f "$USER_CODEX_HOME/auth.json" ]; then
+    echo "no $USER_CODEX_HOME/auth.json — codex is not logged in."
     echo "Sign in first (browser flow):  codex login"
     echo "Then re-run. Without it this measures nothing."
     exit 1
   fi
-  python3 -c "import json,pathlib,sys; m=json.loads((pathlib.Path.home()/'.codex/auth.json').read_text()).get('auth_mode'); print(f'  codex auth_mode: {m}'); sys.exit(0 if m else 1)" \
+  python3 -c "import json,pathlib,sys; m=json.loads(pathlib.Path(sys.argv[1]).read_text()).get('auth_mode'); print(f'  codex auth_mode: {m}'); sys.exit(0 if m else 1)" "$USER_CODEX_HOME/auth.json" \
     || echo "  (auth.json has no auth_mode — wrap will use the API-key block)"
+  seed_codex_home
   # Start one if none is listening, rather than refusing. Telling the user to
   # run the command this script is about to run anyway made `all` impossible on
   # a machine with no proxy already up — which is every clean machine, and `all`
@@ -599,14 +657,26 @@ fixtures() {
   python3 - <<'PY'
 import json, os, random
 random.seed(11)
+# Largest a fixture may be, in characters; 0 is no limit. Set by claude.sh,
+# whose agent hands the model only a preview of output over its inline limit.
+# With no limit every file is byte-for-byte what it always was.
+CAP=int(os.environ.get('FIXTURE_MAX_CHARS') or 0)
+def capped(path, write, n):
+    """Write `path` with `write(f, n)`; under CAP, retry with fewer items."""
+    while True:
+        with open(path,'w') as f: write(f, n)
+        size=os.path.getsize(path)
+        if not CAP or size<=CAP or n<=1: return
+        n=max(1, int(n*CAP/size*0.95))
 for d in ('src','logs','data','data/many','docs'): os.makedirs(d, exist_ok=True)
 
 # log ------------------------------------------------------------------ log
-with open('logs/service.log','w') as f:
-    for i in range(4000):
+def service_log(f, n):
+    for i in range(n):
         lvl='ERROR' if i%500==0 else ('WARN' if i%97==0 else 'DEBUG')
         f.write(f"2026-09-22T10:{i//60%60:02d}:{i%60:02d}Z {lvl} [req-{i:05d}] "
                 f"resolved route /api/v2/items/{i%7} in {i%40}ms cache={'hit' if i%3 else 'miss'}\n")
+capped('logs/service.log', service_log, 4000)
 
 # build output --------------------------------------------------------- log
 with open('logs/build.log','w') as f:
@@ -625,7 +695,9 @@ open('data/small.json','w').write(json.dumps(small, indent=2))
 big=[{"id":i,"name":f"item-{i}","status":random.choice(["active","idle","failed"]),
       "tags":["alpha","beta"],"score":round(random.random(),4),
       "owner":{"team":f"team-{i%9}","email":f"u{i%40}@example.com"}} for i in range(1500)]
-open('data/records.json','w').write(json.dumps(big, indent=2))
+# Cut from the one list rather than regenerated, so a shorter file is a prefix
+# of the full one and nothing generated after it shifts in the random stream.
+capped('data/records.json', lambda f, n: f.write(json.dumps(big[:n], indent=2)), len(big))
 
 # source_code --------------------------------------------------- source_code
 with open('src/engine.py','w') as f:
@@ -636,11 +708,12 @@ with open('src/engine.py','w') as f:
         f.write("    return records\n\n\n")
 
 # tabular ---------------------------------------------------------- tabular
-with open('data/metrics.csv','w') as f:
+def metrics_csv(f, n):
     f.write("date,region,product,units,revenue,margin\n")
-    for i in range(2500):
+    for i in range(n):
         f.write(f"2026-0{i%9+1}-{i%28+1:02d},region-{i%6},prod-{i%30},"
                 f"{i%400},{i*13%99999}.{i%100:02d},0.{i%90:02d}\n")
+capped('data/metrics.csv', metrics_csv, 2500)
 
 # config: yaml, toml, ini ------------------------------------------- config
 with open('data/deploy.yaml','w') as f:
@@ -688,11 +761,12 @@ with open('docs/NOTES.md','w') as f:
     for i in range(240): f.write(f"## Note {i}\n\n{para}\n\n")
 
 # prose with fenced code --------------------------------------------- mixed
-with open('docs/GUIDE.md','w') as f:
-    for i in range(80):
+def guide_md(f, n):
+    for i in range(n):
         f.write(f"### Step {i}\n\nRun the helper and check the result.\n\n```python\n")
         for k in range(26): f.write(f"    value_{k} = transform(records, {k}, offset={i*k})\n")
         f.write("```\n\n")
+capped('docs/GUIDE.md', guide_md, 80)
 print("fixtures built")
 PY
   # a real multi-file git diff --------------------------------------- diff
@@ -791,12 +865,12 @@ sweep() {
   started=$(date +%s%3N); started_s=$(date +%s)
   echo "  16 payloads: log x2, json x2, source_code, tabular, config x3, html,"
   echo "  listing x2, search, diff, text x2 — one codex session, one command each"
-  cp ~/.codex/config.toml "$WORK/codex-config.bak"
+  cp "$CODEX_HOME/config.toml" "$WORK/codex-config.bak"
   cd "$FIX"
   rm -f "$LOG"
   # Anything codex writes for this stage is newer than this marker.
   : > "$WORK/.sweep-started"
-  # `wrap` edits ~/.codex/config.toml, runs codex, and puts the file back.
+  # `wrap` edits $CODEX_HOME/config.toml, runs codex, and puts the file back.
   # --no-proxy: use the server already running rather than starting another.
   # < /dev/null: codex exec hangs forever on "Reading additional input from stdin"
   #              when stdin is an open pipe.
@@ -816,9 +890,9 @@ sweep() {
     agent_failed sweep "$LOG" "$wrap_status"
     return 1
   fi
-  diff -q ~/.codex/config.toml "$WORK/codex-config.bak" >/dev/null \
+  diff -q "$CODEX_HOME/config.toml" "$WORK/codex-config.bak" >/dev/null \
     && echo "codex config restored" \
-    || echo "WARNING: codex config differs — run: $KOMPRESSOR unwrap codex"
+    || echo "WARNING: codex config differs — run: CODEX_HOME=$CODEX_HOME $KOMPRESSOR unwrap codex"
 
   # Did the agent actually do the work? It can answer "SWEEP DONE" after running
   # one empty cell, and then every number below is a measurement of nothing.
@@ -873,8 +947,8 @@ report() {
   say "stats"
   cd "$HOME"   # not a directory holding a kompressor config, or it wins
   "$KOMPRESSOR" stats summary --config "$CONFIG"
-  echo; "$KOMPRESSOR" stats by-provider
-  echo; "$KOMPRESSOR" stats by-type
+  echo; "$KOMPRESSOR" stats by-provider --config "$CONFIG"
+  echo; "$KOMPRESSOR" stats by-type --config "$CONFIG"
   echo; "$KOMPRESSOR" stats retrievals --config "$CONFIG"
 
   say "compression and retrieval, whole store"
@@ -1133,6 +1207,8 @@ FRAME
 Do these three steps in order.
 
 1. Run: cat ledger.py
+   Take its whole output in this one call: do not cap, page or truncate it
+   (no output-token limit), because the file is deleted next.
 2. Run: rm ledger.py
 3. Answer this question: inside the function `reconcile_17`, exactly one call
    to `compute(...)` is passed a quoted string where every other call is
@@ -1146,6 +1222,8 @@ PROMPT_EOF
 
   cd "$dir"
   git init -q . >/dev/null 2>&1 || true
+  # Anything codex writes for this stage is newer than this marker.
+  : > "$WORK/.retrieval-started"
   PATH="$HOME/.local/bin:$PATH" timeout 900 \
     "$KOMPRESSOR" wrap codex --no-proxy --config "$CONFIG" -- \
       exec --skip-git-repo-check --sandbox workspace-write "${MODEL_ARGS[@]}" \
@@ -1192,6 +1270,17 @@ PROMPT_EOF
   case "$final" in *"$token"*) answered="yes" ;; esac
   local reread="no"
   [ -f "$dir/ledger.py" ] && reread="yes"
+  # Did the token reach the model at all? Asked of codex's own session record,
+  # which is written before the proxy sees the request. In code mode the model
+  # picks `max_output_tokens` itself, and at 1,000 codex kept the head and tail
+  # of the read and dropped `reconcile_17` between them: nothing to elide,
+  # nothing to fetch, and the model rightly said the function was not there.
+  # That was filed as a FAIL of the retrieve loop, measured 2026-10-30. The
+  # premise check above cannot catch it: the cap is chosen during the run.
+  local sess seen
+  sess=$(newest_session "$WORK/.retrieval-started")
+  # `|| true`: "missing" exits 1, and under `set -e` that would end the run.
+  seen=$([ -n "$sess" ] && python3 "$SWEEP_LIB/codex-tool-output.py" "$sess" "$token" || true)
   echo
   echo "  retrievals recorded : $fetched   (this stage only; $after in the table)"
   echo "  characters returned : $returned"
@@ -1205,6 +1294,12 @@ PROMPT_EOF
     echo "                 so nothing could be fetched. Check codex's own login."
     verdict retrieval INCONCLUSIVE "reason=agent session failed upstream" \
             "detail=${why:-upstream error}"
+  elif [ -n "$sess" ] && [ "${seen#in }" = "$seen" ]; then
+    echo "  VOID — the token never reached the proxy: $seen."
+    echo "         codex dropped that part of the read before sending it, so there"
+    echo "         was nothing to elide or fetch, whatever the answer. Not a retrieve"
+    echo "         loop failure. Session: $sess"
+    verdict retrieval VOID "reason=codex cut the read before the proxy" "detail=$seen"
   elif [ "${planted:-0}" -eq 0 ]; then
     echo "  INCONCLUSIVE — no stored fragment holds the token, so it was never"
     echo "                 elided and the model did not need to retrieve it."
@@ -1311,7 +1406,12 @@ start_proxy() {
     echo "effective-sha256=$(digest_of "$effective")"
   } > "$PROXY_ENV"
   echo "  websocket frames -> $FRAMES  (written only when the relay is on)"
-  setsid --fork env "${relay[@]}" "$@" "$KOMPRESSOR" serve --proxy --api \
+  # No inherited proxy: a shell started from Claude Code carries HTTPS_PROXY
+  # from `~/.claude/settings.json`, which would route this proxy's upstream
+  # through another kompressor's TLS intercept (`UnknownIssuer`).
+  setsid --fork env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy \
+    -u ALL_PROXY -u all_proxy \
+    "${relay[@]}" "$@" "$KOMPRESSOR" serve --proxy --api \
     --config "$CONFIG" --listen "127.0.0.1:$PORT" \
     >> "$WORK/serve.log" 2>&1 < /dev/null 9>&-
 }
@@ -1383,7 +1483,7 @@ verdict() {
 write_report() {
   local html="$HOME/kompressor-report.html"
   "$KOMPRESSOR" stats report --config "$CONFIG" > "$html" 2>/dev/null \
-    || "$KOMPRESSOR" stats report > "$html" 2>/dev/null \
+    || "$KOMPRESSOR" stats report --stats "$STATS" > "$html" 2>/dev/null \
     || { echo "  could not write $html"; return 1; }
   local pairs=""
   [ -s "$VERDICTS" ] && pairs="$SWEEP_LIB/verdict.py $VERDICTS"
@@ -1612,7 +1712,7 @@ PROMPT_EOF
 
   say "bug hunt result"
   cd "$HOME"
-  "$KOMPRESSOR" stats by-type
+  "$KOMPRESSOR" stats by-type --config "$CONFIG"
   echo
   "$KOMPRESSOR" stats retrievals --config "$CONFIG"
   local fetched returned answered searched onbug refs_db

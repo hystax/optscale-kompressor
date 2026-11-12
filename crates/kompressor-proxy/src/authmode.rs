@@ -233,6 +233,26 @@ mod tests {
         assert_eq!(classify(&keyed), AuthMode::Payg);
     }
 
+    /// The agent strings this branch added reach every platform, not only
+    /// Windows. Under an API key -- the harbor codex runs, and any CI use --
+    /// they must stay pay-as-you-go, or the request is routed to chatgpt.com
+    /// and the key refused there.
+    #[test]
+    fn a_newly_listed_codex_front_end_on_an_api_key_stays_payg() {
+        for agent in [
+            "codex_cli_rs/0.162.1 (Ubuntu 24.4.0; x86_64) xterm-256color",
+            "codex-tui/0.164.0 (Mac OS 15.1.0; arm64) iTerm.app",
+            "codex_vscode/0.164.0",
+            "codex_exec/0.164.0 (Ubuntu 24.4.0; x86_64) dumb",
+        ] {
+            let keyed = headers(&[
+                ("user-agent", agent),
+                ("authorization", "Bearer sk-proj-EXAMPLE"),
+            ]);
+            assert_eq!(classify(&keyed), AuthMode::Payg, "{agent}");
+        }
+    }
+
     #[test]
     fn a_nested_agent_string_still_matches() {
         let nested = headers(&[("user-agent", "some-host/1.0 claude-cli/2.1.278")]);
