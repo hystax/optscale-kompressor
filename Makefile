@@ -134,6 +134,13 @@ test-cache-replay: ## Price a captured run through the proxy: make test-cache-re
 	KOMPRESSOR_REPLAY_BODIES="$(BODIES)" KOMPRESSOR_REPLAY_DETAIL=1 $(CARGO) test --release \
 	  -p kompressor-proxy --test cachesavings a_captured_run -- --nocapture
 
+.PHONY: replay-diff
+replay-diff: release ## Byte-compare upstream traffic of two binaries on a capture: make replay-diff BODIES=… BASE_BIN=…
+	@[ -n "$(BODIES)" ] && [ -n "$(BASE_BIN)" ] || { echo "set BODIES (a kompressor-bodies.jsonl) and BASE_BIN (the binary to compare against)" >&2; exit 2; }
+	python3 scripts/bench/replay-bodies.py --bin "$(BASE_BIN)" --capture "$(BODIES)" --out target/replay/base
+	python3 scripts/bench/replay-bodies.py --bin ./$(RELEASE_BIN) --capture "$(BODIES)" --out target/replay/head
+	python3 scripts/bench/replay-bodies.py --compare target/replay/base target/replay/head
+
 .PHONY: bench
 bench: release ## Replay the committed corpus and gate on the recorded baseline
 	./$(RELEASE_BIN) bench replay --corpus $(CORPUS) --compare $(BASELINE) --check-determinism

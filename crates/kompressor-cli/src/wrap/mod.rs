@@ -750,16 +750,24 @@ async fn launch(
 
 /// npm installs Windows launchers with `.cmd` names. Resolve them only after
 /// the executable lookup fails, preserving the platform's executable search.
+///
+/// A bare name is looked up on `PATH` only, never in the working directory
+/// first as cmd.exe would: `kompressor wrap codex` run inside a checkout that
+/// ships its own `codex.cmd` would otherwise run that file instead of the
+/// installed agent. Rust's own executable search dropped the working directory
+/// for the same reason. A name with a directory in it is the user's explicit
+/// choice and is resolved where it points.
 #[cfg(any(windows, test))]
 fn batch_on_path(binary: &str, path: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
     let binary = std::path::Path::new(binary);
     if binary.extension().is_some() {
         return None;
     }
-    let mut directories = vec![std::path::PathBuf::from(".")];
-    if binary.components().count() == 1 {
-        directories.extend(path.iter().flat_map(std::env::split_paths));
-    }
+    let directories: Vec<std::path::PathBuf> = if binary.components().count() == 1 {
+        path.iter().flat_map(std::env::split_paths).collect()
+    } else {
+        vec![std::path::PathBuf::new()]
+    };
     directories.into_iter().find_map(|directory| {
         ["cmd", "bat"]
             .into_iter()
@@ -1049,6 +1057,24 @@ mod tests {
             batch_on_path(first.join("agent").to_str().unwrap(), None),
             Some(first.join("agent.cmd"))
         );
+    }
+
+    /// A launcher planted in the working directory -- a cloned repository's
+    /// own `codex.cmd` -- is never picked for a bare agent name, with or
+    /// without a match on `PATH`.
+    #[test]
+    fn windows_batch_lookup_never_searches_the_working_directory() {
+        let name = format!("kompressor-planted-{}", std::process::id());
+        let planted = std::env::current_dir().unwrap().join(format!("{name}.cmd"));
+        std::fs::write(&planted, "@echo planted").unwrap();
+        let installed = tempfile::tempdir().unwrap();
+        let path = Some(std::env::join_paths([installed.path()]).unwrap());
+        let without = batch_on_path(&name, path.clone());
+        std::fs::write(installed.path().join(format!("{name}.cmd")), "@echo ok").unwrap();
+        let with = batch_on_path(&name, path);
+        let _ = std::fs::remove_file(&planted);
+        assert_eq!(without, None, "the working directory's launcher was picked");
+        assert_eq!(with, Some(installed.path().join(format!("{name}.cmd"))));
     }
 
     #[test]
