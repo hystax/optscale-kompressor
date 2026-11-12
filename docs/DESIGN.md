@@ -132,7 +132,7 @@ The same thing in text, which is the version that survives a diff:
 | **mcp tools** | `kompressor-mcp` | The same operations as MCP tools, over stateless streamable HTTP, for an agent runtime that wants `optscale_kompressor_retrieve` directly rather than through a proxy. |
 | **Core** (`Arc<AppCore>`) | `kompressor-core` | The operations themselves — compress, compress_raw, retrieve — plus configuration and credential resolution. Every surface above holds *the same* `Arc`, which is why the three cannot answer the same question differently: they are translation, not logic. |
 | **Engine** | `kompressor-engine` | Detection, the compressors, arbitration and the invariants. Free functions over a payload: no state, no I/O, no async. That is what makes it testable without a runtime and replayable against a corpus — and why handlers hand it to `spawn_blocking` rather than running it on an executor thread. The largest crate by far (~12.6k lines). |
-| **RefStore** (trait) | `kompressor-store` | Retention for the fragments a `recoverable` elision put behind a handle, keyed `(tenant, handle)` so a leaked handle resolves to nothing elsewhere. `SqliteRefStore` is the default and `MemoryRefStore` is for tests; a `rusqlite::Connection` is `!Sync`, so a dedicated thread owns it behind a channel, fronted by a write-through cache. TTL is an idle window refreshed on read, capped by an absolute lifetime. |
+| **RefStore** (trait) | `kompressor-store` | Retention for the fragments a `recoverable` elision put behind a handle, keyed `(tenant, handle)` so a leaked handle resolves to nothing elsewhere. `SqliteRefStore` is the default and `MemoryRefStore` is for tests; a `rusqlite::Connection` is `!Sync`, so `SqliteRefStore` holds its one connection behind a `parking_lot::Mutex` (WAL, `busy_timeout=5000`) and every call blocks its caller — callers run it on a blocking thread, the proxy inside the same deadline as the computation (§12.3 step 5). Fronted by a write-through cache bounded in entries and bytes. TTL is an idle window refreshed on read, capped by an absolute lifetime. |
 | **Stats** | `kompressor-stats` | Append-only events written entirely off the request path: a bounded channel into a writer thread that batches into transactions. A full queue **drops** rather than blocking, because losing a row is better than making a compression wait for a disk. Owns the gross-versus-net economy queries. |
 | **Authenticator · Config** | `kompressor-core` | The tenant comes from the credential and never from an argument, so a caller cannot name someone else's fragments. Config is layered file → environment → flags and validated on load. |
 | **reqwest** | (dependency) | The upstream client: rustls, HTTP/2, streaming bodies, redirects followed by us rather than silently, because the proxy may need to re-send a body for a retrieval round. |
@@ -140,7 +140,7 @@ The same thing in text, which is the version that survives a diff:
 | **Upstream providers** | external | OpenAI, Anthropic, or anything speaking their wire formats — including something local. The longest matching path prefix wins; an unmatched path is a 404 rather than a guess. |
 
 - The engine is CPU-bound and synchronous; handlers run it on `tokio::task::spawn_blocking` (or a dedicated rayon pool, §17).
-- Stores are behind traits; SQLite connections are owned by dedicated threads (rusqlite `Connection` is `!Sync`), fronted by channels.
+- Stores are behind traits. `stats.db` is owned by a dedicated writer thread fed by a bounded channel; the fragment store's connection sits behind a mutex and blocks its caller, so it is only ever called from a blocking thread (rusqlite `Connection` is `!Sync`).
 - Stats are fire-and-forget through a bounded channel; the writer batches into transactions.
 
 ![kompressor-core](charts/core.drawio.png)
@@ -207,7 +207,7 @@ Makefile          every target, self-documenting via `make`
 | deflate | `flate2` with the `zlib-rs` backend | the `adaptive_k` compressibility check (§5.2), and gzip/deflate request bodies (§12.1) |
 | zstd | `zstd` | request bodies: codex sends every one of them zstd-encoded (§12.1) |
 | grammars | `tree-sitter 0.25`, `tree-sitter-{python,javascript,typescript,go,rust,java,c-sharp,c,cpp}` | statically linked; feature `code-aware` (default on) |
-| SQLite | `rusqlite` (`bundled`, `modern_sqlite`) | one writer connection per DB on its own thread; readers via a small pool |
+| SQLite | `rusqlite` (`bundled`, `modern_sqlite`) | `stats.db`: one writer connection on its own thread, read-only readers per query; `refs.db`: one mutex-guarded connection, called from blocking threads |
 | Redis (optional) | — | **designed, not built.** `RefsBackend` is `Sqlite` or `Memory`; there is no `redis` dependency and no `redis` feature. See the README's *Not yet built* |
 | MCP | `rmcp` (official Rust MCP SDK: server, `streamable-http-server`) | stateless streamable HTTP |
 | CLI/config | `clap` (derive, env), `toml`, `humantime-serde` | layered config (§13). Neither `figment` nor `config` is used: the layering is hand-rolled, which is what lets `deny_unknown_fields` reject a typo instead of ignoring it |
@@ -1155,7 +1155,7 @@ CREATE INDEX IF NOT EXISTS refs_expiry ON refs (last_accessed);   -- lazy purge 
 - **Get**: `SELECT fragment, kind, request_id, created_at, last_accessed, ttl_seconds, max_lifetime FROM refs WHERE tenant=? AND ref=?`, liveness computed in Rust so `Expired` can be distinguished from `Miss`. On a live hit with `touch`, an `UPDATE … SET last_accessed=?` runs with the liveness predicate repeated **in SQL** — a touch must not be able to resurrect a row the absolute cap already killed.
 - **Purge**: expiry is decided on read (`Lookup::Expired`), and `purge_expired` deletes in bounded batches of 5,000 via `DELETE FROM refs WHERE (tenant, ref) IN (SELECT … LIMIT ?)` — a `WITHOUT ROWID` table has no `rowid` for the usual bounded-delete idiom. **Nothing schedules it**: `refs.purge_interval` (60 s) is currently a knob with no consumer, so dead rows linger until the size cap reclaims them. That is safe but untidy — reads never return an expired fragment, and expired rows do not count toward the cap.
 - **Size cap**: `refs.max_bytes` (default 1 GiB) is enforced inline on every `put_many`. Live bytes over the cap ⇒ evict by `last_accessed ASC, tenant ASC, ref ASC` down to 90% of the cap. The 90% is so a store parked exactly at the limit does not evict on every write for the rest of its life; the key tie-break is so that which member of a same-second batch dies does not vary run to run.
-- **Recent-write cache** (`store::cache::CachedRefStore`): an in-process write-through cache of the last `refs.recent_cache_entries` (default 4,096) `(tenant, ref) → fragment`, with a 60 s window against an hour-scale TTL. It exists to cover the gap around a *write* — the proxy hands the model a marker and the model may ask for it in the same turn — not to be a second store with its own retention. Reads deliberately do **not** populate it: a record coming back from the inner store does not carry its absolute lifetime, so a cached copy could only guess at the one deadline a read is not allowed to extend.
+- **Recent-write cache** (`store::cache::CachedRefStore`): an in-process write-through cache of the last `refs.recent_cache_entries` (default 4,096) `(tenant, ref) → fragment`, bounded as well by `refs.recent_cache_bytes` of fragment text (default 64 MiB; whichever bound binds first evicts, and a fragment larger than the whole budget is written through uncached — the entry cap alone allowed 4,096 × 1 MiB), with a 60 s window against an hour-scale TTL. It exists to cover the gap around a *write* — the proxy hands the model a marker and the model may ask for it in the same turn — not to be a second store with its own retention. Reads deliberately do **not** populate it: a record coming back from the inner store does not carry its absolute lifetime, so a cached copy could only guess at the one deadline a read is not allowed to extend.
 - Schema versioning via `PRAGMA user_version` and an ordered `MIGRATIONS: &[(u32, &str)]` array, keyed on an **integer**. The usual shortcut — sorting migration filenames as strings — puts `V10_` before `V2_`, so the tenth migration runs first the moment a tenth one exists; keying on an integer and iterating the array cannot express that bug.
 
 ### 8.3 Other backends
@@ -1355,7 +1355,7 @@ Error semantics: 400 malformed JSON, 401 missing/unknown key (when auth is enabl
 
 ### 10.3 Request handling
 
-Handlers: parse → merge options (tenant override → request `options`) → `spawn_blocking(engine.compress_messages)` → respond → background: `refstore.put_many`, `refstore.touch_many(protected_refs)`, `stats.send(Optimization)`, `stats.send(ProtectedRefs)`. Payload bodies are logged only when `log.payloads = true` (DEBUG), never by default. Concurrency bounded by `server.max_inflight_compressions` (default = CPU count × 2) via a semaphore; excess requests queue up to `server.queue_timeout` (2 s) then 503 with `Retry-After` — the API caller (unlike the proxy, §12.8) is expected to pass the original through on 503.
+Handlers: parse → merge options (tenant override → request `options`) → `spawn_blocking(engine.compress_messages)` → respond → background: `refstore.put_many`, `refstore.touch_many(protected_refs)`, `stats.send(Optimization)`, `stats.send(ProtectedRefs)`. Payload bodies are logged only when `log.payloads = true` (DEBUG), never by default. Concurrency bounded by `server.max_inflight_compressions` (default = CPU count × 2) via a semaphore that the proxy and MCP surfaces share (`AppCore::engine_slots`); excess requests queue up to `server.queue_timeout` (2 s) then 503 with `Retry-After` — the API caller (unlike the proxy, §12.8) is expected to pass the original through on 503.
 
 ## 11. `kompressor-mcp`: MCP server
 
@@ -1471,10 +1471,15 @@ Tool-call **arguments** in assistant turns are never touched; tool **outputs** a
 3. walk (family) → Messages/TextSlots + frozen floor + tool metadata
 4. quick gate: Σ estimate_tokens(compressible slots) < proxy.min_tokens (512) ⇒ passthrough
    (the same estimator the engine uses, so the skip decision and the reported saving answer the same question)
-5. spawn_blocking(engine.compress_messages) with a hard deadline proxy.compress_timeout (default 2 s;
-   an out-of-process hop would need far more) ⇒ on timeout/panic the original body is used (fail open)
+5. one deadline, proxy.compress_timeout (default 2 s; an out-of-process hop would need far more),
+   covers all of: an engine permit (AppCore::engine_slots, shared with the API and MCP, sized
+   server.max_inflight_compressions), a blocking thread, compress_only, and retain (refs.put_many +
+   verify + touch_many(protected)) — on that thread, never on the async worker
+   ⇒ no permit in time: fail open, stage "admission"; timeout/panic: fail open, stage "compress"
+   ⇒ an abandoned task keeps its permit until it ends; what it leaves is retained fragments no
+     forwarded request names (content-addressed, expire normally) — no saving, no promotion
+   file (revert on failed retention; enqueue stats; non-blocking) only after the race is won
    write slots back; if any marker present and inject_retrieve_tool ⇒ add the tool definition (§12.6)
-   stash refs into the write-through cache + async store; enqueue stats
 6. forward upstream (reqwest, streaming), header policy (§12.7); if stream ⇒ SSE relay (§12.6/§12.9)
 7. capture usage (usage object or final SSE chunk); enqueue ProxyRequest event; touch protected refs
 ```
@@ -2161,6 +2166,7 @@ token_guard = "chars"               # chars | tokens
 backend = "sqlite"                  # sqlite | memory
 path    = "./data/refs.db"
 recent_cache_entries = 4096         # write-through cache
+recent_cache_bytes = 67108864       # …and its byte budget (64 MiB)
 purge_interval = "1m"
 max_bytes = 1073741824              # bytes, not "1GiB"
 
@@ -3569,6 +3575,11 @@ ALTER TABLE proxy_requests ADD COLUMN keep_warm INTEGER NOT NULL DEFAULT 0;
 ```
 
 ## C. Configuration reference — flat environment mapping
+
+Both spellings may be set at once; the sectioned `KOMPRESSOR__SECTION__KEY`
+wins whatever order the two appear in the process environment (every flat name
+is applied first, then every sectioned one). `bench replay --config FILE` reads
+that file alone, with no discovery and no environment overlay.
 
 | Flat `KOMPRESSOR_*` | Sectioned key |
 |---|---|

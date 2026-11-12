@@ -633,9 +633,13 @@ rewritten twice.
 
 **A cache loss invalidates the cost, and the run will not say so by itself.**
 A prefix is append-only, so the part the provider serves from cache can only
-grow. When it shrinks, everything after the first missing byte is billed at full
-price again — the request still succeeds, the agent is unaffected, and the only
-trace is a cost that no longer compares with the run beside it. The validity
+grow. When it shrinks, the part no longer read from cache is paid for again —
+as uncached input, or as a cache write at that TTL's price — the request still
+succeeds, the agent is unaffected, and the only trace is a cost that no longer
+compares with the run beside it. A drop is an observation, not an attribution:
+expiry, provider eviction, a changed request (tools, system, breakpoints) and a
+proxy rewrite all read the same in the counter, and `cache-loss-diff.py` is what
+tells them apart. The validity
 section flags it (`PROVIDER CACHE LOSS`), counting a drop only *within* one
 conversation — two conversations interleaved make a sawtooth that is not a loss
 — and treating a retrieve-round row as something to **step over** rather than

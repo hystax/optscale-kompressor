@@ -37,6 +37,15 @@ pub struct AppCore {
     auth: Authenticator,
     refs: Arc<dyn RefStore>,
     stats: StatsSink,
+    /// Permits for engine work, shared by every surface in the process.
+    ///
+    /// Sized [`crate::config::ServerConfig::inflight_limit`]. It lives here
+    /// rather than on one surface's state because the HTTP API was the only
+    /// surface that ever acquired one: the proxy and MCP spawned blocking work
+    /// directly, so a burst of large histories on either could queue and run
+    /// without limit — and a proxy timeout does not cancel the task it gave up
+    /// on, so abandoned work kept running and kept its copy of the messages.
+    engine_slots: Arc<tokio::sync::Semaphore>,
 }
 
 /// What one compression run produced, beyond the mutated messages.
@@ -58,6 +67,26 @@ pub struct Computed {
     original: Option<Vec<Message>>,
     time_ms: i64,
     engine_ms: f64,
+}
+
+/// A computed result whose fragments have been through the store.
+///
+/// The middle of three stages — compute, retain, file — and the only one that
+/// does storage I/O. [`AppCore::retain`] produces it on a blocking thread;
+/// [`AppCore::file`] consumes it on whatever thread decided to accept the
+/// result, and does nothing there that can block.
+///
+/// Dropping one without filing leaves fragments in the store that no forwarded
+/// request names. They are content-addressed, so a later request that elides
+/// the same text re-uses the row rather than duplicating it, and otherwise
+/// they expire on the ordinary idle window. No saving is recorded and no
+/// promotion moves, which is what made abandoning a result safe before the
+/// split and still does.
+pub struct Retained {
+    computed: Computed,
+    /// Every fragment was retained and verified. When false, filing reverts
+    /// the messages to the originals and records no saving.
+    retained: bool,
 }
 
 /// Where a compression came from, for attribution.
@@ -86,12 +115,22 @@ impl AppCore {
             .filter_map(|name| Some((name.clone(), config.for_provider(name)?)))
             .collect();
         AppCore {
-            config,
             providers,
             auth,
+            engine_slots: Arc::new(tokio::sync::Semaphore::new(config.server.inflight_limit())),
             refs,
             stats,
+            config,
         }
+    }
+
+    /// The permits every surface acquires before running the engine.
+    ///
+    /// Hold the permit inside the blocking closure, not around the `await`
+    /// on it: a caller that stops waiting does not stop the work, and the
+    /// permit has to stay taken until the work actually ends.
+    pub fn engine_slots(&self) -> &Arc<tokio::sync::Semaphore> {
+        &self.engine_slots
     }
 
     pub fn config(&self) -> &Config {
@@ -275,6 +314,11 @@ impl AppCore {
     /// fallback when retention fails, the protected-role refresh and the
     /// optimization event. A [`Computed`] that is never passed to this has
     /// touched nothing outside its own allocations.
+    ///
+    /// The composition of [`AppCore::retain`] and [`AppCore::file`], for a
+    /// caller already on a blocking thread that has nothing to decide between
+    /// the two. The proxy calls them separately so the store I/O falls inside
+    /// its deadline and the filing outside it.
     pub fn publish(
         &self,
         identity: &Identity,
@@ -284,28 +328,65 @@ impl AppCore {
         options: &EngineOptions,
         surface: Surface,
     ) -> CompressOutcome {
-        let Computed {
-            mut stats,
-            refs,
-            original,
-            time_ms,
-            engine_ms,
-        } = computed;
+        let retained = self.retain(identity, computed, request.request_id, options);
+        self.file(identity, messages, retained, request, options, surface)
+    }
 
-        // Carried over from the call this commit's restructure displaced. It
-        // belongs on this side of the split rather than in `compress_only`:
-        // the note is part of what gets filed, so a computed result the caller
-        // abandons should not produce one. `compress_only` has no
-        // `RequestInfo` to name the request with either.
+    /// Put a computed result's fragments in the store, and refresh the handles
+    /// it found in protected content.
+    ///
+    /// Blocking: a SQLite write behind a mutex and a 5-second busy timeout.
+    /// Run it where blocking is allowed — on the proxy, inside the same
+    /// `spawn_blocking` task and the same deadline as the computation, so a
+    /// stalled store falls the request open instead of stalling the runtime
+    /// worker every other stream on it shares.
+    pub fn retain(
+        &self,
+        identity: &Identity,
+        computed: Computed,
+        request_id: &str,
+        options: &EngineOptions,
+    ) -> Retained {
+        let retained = self.retain_fragments(identity, &computed.refs, request_id, options);
+        self.refresh_protected(identity, &computed.stats);
+        Retained { computed, retained }
+    }
+
+    /// Accept a retained result: revert it if retention failed, then record it.
+    ///
+    /// Nothing here blocks — the event goes to the statistics writer's bounded
+    /// queue, which drops rather than waits — so it is safe on an async worker,
+    /// and it is the commit point: a result never filed has recorded nothing.
+    pub fn file(
+        &self,
+        identity: &Identity,
+        messages: &mut [Message],
+        retained: Retained,
+        request: &RequestInfo<'_>,
+        options: &EngineOptions,
+        surface: Surface,
+    ) -> CompressOutcome {
+        let Retained {
+            computed:
+                Computed {
+                    mut stats,
+                    refs,
+                    original,
+                    time_ms,
+                    engine_ms,
+                },
+            retained,
+        } = retained;
+
+        // On this side of the split rather than in `compress_only`: the note
+        // is part of what gets filed, so a computed result the caller abandons
+        // should not produce one.
         note_oversized_refusals(&mut stats, &refs, request.request_id);
 
-        if !self.retain_fragments(identity, &refs, request.request_id, options)
-            && let Some(original) = original
-        {
+        if !retained && let Some(original) = original {
             messages.clone_from_slice(&original);
             discard_compression_stats(&mut stats);
         }
-        self.refresh_protected(identity, &stats);
         self.record_compression(identity, &stats, request, surface, time_ms, engine_ms);
 
         CompressOutcome {
@@ -423,6 +504,25 @@ impl AppCore {
         request: &RequestInfo<'_>,
         surface: Surface,
     ) -> Retrieved {
+        // A typed surface either deserialized the range exactly or refused
+        // the call; there is no salvage on those paths to report.
+        let status = range.map(|_| crate::retrieve::RangeParse::Exact);
+        self.retrieve_as(identity, handle, range, status, request, surface)
+    }
+
+    /// [`AppCore::retrieve`], saying how the range was read, so the retrieval
+    /// event can tell a failed narrowing from a whole fragment asked for.
+    /// `status` is `None` when the caller sent no range at all.
+    pub fn retrieve_as(
+        &self,
+        identity: &Identity,
+        handle: &str,
+        range: Option<&RetrieveRange>,
+        status: Option<crate::retrieve::RangeParse>,
+        request: &RequestInfo<'_>,
+        surface: Surface,
+    ) -> Retrieved {
+        let status = status.map(crate::retrieve::RangeParse::as_str);
         let time_ms = now_ms();
         let Some(id) = kompressor_engine::RefId::parse(handle) else {
             // A malformed handle is not a store miss, but the caller learns the
@@ -434,6 +534,7 @@ impl AppCore {
                 request,
                 surface,
                 time_ms,
+                status,
             );
             return Retrieved::miss();
         };
@@ -455,7 +556,7 @@ impl AppCore {
             }
         };
 
-        self.record_retrieval(identity, handle, &result, request, surface, time_ms);
+        self.record_retrieval(identity, handle, &result, request, surface, time_ms, status);
         result
     }
 
@@ -640,9 +741,11 @@ impl AppCore {
             returned_chars: 0,
             returned_tokens: 0,
             withheld: true,
+            range_status: None,
         }));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_retrieval(
         &self,
         identity: &Identity,
@@ -651,6 +754,7 @@ impl AppCore {
         request: &RequestInfo<'_>,
         surface: Surface,
         time_ms: i64,
+        range_status: Option<&str>,
     ) {
         if !self.stats.is_enabled() {
             return;
@@ -674,6 +778,7 @@ impl AppCore {
             returned_chars: returned.chars().count() as u64,
             returned_tokens: kompressor_engine::estimate_tokens(returned, ""),
             withheld: false,
+            range_status: range_status.map(str::to_string),
         }));
     }
 }
@@ -747,7 +852,9 @@ pub fn build_ref_store(config: &Config) -> Result<Arc<dyn RefStore>, crate::erro
             // minted the handle, so the most recent fragments are served from
             // memory rather than racing the write behind them.
             Ok(Arc::new(
-                CachedRefStore::new(store).with_capacity(config.refs.recent_cache_entries),
+                CachedRefStore::new(store)
+                    .with_capacity(config.refs.recent_cache_entries)
+                    .with_max_bytes(config.refs.recent_cache_bytes),
             ))
         }
     }

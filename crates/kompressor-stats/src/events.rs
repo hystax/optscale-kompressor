@@ -243,6 +243,22 @@ pub struct RetrievalEvent {
     /// to measure. Every rate computed over these rows excludes them, and the
     /// count is reported beside the rate rather than folded into it.
     pub withheld: bool,
+    /// Whether the window asked for is the window served: `exact`,
+    /// `salvaged` (one of several variants kept), `normalized` (a flat shape
+    /// read as the one window it names) or `unusable` (nothing narrowable, so
+    /// the whole fragment went back). `None` when no range was asked for.
+    ///
+    /// The split the 2026-11-11 review asked for: a whole-fragment read the
+    /// model meant and one whose narrowing failed looked identical before,
+    /// and only the second is a cost the tool's guidance can fix.
+    ///
+    /// Not persisted on this line yet: the column is stats schema v14, after
+    /// the v13 that `experimental/v2` already assigned, and it arrives with
+    /// that branch. Claiming v13 here would give one version number two
+    /// schemas, and a database stamped by one line would fail to open on the
+    /// other. Until then the status reaches the model and in-process sinks.
+    #[serde(default)]
+    pub range_status: Option<String>,
 }
 
 /// One compress that found handles inside content it was not allowed to touch.

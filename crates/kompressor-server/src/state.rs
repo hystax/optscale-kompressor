@@ -26,7 +26,8 @@ pub struct ServerState {
     /// Configuration, tenants, and the compress/retrieve operations themselves.
     pub core: Arc<AppCore>,
     metrics: PrometheusHandle,
-    /// Permits for engine work. Sized [`kompressor_core::config::ServerConfig::inflight_limit`].
+    /// Permits for engine work: [`AppCore::engine_slots`], shared with every
+    /// other surface. Sized [`kompressor_core::config::ServerConfig::inflight_limit`].
     inflight: Arc<Semaphore>,
     queue_timeout: Duration,
     /// Opened on first use, because a server can start before the statistics
@@ -42,7 +43,9 @@ impl ServerState {
         let stats_path = config.stats.enabled.then(|| config.stats.path.clone());
         let state = ServerState {
             metrics: crate::metrics::install(),
-            inflight: Arc::new(Semaphore::new(config.server.inflight_limit())),
+            // The process-wide permits, shared with the proxy and MCP, so
+            // `max_inflight_compressions` bounds every surface together.
+            inflight: core.engine_slots().clone(),
             queue_timeout: config.server.queue_timeout,
             stats: Mutex::new(None),
             stats_path,
@@ -198,6 +201,31 @@ mod tests {
             "the refusal comes from the queue timeout, not from waiting out the work"
         );
         blocker.await.unwrap();
+    }
+
+    /// The API's permits are the process's: work the proxy or MCP holds
+    /// counts against `max_inflight_compressions` here too. Before the
+    /// 2026-11-11 review this surface owned the only semaphore, and the other
+    /// two ran unbounded beside it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_api_shares_its_engine_permits_with_every_other_surface() {
+        let state = state(1, Duration::from_millis(30));
+        // What the proxy or MCP does with the core's permit.
+        let held = state
+            .core
+            .engine_slots()
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        assert_eq!(state.available_permits(), 0);
+        let refused = run_engine(&state, || 1).await.unwrap_err();
+        assert_eq!(
+            refused.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        drop(held);
+        assert_eq!(run_engine(&state, || 1).await.unwrap(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

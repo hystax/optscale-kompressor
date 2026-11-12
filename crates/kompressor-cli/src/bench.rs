@@ -62,9 +62,13 @@ pub fn replay_corpus(args: ReplayArgs) -> CliResult {
     // `KOMPRESSOR_*` overlay, because `--save` writes the baseline that
     // `--compare` checks and both have to mean the same thing on every
     // machine.
+    //
+    // Which is why this is `load_file` and not `load`: `load` overlays the
+    // environment even for an explicit path, so the comment above was not true
+    // of the code until the 2026-11-11 review reproduced it.
     let config = match args.config.as_deref() {
         Some(path) => {
-            kompressor_core::Config::load(Some(path)).map_err(|e| CliError::Usage(e.to_string()))?
+            kompressor_core::Config::load_file(path).map_err(|e| CliError::Usage(e.to_string()))?
         }
         None => kompressor_core::Config::default(),
     };
@@ -88,8 +92,13 @@ pub fn replay_corpus(args: ReplayArgs) -> CliResult {
     };
 
     if args.json {
+        // The resolved engine options ride along, so two replays that were
+        // meant to differ can be shown to — or shown not to.
         let mut value = json!({
             "corpus": args.corpus.display().to_string(),
+            "config": args.config.as_ref().map(|path| path.display().to_string()),
+            "engine": serde_json::to_value(&options)
+                .map_err(|e| CliError::runtime("rendering the engine options", e))?,
             "baseline": report.to_baseline(),
         });
         if let Some(comparison) = &comparison {

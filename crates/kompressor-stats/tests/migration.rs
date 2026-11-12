@@ -290,3 +290,26 @@ fn a_v11_database_gains_keep_warm_and_its_rows_are_client_requests() {
         "rows that predate the column read 0, not NULL"
     );
 }
+
+#[test]
+fn the_ladder_stops_where_experimental_v2_takes_over() {
+    // `experimental/v2` already owns v13 (request context and daily analysis)
+    // and v14 (retrieval range_status). A v13 assigned here would mean a
+    // different schema under the same number: a database this line stamped
+    // 13 would make that line skip its own v13 and fail on v14 with
+    // "duplicate column range_status", and the server would not start.
+    // Raise this only together with that ladder, never past it on its own.
+    assert_eq!(schema::latest_version(), 12);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stats.db");
+    drop(StatsWriter::open(&StatsConfig::at(&path)).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    let has_status: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('retrieval_events') WHERE name = 'range_status'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(has_status, 0, "range_status is v14, not this line's to add");
+}
