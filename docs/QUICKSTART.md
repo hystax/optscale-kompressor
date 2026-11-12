@@ -37,15 +37,14 @@ variable the agent documents into that agent's environment. Whether the agent
 *reads* that variable for the provider you are using is the agent's business,
 and the entries below differ:
 
-- **codex** ignores `OPENAI_BASE_URL` entirely (measured on 0.155.1), so it is
-  wrapped by editing `$CODEX_HOME/config.toml` instead — marker-delimited
-  blocks added at startup and removed on exit, with everything outside them
-  preserved byte for byte. What gets written depends on how codex is logged
-  in, because the two modes need different blocks and each one's block breaks
-  the other: an API-key install gets a custom provider, a ChatGPT plan gets a
-  single `openai_base_url` override. `wrap` reads the mode from codex's own
-  `auth.json`; `kompressor unwrap codex` removes a block left behind by a
-  session that was killed. [CODEX.md](CODEX.md) has the details.
+- **codex** ignores `OPENAI_BASE_URL` entirely (measured on 0.155.1). Under a
+  ChatGPT login it is pointed at the proxy with `-c openai_base_url` on its
+  command line, which leaves its config alone (see [`CODEX.md`](CODEX.md) for
+  why). Under an API key it is wrapped by editing `$CODEX_HOME/config.toml`:
+  marker-delimited blocks, with a custom provider, added at startup and
+  removed on exit, everything outside them preserved byte for byte. `wrap`
+  reads the login mode from codex's own `auth.json`; `kompressor unwrap codex`
+  removes a block left behind by a session that was killed.
 - **opencode** reads it only for its built-in `openai` provider. A provider
   declared in `opencode.json` carries its own `options.baseURL`, and config
   beats environment — so point that provider at the proxy instead.
@@ -588,6 +587,11 @@ Either way it registers an uninstaller under *Installed apps*, which takes the
 binary and the `PATH` entry back out (and the service), keeps the config and the
 data, and lists where they are on its last page. `/S` installs silently for the user;
 `/S /SYSTEM`, from an elevated prompt, installs the service.
+
+Without the installer, `cargo install --path crates/kompressor-cli --locked`
+builds it on Windows itself. [`WINDOWS.md`](WINDOWS.md) is the step-by-step
+version, including where to put the config so the loader finds it — `~` there
+is `%USERPROFILE%`, since PowerShell and cmd do not set `HOME`.
 
 ### Upgrading
 

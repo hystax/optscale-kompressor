@@ -12,7 +12,7 @@
 //! `kompressor serve` deliberately; a wrap session exiting is not a reason to
 //! take it away.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -30,6 +30,19 @@ use crate::error::CliError;
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const READY_POLL: Duration = Duration::from_millis(200);
 
+/// How long a proxy asked to stop gets before it is killed.
+///
+/// By the time a session stops its proxy the agent has exited, so there are no
+/// connections left to drain and a healthy proxy is gone in well under a
+/// second. This only bounds a proxy that is wedged.
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+/// [`STOP_TIMEOUT`] once this process has been asked to stop: well inside the
+/// five seconds Windows allows after a closed window or a logoff. A wrap ended
+/// there before its kill would leave the proxy running in its own hidden
+/// console, which nothing closes.
+const HURRIED_STOP_TIMEOUT: Duration = Duration::from_secs(3);
+const STOP_POLL: Duration = Duration::from_millis(100);
+
 /// How the proxy behind this session came to exist, which decides who may stop
 /// it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -44,6 +57,10 @@ pub struct Proxy {
     pub port: u16,
     pub ownership: Ownership,
     pub log_path: PathBuf,
+    /// The proxy process, for one this session started. Its standard input is
+    /// how [`stop`] asks it to go; dropping it unstopped closes that pipe,
+    /// which the proxy takes as "keep running".
+    pub child: Option<std::process::Child>,
 }
 
 /// Whether something is already serving `/healthz` on `port`.
@@ -164,18 +181,32 @@ pub async fn start(
         .arg(config_path)
         .arg("--listen")
         .arg(format!("127.0.0.1:{port}"))
-        .stdin(Stdio::null())
+        .arg("--stop-on-stdin")
+        .stdin(Stdio::piped())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
+    // Out of reach of the terminal's interrupt keys: the proxy may serve other
+    // sessions, and it is stopped through its stdin, not by whoever pressed
+    // Ctrl-C here. A process group of its own does that on Unix. On Windows a
+    // console delivers its keys and its closing to every process attached to
+    // it, so the proxy gets a hidden console of its own instead.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
 
-    let mut child = command
-        .spawn()
-        .map_err(|e| CliError::runtime("could not start the proxy", e))?;
+    let mut unready =
+        Unready(Some(command.spawn().map_err(|e| {
+            CliError::runtime("could not start the proxy", e)
+        })?));
+    let child = unready.0.as_mut().expect("just spawned");
 
     let deadline = std::time::Instant::now() + READY_TIMEOUT;
     loop {
@@ -184,6 +215,7 @@ pub async fn start(
                 port,
                 ownership: Ownership::Started,
                 log_path,
+                child: unready.0.take(),
             });
         }
         // A proxy that exited has a reason in its log, and printing the tail
@@ -209,6 +241,19 @@ pub async fn start(
     }
 }
 
+/// A proxy not yet handed to its session, killed if the wait for it is given up
+/// — an interrupted wrap — since nothing else would ever stop it.
+struct Unready(Option<std::process::Child>);
+
+impl Drop for Unready {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 fn log_tail(path: &std::path::Path, lines: usize) -> String {
     let Ok(text) = std::fs::read_to_string(path) else {
         return "  (the log could not be read)".to_string();
@@ -229,6 +274,13 @@ pub fn register_client(paths: &Paths, port: u16) -> std::io::Result<()> {
     let dir = paths.clients(port);
     super::paths::ensure_dir(&dir)?;
     let me = super::paths::ProcessId::current();
+    // The lock on `<pid>.held` is the record. Where it cannot be taken, a
+    // `<pid>` file naming the process stands in, judged by the pid, as markers
+    // from versions before the lock still are. It needs a name of its own: an
+    // unlocked `.held` file is a dead session's, and a peer would remove it.
+    if super::paths::hold(&held_marker(&dir, me.pid)).is_ok() {
+        return Ok(());
+    }
     let body = match me.start_time {
         Some(start) => format!("{} {}\n", me.pid, start),
         None => format!("{}\n", me.pid),
@@ -236,10 +288,17 @@ pub fn register_client(paths: &Paths, port: u16) -> std::io::Result<()> {
     std::fs::write(dir.join(me.pid.to_string()), body)
 }
 
-/// Drop this process's client marker.
+/// The marker a client keeps locked while it runs.
+fn held_marker(dir: &Path, pid: u32) -> PathBuf {
+    dir.join(format!("{pid}.held"))
+}
+
+/// Drop this process's client marker, whichever kind it is.
 pub fn unregister_client(paths: &Paths, port: u16) {
-    let path = paths.clients(port).join(std::process::id().to_string());
-    let _ = std::fs::remove_file(path);
+    let dir = paths.clients(port);
+    let pid = std::process::id();
+    super::paths::let_go(&held_marker(&dir, pid));
+    let _ = std::fs::remove_file(dir.join(pid.to_string()));
 }
 
 /// How many *other* live sessions are using the proxy on `port`.
@@ -256,23 +315,34 @@ pub fn other_live_clients(paths: &Paths, port: u16) -> usize {
     let mut live = 0;
     for entry in entries.flatten() {
         let path = entry.path();
-        let Some(pid) = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(|n| n.parse::<u32>().ok())
-        else {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let (pid, held) = match name.strip_suffix(".held") {
+            Some(pid) => (pid, true),
+            None => (name, false),
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
             continue;
         };
         if pid == me {
             continue;
         }
-        let recorded = std::fs::read_to_string(&path).unwrap_or_default();
-        let start_time = recorded
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse::<u64>().ok());
-        let holder = super::paths::ProcessId { pid, start_time };
-        if holder.is_alive() && !(start_time.is_none() && super::paths::marker_is_stale(&path)) {
+        let by_pid = || {
+            let recorded = std::fs::read_to_string(&path).unwrap_or_default();
+            let start_time = recorded
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse::<u64>().ok());
+            let holder = super::paths::ProcessId { pid, start_time };
+            holder.is_alive() && !(start_time.is_none() && super::paths::marker_is_stale(&path))
+        };
+        let alive = if held {
+            super::paths::reap_if_dead(&path).unwrap_or_else(by_pid)
+        } else {
+            by_pid()
+        };
+        if alive {
             live += 1;
         } else {
             let _ = std::fs::remove_file(&path);
@@ -281,44 +351,49 @@ pub fn other_live_clients(paths: &Paths, port: u16) -> usize {
     live
 }
 
-/// Ask the proxy on `port` to shut down, and wait briefly for the port to free.
+/// Ask the proxy this session started to shut down, and wait for it to exit.
 ///
-/// There is no admin endpoint, so this is a signal to the process group the
-/// proxy was started in. Only ever called for a proxy this session started.
-pub async fn stop(port: u16) {
-    let Some(pid) = serving_pid(port) else {
-        return;
-    };
-    // SIGTERM: `serve` shuts down gracefully on it and drains queued statistics,
-    // which a SIGKILL would discard.
-    let _ = std::process::Command::new("kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    for _ in 0..50 {
-        if port_is_free(port) {
+/// The request is a [`STOP_LINE`](crate::serve::STOP_LINE) on the proxy's
+/// standard input, which this process has held since [`start`]. It used to be
+/// `kill -TERM` to a pid looked up with `ss`, and neither exists on Windows or
+/// `ss` on macOS: the lookup failed in silence and every session there left
+/// its proxy running. The child handle also pins the pid, so the process asked
+/// to stop is the one that was started rather than whatever owns the port now.
+///
+/// `serve` drains its statistics queue on the way out, which a kill would
+/// discard, so killing is only the answer to a proxy that ignored the request.
+/// `hurry` resolving, before or during the wait, cuts the wait short.
+pub async fn stop(
+    child: &mut std::process::Child,
+    port: u16,
+    hurry: impl std::future::Future<Output = ()>,
+) {
+    use std::io::Write as _;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = writeln!(stdin, "{}", crate::serve::STOP_LINE);
+    }
+    let asked = std::time::Instant::now();
+    let mut deadline = asked + STOP_TIMEOUT;
+    let mut hurry = std::pin::pin!(hurry);
+    let mut hurried = false;
+    while std::time::Instant::now() < deadline {
+        if !matches!(child.try_wait(), Ok(None)) {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(STOP_POLL) => {}
+            _ = &mut hurry, if !hurried => {
+                hurried = true;
+                deadline = deadline.min(asked + HURRIED_STOP_TIMEOUT);
+            }
+        }
     }
-}
-
-/// The pid listening on `port`, read from `/proc/net/tcp` via `ss` where
-/// available. Returns `None` rather than guessing.
-fn serving_pid(port: u16) -> Option<u32> {
-    let output = std::process::Command::new("ss")
-        .args(["-lptnH", &format!("sport = :{port}")])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let marker = text.find("pid=")?;
-    text[marker + 4..]
-        .split(|c: char| !c.is_ascii_digit())
-        .next()?
-        .parse()
-        .ok()
+    say!(
+        "kompressor: the proxy on {port} did not stop within {}s; killing it",
+        asked.elapsed().as_secs()
+    );
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[cfg(test)]
@@ -355,20 +430,63 @@ mod tests {
         let (paths, dir) = scratch("sweep");
         let clients = paths.clients(9102);
         super::super::paths::ensure_dir(&clients).unwrap();
-        // pid 0 never exists; the start time makes it unambiguously a corpse.
-        std::fs::write(clients.join("0"), "0 12345\n").unwrap();
-        if cfg!(target_os = "linux") {
-            assert_eq!(
-                other_live_clients(&paths, 9102),
-                0,
-                "a dead marker counts for nothing"
-            );
-            assert!(
-                !clients.join("0").exists(),
-                "and it is removed, or it would pin the proxy forever"
-            );
-        }
+        // What a killed session leaves: its marker, locked by no one.
+        std::fs::write(clients.join("1.held"), "").unwrap();
+        assert_eq!(
+            other_live_clients(&paths, 9102),
+            0,
+            "a dead marker counts for nothing"
+        );
+        assert!(
+            !clients.join("1.held").exists(),
+            "and it is removed, or it would pin the proxy forever"
+        );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A marker with no lock, from a session that could not take one or from
+    /// an older version, goes by its pid. Read as an abandoned lock, it would
+    /// be removed under a live session, and its proxy stopped with it.
+    #[test]
+    fn a_pid_marker_is_judged_by_its_pid_not_reaped() {
+        let (paths, dir) = scratch("pid-marker");
+        let clients = paths.clients(9104);
+        super::super::paths::ensure_dir(&clients).unwrap();
+        // pid 1 is running (init on Linux, assumed alive elsewhere), and a
+        // marker with no start time is believed until it goes stale.
+        std::fs::write(clients.join("1"), "1\n").unwrap();
+        assert_eq!(other_live_clients(&paths, 9104), 1);
+        assert!(clients.join("1").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A process that ignores the stop line, as a wedged proxy would.
+    fn deaf_child() -> std::process::Child {
+        let mut command = if cfg!(windows) {
+            let mut ping = std::process::Command::new("ping");
+            ping.args(["-n", "30", "127.0.0.1"]);
+            ping
+        } else {
+            let mut sleep = std::process::Command::new("sleep");
+            sleep.arg("30");
+            sleep
+        };
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    /// Once this process is asked to stop, a proxy that will not go is killed
+    /// on the short timeout: Windows ends a wrap five seconds after a close.
+    #[tokio::test]
+    async fn a_hurried_stop_kills_a_deaf_proxy_on_the_short_timeout() {
+        let mut child = deaf_child();
+        let begun = std::time::Instant::now();
+        stop(&mut child, 9105, std::future::ready(())).await;
+        assert!(begun.elapsed() < STOP_TIMEOUT, "{:?}", begun.elapsed());
+        assert!(child.try_wait().unwrap().is_some(), "and it is gone");
     }
 
     #[test]
