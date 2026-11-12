@@ -37,6 +37,7 @@
 use std::collections::HashMap;
 
 use crate::options::EngineOptions;
+use crate::refs::refs_in;
 use crate::text::{chars_len, is_blank, split_lines};
 use crate::types::Mode;
 
@@ -94,6 +95,26 @@ fn is_anchorable(line: &str) -> bool {
     !is_blank(line) && chars_len(line) >= MIN_ANCHOR_CHARS
 }
 
+/// Whether `line` names a fragment the model can fetch back.
+///
+/// Such a line is never folded. The pointer this module writes is honest only
+/// because the text it replaces is still on screen, but a handle is not text
+/// the model reads; it is the one way back to what an earlier compression
+/// elided. Folding it leaves a pointer to a pointer, and a model that does not
+/// make the second hop has nothing left to act on.
+///
+/// Measured on two opencode bughunt runs (glm-5.3-flash, 2026-11-08), both cut
+/// off by the 30-minute stage limit. `ledger.c` and `ledger.cpp` have the same
+/// function bodies, so their elided reads differ only in the `#include` line.
+/// The cpp read shipped as two lines and `[... 30 lines omitted; shown in full
+/// earlier in this conversation]`, with all twelve of its handles under the
+/// fold. The model guessed a handle that did not exist, then read the file 386
+/// more times, each read folded to the same 126 characters. The second run did
+/// the same with `cat ledger.py` 477 times, each read folded to a single line.
+fn carries_handle(line: &str) -> bool {
+    !refs_in(line).is_empty()
+}
+
 impl SeenText {
     /// Record what a message shipped, so later messages can point at it.
     pub fn push(&mut self, text: &str) {
@@ -125,12 +146,16 @@ impl SeenText {
     }
 
     /// The longest run at `origin` that also runs forward from `lines[at]`.
+    ///
+    /// A run ends at the first line that carries a retrieve handle: see
+    /// [`carries_handle`].
     fn run_length(&self, lines: &[&str], at: usize, origin: Origin) -> usize {
         let earlier = &self.messages[origin.message];
         let mut n = 0usize;
         while at + n < lines.len()
             && origin.line + n < earlier.len()
             && lines[at + n] == earlier[origin.line + n].as_str()
+            && !carries_handle(lines[at + n])
         {
             n += 1;
         }
@@ -236,6 +261,55 @@ mod tests {
         let out = seen.fold(&body, &opts()).expect("a repeat is folded");
         assert!(out.contains("shown in full earlier"), "{out}");
         assert!(chars_len(&out) < chars_len(&body));
+    }
+
+    /// A source read the code compressor elided: every body is a marker line
+    /// with its own handle, between the line numbers the read tool prints.
+    fn elided_read(include: &str) -> String {
+        let mut out = format!("Read file ledger, lines 1-404\n1: #include <{include}>\n2: \n");
+        out.push_str("3: static long accumulate(const long *rows, int k, long off) {\n");
+        out.push_str("4:     long s = off;\n5:     for (int i = 0; i <= k; i++) s += rows[i];\n");
+        out.push_str("6:     return s;\n7: }\n8: \n");
+        for i in 0..12 {
+            out.push_str(&format!(
+                " long reconcile{i:02}(const long *rows, int count) {{/* [... 32 body lines \
+                 omitted from reconcile{i:02}; retrieve: ref:k_body{i:02}aaaaaa] */}}\n{}: \n",
+                41 + 33 * i
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn a_fold_never_hides_a_handle() {
+        // The opencode bughunt shape: two files whose elided reads differ only
+        // in the include. Before this rule the second read shipped as two
+        // lines and one pointer, and its twelve handles went under the fold.
+        let mut seen = SeenText::default();
+        seen.push(&elided_read("stddef.h"));
+        let second = elided_read("cstddef");
+        let out = seen
+            .fold(&second, &opts())
+            .unwrap_or_else(|| second.clone());
+        assert_eq!(
+            refs_in(&out),
+            refs_in(&second),
+            "every handle the read carries is still on screen:\n{out}"
+        );
+        // The shared prefix with no handle in it is still folded: the rule
+        // stops a run at a handle, it does not switch the fold off.
+        assert!(out.contains("shown in full earlier"), "{out}");
+    }
+
+    #[test]
+    fn a_reread_keeps_its_handles() {
+        // The same read again, which is what the model does when it cannot
+        // find a body: each re-read used to come back as one pointer.
+        let read = elided_read("cstddef");
+        let mut seen = SeenText::default();
+        seen.push(&read);
+        let out = seen.fold(&read, &opts()).unwrap_or_else(|| read.clone());
+        assert_eq!(refs_in(&out).len(), 12, "{out}");
     }
 
     #[test]

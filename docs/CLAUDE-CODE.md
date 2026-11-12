@@ -1,12 +1,24 @@
 # Wrapping Claude Code
 
-`kompressor wrap claude` works, and compresses nothing. Both halves of that
-sentence are accurate and neither is a defect: every request reaches the
-provider, every answer is correct, the proxy adds no errors and no measurable
-latency — and the engine is not permitted to rewrite a single byte.
+`kompressor wrap claude` compresses Claude Code's tool output once the
+Anthropic profile is applied. One setting decides whether anything is
+compressed at all: `proxy.frozen_prefix`. Claude Code puts a `cache_control`
+breakpoint on its final message, and under the deployment default, `marker`,
+that breakpoint freezes the whole conversation, so the engine is handed nothing
+it may rewrite. With `first_seen` only the part the provider has already cached
+stays frozen, and the new tail of every turn is compressed before it is cached.
 
-This document exists so that result is expected rather than discovered, and so
-that nobody tries to "fix" it with the one setting that makes it much worse.
+The packaged configuration sets `first_seen` and the rest of the profile under
+`[proxy.providers.anthropic]`; with no config file at all you get the default
+and a session that forwards its requests untouched. Anthropic traffic is
+supported both from the Claude Code CLI (`wrap claude`, this document) and from
+Claude Desktop's Code tab, which cannot be pointed at a base URL and is reached
+through the intercept instead — see [CLAUDE-DESKTOP.md](CLAUDE-DESKTOP.md). The
+settings are the same for both.
+
+This document lists what to set, how to check that it took effect, and why the
+default behaves the way it does — including the one setting that looks like a
+fix and makes things much worse.
 
 Measured against **Claude Code 2.1.278** with a ChatGPT-style OAuth subscription
 login (`oauth-2025-04-20`), model `claude-opus-5[1m]`, OptScale Kompressor in
@@ -15,14 +27,15 @@ login (`oauth-2025-04-20`), model `claude-opus-5[1m]`, OptScale Kompressor in
 ## Contents
 
 - [What a wrapped session actually does](#what-a-wrapped-session-actually-does)
+- [Settings that make it compress](#settings-that-make-it-compress)
 - [The retrieval tools](#the-retrieval-tools)
-- [Why nothing compresses](#why-nothing-compresses)
+- [Why the default freezes everything](#why-the-default-freezes-everything)
 - [Do not disable prompt caching](#do-not-disable-prompt-caching)
 - [Verify it for yourself](#verify-it-for-yourself)
 - [Reading the outcome field](#reading-the-outcome-field)
 - [What the proxy changes about your request](#what-the-proxy-changes-about-your-request)
 - [What compression costs, measured](#what-compression-costs-measured)
-- [When wrapping Claude Code is still worth it](#when-wrapping-claude-code-is-still-worth-it)
+- [What else the proxy gives you](#what-else-the-proxy-gives-you)
 
 ## What a wrapped session actually does
 
@@ -33,7 +46,10 @@ kompressor wrap claude
 That is the whole setup. Claude Code reads `ANTHROPIC_BASE_URL`, which `wrap`
 sets, so unlike codex there is nothing to configure. It also gets the retrieval
 tools for the length of the session — see [below](#the-retrieval-tools), and
-note that no file of yours is edited to arrange it. A measured session:
+note that no file of yours is edited to arrange it.
+
+What the proxy does with the traffic depends on the profile. A measured session
+on the deployment defaults (`frozen_prefix = "marker"`):
 
 | | |
 |---|---|
@@ -41,14 +57,64 @@ note that no file of yours is edited to arrange it. A measured session:
 | Family detected | `anthropic_messages`, streamed |
 | Answers | correct |
 | Tokens in → out | 52,886 → 52,886 |
-| **Saved gross** | **0** |
+| Saved gross | 0 — every message was inside the frozen prefix |
 
-Bodies are forwarded byte for byte. That matters more than it sounds: because
-nothing is rewritten, the wrap cannot disturb the provider's prompt cache, and
-the cost of running it is the loopback hop. If you compare two wrapped and
-unwrapped runs and see different cache figures, that is conversation variance,
-not a compression penalty — confirm it by checking that the proxy logged no
-`compressed` events at all.
+On those defaults bodies are forwarded byte for byte, so the wrap cannot disturb
+the provider's prompt cache. With `frozen_prefix = "first_seen"` the same kind
+of session compresses: 21.6% removed on a measured Opus run, with 56 of 1,363
+messages frozen instead of all of them, and the cached prefix left as the
+client marked it.
+
+## Settings that make it compress
+
+The packaged configurations (`/etc/kompressor/config.toml` on Linux,
+`~/.config/kompressor/config.toml` on macOS) ship all of these under
+`[proxy.providers.anthropic]`, so they apply to Anthropic traffic only and any
+OpenAI client of the same proxy keeps the deployment defaults (DESIGN §12.11):
+
+```toml
+[engine]
+mode = "recoverable"
+
+[proxy.providers.anthropic]
+frozen_prefix = "first_seen"   # required: without it nothing is compressed
+retrieve_tool = "always"
+cache_ttl = "adaptive"
+
+[proxy.providers.anthropic.engine]
+enable_code_aware = false
+min_elision_saving_chars = 4000
+```
+
+| Setting | Why |
+|---|---|
+| `frozen_prefix = "first_seen"` | **The one that turns compression on.** Freezes only what the provider cached when the proxy first saw the conversation, instead of everything up to Claude Code's final breakpoint. See [below](#why-the-default-freezes-everything). |
+| `engine.mode = "recoverable"` | Elided text leaves a `ref:k_…` handle the model can fetch back with the retrieve tool. |
+| `retrieve_tool = "always"` | Offers the retrieve tool on every request; adding it mid-conversation would change the tool list and throw away Anthropic's cached prefix. |
+| `cache_ttl = "adaptive"` | One-hour cache entries once a conversation has paused past five minutes. |
+| `engine.enable_code_aware = false` | Function bodies were fetched back often enough to cost more than they saved. |
+| `engine.min_elision_saving_chars = 4000` | A tool result that would save less than this ships whole: it is worth less than the fetch it invites. |
+
+An install that already has a config keeps it — dpkg leaves an edited conffile
+in place beside a `.dpkg-dist` copy, and the macOS installer never overwrites
+one — so check that yours has the block. To set the profile for one session
+without editing a file:
+
+```bash
+export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__FROZEN_PREFIX=first_seen
+export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__RETRIEVE_TOOL=always
+export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__CACHE_TTL=adaptive
+export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__ENGINE__ENABLE_CODE_AWARE=false
+export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__ENGINE__MIN_ELISION_SAVING_CHARS=4000
+kompressor wrap claude
+```
+
+`wrap claude` uses a kompressor already serving on its port, such as the
+installed service, so in that case the settings belong in the service's config,
+not in the shell that runs `wrap`. The measured effect of each setting is in
+[What compression costs, measured](#what-compression-costs-measured), and
+[Verify it for yourself](#verify-it-for-yourself) shows how to confirm they took
+effect.
 
 ## The retrieval tools
 
@@ -104,20 +170,18 @@ Two things to know:
   to put the flag on. Registering durably so those cases could be covered is the
   trade above, refused.
 
-## Why nothing compresses
+## Why the default freezes everything
 
-Two independent ceilings, either of which alone would be enough.
-
-**One of the two now has a switch.** Everything below describes the shipped
-default, `proxy.frozen_prefix = "marker"`. With `first_seen` the first ceiling
-lifts and a Claude Code session does compress — 21.6% removed on a measured
-Opus run, 56 of 1,363 messages frozen instead of all of them. It is off by
-default and there are open issues against it; see "Lifting the first ceiling"
-below and §19 of DESIGN.md.
+Two things limit what the engine can reach on a Claude Code request. The first
+is the cache breakpoint, and `frozen_prefix = "first_seen"` is the setting that
+lifts it; the second is how much of the request is `messages` at all, which no
+setting changes.
 
 ### The trailing cache breakpoint
 
-Claude Code marks its **final** message as a prompt-cache breakpoint. A
+Under the deployment default, `proxy.frozen_prefix = "marker"`, the proxy
+freezes everything up to the client's last breakpoint. Claude Code marks its
+**final** message as a prompt-cache breakpoint. A
 breakpoint pins everything before it, so honouring the cache means the whole
 conversation is off limits. From a captured request:
 
@@ -126,11 +190,11 @@ system blocks: 3     → [1] and [2] carry cache_control ttl=1h
 messages: 2          → [1] carries cache_control at block[0]   ← the final message
 ```
 
-The walker reports that as `frozen_message_count`, and the engine withholds
-every message inside it. Across one real session: 5 of 5, 7 of 8, and 10 of 11
-messages frozen.
+The walker reports that as `frozen_message_count`, and on `marker` the engine
+withholds every message inside it. Across one real session: 5 of 5, 7 of 8, and
+10 of 11 messages frozen.
 
-### Lifting the first ceiling
+### What `first_seen` changes
 
 The breakpoint marks Claude Code's *final* message, so the floor it implies —
 `max(i) + 1` — covers the messages that arrived on this very turn. Those are not
@@ -157,9 +221,16 @@ with session length, because a frozen tail token is re-read on every later turn:
 At 70 turns a tail token averages $27.58/MTok against $5.00 for plain input; the
 earliest costs $40.25/MTok, eight times face value.
 
-What it does not yet have is a paired control, and one measured run showed cache
-churn on the turn the first handle appears. Both are recorded as open issues in
-§19 of DESIGN.md. Default stays `marker`.
+The deployment default stays `marker`, because it is the rule that is right for
+a client that places its breakpoints before the history it wants compressed. For
+Anthropic the packaged configuration sets `first_seen`; its cost against
+compression off is measured in
+[What compression costs, measured](#what-compression-costs-measured).
+
+A conversation Claude Code moves to another model mid-session — its refusal
+fallback, for example — keeps the floor it had: the proxy recognises the same
+history under the new model and does not re-freeze it to the new request's
+marker.
 
 ### Two side effects of the custom base URL
 
@@ -273,7 +344,7 @@ that Claude Code did not consider it worth persisting.
 working. It is still the wrong trade, by a wide margin, and this was measured
 rather than reasoned:
 
-| | caching on (default) | caching off |
+| | caching on, `marker` | caching off |
 |---|---|---|
 | Messages compressed | 0 of 24 | 7 of 30 |
 | Engine tokens | 52,886 → 52,886 | 32,027 → 22,888 (**−9,139**) |
@@ -286,38 +357,39 @@ Disabling the cache to unlock 9,139 tokens of compression costs roughly **four
 times** as much and doubles latency. The engine's saving is about 1.7% of the
 uncached prompt volume it created.
 
-There is no configuration of OptScale Kompressor that makes this trade work on Claude
-Code. The fix, if one ever exists, is client-side: a breakpoint placed before
-the tool-result history rather than after it.
+Keep caching on and set `frozen_prefix = "first_seen"` instead: it compresses
+the tail that is not cached yet and leaves the cached prefix alone, which is the
+trade that pays.
 
 ## Verify it for yourself
 
-A wrapped session tells you as it exits, and on Claude Code the expected
-reading is the middle one — traffic arrived, and none of it was eligible:
-
-```console
-kompressor: 2 request(s), nothing compressed — every message was withheld.
-           Usually a client that pins its whole prompt with cache_control; see docs/CLAUDE-CODE.md.
-```
-
-That is success. `no requests reached the proxy` would be the failure, and it
-is not what Claude Code does — it honours `ANTHROPIC_BASE_URL` correctly.
-
-For the detail behind that line, run a task and then:
+Run a task that reads something sizeable — a long log, a large file, a test
+run — and then:
 
 ```bash
 kompressor stats summary
 ```
 
-A healthy wrapped Claude Code session looks like this, and the zero is the
-expected reading:
+With the profile applied, `messages … compressed` is above zero and
+`saved gross` is positive. A short session may still show zero: a turn whose
+tool output is smaller than `min_elision_saving_chars` is shipped whole on
+purpose.
 
+A wrapped session also reports as it exits. If it says no message was
+compressed and the session did read large output, the profile is not in effect:
+
+```console
+kompressor: 2 request(s), no message compressed — every message was withheld.
+           Either there was nothing worth rewriting, or proxy.frozen_prefix is "marker"
+           and the client pins its whole prompt with cache_control (Claude Code does);
+           set it to "first_seen" — see docs/CLAUDE-CODE.md.
 ```
-requests            3
-messages            24 total, 0 compressed
-tokens              52886 in, 52886 out
-saved gross         0
-```
+
+The usual causes are a config file without the `[proxy.providers.anthropic]`
+block (an older install keeps its own), or `wrap` attaching to a service that
+runs on a different config than the one you edited. `no requests reached the
+proxy` is a different failure — the client did not use the base URL — and it is
+not what Claude Code does: it honours `ANTHROPIC_BASE_URL` correctly.
 
 To confirm the cause rather than assume it:
 
@@ -328,8 +400,10 @@ sqlite3 ./data/stats.db \
 ```
 
 `protected_by_reason` reading `{"frozen": N}` with `N` close to
-`messages_total` is the cache breakpoint. Anything else — `role:assistant`,
-`flagged` — is a different story and worth looking at.
+`messages_total` on every row is the cache breakpoint under `marker`: set
+`frozen_prefix = "first_seen"`. With `first_seen`, `N` stays near the count the
+first request of the conversation carried while `messages_total` grows. Anything
+else — `role:assistant`, `flagged` — is a different story and worth looking at.
 
 ## Reading the outcome field
 
@@ -451,7 +525,7 @@ With `proxy.cache_keep_warm = true`, after a response that stopped on
 `tool_use` the proxy re-sends that request with `max_tokens: 1` every 270
 seconds until Claude Code's next request arrives, at most 11 times; after an
 `end_turn` while a background task or `Monitor` watch Claude Code started is
-still running (neither reported nor stopped with `TaskStop`), also at most 11 times (`proxy.cache_keep_warm_background_pings`,
+still running (its end neither reported nor caused by `TaskStop`; a `Monitor` watch runs until it expires, whatever events it sends, and a wait on watches alone stops at the longest one's stated expiry, three pings for the usual ten minutes), also at most 11 times (`proxy.cache_keep_warm_background_pings`,
 0 to turn that off), or while a `ScheduleWakeup` wake is still to come, until
 it is due.
 Each ping costs the conversation at the cache-read price plus one output token,
@@ -468,23 +542,25 @@ asked for, using the client's credentials while the client is busy elsewhere
 export KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__CACHE_KEEP_WARM=true
 ```
 
-## When wrapping Claude Code is still worth it
+## What else the proxy gives you
 
-Compression is not the only thing the proxy does, and the rest of it costs
-nothing here:
+Compression is not the only thing the proxy does:
 
 - **Statistics.** `proxy_requests` records every request, model, status, latency
   and the full usage breakdown — prompt, completion, cache read and cache write
   — per turn. That is a usable picture of where a subscription is going, and it
   exists whether or not anything compressed.
-- **A correctness baseline.** A wrapped session that forwards byte-identically
-  is a control run. If a change to the engine ever starts rewriting Claude Code
-  traffic, the diff against these numbers is the alarm.
-- **It is free.** No rewrites, no cache disturbance, one loopback hop.
+- **Cache management.** The adaptive TTL and, if you turn it on, keep-warm act
+  on the cache Claude Code builds, with compression on or off.
+- **A control run.** With `proxy.compress = false` the proxy forwards
+  byte-identically and still records every request, which is the baseline the
+  measurements above were scored against.
 
-For actual compression on an agent workload, `codex` is the supported path —
-see [CODEX.md](CODEX.md). Seven measured sessions on a ChatGPT subscription
-removed **60.1% overall**, ranging from 78.3% on grep output to 16.4% on build
-output; what a session saves is decided by what it reads. The difference
-between codex and Claude Code is entirely client-side prompt structure, not
-engine quality.
+Anthropic is supported for both the Claude Code CLI (`kompressor wrap claude`)
+and Claude Desktop's Code tab (the TLS intercept, [CLAUDE-DESKTOP.md](CLAUDE-DESKTOP.md)).
+To make either compress, apply the profile in
+[Settings that make it compress](#settings-that-make-it-compress) —
+`frozen_prefix = "first_seen"` above all — and check it with
+[Verify it for yourself](#verify-it-for-yourself). What a session saves is
+decided by what it reads: large logs, file reads and test output compress;
+short tool results are shipped whole.

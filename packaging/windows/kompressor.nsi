@@ -125,7 +125,7 @@ Page custom ReinstallPage ReinstallLeave
 !macro EditPath VERB KEY
     !insertmacro SetEnv "KOMPRESSOR_SETUP_DIR" "$INSTDIR"
     !insertmacro SetEnv "KOMPRESSOR_SETUP_KEY" "${KEY}"
-    nsExec::ExecToLog `${POWERSHELL} "$$ErrorActionPreference = 'Stop'; $$d = $$env:KOMPRESSOR_SETUP_DIR.TrimEnd('\'); $$key = $$env:KOMPRESSOR_SETUP_KEY; try { $$p = [string](Get-Item -LiteralPath $$key).GetValue('Path', '', 'DoNotExpandEnvironmentNames') } catch { $$p = [string](Get-ItemProperty -LiteralPath $$key -Name Path -ErrorAction SilentlyContinue).Path }; $$keep = @($$p -split ';' | Where-Object { $$_ -and $$_.TrimEnd('\') -ne $$d }); if ('${VERB}' -eq 'add') { $$keep += $$d }; Set-ItemProperty -LiteralPath $$key -Name Path -Value ($$keep -join ';') -Type ExpandString"`
+    nsExec::ExecToLog /OEM `${POWERSHELL} "$$ErrorActionPreference = 'Stop'; $$d = $$env:KOMPRESSOR_SETUP_DIR.TrimEnd('\'); $$key = $$env:KOMPRESSOR_SETUP_KEY; try { $$p = [string](Get-Item -LiteralPath $$key).GetValue('Path', '', 'DoNotExpandEnvironmentNames') } catch { $$p = [string](Get-ItemProperty -LiteralPath $$key -Name Path -ErrorAction SilentlyContinue).Path }; $$keep = @($$p -split ';' | Where-Object { $$_ -and $$_.TrimEnd('\') -ne $$d }); if ('${VERB}' -eq 'add') { $$keep += $$d }; Set-ItemProperty -LiteralPath $$key -Name Path -Value ($$keep -join ';') -Type ExpandString"`
     Pop $0
     ${If} $0 != 0
         DetailPrint "could not update PATH (exit $0)"
@@ -419,7 +419,7 @@ FunctionEnd
 ; only an upgrade passes, and only if the folder is still owned by
 ; administrators, SYSTEM or the service.
 Function CheckState
-    nsExec::ExecToLog `${CHECK_OWNERS}`
+    nsExec::ExecToLog /OEM `${CHECK_OWNERS}`
     Pop $0
     ${If} $0 == 0
         Return
@@ -446,6 +446,9 @@ Function CheckState
     Abort "could not check $APPDATA\${APP}"
 FunctionEnd
 
+; icacls and sc.exe run hidden: their output is localized in the OEM code page
+; and only their exit code is used. Other commands log with /OEM to decode it.
+
 ; The service's state folder: refuses one another user prepared, then creates
 ; or locks it down. Everyone reads the stores, as on Linux; only the service and
 ; administrators write them and read the CA key.
@@ -455,7 +458,7 @@ Function SecureState
         Call CheckState
         ; Checked again after icacls: users may add to it until then. /L
         ; changes a link, not its target.
-        nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$APPDATA\${APP}" /L /inheritance:r /grant:r ${SID_SYSTEM}:(OI)(CI)F ${SID_ADMINS}:(OI)(CI)F ${SID_SERVICE}:(OI)(CI)M ${SID_USERS}:(OI)(CI)RX'
+        nsExec::Exec '"$SYSDIR\icacls.exe" "$APPDATA\${APP}" /L /inheritance:r /grant:r ${SID_SYSTEM}:(OI)(CI)F ${SID_ADMINS}:(OI)(CI)F ${SID_SERVICE}:(OI)(CI)M ${SID_USERS}:(OI)(CI)RX'
         Pop $0
         ${If} $0 != 0
             MessageBox MB_OK|MB_ICONSTOP "Could not set the permissions of $APPDATA\${APP}." /SD IDOK
@@ -487,7 +490,7 @@ Function SecureState
 
     CreateDirectory "$APPDATA\${APP}\logs"
     CreateDirectory "$APPDATA\${APP}\ca"
-    nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$APPDATA\${APP}\ca" /L /inheritance:r /grant:r ${SID_SYSTEM}:(OI)(CI)F ${SID_ADMINS}:(OI)(CI)F ${SID_SERVICE}:(OI)(CI)M'
+    nsExec::Exec '"$SYSDIR\icacls.exe" "$APPDATA\${APP}\ca" /L /inheritance:r /grant:r ${SID_SYSTEM}:(OI)(CI)F ${SID_ADMINS}:(OI)(CI)F ${SID_SERVICE}:(OI)(CI)M'
     Pop $0
     ${If} $0 != 0
         MessageBox MB_OK|MB_ICONSTOP "Could not set the permissions of $APPDATA\${APP}\ca." /SD IDOK
@@ -505,7 +508,7 @@ Function InstallService
     !insertmacro SetEnv "KOMPRESSOR_SETUP_TEMPLATE" "$INSTDIR\config.toml.in"
     !insertmacro SetEnv "KOMPRESSOR_SETUP_CONFIG"   "$APPDATA\${APP}\config.toml"
     !insertmacro SetEnv "KOMPRESSOR_SETUP_STATE"    "$APPDATA\${APP}"
-    nsExec::ExecToLog `${POWERSHELL} "$$ErrorActionPreference = 'Stop'; $$c = $$env:KOMPRESSOR_SETUP_CONFIG; if (Test-Path -LiteralPath $$c) { 'kept existing ' + $$c; exit 0 }; $$s = $$env:KOMPRESSOR_SETUP_STATE.Replace('\', '/'); $$t = (Get-Content -LiteralPath $$env:KOMPRESSOR_SETUP_TEMPLATE -Raw -Encoding UTF8).Replace('@STATE@', $$s); Set-Content -LiteralPath $$c -Value $$t -Encoding UTF8 -NoNewline; 'wrote ' + $$c"`
+    nsExec::ExecToLog /OEM `${POWERSHELL} "$$ErrorActionPreference = 'Stop'; $$c = $$env:KOMPRESSOR_SETUP_CONFIG; if (Test-Path -LiteralPath $$c) { 'kept existing ' + $$c; exit 0 }; $$s = $$env:KOMPRESSOR_SETUP_STATE.Replace('\', '/'); $$t = (Get-Content -LiteralPath $$env:KOMPRESSOR_SETUP_TEMPLATE -Raw -Encoding UTF8).Replace('@STATE@', $$s); Set-Content -LiteralPath $$c -Value $$t -Encoding UTF8 -NoNewline; 'wrote ' + $$c"`
     Pop $0
     ${If} $0 != 0
         DetailPrint "could not write the config (exit $0)"
@@ -514,7 +517,7 @@ Function InstallService
     ${EndIf}
     ; What setup creates is owned by the admin running it; hand it all to
     ; Administrators, so another admin's upgrade passes the owner check.
-    nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$APPDATA\${APP}" /setowner ${SID_ADMINS} /T /C /L /Q'
+    nsExec::Exec '"$SYSDIR\icacls.exe" "$APPDATA\${APP}" /setowner ${SID_ADMINS} /T /C /L /Q'
     Pop $0
     ${If} $0 != 0
         DetailPrint "could not make Administrators the owner of $APPDATA\${APP} (exit $0)"
@@ -525,9 +528,9 @@ Function InstallService
     ; service (already stopped by then) and registers it again.
     File "/oname=kompressor-service.exe" "${WINSW}"
     File "/oname=kompressor-service.xml" "${ROOT}/packaging/windows/kompressor-service.xml"
-    nsExec::ExecToLog '"${SERVICE}" uninstall'
+    nsExec::ExecToLog /OEM '"${SERVICE}" uninstall'
     Pop $0
-    nsExec::ExecToLog '"${SERVICE}" install'
+    nsExec::ExecToLog /OEM '"${SERVICE}" install'
     Pop $0
     ${If} $0 != 0
         DetailPrint "could not register the service (exit $0)"
@@ -537,18 +540,18 @@ Function InstallService
     ${EndIf}
     ; WinSW registers it as LocalSystem. If it cannot be switched to
     ; LocalService it is removed, or else disabled, so it never runs as SYSTEM.
-    nsExec::ExecToLog '"$SYSDIR\sc.exe" config ${APP} obj= "NT AUTHORITY\LocalService" password= ""'
+    nsExec::Exec '"$SYSDIR\sc.exe" config ${APP} obj= "NT AUTHORITY\LocalService" password= ""'
     Pop $0
     ${If} $0 != 0
         DetailPrint "could not run the service as LocalService (exit $0)"
-        nsExec::ExecToLog '"${SERVICE}" uninstall'
+        nsExec::ExecToLog /OEM '"${SERVICE}" uninstall'
         Pop $0
         ${If} $0 == 0
             StrCpy $FinishText "OptScale Kompressor is installed, but its service is not: it could not be set to run as LocalService.$\r$\n$\r$\nFrom an administrator PowerShell:$\r$\n      & $\"$INSTDIR\kompressor-service.exe$\" install$\r$\n      sc.exe config ${APP} obj= $\"NT AUTHORITY\LocalService$\" password= $\"$\"$\r$\n      Start-Service ${APP}"
             MessageBox MB_OK|MB_ICONEXCLAMATION "The OptScale Kompressor service could not be set to run as LocalService, so it was removed again. The last page says how to finish by hand." /SD IDOK
             Return
         ${EndIf}
-        nsExec::ExecToLog '"$SYSDIR\sc.exe" config ${APP} start= disabled'
+        nsExec::Exec '"$SYSDIR\sc.exe" config ${APP} start= disabled'
         Pop $0
         ${If} $0 == 0
             StrCpy $FinishText "OptScale Kompressor is installed, but its service is disabled: it could not be set to run as LocalService.$\r$\n$\r$\nFrom an administrator PowerShell:$\r$\n      sc.exe config ${APP} obj= $\"NT AUTHORITY\LocalService$\" password= $\"$\" start= auto$\r$\n      Start-Service ${APP}"
@@ -559,7 +562,7 @@ Function InstallService
         MessageBox MB_OK|MB_ICONSTOP "The OptScale Kompressor service is registered to run as LocalSystem and could not be set to LocalService, removed or disabled. It is not started, but it would start with Windows. The last page says how to remove it." /SD IDOK
         Return
     ${EndIf}
-    nsExec::ExecToLog '"${SERVICE}" start'
+    nsExec::ExecToLog /OEM '"${SERVICE}" start'
     Pop $0
     ${If} $0 != 0
         StrCpy $FinishText "OptScale Kompressor is installed, but its service did not start. Its logs are in $APPDATA\${APP}\logs."
@@ -575,7 +578,7 @@ Function InstallService
     ; Mode will not load; a listener is the TCP row whose remote address is
     ; port 0, which reads the same in every Windows language.
     DetailPrint "waiting for the service to listen ..."
-    nsExec::ExecToLog `${POWERSHELL} "for ($$i = 0; $$i -lt 20; $$i++) { $$l = @(netstat -ano -p TCP | ForEach-Object { $$f = -split $$_; if ($$f.Count -ge 5 -and $$f[0] -eq 'TCP' -and $$f[2] -match ':0$$') { $$p = Get-Process -Id $$f[4] -ErrorAction SilentlyContinue; if ($$p -and $$p.ProcessName -eq 'kompressor' -and $$p.SessionId -eq 0) { $$f[1] } } }); if ($$l.Count) { 'serving on ' + ($$l -join ', '); exit 0 }; Start-Sleep -Seconds 1 }; exit 3"`
+    nsExec::ExecToLog /OEM `${POWERSHELL} "for ($$i = 0; $$i -lt 20; $$i++) { $$l = @(netstat -ano -p TCP | ForEach-Object { $$f = -split $$_; if ($$f.Count -ge 5 -and $$f[0] -eq 'TCP' -and $$f[2] -match ':0$$') { $$p = Get-Process -Id $$f[4] -ErrorAction SilentlyContinue; if ($$p -and $$p.ProcessName -eq 'kompressor' -and $$p.SessionId -eq 0) { $$f[1] } } }); if ($$l.Count) { 'serving on ' + ($$l -join ', '); exit 0 }; Start-Sleep -Seconds 1 }; exit 3"`
     Pop $0
     ${If} $0 == 3
         StrCpy $FinishText "OptScale Kompressor is installed and its service is registered, but it is not serving: kompressor keeps exiting. The usual cause is port 8817 already in use, by a kompressor wrap or serve you started; stop it and the service recovers within seconds. Its logs are in $APPDATA\${APP}\logs."
@@ -593,7 +596,7 @@ Section "kompressor" Main
     ; not `stop`: WinSW's `stop` returns before serve has exited.
     ${If} $SystemMode == 1
     ${AndIf} ${FileExists} "${SERVICE}"
-        nsExec::ExecToLog '"${SERVICE}" stopwait'
+        nsExec::ExecToLog /OEM '"${SERVICE}" stopwait'
         Pop $0
     ${EndIf}
     Call CheckNotRunning
@@ -663,14 +666,14 @@ FunctionEnd
 Section "Uninstall"
     ${If} $SystemMode == 1
     ${AndIf} ${FileExists} "${SERVICE}"
-        nsExec::ExecToLog '"${SERVICE}" stopwait'
+        nsExec::ExecToLog /OEM '"${SERVICE}" stopwait'
         Pop $0
     ${EndIf}
     SetFileAttributes "$INSTDIR\kompressor.exe" NORMAL
     Delete "$INSTDIR\kompressor.exe"
     ${If} ${FileExists} "$INSTDIR\kompressor.exe"
         ${If} $SystemMode == 1
-            nsExec::ExecToLog '"${SERVICE}" start'
+            nsExec::ExecToLog /OEM '"${SERVICE}" start'
             Pop $0
         ${EndIf}
         MessageBox MB_OK|MB_ICONEXCLAMATION "$INSTDIR\kompressor.exe cannot be removed: it is running, or another program has it open. Stop kompressor (close the wrap or serve that runs it, or: Get-Process kompressor | Stop-Process) and uninstall again." /SD IDOK
@@ -678,7 +681,7 @@ Section "Uninstall"
     ${EndIf}
 
     ${If} $SystemMode == 1
-        nsExec::ExecToLog '"${SERVICE}" uninstall'
+        nsExec::ExecToLog /OEM '"${SERVICE}" uninstall'
         Pop $0
         !insertmacro EditPath "remove" "${SYSTEM_ENV}"
         DeleteRegKey HKLM "${UNINST}"

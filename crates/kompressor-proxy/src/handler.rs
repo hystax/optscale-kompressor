@@ -221,7 +221,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     // cache warm has done its job. Cancelled before this request is sent, so a
     // ping cannot race the request it was waiting for.
     if let Some(conversation) = prepared.prefix {
-        state.keepwarm.cancel(conversation);
+        state.keepwarm.cancel(conversation, prepared.messages);
     }
 
     // Both bodies, before either is re-encoded, when a capture is asked for.
@@ -455,6 +455,9 @@ struct Prepared {
     /// provider reports can be filed against it for next turn. `None` when
     /// nothing was frozen — there is no prefix to have an opinion about.
     prefix: Option<u64>,
+    /// How many messages the request carried, stamped with `prefix`: what tells
+    /// the conversation coming back from another that opened the same way.
+    messages: Option<usize>,
     /// The request asked for one-hour cache entries, which outlast any pause a
     /// keep-warm ping would bridge.
     one_hour: bool,
@@ -465,6 +468,7 @@ impl Prepared {
     fn passthrough(body: Bytes, stream: bool, model: Option<String>) -> Prepared {
         Prepared {
             prefix: None,
+            messages: None,
             one_hour: false,
             body,
             json: None,
@@ -569,6 +573,7 @@ fn passthrough_with_stable_tools(
         // Stamped by `prepare`, which computes it for every request however
         // this one turned out.
         prefix: None,
+        messages: None,
         one_hour: false,
     }
 }
@@ -644,7 +649,7 @@ fn prefix_identity(
     family: Option<ApiFamily>,
     body: &Bytes,
     provider: &str,
-) -> Option<u64> {
+) -> Option<(u64, usize)> {
     // Identified with compression off too. The control arm of a comparison has
     // to be observed the way the treated arm is: without a conversation its
     // rows filed no conversation, its cache-read drops went untracked — an
@@ -669,7 +674,11 @@ fn prefix_identity(
     // mid-session finds a watermark describing what the client established
     // rather than whatever this turn happens to mark.
     state.prefixes.floor(fingerprint, walk.frozen_message_count);
-    Some(fingerprint)
+    let messages = value
+        .get("messages")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    Some((fingerprint, messages))
 }
 
 /// Decide what to send, then stamp the conversation's cache identity on it.
@@ -693,7 +702,8 @@ async fn prepare(
     request_id: &str,
     provider: &str,
 ) -> Prepared {
-    let fingerprint = prefix_identity(state, identity, family, &body, provider);
+    let identified = prefix_identity(state, identity, family, &body, provider);
+    let fingerprint = identified.map(|(key, _)| key);
     // Decided once, here: under `adaptive` the question itself moves the
     // conversation's state. Anthropic only; the TTL is its field.
     let long_ttl = family == Some(ApiFamily::AnthropicMessages)
@@ -724,6 +734,7 @@ async fn prepare(
     if prepared.prefix.is_none() {
         prepared.prefix = fingerprint;
     }
+    prepared.messages = identified.map(|(_, messages)| messages);
     // After every way `prepare_inner` can decline, for the reason the identity
     // is stamped here: under the default marker floor Claude Code freezes its
     // whole conversation, so nearly every request is a passthrough, and a TTL
@@ -1104,6 +1115,7 @@ async fn prepare_inner(
                 strip_usage,
                 model,
                 prefix: fingerprint,
+                messages: None,
                 one_hour: false,
             }
         }
@@ -1931,6 +1943,7 @@ async fn stream_response(
         retriever,
         budget,
         buffer_limit: config.proxy.stream_buffer_bytes,
+        hold_ceiling: config.proxy.max_body_bytes,
         buffer_timeout: config.proxy.stream_buffer_timeout,
         intercept_limit: config.proxy.stream_intercept_bytes,
         intercept_timeout: config.proxy.stream_intercept_timeout,
@@ -2449,6 +2462,7 @@ mod tests {
                 &body(model),
                 provider,
             )
+            .map(|(key, _)| key)
         };
 
         let tenant_a = make_identity("tenant-a");

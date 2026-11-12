@@ -747,12 +747,15 @@ usage() {
   sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
-trap stop_proxy EXIT
-
 # Serialise runs that share the databases and saved reports.
 mkdir -p "$WORK"
 exec 9>"$WORK/.sweep.lock"
 flock -n 9 || die "another Claude sweep is running in $WORK"
+
+# Only once the lock is ours. Installed before it, a second invocation that
+# lost the race died through this trap and killed the *running* sweep's proxy
+# by the shared PID file: the live session then failed with ECONNREFUSED.
+trap stop_proxy EXIT
 
 case "${1:-all}" in
   all|sweep|retrieval|bughunt)

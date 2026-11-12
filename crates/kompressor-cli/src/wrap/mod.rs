@@ -619,10 +619,11 @@ fn report_session(config: &Config, started_ms: i64, manual: bool) {
     }
     if outcome.messages_compressed == 0 {
         say!(
-            "kompressor: {} request(s), nothing compressed — every message was \
-             withheld.\n           Either there was nothing worth rewriting, or the \
-             client pinned its whole\n           prompt with cache_control; see \
-             docs/CLAUDE-CODE.md for the second.",
+            "kompressor: {} request(s), no message compressed — every message was \
+             withheld.\n           Either there was nothing worth rewriting, or \
+             proxy.frozen_prefix is \"marker\"\n           and the client pins its \
+             whole prompt with cache_control (Claude Code does);\n           set it \
+             to \"first_seen\" — see docs/CLAUDE-CODE.md.",
             outcome.proxy_requests
         );
         return;

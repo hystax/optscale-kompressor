@@ -319,7 +319,7 @@ says what it needs if a tool is missing. [docs/QUICKSTART.md](docs/QUICKSTART.md
 
 ## Quick start
 
-### Codex — the supported path
+### Codex
 
 ```bash
 kompressor wrap codex

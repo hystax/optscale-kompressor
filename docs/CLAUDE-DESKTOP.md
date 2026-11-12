@@ -129,8 +129,14 @@ provider.
 > one keeps it and needs the edits above. dpkg leaves the new default at
 > `/etc/kompressor/config.toml.dpkg-dist` to merge from.
 
-`first_seen` opts into compressing history beyond the initially frozen prefix;
-monitor cache usage as well as compression. Keep prompt caching enabled.
+`frozen_prefix = "first_seen"` is the setting that makes this traffic compress:
+Claude Code marks its final message with `cache_control`, and the default
+`marker` rule would freeze the whole conversation. `first_seen` freezes only
+what the provider had cached when the proxy first saw the conversation, so each
+new turn's tool output is compressed before it is cached. Keep prompt caching
+enabled. The rest of the Anthropic profile (`retrieve_tool`, `cache_ttl`, the
+engine overrides) is the same as for the CLI — see
+[CLAUDE-CODE.md](CLAUDE-CODE.md#settings-that-make-it-compress).
 
 ```bash
 mkdir -p ~/.local/share/kompressor
@@ -242,7 +248,7 @@ statistics; join `optimization_events` and `proxy_requests` by `request_id`.
 | `TLS handshake failed` in the log | Two causes, indistinguishable from the server side. Check `alpn` contains `h2` first — Desktop offers only that — then `NODE_EXTRA_CA_CERTS`. The log line reports what was advertised. |
 | Mid-session 404 from the proxy | No `/api` mount; a session probes `/api/hello` and signs in through `/api/oauth/*`. |
 | Anthropic traffic reaching `api.openai.com` or `chatgpt.com` | Two mounts claim `/v1`, or this mount was inserted above a `[proxy.upstreams.subscription]` block and adopted it. |
-| `intercept is listening with no intercept_hosts` | `intercept_hosts` is empty, so every connection is tunnelled. A working listener that compresses nothing. |
+| `intercept is listening with no intercept_hosts` | `intercept_hosts` is empty, so every connection is tunnelled. Traffic passes through unread, so none of it is compressed. |
 | Claude works but old tool results stay full | Check `CLAUDE_CODE_TETHER_LIVE=0`, restart Desktop, and use a fresh session. |
 | Requests still bypass the listener | Check other environment/settings overrides, lowercase proxy variables, and `NO_PROXY` bypasses. |
 

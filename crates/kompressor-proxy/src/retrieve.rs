@@ -256,12 +256,12 @@ impl Retriever {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use kompressor_core::Config;
     use kompressor_store::memory::MemoryRefStore;
 
-    fn retriever() -> Retriever {
+    pub(crate) fn retriever() -> Retriever {
         let core = AppCore::new(
             Config::default(),
             Arc::new(MemoryRefStore::new()),

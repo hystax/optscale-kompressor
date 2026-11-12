@@ -48,9 +48,11 @@ and the entries below differ:
 - **opencode** reads it only for its built-in `openai` provider. A provider
   declared in `opencode.json` carries its own `options.baseURL`, and config
   beats environment — so point that provider at the proxy instead.
-- **claude** reads it and routes correctly, but pins its whole prompt with a
-  `cache_control` breakpoint, so a wrapped session compresses nothing by design.
-  [CLAUDE-CODE.md](CLAUDE-CODE.md) explains why that is the right outcome.
+- **claude** reads it and routes correctly. It pins its whole prompt with a
+  `cache_control` breakpoint, so compression needs
+  `proxy.providers.anthropic.frozen_prefix = "first_seen"`, which the packaged
+  configuration sets along with the rest of the Anthropic profile.
+  [CLAUDE-CODE.md](CLAUDE-CODE.md) lists the settings and how to check them.
 
 You do not have to remember any of this: `wrap` counts what reached the proxy
 and tells you on the way out, which is how each of the above was found.
