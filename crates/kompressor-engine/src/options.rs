@@ -16,10 +16,21 @@ pub enum TokenGuard {
     Chars,
     /// Also require the estimated token count to fall.
     ///
-    /// Roughly a tenth of compressed payloads lose characters without losing
-    /// tokens — compression strips cheap letters and spaces while keeping
-    /// expensive digits and separators, so the remainder is denser than what it
-    /// replaced. Opt-in until a corpus A/B says it should be the default.
+    /// Compression can strip cheap letters and spaces while keeping expensive
+    /// digits and separators, so a shorter remainder is not always a cheaper
+    /// one.
+    ///
+    /// Still opt-in, but no longer for want of a measurement (2026-11-11
+    /// review, F6). On the committed 894-payload corpus it changes two
+    /// payloads — two `text` rewrites removing 16 and 17 characters for no
+    /// estimated token — and coverage by 0.0009 points (43.9486% -> 43.9477%);
+    /// on 161 tool outputs captured from the 2026-11-09/10 Claude Code Harbor
+    /// runs it changes nothing; three of 822 golden comparisons move. The
+    /// "roughly a tenth" this comment used to claim no longer holds of the
+    /// engine. Making it the default refuses those two rewrites, which the
+    /// character-denominated `claimed_pct` gate reads as -0.43 points, so it
+    /// means re-recording `fixtures/baseline.json` — a deliberate move, not a
+    /// side effect.
     Tokens,
 }
 
@@ -674,7 +685,8 @@ mod measured_defaults {
         assert_eq!(
             opts.token_guard,
             TokenGuard::Chars,
-            "the token guard is opt-in until a corpus A/B moves it"
+            "the A/B is in (2 of 894 corpus payloads, 0 of 161 captured); turning it \
+             on is a baseline re-record, see `TokenGuard::Tokens`"
         );
     }
 

@@ -28,6 +28,14 @@ use std::collections::{HashMap, VecDeque};
 /// How many fragments the cache holds by default.
 pub const DEFAULT_CAPACITY: usize = 4_096;
 
+/// How many fragment bytes the cache holds by default.
+///
+/// The entry cap alone does not bound memory: 4,096 entries at the default
+/// `max_ref_bytes` of 1 MiB is 4 GiB of fragments before any copy or
+/// bookkeeping. The window this cache covers is the milliseconds around a
+/// write, so 64 MiB is still thousands of typical fragments.
+pub const DEFAULT_MAX_BYTES: usize = 64 * 1024 * 1024;
+
 /// How long a cached fragment is served without consulting the inner store.
 pub const DEFAULT_CACHE_TTL_SECONDS: u64 = 60;
 
@@ -55,6 +63,9 @@ pub struct CachedRefStore<S: RefStore> {
     inner: S,
     state: Mutex<CacheState>,
     capacity: usize,
+    /// Fragment bytes held, summed over live entries. Enforced alongside
+    /// `capacity`; whichever binds first evicts.
+    max_bytes: usize,
     cache_ttl_seconds: u64,
     clock: Clock,
 }
@@ -62,10 +73,33 @@ pub struct CachedRefStore<S: RefStore> {
 #[derive(Debug, Default)]
 struct CacheState {
     entries: HashMap<Key, Entry>,
+    /// Fragment bytes of `entries`, kept in step by every insert and removal.
+    bytes: usize,
+    /// Entries pushed out by either bound, for the occupancy report.
+    evictions: u64,
     /// Insertion order. A key re-inserted appears twice; the `seq` check on
     /// eviction drops the outdated slot instead of the live entry.
     order: VecDeque<(u64, Key)>,
     next_seq: u64,
+}
+
+impl CacheState {
+    /// Drop one entry, keeping the byte count in step.
+    fn remove(&mut self, key: &Key) -> Option<Entry> {
+        let entry = self.entries.remove(key)?;
+        self.bytes -= entry.record.fragment.len();
+        Some(entry)
+    }
+}
+
+/// What the cache holds against its two bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheOccupancy {
+    pub entries: usize,
+    pub bytes: usize,
+    pub evictions: u64,
+    pub max_entries: usize,
+    pub max_bytes: usize,
 }
 
 impl<S: RefStore> CachedRefStore<S> {
@@ -75,6 +109,7 @@ impl<S: RefStore> CachedRefStore<S> {
             inner,
             state: Mutex::new(CacheState::default()),
             capacity: DEFAULT_CAPACITY,
+            max_bytes: DEFAULT_MAX_BYTES,
             cache_ttl_seconds: DEFAULT_CACHE_TTL_SECONDS,
             clock: Clock::system(),
         }
@@ -83,6 +118,13 @@ impl<S: RefStore> CachedRefStore<S> {
     /// Hold at most `capacity` fragments.
     pub fn with_capacity(mut self, capacity: usize) -> CachedRefStore<S> {
         self.capacity = capacity;
+        self
+    }
+
+    /// Hold at most `bytes` of fragment text. A fragment larger than this on
+    /// its own is written through without being cached.
+    pub fn with_max_bytes(mut self, bytes: usize) -> CachedRefStore<S> {
+        self.max_bytes = bytes;
         self
     }
 
@@ -108,9 +150,37 @@ impl<S: RefStore> CachedRefStore<S> {
         self.state.lock().entries.len()
     }
 
+    /// Fragment bytes cached right now, expired copies included.
+    pub fn cached_bytes(&self) -> usize {
+        self.state.lock().bytes
+    }
+
+    /// Entries, bytes and evictions so far, for an occupancy report.
+    pub fn occupancy(&self) -> CacheOccupancy {
+        let state = self.state.lock();
+        CacheOccupancy {
+            entries: state.entries.len(),
+            bytes: state.bytes,
+            evictions: state.evictions,
+            max_entries: self.capacity,
+            max_bytes: self.max_bytes,
+        }
+    }
+
     fn insert(&self, state: &mut CacheState, key: Key, entry: Entry) {
+        let size = entry.record.fragment.len();
+        if size > self.max_bytes {
+            // Caching it would evict everything else and still break the
+            // bound. The inner store answers for it; a stale copy under the
+            // same key must not survive in its place.
+            state.remove(&key);
+            return;
+        }
         state.order.push_back((entry.seq, key.clone()));
-        state.entries.insert(key, entry);
+        if let Some(replaced) = state.entries.insert(key, entry) {
+            state.bytes -= replaced.record.fragment.len();
+        }
+        state.bytes += size;
         // Repeated writes must also bound the eviction index, even when the
         // number of distinct fragments never reaches capacity.
         if state.order.len() > self.capacity.saturating_mul(2) {
@@ -121,14 +191,15 @@ impl<S: RefStore> CachedRefStore<S> {
                     .is_some_and(|entry| entry.seq == *seq)
             });
         }
-        while state.entries.len() > self.capacity {
+        while state.entries.len() > self.capacity || state.bytes > self.max_bytes {
             let Some((seq, evicted)) = state.order.pop_front() else {
                 break;
             };
             // A key written twice left an older slot behind; dropping the
             // current entry for it would evict something still fresh.
             if state.entries.get(&evicted).is_some_and(|e| e.seq == seq) {
-                state.entries.remove(&evicted);
+                state.remove(&evicted);
+                state.evictions += 1;
             }
         }
     }
@@ -211,7 +282,7 @@ impl<S: RefStore> RefStore for CachedRefStore<S> {
         if result.is_err() {
             let mut state = self.state.lock();
             for (id, _) in refs {
-                state.entries.remove(&(tenant.0.clone(), *id));
+                state.remove(&(tenant.0.clone(), *id));
             }
             return result;
         }
@@ -235,7 +306,7 @@ impl<S: RefStore> RefStore for CachedRefStore<S> {
                     // Past either window: drop the copy and let the inner store
                     // give the authoritative answer, which distinguishes an
                     // expiry from a miss.
-                    state.entries.remove(&key);
+                    state.remove(&key);
                     None
                 }
                 None => None,
@@ -289,6 +360,11 @@ impl<S: RefStore> RefStore for CachedRefStore<S> {
             state
                 .entries
                 .retain(|_, entry| self.is_servable(entry, now));
+            state.bytes = state
+                .entries
+                .values()
+                .map(|entry| entry.record.fragment.len())
+                .sum();
         }
         self.inner.purge_expired(now)
     }
@@ -560,6 +636,95 @@ mod tests {
             store.get(&acme, &ids[2], false).unwrap().fragment(),
             Some("three")
         );
+    }
+
+    /// The entry cap does not bound memory on its own: 4,096 entries of a
+    /// 1 MiB fragment each is 4 GiB. Whichever bound binds first evicts.
+    #[test]
+    fn the_cache_holds_no_more_bytes_than_its_budget() {
+        let clock = ManualClock::at(1_000);
+        let store = CachedRefStore::new(StalledStore::default())
+            .with_clock(clock.clock())
+            .with_capacity(1_000)
+            .with_max_bytes(250);
+        let acme = tenant("acme");
+        let fragments: Vec<String> = (0..5).map(|i| format!("{i}").repeat(100)).collect();
+        let ids: Vec<_> = fragments.iter().map(|f| ref_for(f)).collect();
+        for (id, fragment) in ids.iter().zip(&fragments) {
+            store
+                .put_many(&acme, &[(*id, fragment.clone())], &meta())
+                .unwrap();
+            assert!(store.cached_bytes() <= 250, "{}", store.cached_bytes());
+        }
+
+        let occupancy = store.occupancy();
+        assert_eq!((occupancy.entries, occupancy.bytes), (2, 200));
+        assert_eq!(occupancy.evictions, 3);
+        // the newest survive, insertion order as for the entry cap
+        assert_eq!(store.get(&acme, &ids[0], false).unwrap(), Lookup::Miss);
+        assert_eq!(
+            store.get(&acme, &ids[4], false).unwrap().fragment(),
+            Some(fragments[4].as_str())
+        );
+    }
+
+    /// A fragment over the whole budget is written through but never cached:
+    /// caching it would empty the cache and still break the bound.
+    #[test]
+    fn a_fragment_larger_than_the_budget_is_not_cached() {
+        let inner = MemoryRefStore::new();
+        let store = CachedRefStore::new(inner).with_max_bytes(10);
+        let acme = tenant("acme");
+        let small = "tiny";
+        let large = "x".repeat(11);
+        store
+            .put_many(
+                &acme,
+                &[
+                    (ref_for(small), small.into()),
+                    (ref_for(&large), large.clone()),
+                ],
+                &meta(),
+            )
+            .unwrap();
+        assert_eq!(store.cached_len(), 1);
+        assert_eq!(store.cached_bytes(), small.len());
+        // and still retrievable, from the inner store
+        assert_eq!(
+            store
+                .get(&acme, &ref_for(&large), false)
+                .unwrap()
+                .fragment(),
+            Some(large.as_str())
+        );
+    }
+
+    /// Every way an entry leaves keeps the byte count honest; a drift here
+    /// would make the budget evict too much or too little forever after.
+    #[test]
+    fn the_byte_count_follows_replacement_and_purge() {
+        let clock = ManualClock::at(1_000);
+        let store = CachedRefStore::new(MemoryRefStore::new())
+            .with_clock(clock.clock())
+            .with_cache_ttl(10);
+        let acme = tenant("acme");
+        let ids: Vec<_> = ["aaaa", "bbbbbb"].iter().map(|f| ref_for(f)).collect();
+        store
+            .put_many(
+                &acme,
+                &[(ids[0], "aaaa".into()), (ids[1], "bbbbbb".into())],
+                &meta(),
+            )
+            .unwrap();
+        assert_eq!(store.cached_bytes(), 10);
+        // the same handle again: replaced, not double counted
+        store
+            .put_many(&acme, &[(ids[0], "aaaa".into())], &meta())
+            .unwrap();
+        assert_eq!(store.cached_bytes(), 10);
+        clock.advance(60);
+        store.purge_expired(clock.clock().now()).unwrap();
+        assert_eq!(store.cached_bytes(), 0);
     }
 
     #[test]

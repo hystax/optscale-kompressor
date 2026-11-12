@@ -11,10 +11,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use http::{HeaderMap, Method};
+use http::{HeaderMap, Method, StatusCode};
 use serde_json::Value;
 
 use crate::bodycodec::BodyEncoding;
+use crate::retention;
 
 /// A request in flight to the provider.
 pub(crate) struct Outbound {
@@ -41,9 +42,21 @@ pub(crate) struct Outbound {
     /// understate the wait by exactly the part the loop added. Accumulating at
     /// the one place every path goes through is what stops the two disagreeing.
     waited_us: Arc<AtomicU64>,
+    /// Set when the proxy added `prompt_cache_retention`, so a refusal of it
+    /// can be answered by sending without it. See [`crate::retention`].
+    retention: Option<retention::Guard>,
 }
 
 impl Outbound {
+    /// The path this request is sent to, for log lines. The query is left
+    /// out: it is the client's, and nothing a log reader needs.
+    pub(crate) fn path(&self) -> String {
+        self.url
+            .parse::<http::Uri>()
+            .map(|uri| uri.path().to_string())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn new(
         client: reqwest::Client,
         method: Method,
@@ -62,7 +75,14 @@ impl Outbound {
             timeout: None,
             encoding,
             waited_us: Arc::new(AtomicU64::new(0)),
+            retention: None,
         }
+    }
+
+    /// The body carries a `prompt_cache_retention` the proxy added.
+    pub(crate) fn with_retention(mut self, guard: Option<retention::Guard>) -> Outbound {
+        self.retention = guard;
+        self
     }
 
     /// Keep the parsed body so later rounds can append to it.
@@ -120,12 +140,50 @@ impl Outbound {
     /// every long answer look like a slow upstream. What the caller gets is the
     /// wait before the provider said anything, which is the half a proxy can
     /// be blamed for being slow on top of.
+    ///
+    /// A body carrying a `prompt_cache_retention` this proxy added is sent
+    /// without it once the upstream has refused it, and the request that is
+    /// refused is sent again without it, so the setting can cost a round trip
+    /// but never a request. Every other answer comes back as it arrived.
     pub(crate) async fn send(&self) -> reqwest::Result<reqwest::Response> {
+        let Some(guard) = &self.retention else {
+            return self.send_body(self.body.clone()).await;
+        };
+        if guard.refused() {
+            // A retrieve round extends the body it was given, field and all.
+            let body = guard
+                .strip(&self.body, self.encoding)
+                .unwrap_or_else(|| self.body.clone());
+            return self.send_body(body).await;
+        }
+        let response = self.send_body(self.body.clone()).await?;
+        if response.status() != StatusCode::BAD_REQUEST {
+            return Ok(response);
+        }
+        // An error is small; reading it is the only way to know whose it is.
+        let status = response.status();
+        let version = response.version();
+        let headers = response.headers().clone();
+        let bytes = response.bytes().await?;
+        if retention::names_field(&bytes)
+            && let Some(stripped) = guard.strip(&self.body, self.encoding)
+        {
+            guard.refuse();
+            return self.send_body(stripped).await;
+        }
+        let mut rebuilt = http::Response::new(bytes);
+        *rebuilt.status_mut() = status;
+        *rebuilt.version_mut() = version;
+        *rebuilt.headers_mut() = headers;
+        Ok(reqwest::Response::from(rebuilt))
+    }
+
+    async fn send_body(&self, body: Bytes) -> reqwest::Result<reqwest::Response> {
         let mut request = self
             .client
             .request(self.method.clone(), &self.url)
             .headers(self.headers.clone())
-            .body(self.body.clone());
+            .body(body);
         if let Some(timeout) = self.timeout {
             request = request.timeout(timeout);
         }

@@ -688,23 +688,37 @@ async fn launch(
         }
     }
 
-    let mut command = tokio::process::Command::new(&binary);
-    // Before the user's own arguments, not after: the last of theirs may be a
-    // positional the agent reads as a prompt, and a flag pair appended past it
-    // would be swallowed into that string rather than parsed.
-    command.args(flags);
-    if let Some(offered) = offered {
-        command.args(offered.args());
-    }
-    command.args(&rest);
-    // If this wrapper is stopped, the agent goes with it. Leaving it running
-    // against a proxy that is about to be torn down, with its config file
-    // about to be restored, would be worse than ending it.
-    command.kill_on_drop(true);
-    for (name, value) in env {
-        command.env(name, value);
-    }
-    let mut child = command.spawn().map_err(|e| {
+    let spawn = |program: &std::path::Path| {
+        let mut command = tokio::process::Command::new(program);
+        // Before the user's own arguments, not after: the last of theirs may be a
+        // positional the agent reads as a prompt, and a flag pair appended past it
+        // would be swallowed into that string rather than parsed.
+        command.args(flags);
+        if let Some(offered) = offered {
+            command.args(offered.args());
+        }
+        command.args(&rest);
+        // If this wrapper is stopped, the agent goes with it. Leaving it running
+        // against a proxy that is about to be torn down, with its config file
+        // about to be restored, would be worse than ending it.
+        command.kill_on_drop(true);
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        command.spawn()
+    };
+    let spawned = spawn(std::path::Path::new(&binary));
+    #[cfg(windows)]
+    let spawned = match spawned {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match batch_on_path(&binary, std::env::var_os("PATH")) {
+                Some(path) => spawn(&path),
+                None => Err(error),
+            }
+        }
+        result => result,
+    };
+    let mut child = spawned.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             CliError::Usage(format!("{binary} is not on PATH"))
         } else {
@@ -734,8 +748,56 @@ async fn launch(
     }
 }
 
-/// Configure an agent this command does not launch, and hold the proxy up until
-/// the user is done with it.
+/// npm installs Windows launchers with `.cmd` names. Resolve them only after
+/// the executable lookup fails, preserving the platform's executable search.
+#[cfg(any(windows, test))]
+fn batch_on_path(binary: &str, path: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    let binary = std::path::Path::new(binary);
+    if binary.extension().is_some() {
+        return None;
+    }
+    let mut directories = vec![std::path::PathBuf::from(".")];
+    if binary.components().count() == 1 {
+        directories.extend(path.iter().flat_map(std::env::split_paths));
+    }
+    directories.into_iter().find_map(|directory| {
+        ["cmd", "bat"]
+            .into_iter()
+            .map(|extension| directory.join(binary).with_extension(extension))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+/// Restore claimed settings when an attachment exits or its future is cancelled.
+struct AttachedSettings {
+    target: settings::Target,
+    keys: Vec<String>,
+}
+
+impl AttachedSettings {
+    fn claim(&mut self, name: &str, value: &str) -> Result<(), CliError> {
+        settings::claim(&self.target, name, value)?;
+        self.keys.push(name.to_owned());
+        Ok(())
+    }
+}
+
+impl Drop for AttachedSettings {
+    fn drop(&mut self) {
+        for name in &self.keys {
+            match settings::release(&self.target, name, false) {
+                Ok(settings::Released::Restored) => say!("kompressor: restored {name}"),
+                Ok(settings::Released::StillInUse) => {
+                    say!("kompressor: {name} left in place, another session still holds it");
+                }
+                Ok(settings::Released::NotOurs) => {}
+                Err(error) => say!("kompressor: could not restore {name}: {error}"),
+            }
+        }
+    }
+}
+
+/// Configure an agent this command does not launch until the user finishes.
 async fn attach(
     agent: Option<&'static Agent>,
     env: &[(String, String)],
@@ -753,27 +815,22 @@ async fn attach(
     }
     let root = std::env::current_dir()
         .map_err(|e| CliError::runtime("could not read the working directory", e))?;
-    let target = settings::Target::claude_code(&root);
-
+    let mut attached = AttachedSettings {
+        target: settings::Target::claude_code(&root),
+        keys: Vec::new(),
+    };
     for (name, value) in env {
-        settings::claim(&target, name, value)?;
-        say!("kompressor: {} {name}={value}", target.settings.display());
+        attached.claim(name, value)?;
+        say!(
+            "kompressor: {} {name}={value}",
+            attached.target.settings.display()
+        );
     }
     say!("kompressor: attached. Ctrl-C restores the settings and releases the proxy.");
 
     interrupts.recv().await;
     say!();
-    for (name, _) in env {
-        match settings::release(&target, name, false)? {
-            settings::Released::Restored => {
-                say!("kompressor: restored {name}");
-            }
-            settings::Released::StillInUse => {
-                say!("kompressor: {name} left in place, another session still holds it");
-            }
-            settings::Released::NotOurs => {}
-        }
-    }
+    drop(attached);
     Ok(())
 }
 
@@ -940,6 +997,58 @@ mod tests {
             env: Vec::new(),
             list: false,
         }
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_attachment_restores_every_claimed_setting() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = settings::Target::claude_code(directory.path());
+        let path = target.settings.clone();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = serde_json::json!({"env": {"ANTHROPIC_BASE_URL": "https://original"}});
+        std::fs::write(&path, original.to_string()).unwrap();
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut attached = AttachedSettings {
+                target,
+                keys: Vec::new(),
+            };
+            attached
+                .claim("ANTHROPIC_BASE_URL", "http://127.0.0.1:8817")
+                .unwrap();
+            attached.claim("ENABLE_TOOL_SEARCH", "false").unwrap();
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(attached);
+        });
+        started.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let restored: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn windows_batch_lookup_preserves_path_order_and_spaces() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first bin");
+        let second = directory.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("agent.cmd"), "@echo first").unwrap();
+        std::fs::write(second.join("agent.cmd"), "@echo second").unwrap();
+        let path = Some(std::env::join_paths([&first, &second]).unwrap());
+        assert_eq!(
+            batch_on_path("agent", path.clone()),
+            Some(first.join("agent.cmd"))
+        );
+        assert_eq!(batch_on_path("missing-agent", path.clone()), None);
+        assert_eq!(batch_on_path("agent.exe", path), None);
+        assert_eq!(
+            batch_on_path(first.join("agent").to_str().unwrap(), None),
+            Some(first.join("agent.cmd"))
+        );
     }
 
     #[test]

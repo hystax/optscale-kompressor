@@ -186,11 +186,11 @@ impl Retriever {
         // merely over-specified is salvaged rather than dropped, and whatever
         // happens is said out loud. This used to be a `debug!`, and two paid
         // runs narrowed nothing at all without anyone noticing.
-        let range = arguments
-            .get("range")
-            .filter(|range| !range.is_null())
-            .and_then(|range| {
-                let (parsed, how) = RetrieveRange::parse_loose(range);
+        let asked = arguments.get("range").filter(|range| !range.is_null());
+        let (range, status) = match asked {
+            None => (None, None),
+            Some(asked) => {
+                let (parsed, how) = RetrieveRange::parse_loose(asked);
                 match how {
                     RangeParse::Exact => {}
                     RangeParse::Salvaged { offered } => tracing::warn!(
@@ -198,18 +198,25 @@ impl Retriever {
                         chose = ?parsed,
                         "the model asked for several ranges at once; kept the only substantive one"
                     ),
+                    RangeParse::Normalized => tracing::info!(
+                        range = %asked,
+                        read_as = ?parsed,
+                        "read a flat range as the one window it names"
+                    ),
                     RangeParse::Unusable => tracing::warn!(
-                        range = %range,
+                        range = %asked,
                         "ignoring a range that names no usable window; sending the fragment whole"
                     ),
                 }
-                parsed
-            });
+                (parsed, Some(how))
+            }
+        };
 
-        let got = self.core.retrieve(
+        let got = self.core.retrieve_as(
             &self.identity,
             handle,
             range.as_ref(),
+            status,
             &RequestInfo {
                 request_id: &self.request_id,
                 api_family: Some(&self.api_family),
@@ -250,6 +257,38 @@ impl Retriever {
         // range missed is what lets it spend the next one better.
         if let Some(hint) = got.range_hint {
             payload["hint"] = Value::String(hint);
+        }
+        // Whether the window asked for is the window served. Without it a
+        // narrowing that failed reads exactly like a whole fragment asked
+        // for, and the model learns that the malformed shape works.
+        if let Some(status) = status {
+            payload["range_status"] = Value::String(status.as_str().to_string());
+            match status {
+                RangeParse::Unusable => {
+                    payload["hint"] = Value::String(format!(
+                        "the range {} could not be read, so this is the whole fragment{}. To \
+                         narrow, send exactly one variant, e.g. \
+                         {{\"lines\":{{\"start\":1,\"end\":60}}}} or \
+                         {{\"grep\":{{\"pattern\":\"error\"}}}}",
+                        asked.map(Value::to_string).unwrap_or_default(),
+                        if got.truncated {
+                            ", cut to the cap"
+                        } else {
+                            ""
+                        },
+                    ));
+                }
+                RangeParse::Normalized if payload.get("hint").is_none() => {
+                    if let Some(read_as) =
+                        range.as_ref().and_then(|r| serde_json::to_string(r).ok())
+                    {
+                        payload["hint"] = Value::String(format!(
+                            "read the range as {read_as}; send it in that shape next time"
+                        ));
+                    }
+                }
+                _ => {}
+            }
         }
         payload
     }
@@ -306,6 +345,124 @@ pub(crate) mod tests {
             name: crate::tool::RETRIEVE_TOOL_NAME.into(),
             arguments,
         }
+    }
+
+    /// A retriever over one stored fragment of `lines` numbered lines, whose
+    /// events can be read back. Returns the fragment's handle too.
+    fn holding_lines(
+        lines: usize,
+    ) -> (Retriever, kompressor_stats::writer::CapturedEvents, String) {
+        use kompressor_store::types::{PutMeta, RefStore, Tenant};
+
+        let store = MemoryRefStore::new();
+        let fragment = (1..=lines)
+            .map(|i| format!("line {i} of the captured build output"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let id = kompressor_engine::refs::ref_for(&fragment);
+        store
+            .put_many(
+                &Tenant::new(""),
+                &[(id, fragment)],
+                &PutMeta::new(kompressor_engine::types::Kind::Text),
+            )
+            .unwrap();
+        let (sink, events) = kompressor_stats::writer::capturing_sink(64);
+        let core = AppCore::new(Config::default(), Arc::new(store), sink);
+        let retriever = Retriever::new(
+            Arc::new(core),
+            Identity::anonymous(),
+            "req-1".into(),
+            "anthropic_messages".into(),
+            None,
+            std::sync::Arc::new(crate::prefixcache::PrefixTracker::new(
+                std::time::Duration::ZERO,
+            )),
+            Some(1),
+        );
+        (retriever, events, id.to_string())
+    }
+
+    fn range_statuses(events: &kompressor_stats::writer::CapturedEvents) -> Vec<Option<String>> {
+        events
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                kompressor_stats::events::Event::Retrieval(e) => Some(e.range_status),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The argument the model sent on the 2026-11-10 Harbor run (`08f3d50`,
+    /// the 11:03 task suite), logged as "names no usable window" and answered
+    /// with the whole fragment. It names one window, and now gets it.
+    #[test]
+    fn the_recorded_flat_range_is_served_as_the_window_it_names() {
+        let (retriever, events, handle) = holding_lines(200);
+        let (payload, _) = retriever.answer(&call(json!({
+            "ref": handle,
+            "range": {"lines": 1, "end": 60}
+        })));
+        let parsed: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed["found"], true);
+        assert_eq!(parsed["ranged"], true);
+        assert_eq!(parsed["range_status"], "normalized");
+        let content = parsed["content"].as_str().unwrap();
+        assert_eq!(content.lines().count(), 60);
+        assert!(content.ends_with("line 60 of the captured build output"));
+        assert!(
+            parsed["hint"]
+                .as_str()
+                .unwrap()
+                .contains(r#"{"lines":{"start":1,"end":60}}"#),
+            "the canonical shape is shown back: {parsed}"
+        );
+        assert_eq!(
+            range_statuses(&events),
+            vec![Some("normalized".to_string())]
+        );
+    }
+
+    /// A narrowing that fails is said to have failed — in the answer the
+    /// model reads and in the retrieval event — rather than looking exactly
+    /// like a whole fragment the model meant to ask for.
+    #[test]
+    fn an_unusable_range_is_reported_as_a_failed_narrowing() {
+        let (retriever, events, handle) = holding_lines(200);
+        let (payload, _) = retriever.answer(&call(json!({
+            "ref": handle,
+            "range": {"lines": 60}
+        })));
+        let parsed: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed["found"], true);
+        assert_eq!(parsed["ranged"], false);
+        assert_eq!(parsed["range_status"], "unusable");
+        let hint = parsed["hint"].as_str().unwrap();
+        assert!(hint.contains("could not be read"), "{hint}");
+        assert!(hint.contains(r#"{"lines":{"start":1,"end":60}}"#), "{hint}");
+
+        // and the two ordinary cases stay as they were
+        let (payload, _) = retriever.answer(&call(json!({"ref": handle})));
+        let parsed: Value = serde_json::from_str(&payload).unwrap();
+        assert!(parsed.get("range_status").is_none());
+        assert!(parsed.get("hint").is_none());
+        let (payload, _) = retriever.answer(&call(json!({
+            "ref": handle,
+            "range": {"lines": {"start": 5, "end": 6}}
+        })));
+        let parsed: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed["range_status"], "exact");
+        assert!(parsed.get("hint").is_none());
+
+        assert_eq!(
+            range_statuses(&events),
+            vec![
+                Some("unusable".to_string()),
+                None,
+                Some("exact".to_string())
+            ]
+        );
     }
 
     #[test]

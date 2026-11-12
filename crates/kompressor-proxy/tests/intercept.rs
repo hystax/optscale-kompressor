@@ -77,6 +77,54 @@ async fn an_intercepted_host_reaches_our_router() {
 }
 
 #[tokio::test]
+async fn an_intercepted_request_carries_the_origin_it_was_addressed_to() {
+    use axum::Extension;
+    use kompressor_proxy::intercept::InterceptedOrigin;
+
+    let ca_dir = temp_dir("origin");
+    let intercept = Intercept::bind(
+        "127.0.0.1:0",
+        &["api.anthropic.com".to_string()],
+        &ca_dir,
+        &["http/1.1".to_string()],
+        8,
+    )
+    .await
+    .expect("bind");
+    let proxy = intercept.address();
+    let ca_pem = std::fs::read(intercept.certificate_path()).expect("ca pem");
+
+    let echo = Router::new().route(
+        "/v1/code/sessions",
+        get(
+            |Extension(origin): Extension<InterceptedOrigin>| async move {
+                format!("{}:{}", origin.host, origin.port)
+            },
+        ),
+    );
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(intercept.serve(echo, async move {
+        let _ = stop_rx.await;
+    }));
+
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(format!("http://{proxy}")).expect("proxy"))
+        .add_root_certificate(reqwest::Certificate::from_pem(&ca_pem).expect("cert"))
+        .build()
+        .expect("client");
+    let response = client
+        .get("https://api.anthropic.com/v1/code/sessions")
+        .send()
+        .await
+        .expect("request");
+    assert!(response.status().is_success(), "{:?}", response.status());
+    assert_eq!(response.text().await.unwrap(), "api.anthropic.com:443");
+
+    let _ = stop_tx.send(());
+    let _ = std::fs::remove_dir_all(&ca_dir);
+}
+
+#[tokio::test]
 async fn any_other_host_is_tunnelled_untouched() {
     // An origin that is not HTTP at all, so anything that reads or rewrites
     // the stream would corrupt it.

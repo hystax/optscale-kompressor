@@ -44,6 +44,15 @@ impl Harness {
 
     /// The default deployment, with the config adjusted.
     pub async fn with(configure: impl FnOnce(&mut Config)) -> Harness {
+        Harness::with_store(configure, Arc::new(MemoryRefStore::new())).await
+    }
+
+    /// The default deployment over a fragment store the test supplies — one
+    /// that stalls, fails or counts, to state what the proxy does then.
+    pub async fn with_store(
+        configure: impl FnOnce(&mut Config),
+        store: Arc<dyn kompressor_store::types::RefStore>,
+    ) -> Harness {
         let server = MockServer::start().await;
         let mut config = Config::default();
         config.stats.enabled = false;
@@ -58,7 +67,7 @@ impl Harness {
         configure(&mut config);
 
         let (sink, events) = kompressor_stats::writer::capturing_sink(256);
-        let core = Arc::new(AppCore::new(config, Arc::new(MemoryRefStore::new()), sink));
+        let core = Arc::new(AppCore::new(config, store, sink));
         let state = ProxyState::new(core, reqwest::Client::new());
         let failopen = state.failopen();
         Harness {

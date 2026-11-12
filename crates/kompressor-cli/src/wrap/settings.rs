@@ -148,20 +148,24 @@ pub(super) fn sibling(settings: &Path, name: &str) -> PathBuf {
 /// every future wrap in the project.
 pub(super) struct Lock {
     path: PathBuf,
-    held: bool,
 }
 
 const LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
 
 impl Lock {
-    pub(super) fn acquire(path: PathBuf) -> Lock {
+    pub(super) fn acquire(path: PathBuf) -> Result<Lock, CliError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                CliError::runtime("could not create the settings directory", error)
+            })?;
+        }
         for _ in 0..100 {
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&path)
             {
-                Ok(_) => return Lock { path, held: true },
+                Ok(_) => return Ok(Lock { path }),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     if let Ok(meta) = std::fs::metadata(&path) {
                         let stale = meta
@@ -177,20 +181,19 @@ impl Lock {
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                // A directory we cannot write is degraded, not unusable: the
-                // edit still happens, it is just not serialised against a peer.
-                Err(_) => return Lock { path, held: false },
+                Err(error) => return Err(CliError::runtime("could not lock settings", error)),
             }
         }
-        Lock { path, held: false }
+        Err(CliError::Runtime(format!(
+            "timed out locking {}",
+            path.display()
+        )))
     }
 }
 
 impl Drop for Lock {
     fn drop(&mut self) {
-        if self.held {
-            let _ = std::fs::remove_file(&self.path);
-        }
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -262,7 +265,7 @@ pub(super) fn clear(claim: &mut Claim) {
 /// Returns whether the file was changed, so a caller can stay quiet when there
 /// was nothing to do.
 pub fn claim(target: &Target, key: &str, value: &str) -> Result<bool, CliError> {
-    let _lock = Lock::acquire(target.lock_path());
+    let _lock = Lock::acquire(target.lock_path())?;
     let owners_path = target.owners_path();
     let mut owners = read_owners(&owners_path);
 
@@ -320,7 +323,7 @@ pub enum Released {
 /// `force` is `unwrap`: the user is asking for their settings back, so every
 /// claim is dropped and the restore happens regardless of who else is running.
 pub fn release(target: &Target, key: &str, force: bool) -> Result<Released, CliError> {
-    let _lock = Lock::acquire(target.lock_path());
+    let _lock = Lock::acquire(target.lock_path())?;
     let owners_path = target.owners_path();
     let mut owners = read_owners(&owners_path);
     // One lock covers every key this process holds in the file, so it goes
@@ -403,6 +406,19 @@ mod tests {
             .get(key)?
             .as_str()
             .map(str::to_string)
+    }
+
+    #[test]
+    fn a_first_claim_in_a_new_directory_has_a_liveness_lock() {
+        let scratch = Scratch::new("first-lock");
+        let target = scratch.target();
+        assert!(!target.settings.parent().unwrap().exists());
+        claim(&target, "ANTHROPIC_BASE_URL", "http://127.0.0.1:8817").unwrap();
+        let owners = read_owners(&target.owners_path());
+        let holder = &owners.keys["ANTHROPIC_BASE_URL"].holders[0];
+        assert!(holder.lock.is_some());
+        assert_eq!(holder.proven_alive(), Some(true));
+        release(&target, "ANTHROPIC_BASE_URL", false).unwrap();
     }
 
     #[test]
@@ -655,11 +671,20 @@ mod tests {
     }
 
     #[test]
+    fn a_lock_error_is_reported_before_editing_settings() {
+        let scratch = Scratch::new("lock-error");
+        let path = scratch.0.join("file");
+        std::fs::write(&path, "keep").unwrap();
+        assert!(Lock::acquire(path.join("settings.lock")).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "keep");
+    }
+
+    #[test]
     fn the_lock_is_exclusive_and_self_releasing() {
         let scratch = Scratch::new("lock");
         let path = scratch.0.join("l.lock");
         {
-            let _held = Lock::acquire(path.clone());
+            let _held = Lock::acquire(path.clone()).unwrap();
             assert!(path.exists(), "the lock file is the lock");
         }
         assert!(!path.exists(), "and it is gone once dropped");

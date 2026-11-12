@@ -89,6 +89,36 @@ class AccountingTests(unittest.TestCase):
         rows[1]["messages_total"] = 2
         self.assertEqual(bench.billed_tokens(rows, "tokens_in", "anthropic"), (300, 300, 300))
 
+    def test_engine_participation_is_not_compression(self):
+        # The 2026-11-11 review: smoke runs reported 8-17 "requests_compressed"
+        # with tokens_in == tokens_out on every row.
+        # every column a proxy_requests row carries, as the self-test's rows do
+        keys = ['time_ms', 'request_id', 'model', 'status', 'stream', 'prompt_tokens', 'completion_tokens', 'cache_read_tokens', 'cache_write_tokens', 'retrieve_rounds', 'retrieve_tokens_injected', 'upstream_ms', 'total_ms', 'error', 'mode', 'tokens_in', 'tokens_out', 'chars_in', 'chars_out', 'messages_total', 'messages_compressed', 'messages_skipped', 'frozen_messages', 'skipped_by_reason', 'outcome', 'skipped_tokens_by_reason', 'conversation', 'refs_emitted', 'ref_bytes_emitted', 'content_types']
+        def row(tokens_in, tokens_out, outcome=None, **extra):
+            return dict(dict.fromkeys(keys), status=200, stream=1, prompt_tokens=1000, completion_tokens=10,
+                        cache_read_tokens=0, retrieve_rounds=0, model="m",
+                        tokens_in=tokens_in, tokens_out=tokens_out,
+                        chars_in=tokens_in * 4, chars_out=tokens_out * 4,
+                        outcome=outcome, **extra)
+        eff = bench.efficiency([row(500, 500), row(500, 500)], [])
+        self.assertEqual((eff["requests_processed"], eff["requests_changed"],
+                          eff["requests_token_reduced"]), (2, 0, 0))
+        self.assertEqual(eff["requests_compressed"], eff["requests_processed"])
+        flags = bench.validity_flags(eff, {"counts": (1, 1)}, {}, "recoverable")
+        self.assertTrue(any("none came out smaller" in f for f in flags), flags)
+        self.assertFalse(any("TRAFFIC" in f for f in flags), flags)
+        # A row with no engine row at all is not "relayed unparsed" by fiat.
+        none = bench.efficiency([dict(row(0, 0), tokens_in=None)], [])
+        flags = bench.validity_flags(none, {"counts": (1, 1)}, {}, "recoverable")
+        self.assertTrue(any("never got past setup" in f for f in flags), flags)
+
+    def test_range_status_is_counted_when_present(self):
+        retrievals = [dict(found=1, ranged=1, returned_tokens=10, range_status="normalized"),
+                      dict(found=1, ranged=0, returned_tokens=90, range_status="unusable"),
+                      dict(found=1, ranged=0, returned_tokens=90, range_status=None)]
+        eff = bench.efficiency([], retrievals)
+        self.assertEqual(eff["retrieval_range_status"], {"normalized": 1, "unusable": 1})
+
     def test_discarded_rewrite_has_no_weighted_or_unique_savings(self):
         rows = [dict(conversation="a", time_ms=1, prompt_tokens=1000,
                      tokens_in=1000, tokens_out=500, outcome="discarded")]

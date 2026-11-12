@@ -132,7 +132,7 @@ The same thing in text, which is the version that survives a diff:
 | **mcp tools** | `kompressor-mcp` | The same operations as MCP tools, over stateless streamable HTTP, for an agent runtime that wants `optscale_kompressor_retrieve` directly rather than through a proxy. |
 | **Core** (`Arc<AppCore>`) | `kompressor-core` | The operations themselves — compress, compress_raw, retrieve — plus configuration and credential resolution. Every surface above holds *the same* `Arc`, which is why the three cannot answer the same question differently: they are translation, not logic. |
 | **Engine** | `kompressor-engine` | Detection, the compressors, arbitration and the invariants. Free functions over a payload: no state, no I/O, no async. That is what makes it testable without a runtime and replayable against a corpus — and why handlers hand it to `spawn_blocking` rather than running it on an executor thread. The largest crate by far (~12.6k lines). |
-| **RefStore** (trait) | `kompressor-store` | Retention for the fragments a `recoverable` elision put behind a handle, keyed `(tenant, handle)` so a leaked handle resolves to nothing elsewhere. `SqliteRefStore` is the default and `MemoryRefStore` is for tests; a `rusqlite::Connection` is `!Sync`, so a dedicated thread owns it behind a channel, fronted by a write-through cache. TTL is an idle window refreshed on read, capped by an absolute lifetime. |
+| **RefStore** (trait) | `kompressor-store` | Retention for the fragments a `recoverable` elision put behind a handle, keyed `(tenant, handle)` so a leaked handle resolves to nothing elsewhere. `SqliteRefStore` is the default and `MemoryRefStore` is for tests; a `rusqlite::Connection` is `!Sync`, so `SqliteRefStore` holds its one connection behind a `parking_lot::Mutex` (WAL, `busy_timeout=5000`) and every call blocks its caller — callers run it on a blocking thread, the proxy inside the same deadline as the computation (§12.3 step 5). Fronted by a write-through cache bounded in entries and bytes. TTL is an idle window refreshed on read, capped by an absolute lifetime. |
 | **Stats** | `kompressor-stats` | Append-only events written entirely off the request path: a bounded channel into a writer thread that batches into transactions. A full queue **drops** rather than blocking, because losing a row is better than making a compression wait for a disk. Owns the gross-versus-net economy queries. |
 | **Authenticator · Config** | `kompressor-core` | The tenant comes from the credential and never from an argument, so a caller cannot name someone else's fragments. Config is layered file → environment → flags and validated on load. |
 | **reqwest** | (dependency) | The upstream client: rustls, HTTP/2, streaming bodies, redirects followed by us rather than silently, because the proxy may need to re-send a body for a retrieval round. |
@@ -140,7 +140,7 @@ The same thing in text, which is the version that survives a diff:
 | **Upstream providers** | external | OpenAI, Anthropic, or anything speaking their wire formats — including something local. The longest matching path prefix wins; an unmatched path is a 404 rather than a guess. |
 
 - The engine is CPU-bound and synchronous; handlers run it on `tokio::task::spawn_blocking` (or a dedicated rayon pool, §17).
-- Stores are behind traits; SQLite connections are owned by dedicated threads (rusqlite `Connection` is `!Sync`), fronted by channels.
+- Stores are behind traits. `stats.db` is owned by a dedicated writer thread fed by a bounded channel; the fragment store's connection sits behind a mutex and blocks its caller, so it is only ever called from a blocking thread (rusqlite `Connection` is `!Sync`).
 - Stats are fire-and-forget through a bounded channel; the writer batches into transactions.
 
 ![kompressor-core](charts/core.drawio.png)
@@ -207,7 +207,7 @@ Makefile          every target, self-documenting via `make`
 | deflate | `flate2` with the `zlib-rs` backend | the `adaptive_k` compressibility check (§5.2), and gzip/deflate request bodies (§12.1) |
 | zstd | `zstd` | request bodies: codex sends every one of them zstd-encoded (§12.1) |
 | grammars | `tree-sitter 0.25`, `tree-sitter-{python,javascript,typescript,go,rust,java,c-sharp,c,cpp}` | statically linked; feature `code-aware` (default on) |
-| SQLite | `rusqlite` (`bundled`, `modern_sqlite`) | one writer connection per DB on its own thread; readers via a small pool |
+| SQLite | `rusqlite` (`bundled`, `modern_sqlite`) | `stats.db`: one writer connection on its own thread, read-only readers per query; `refs.db`: one mutex-guarded connection, called from blocking threads |
 | Redis (optional) | — | **designed, not built.** `RefsBackend` is `Sqlite` or `Memory`; there is no `redis` dependency and no `redis` feature. See the README's *Not yet built* |
 | MCP | `rmcp` (official Rust MCP SDK: server, `streamable-http-server`) | stateless streamable HTTP |
 | CLI/config | `clap` (derive, env), `toml`, `humantime-serde` | layered config (§13). Neither `figment` nor `config` is used: the layering is hand-rolled, which is what lets `deny_unknown_fields` reject a typo instead of ignoring it |
@@ -1155,7 +1155,7 @@ CREATE INDEX IF NOT EXISTS refs_expiry ON refs (last_accessed);   -- lazy purge 
 - **Get**: `SELECT fragment, kind, request_id, created_at, last_accessed, ttl_seconds, max_lifetime FROM refs WHERE tenant=? AND ref=?`, liveness computed in Rust so `Expired` can be distinguished from `Miss`. On a live hit with `touch`, an `UPDATE … SET last_accessed=?` runs with the liveness predicate repeated **in SQL** — a touch must not be able to resurrect a row the absolute cap already killed.
 - **Purge**: expiry is decided on read (`Lookup::Expired`), and `purge_expired` deletes in bounded batches of 5,000 via `DELETE FROM refs WHERE (tenant, ref) IN (SELECT … LIMIT ?)` — a `WITHOUT ROWID` table has no `rowid` for the usual bounded-delete idiom. **Nothing schedules it**: `refs.purge_interval` (60 s) is currently a knob with no consumer, so dead rows linger until the size cap reclaims them. That is safe but untidy — reads never return an expired fragment, and expired rows do not count toward the cap.
 - **Size cap**: `refs.max_bytes` (default 1 GiB) is enforced inline on every `put_many`. Live bytes over the cap ⇒ evict by `last_accessed ASC, tenant ASC, ref ASC` down to 90% of the cap. The 90% is so a store parked exactly at the limit does not evict on every write for the rest of its life; the key tie-break is so that which member of a same-second batch dies does not vary run to run.
-- **Recent-write cache** (`store::cache::CachedRefStore`): an in-process write-through cache of the last `refs.recent_cache_entries` (default 4,096) `(tenant, ref) → fragment`, with a 60 s window against an hour-scale TTL. It exists to cover the gap around a *write* — the proxy hands the model a marker and the model may ask for it in the same turn — not to be a second store with its own retention. Reads deliberately do **not** populate it: a record coming back from the inner store does not carry its absolute lifetime, so a cached copy could only guess at the one deadline a read is not allowed to extend.
+- **Recent-write cache** (`store::cache::CachedRefStore`): an in-process write-through cache of the last `refs.recent_cache_entries` (default 4,096) `(tenant, ref) → fragment`, bounded as well by `refs.recent_cache_bytes` of fragment text (default 64 MiB; whichever bound binds first evicts, and a fragment larger than the whole budget is written through uncached — the entry cap alone allowed 4,096 × 1 MiB), with a 60 s window against an hour-scale TTL. It exists to cover the gap around a *write* — the proxy hands the model a marker and the model may ask for it in the same turn — not to be a second store with its own retention. Reads deliberately do **not** populate it: a record coming back from the inner store does not carry its absolute lifetime, so a cached copy could only guess at the one deadline a read is not allowed to extend.
 - Schema versioning via `PRAGMA user_version` and an ordered `MIGRATIONS: &[(u32, &str)]` array, keyed on an **integer**. The usual shortcut — sorting migration filenames as strings — puts `V10_` before `V2_`, so the tenth migration runs first the moment a tenth one exists; keying on an integer and iterating the array cannot express that bug.
 
 ### 8.3 Other backends
@@ -1355,7 +1355,7 @@ Error semantics: 400 malformed JSON, 401 missing/unknown key (when auth is enabl
 
 ### 10.3 Request handling
 
-Handlers: parse → merge options (tenant override → request `options`) → `spawn_blocking(engine.compress_messages)` → respond → background: `refstore.put_many`, `refstore.touch_many(protected_refs)`, `stats.send(Optimization)`, `stats.send(ProtectedRefs)`. Payload bodies are logged only when `log.payloads = true` (DEBUG), never by default. Concurrency bounded by `server.max_inflight_compressions` (default = CPU count × 2) via a semaphore; excess requests queue up to `server.queue_timeout` (2 s) then 503 with `Retry-After` — the API caller (unlike the proxy, §12.8) is expected to pass the original through on 503.
+Handlers: parse → merge options (tenant override → request `options`) → `spawn_blocking(engine.compress_messages)` → respond → background: `refstore.put_many`, `refstore.touch_many(protected_refs)`, `stats.send(Optimization)`, `stats.send(ProtectedRefs)`. Payload bodies are logged only when `log.payloads = true` (DEBUG), never by default. Concurrency bounded by `server.max_inflight_compressions` (default = CPU count × 2) via a semaphore that the proxy and MCP surfaces share (`AppCore::engine_slots`); excess requests queue up to `server.queue_timeout` (2 s) then 503 with `Retry-After` — the API caller (unlike the proxy, §12.8) is expected to pass the original through on 503.
 
 ## 11. `kompressor-mcp`: MCP server
 
@@ -1471,10 +1471,15 @@ Tool-call **arguments** in assistant turns are never touched; tool **outputs** a
 3. walk (family) → Messages/TextSlots + frozen floor + tool metadata
 4. quick gate: Σ estimate_tokens(compressible slots) < proxy.min_tokens (512) ⇒ passthrough
    (the same estimator the engine uses, so the skip decision and the reported saving answer the same question)
-5. spawn_blocking(engine.compress_messages) with a hard deadline proxy.compress_timeout (default 2 s;
-   an out-of-process hop would need far more) ⇒ on timeout/panic the original body is used (fail open)
+5. one deadline, proxy.compress_timeout (default 2 s; an out-of-process hop would need far more),
+   covers all of: an engine permit (AppCore::engine_slots, shared with the API and MCP, sized
+   server.max_inflight_compressions), a blocking thread, compress_only, and retain (refs.put_many +
+   verify + touch_many(protected)) — on that thread, never on the async worker
+   ⇒ no permit in time: fail open, stage "admission"; timeout/panic: fail open, stage "compress"
+   ⇒ an abandoned task keeps its permit until it ends; what it leaves is retained fragments no
+     forwarded request names (content-addressed, expire normally) — no saving, no promotion
+   file (revert on failed retention; enqueue stats; non-blocking) only after the race is won
    write slots back; if any marker present and inject_retrieve_tool ⇒ add the tool definition (§12.6)
-   stash refs into the write-through cache + async store; enqueue stats
 6. forward upstream (reqwest, streaming), header policy (§12.7); if stream ⇒ SSE relay (§12.6/§12.9)
 7. capture usage (usage object or final SSE chunk); enqueue ProxyRequest event; touch protected refs
 ```
@@ -1633,6 +1638,8 @@ A background task's wait, which ends on `end_turn` rather than `tool_use`, again
 
 ![keep-warm for background tasks](charts/keepwarm-background.drawio.png)
 
+**On OpenAI the lever is retention, not pings** (`proxy.prompt_cache_retention`, default `default`). OpenAI caches every prompt of 1,024 tokens or more unasked and, on gpt-5.5 and the models before it, charges nothing to write; how long it keeps an entry is the request's `prompt_cache_retention`, `in_memory` (typically five to ten minutes idle) or `24h` (around 30 minutes, up to a day). Codex names neither, so it gets whatever the organization defaults to. Over 12,114 archived Codex requests on gpt-5.5 (2026-09-18 to 10-31), turns that came back after more than five minutes idle failed to read back 46–76% of the prefix the turn before had cached — the in-memory lifetime — but only 135 turns came back that late, because Codex blocks on its tools rather than waiting on background jobs, and the 476K tokens they lost came to about 0.35% of the Codex bill, against 12.6% for Claude Code on Opus 5.5 without keep-warm. Pinging would recover at most that, at $30 per million output tokens a ping, so OpenAI is not pinged; `"24h"` costs nothing on these models, so it is offered. It is added only where it is documented to be read: Chat Completions and Responses requests through the `openai` upstream or any upstream on `api.openai.com`, not the ChatGPT-subscription route on the same mount, not a request that names a retention itself, and only for the models OpenAI lists for `24h` (`retention::SUPPORTED`, matched whole so `gpt-5` does not take in `gpt-5.6`). GPT-5.6 and later take `prompt_cache_options.ttl` instead and price their writes, 1.25x for 30 minutes and 2.5x for 12 hours, which makes them an `adaptive` question like Anthropic's and is not built. A 400 whose body names the field is answered inside `Outbound::send` by sending the same request again without it, and the upstream and model are remembered (`retention::Rejections`) so the field is not added there again; any other answer, a 400 that does not name it included, reaches the client as the provider sent it. The websocket relay is left alone: a `response.create` frame has not been shown to accept the field.
+
 **Stale-read is the exception**: a later write to the same path replaces the read before it, so appending a turn *does* rewrite an earlier one. The two features cannot both be had, and `frozen_prefix = "first_seen"` therefore withholds `enable_stale_read`. The economics decide which goes: at Opus rates, re-writing a 20,000-token suffix to remove a 2,000-token stale read needs ~125 further turns to break even, against sessions that run 20 to 70. `stale_reads_are_the_one_transform_that_rewrites_what_came_before` asserts both directions, so whoever makes the transform causal finds the test rather than the bill.
 
 Note the reach: the stale replacement handles `MessageContent::Text` only, so it cannot fire for Anthropic tool results that walk to `Blocks`. The gate is insurance for the shapes where it can (OpenAI string content, single-block messages), **not** an explanation of the cache churn measured on the 2026-09-27 `first_seen` run — that break, on the one turn where `refs_emitted` went 0→1, is still unexplained and needs the two consecutive request bodies diffed (`log.payloads`) rather than another hypothesis.
@@ -1678,6 +1685,7 @@ min_elision_saving_chars = 4000
 
 [proxy.providers.openai]
 compress = true
+prompt_cache_retention = "24h"
 ```
 
 **`min_elision_saving_chars`** is the Anthropic setting that is not a switch. In `recoverable` mode `compress_content` ships a payload whole, rolling back what it retained, when its compression leaves a handle but saves fewer characters than this. A handle invites a fetch, and a fetch is a whole extra model answer: about $0.03 on Claude Opus 5.5, where re-sent history is billed as cache reads at $0.20 against $4.00. A 2,000-character elision re-sent twenty times saves about $0.004. Across ten recoverable Claude runs (four full, six panels), tool results that saved under 4,000 characters were fetched back 30% of the time. Replaying all ten runs' tool outputs through the current engine and linking each live fetch round to its payload by content hash:
@@ -2161,6 +2169,7 @@ token_guard = "chars"               # chars | tokens
 backend = "sqlite"                  # sqlite | memory
 path    = "./data/refs.db"
 recent_cache_entries = 4096         # write-through cache
+recent_cache_bytes = 67108864       # …and its byte budget (64 MiB)
 purge_interval = "1m"
 max_bytes = 1073741824              # bytes, not "1GiB"
 
@@ -2194,6 +2203,7 @@ retrieve_max_rounds = 3
 retrieve_max_tokens_per_request = 16384
 frozen_prefix = "marker"            # marker | first_seen, §12.10
 cache_ttl = "default"               # default | 1h | adaptive (Anthropic), §12.10
+prompt_cache_retention = "default"  # default | 24h (OpenAI, gpt-5.5 and earlier), §12.10
 cache_keep_warm = false             # ping a tool-waiting conversation to keep its cache (Anthropic), §12.10
 cache_keep_warm_interval = "270s"   # between pings; must be under the 5-minute TTL
 cache_keep_warm_max_pings = 11      # per wait, about 50 minutes
@@ -3569,6 +3579,11 @@ ALTER TABLE proxy_requests ADD COLUMN keep_warm INTEGER NOT NULL DEFAULT 0;
 ```
 
 ## C. Configuration reference — flat environment mapping
+
+Both spellings may be set at once; the sectioned `KOMPRESSOR__SECTION__KEY`
+wins whatever order the two appear in the process environment (every flat name
+is applied first, then every sectioned one). `bench replay --config FILE` reads
+that file alone, with no discovery and no environment overlay.
 
 | Flat `KOMPRESSOR_*` | Sectioned key |
 |---|---|

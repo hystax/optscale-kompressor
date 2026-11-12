@@ -337,6 +337,18 @@ on by default since 0.14.0. Relayed turns report no provider usage, so their
 savings are real but unmeasured; `KOMPRESSOR__PROXY__WEBSOCKET_RELAY=false` trades
 that coverage back for the numbers.
 
+With an API key, the proxy can also ask OpenAI to keep each prompt's cache for a
+day rather than minutes. It is free to write on gpt-5.5 and earlier, added only
+on `api.openai.com` for the models OpenAI documents it for, and dropped again if
+the upstream refuses it. Off by default; on archived Codex runs the expiry it
+prevents was about 0.35% of the bill
+([DESIGN.md §12.10](docs/DESIGN.md#1210-telling-a-live-provider-cache-from-a-lapsed-one)):
+
+```toml
+[proxy.providers.openai]
+prompt_cache_retention = "24h"
+```
+
 ### Other agents
 
 ```bash
