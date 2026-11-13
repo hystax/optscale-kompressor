@@ -1240,6 +1240,10 @@ fn the_reported_segfault_buried_in_a_training_log_is_no_longer_hidden() {
 
 /// `serve` as `kompressor wrap` starts it: stdin is a pipe the wrap holds.
 fn supervised_serve() -> std::process::Child {
+    supervised_serve_with(&[])
+}
+
+fn supervised_serve_with(extra: &[&std::ffi::OsStr]) -> std::process::Child {
     std::process::Command::new(env!("CARGO_BIN_EXE_kompressor"))
         .args([
             "serve",
@@ -1248,6 +1252,7 @@ fn supervised_serve() -> std::process::Child {
             "127.0.0.1:0",
             "--stop-on-stdin",
         ])
+        .args(extra)
         .env_remove("KOMPRESSOR_CONFIG")
         .env("XDG_CONFIG_HOME", no_config_dir())
         .current_dir(scratch_dir())
@@ -1283,6 +1288,66 @@ fn a_supervised_proxy_stops_on_the_stop_line() {
         let _ = child.kill();
     }
     assert!(stopped, "serve ignored the stop line");
+    assert!(
+        child.wait().unwrap().success(),
+        "a requested stop is a clean exit"
+    );
+}
+
+/// A proxy whose owner has gone (exited while others used it, or was killed)
+/// keeps serving while a live session holds its marker, and stops by itself,
+/// cleanly, once the last one lets go. Before this nothing ever stopped it: no
+/// later session owns it, and on Windows it has no window to close.
+#[test]
+fn an_orphaned_proxy_stops_once_no_session_uses_it() {
+    let clients = tempfile::tempdir().unwrap();
+    let live = clients.path().join("4242.held");
+    let marker = std::fs::File::create(&live).unwrap();
+    marker.lock().unwrap();
+    // A dead session's marker: nobody holds its lock, so it must not count.
+    std::fs::File::create(clients.path().join("4343.held")).unwrap();
+
+    let mut child =
+        supervised_serve_with(&["--stop-when-unused".as_ref(), clients.path().as_os_str()]);
+    drop(child.stdin.take());
+    let exited_while_used = exited_within(&mut child, std::time::Duration::from_secs(6));
+    if exited_while_used {
+        let _ = child.wait();
+    }
+    assert!(!exited_while_used, "stopped while a live session used it");
+    assert!(
+        !clients.path().join("4343.held").exists(),
+        "the dead session's marker was not reaped"
+    );
+
+    marker.unlock().unwrap();
+    drop(marker);
+    let stopped = exited_within(&mut child, std::time::Duration::from_secs(20));
+    if !stopped {
+        let _ = child.kill();
+    }
+    assert!(stopped, "an unused orphaned proxy kept running");
+    assert!(
+        child.wait().unwrap().success(),
+        "stopping when unused is a clean exit"
+    );
+}
+
+/// What a .NET supervisor writes: a UTF-8 byte-order mark, a line that is not
+/// UTF-8 at all, then the stop with a CRLF ending. Neither of the first two may
+/// end the listener, or the stop that follows is never heard.
+#[test]
+fn a_supervised_proxy_stops_after_a_bom_and_a_line_that_is_not_utf8() {
+    let mut child = supervised_serve();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"\xFF\xFEnoise\r\n").unwrap();
+    stdin.write_all(b"\xEF\xBB\xBFstop\r\n").unwrap();
+    stdin.flush().unwrap();
+    let stopped = exited_within(&mut child, std::time::Duration::from_secs(20));
+    if !stopped {
+        let _ = child.kill();
+    }
+    assert!(stopped, "serve ignored a BOM-prefixed stop line");
     assert!(
         child.wait().unwrap().success(),
         "a requested stop is a clean exit"

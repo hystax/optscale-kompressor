@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
@@ -229,13 +230,23 @@ pub async fn run_stdio(config: Config) -> CliResult {
     result
 }
 
-/// Bind and serve until interrupted, or until [`STOP_LINE`] arrives on standard
-/// input when `stop_on_stdin` is set.
+/// How a supervising `kompressor wrap` may stop this process, beyond signals.
+#[derive(Default)]
+pub struct Supervision {
+    /// Stop when [`STOP_LINE`] arrives on standard input.
+    pub stop_on_stdin: bool,
+    /// After standard input closes, stop once no live client marker is left in
+    /// this directory.
+    pub stop_when_unused: Option<PathBuf>,
+}
+
+/// Bind and serve until interrupted, or until the supervisor asks it to stop
+/// (see [`Supervision`]).
 pub async fn run(
     config: Config,
     surfaces: Surfaces,
     listen: Option<String>,
-    stop_on_stdin: bool,
+    supervision: Supervision,
 ) -> CliResult {
     init_logging(&config.log);
     let listen = listen.unwrap_or_else(|| config.server.listen.clone());
@@ -327,7 +338,7 @@ pub async fn run(
     let upkeep = maintenance(core.clone(), shutdown_rx);
     let mut serve_error = None;
     tokio::select! {
-        _ = shutdown_signal(stop_on_stdin) => {},
+        _ = shutdown_signal(supervision) => {},
         result = servers.join_next() => {
             serve_error = Some(format!("listener stopped unexpectedly: {result:?}"));
         }
@@ -398,15 +409,15 @@ fn listener_groups(
 /// stop it. See [`stdin_stop`].
 pub const STOP_LINE: &str = "stop";
 
-async fn shutdown_signal(stop_on_stdin: bool) {
+async fn shutdown_signal(supervision: Supervision) {
     let interrupt = async {
         tokio::signal::ctrl_c()
             .await
             .expect("ctrl-c handler installs");
     };
     let requested = async {
-        if stop_on_stdin {
-            stdin_stop().await;
+        if supervision.stop_on_stdin {
+            stdin_stop(supervision.stop_when_unused).await;
         } else {
             std::future::pending::<()>().await;
         }
@@ -485,6 +496,19 @@ fn hangup_ignored_in(status: &str) -> bool {
         .is_none_or(|mask| mask & 1 != 0)
 }
 
+/// Is this line from the supervisor a request to stop?
+///
+/// Read as bytes, not as `str` lines: a line that is not UTF-8 is not a stop,
+/// but it must not end the listener either, or every later `stop` is lost.
+/// A leading byte-order mark is ignored. A .NET supervisor's
+/// `Process.StandardInput` writes one when the console encoding is UTF-8, and
+/// `str::trim` does not remove U+FEFF, so `\u{feff}stop` used to leave the
+/// proxy running for good.
+fn is_stop_line(line: &[u8]) -> bool {
+    let line = line.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(line);
+    std::str::from_utf8(line).is_ok_and(|text| text.trim() == STOP_LINE)
+}
+
 /// Resolve when the supervising `kompressor wrap` writes [`STOP_LINE`].
 ///
 /// This is how a wrap session stops the proxy it started, on every platform:
@@ -492,31 +516,77 @@ fn hangup_ignored_in(status: &str) -> bool {
 /// parent holds is a stop button nothing else can press.
 ///
 /// End of input is *not* a request to stop. It is the supervisor exiting while
-/// other wrap sessions still use this proxy, and taking the proxy down then
-/// would cut them off mid-turn. So it leaves this pending for ever.
+/// other wrap sessions still use this proxy, or being killed, and taking the
+/// proxy down then would cut the others off mid-turn. Without `unused` it
+/// leaves this pending for ever. With it, the proxy has no owner left, so it
+/// watches the client markers in that directory and stops once no live session
+/// remains: otherwise nothing would ever stop it, and on Windows it runs with
+/// no window until logoff.
 ///
 /// Read on a plain thread rather than through `tokio::io::stdin`, which reads
 /// on the blocking pool: a read still pending there holds up the runtime's
 /// shutdown after a Ctrl-C for as long as the supervisor keeps the pipe open.
-async fn stdin_stop() {
+async fn stdin_stop(unused: Option<PathBuf>) {
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
         use std::io::BufRead as _;
-        for line in std::io::stdin().lock().lines() {
-            match line {
-                Ok(line) if line.trim() == STOP_LINE => {
+        let mut stdin = std::io::stdin().lock();
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match stdin.read_until(b'\n', &mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) if is_stop_line(&line) => {
                     let _ = tx.send(());
                     return;
                 }
                 Ok(_) => continue,
-                Err(_) => return,
             }
         }
     });
     // The sender is dropped on end of input, which resolves this with an
     // error. That is the case above, not a stop.
-    if rx.await.is_err() {
-        std::future::pending::<()>().await;
+    if rx.await.is_ok() {
+        return;
+    }
+    match unused {
+        Some(dir) => stop_when_unused(&dir).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// How often an orphaned proxy looks for live client markers.
+const UNUSED_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+/// How many polls in a row must find none before it stops. More than one,
+/// because a session that is starting registers its marker before it checks
+/// for a running proxy, and one empty look can fall between two sessions.
+const UNUSED_POLLS: u32 = 2;
+
+/// Resolve once no live session holds a marker in `dir`, for
+/// [`UNUSED_POLLS`] consecutive looks.
+async fn stop_when_unused(dir: &std::path::Path) {
+    let me = std::process::id();
+    tracing::info!(
+        clients = %dir.display(),
+        "the supervising wrap has gone; stopping once no session uses this proxy"
+    );
+    let mut empty = 0;
+    loop {
+        tokio::time::sleep(UNUSED_POLL).await;
+        let dir = dir.to_path_buf();
+        let live =
+            tokio::task::spawn_blocking(move || crate::wrap::proxy::live_clients_in(&dir, me))
+                .await
+                .unwrap_or(1);
+        if live > 0 {
+            empty = 0;
+            continue;
+        }
+        empty += 1;
+        if empty >= UNUSED_POLLS {
+            tracing::info!("no session uses this proxy any more; stopping");
+            return;
+        }
     }
 }
 
@@ -557,6 +627,29 @@ mod tests {
         config.refs.backend = RefsBackend::Memory;
         config.stats.enabled = false;
         config
+    }
+
+    #[test]
+    fn a_stop_line_is_recognised_with_any_line_ending_and_a_bom() {
+        for line in [
+            &b"stop"[..],
+            b"stop\n",
+            b"stop\r\n",
+            b"  stop  \r\n",
+            b"\xEF\xBB\xBFstop\r\n",
+        ] {
+            assert!(is_stop_line(line), "{line:?} is a stop");
+        }
+        for line in [
+            &b""[..],
+            b"\n",
+            b"stopp\n",
+            b"please stop\n",
+            b"\xFF\xFEs\x00t\x00o\x00p\x00\n",
+            b"\xEF\xBB\xBF\xEF\xBB\xBFstop\n",
+        ] {
+            assert!(!is_stop_line(line), "{line:?} is not a stop");
+        }
     }
 
     #[tokio::test]

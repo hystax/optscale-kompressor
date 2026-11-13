@@ -155,6 +155,11 @@ struct ServeCmd {
     /// `kompressor wrap`, which holds the other end of the pipe.
     #[arg(long, hide = true)]
     stop_on_stdin: bool,
+    /// Once standard input closes, stop as soon as no live client marker is
+    /// left in this directory. Passed by `kompressor wrap` with
+    /// `--stop-on-stdin`, so a proxy whose owner is gone does not run for ever.
+    #[arg(long, hide = true, value_name = "DIR", requires = "stop_on_stdin")]
+    stop_when_unused: Option<std::path::PathBuf>,
 }
 
 #[derive(Args)]
@@ -471,7 +476,10 @@ fn run(cli: Cli) -> CliResult {
                 config,
                 surfaces,
                 args.listen,
-                args.stop_on_stdin,
+                serve::Supervision {
+                    stop_on_stdin: args.stop_on_stdin,
+                    stop_when_unused: args.stop_when_unused,
+                },
             ))
         }
         Command::Mcp(McpCmd::Serve(args)) => {

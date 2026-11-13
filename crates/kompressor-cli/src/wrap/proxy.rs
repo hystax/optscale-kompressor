@@ -182,6 +182,12 @@ pub async fn start(
         .arg("--listen")
         .arg(format!("127.0.0.1:{port}"))
         .arg("--stop-on-stdin")
+        // Once this session's end of the pipe closes, whether it exited while
+        // others still used the proxy or was killed outright, the proxy watches
+        // the client markers and stops itself when the last one is gone. No
+        // later session owns it, so nothing else ever would.
+        .arg("--stop-when-unused")
+        .arg(paths.clients(port))
         .stdin(Stdio::piped())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
@@ -307,11 +313,19 @@ pub fn unregister_client(paths: &Paths, port: u16) {
 /// crashed session would otherwise keep the proxy alive forever, and the sweep
 /// is the only thing that ever removes it.
 pub fn other_live_clients(paths: &Paths, port: u16) -> usize {
-    let dir = paths.clients(port);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    live_clients_in(&paths.clients(port), std::process::id())
+}
+
+/// How many live sessions hold a marker in `dir`, not counting the process
+/// `me`. Sweeps dead markers as it goes, like [`other_live_clients`].
+///
+/// Also called by a proxy whose supervisor has gone (`serve
+/// --stop-when-unused`), which is how a proxy outlives a crashed or departed
+/// owner only for as long as some session still uses it.
+pub fn live_clients_in(dir: &Path, me: u32) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
-    let me = std::process::id();
     let mut live = 0;
     for entry in entries.flatten() {
         let path = entry.path();

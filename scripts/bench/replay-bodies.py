@@ -123,7 +123,9 @@ class Upstream:
     """A recording upstream on a background thread."""
 
     def __init__(self, out: Path):
-        self.out = out.open("w")
+        # LF on every platform: Windows text mode would write CRLF, and the
+        # file's hash is what two machines' replays are compared by.
+        self.out = out.open("w", encoding="utf-8", newline="\n")
         self.lock = threading.Lock()
         self.current = -1
         self.bytes = 0
@@ -182,7 +184,7 @@ def write_config(out: Path, upstream_port: int, proxy_port: int) -> Path:
     # Forward slashes: a Windows path in a TOML basic string would read
     # `\U` and friends as escapes. Windows accepts either separator.
     out = out.resolve()
-    text = PACKAGED.read_text()
+    text = PACKAGED.read_text(encoding="utf-8")
     text = re.sub(
         r'base_url = "https://[^"]+"', f'base_url = "http://127.0.0.1:{upstream_port}"', text
     )
@@ -208,7 +210,7 @@ def write_config(out: Path, upstream_port: int, proxy_port: int) -> Path:
         1,
     )
     path = out / "kompressor.toml"
-    path.write_text(text)
+    path.write_text(text, encoding="utf-8", newline="\n")
     return path
 
 
@@ -316,7 +318,7 @@ def replay(args) -> dict:
         except subprocess.TimeoutExpired:
             proc.kill()
         upstream.close()
-    log_text = log.read_text(errors="replace")
+    log_text = log.read_text(encoding="utf-8", errors="replace")
     summary = {
         "capture": str(args.capture),
         "bin": str(args.bin),
@@ -331,13 +333,15 @@ def replay(args) -> dict:
         "panics": log_text.count("panicked"),
         "original_run_reduction_pct": round(100 * (1 - orig_out / orig_in), 3) if orig_in else None,
     }
-    (out / "summary.json").write_text(json.dumps(summary, indent=2))
+    (out / "summary.json").write_text(
+        json.dumps(summary, indent=2), encoding="utf-8", newline="\n"
+    )
     return summary
 
 
 def compare(a: Path, b: Path) -> int:
-    la = (a / "upstream.jsonl").read_text().splitlines()
-    lb = (b / "upstream.jsonl").read_text().splitlines()
+    la = (a / "upstream.jsonl").read_text(encoding="utf-8").splitlines()
+    lb = (b / "upstream.jsonl").read_text(encoding="utf-8").splitlines()
     differ = [i for i, (x, y) in enumerate(zip(la, lb)) if x != y]
     result = {
         "a": str(a),

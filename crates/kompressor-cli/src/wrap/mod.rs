@@ -928,12 +928,20 @@ async fn shutdown(
     proxy::unregister_client(paths, port);
     let Some(mut started) = started else { return };
     if started.ownership == proxy::Ownership::Adopted {
+        // Not ours to stop, but the sweep is: a session killed outright leaves
+        // its marker behind, and only a sweep ever removes it.
+        let _ = proxy::other_live_clients(paths, started.port);
         return;
     }
     let port = started.port;
     let others = proxy::other_live_clients(paths, port);
     if others > 0 {
-        say!("kompressor: leaving the proxy on {port} up for {others} other session(s)");
+        // Dropping `started` closes the proxy's stdin; from then on it stops
+        // itself once the last of those sessions has gone.
+        say!(
+            "kompressor: leaving the proxy on {port} up for {others} other session(s); \
+             it stops when the last of them exits"
+        );
         return;
     }
     if let Some(child) = started.child.as_mut() {

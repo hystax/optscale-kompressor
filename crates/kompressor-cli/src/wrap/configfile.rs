@@ -518,20 +518,23 @@ fn injected_content(target: &Target, current: &str) -> String {
     let eol = line_ending(current);
     let (head, foot) = target.render(eol);
     let body = target.disable_collisions(&strip_blocks(current));
+    // Nothing outside the markers is changed: no blank line trimmed after the
+    // head, none added before the foot. `strip_blocks` removes exactly what is
+    // between the markers, so whatever is added out here stays behind whenever
+    // a file is cleaned without the original to hand: after a crash, under
+    // `unwrap`, or once the user has edited the file mid-session. The `BEGIN`
+    // comment already sets each block apart.
     let mut next = String::new();
     next.push_str(&head);
     if !body.trim().is_empty() {
-        next.push_str(body.trim_start_matches(['\r', '\n']));
-        if !next.ends_with('\n') {
+        next.push_str(&body);
+        // The one exception: a file with no final newline gets one, or the
+        // foot's `BEGIN` would land on the user's last line.
+        if !foot.is_empty() && !next.ends_with('\n') {
             next.push_str(eol);
         }
     }
-    if !foot.is_empty() {
-        if !next.is_empty() && !next.ends_with(&format!("{eol}{eol}")) {
-            next.push_str(eol);
-        }
-        next.push_str(&foot);
-    }
+    next.push_str(&foot);
 
     next
 }
@@ -717,7 +720,7 @@ mod tests {
         std::fs::remove_file(target.owners_path()).unwrap();
         claim(&target).unwrap();
         release(&target, false).unwrap();
-        assert_eq!(scratch.read().trim(), original.trim());
+        assert_eq!(scratch.read(), original);
         assert!(!scratch.read().contains(BEGIN));
     }
 
@@ -841,6 +844,45 @@ mod tests {
         assert!(!cleaned.contains(BEGIN) && !cleaned.contains(DISABLED));
     }
 
+    /// Cleaning up without the original to hand (a crashed session, `unwrap`,
+    /// or a file the user edited mid-session) used to leave the blank line that
+    /// was put before the foot block, and drop blank lines that opened the file.
+    #[test]
+    fn cleanup_without_the_original_adds_and_drops_no_blank_lines() {
+        let original = "\r\n# my codex config\r\nmodel = \"gpt-5.5\"\r\n\r\n[profiles.x]\r\nmodel = \"o3\"\r\n";
+
+        // Killed mid-session, then `unwrap codex`.
+        let scratch = Scratch::new("no-blank-crash");
+        scratch.write(original);
+        let target = scratch.target(9134);
+        claim(&target).unwrap();
+        let _ = std::fs::remove_file(target.owners_path());
+        assert_eq!(release(&target, true).unwrap(), Released::Restored);
+        assert_eq!(scratch.read(), original);
+        let_go(&target.path);
+
+        // A line the user appended while the session ran.
+        let scratch = Scratch::new("no-blank-edit");
+        scratch.write(original);
+        let target = scratch.target(9135);
+        claim(&target).unwrap();
+        scratch.write(&(scratch.read() + "user_added = true\r\n"));
+        release(&target, false).unwrap();
+        assert_eq!(scratch.read(), format!("{original}user_added = true\r\n"));
+
+        // No final newline: the one line ending added, so the block starts on
+        // a line of its own, and nothing else.
+        let scratch = Scratch::new("no-final-newline");
+        scratch.write("model = \"gpt-5.5\"");
+        let target = scratch.target(9136);
+        claim(&target).unwrap();
+        assert!(scratch.read().contains(&format!("\"gpt-5.5\"\n{BEGIN}")));
+        let _ = std::fs::remove_file(target.owners_path());
+        release(&target, true).unwrap();
+        assert_eq!(scratch.read(), "model = \"gpt-5.5\"\n");
+        let_go(&target.path);
+    }
+
     #[test]
     fn unwrap_keeps_a_crlf_file_crlf() {
         let scratch = Scratch::new("crlf-orphan");
@@ -853,7 +895,10 @@ mod tests {
         assert_eq!(release(&target, true).unwrap(), Released::Restored);
         let cleaned = scratch.read();
         assert!(all_crlf(&cleaned), "{cleaned:?}");
-        assert_eq!(cleaned.trim_end(), original.trim_end());
+        assert_eq!(
+            cleaned, original,
+            "unwrap must leave the file byte for byte"
+        );
     }
 
     /// A session killed under the file route leaves its block. A later ChatGPT
@@ -872,7 +917,7 @@ mod tests {
         // Killed: its claim never recorded, or recorded and then lost.
         let _ = std::fs::remove_file(target.owners_path());
         assert_eq!(clear_stale(&target).unwrap(), Released::Restored);
-        assert_eq!(scratch.read().trim_end(), original.trim_end());
+        assert_eq!(scratch.read(), original);
         assert_eq!(clear_stale(&target).unwrap(), Released::NotOurs);
         let_go(&target.path);
     }
