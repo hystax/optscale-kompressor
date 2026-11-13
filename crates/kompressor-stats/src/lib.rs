@@ -1572,6 +1572,29 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_whose_commit_fails_is_counted_as_dropped() {
+        let mut harness = Harness::with_config(|config| {
+            config.flush_interval = Duration::from_secs(600);
+            config.batch_max = 10_000;
+        });
+        // make every insert into the table abort, so the next commit fails
+        let writer = StatsWriter::open(&StatsConfig::at(harness.path())).unwrap();
+        writer.connection().execute_batch("CREATE TRIGGER reject_insert BEFORE INSERT ON optimization_events BEGIN SELECT RAISE(ABORT, 'test failure'); END;").unwrap();
+        for i in 0..3 {
+            harness
+                .sink
+                .send(optimization(T0, "acme", &format!("req-{i}"), 100, 10));
+        }
+        assert!(harness.sink.flush().is_err(), "the commit fails");
+        assert_eq!(
+            harness.sink.dropped(),
+            3,
+            "a failed commit counts its whole batch as dropped"
+        );
+        harness.shutdown();
+    }
+
+    #[test]
     fn the_batch_cap_commits_before_the_interval_expires() {
         let harness = Harness::with_config(|config| {
             config.flush_interval = Duration::from_secs(600);
