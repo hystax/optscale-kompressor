@@ -114,7 +114,7 @@ fn describe() {
     describe_gauge!("kompressor_refs_bytes_live", "Bytes those fragments occupy");
     describe_gauge!(
         "kompressor_stats_dropped_total",
-        "Analytics events dropped by a full or dead queue; any report from a window with a non-zero value is an undercount"
+        "Analytics events dropped by a full or dead queue, or lost to a failed commit; any report from a window with a non-zero value is an undercount"
     );
 }
 
