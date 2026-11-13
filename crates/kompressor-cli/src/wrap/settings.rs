@@ -29,7 +29,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::paths::{ProcessId, marker_is_stale};
+use super::paths::{self, ProcessId, marker_is_stale};
 use crate::error::CliError;
 
 /// One process's claim on one settings key.
@@ -38,27 +38,55 @@ pub(super) struct Holder {
     pub(super) pid: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     start_time: Option<u64>,
+    /// The file this holder keeps locked while it runs; see [`paths::hold`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    port: Option<u16>,
+    lock: Option<PathBuf>,
 }
 
 impl Holder {
-    pub(super) fn me(port: Option<u16>) -> Holder {
+    /// This process, holding the lock next to `file` that proves it is alive.
+    pub(super) fn me(file: &Path) -> Holder {
         let id = ProcessId::current();
+        let lock = held_path(file);
         Holder {
             pid: id.pid,
             start_time: id.start_time,
-            port,
+            lock: paths::hold(&lock).ok().map(|()| lock),
         }
     }
 
-    pub(super) fn is_alive(&self) -> bool {
+    /// Whether this holder still runs, where that can be proven: by its lock,
+    /// or by its pid and start time. `None` otherwise — no lock or one that
+    /// could not be checked, and no start time, as outside Linux. A dead
+    /// holder's lock file is removed on the way; see [`paths::reap_if_dead`].
+    fn proven_alive(&self) -> Option<bool> {
+        if let Some(alive) = self.lock.as_deref().and_then(paths::reap_if_dead) {
+            return Some(alive);
+        }
+        self.start_time.map(|_| self.pid_alive())
+    }
+
+    /// Whether the pid runs, which off Linux it is always taken to.
+    fn pid_alive(&self) -> bool {
         ProcessId {
             pid: self.pid,
             start_time: self.start_time,
         }
         .is_alive()
     }
+}
+
+/// The lock this process holds next to `file` while it has a claim on it.
+fn held_path(file: &Path) -> PathBuf {
+    sibling(
+        file,
+        &format!(".kompressor-wrap.{}.held", std::process::id()),
+    )
+}
+
+/// Give up the lock [`Holder::me`] took next to `file`.
+pub(super) fn let_go(file: &Path) {
+    paths::let_go(&held_path(file));
 }
 
 /// Everyone currently claiming one key, and what the key held before any of
@@ -120,20 +148,46 @@ pub(super) fn sibling(settings: &Path, name: &str) -> PathBuf {
 /// every future wrap in the project.
 pub(super) struct Lock {
     path: PathBuf,
-    held: bool,
 }
 
 const LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
 
+/// How long [`Lock::acquire`] waits for a held lock before giving up.
+///
+/// Longer than [`LOCK_STALE_AFTER`], so a lock left by a session that died
+/// mid-edit is always broken within the wait rather than reported. A live
+/// holder keeps it for one read-modify-write, milliseconds, so the wait is
+/// only ever this long when that holder crashed.
+const LOCK_WAIT: Duration = Duration::from_secs(35);
+
+/// How often `PermissionDenied` is retried before it counts as an error.
+///
+/// On Windows a file that a scanner or indexer has open, or that is being
+/// deleted, refuses `create_new` with access denied for a moment. A directory
+/// that is genuinely read-only still fails, after about a second.
+const DENIED_RETRIES: u32 = 20;
+
 impl Lock {
-    pub(super) fn acquire(path: PathBuf) -> Lock {
-        for _ in 0..100 {
+    pub(super) fn acquire(path: PathBuf) -> Result<Lock, CliError> {
+        Lock::acquire_within(path, LOCK_WAIT)
+    }
+
+    /// [`Lock::acquire`], giving up after `wait`.
+    fn acquire_within(path: PathBuf, wait: Duration) -> Result<Lock, CliError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                CliError::runtime("could not create the settings directory", error)
+            })?;
+        }
+        let started = std::time::Instant::now();
+        let mut denied = 0;
+        loop {
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&path)
             {
-                Ok(_) => return Lock { path, held: true },
+                Ok(_) => return Ok(Lock { path }),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     if let Ok(meta) = std::fs::metadata(&path) {
                         let stale = meta
@@ -142,27 +196,39 @@ impl Lock {
                             .and_then(|m| m.elapsed().ok())
                             .map(|age| age > LOCK_STALE_AFTER)
                             .unwrap_or(false);
-                        if stale {
-                            let _ = std::fs::remove_file(&path);
+                        // Only retried at once when the removal worked. One
+                        // that fails -- on Windows, a file another process
+                        // holds open without delete sharing -- falls through
+                        // to the wait and the deadline below, rather than
+                        // spinning on it for ever.
+                        if stale && std::fs::remove_file(&path).is_ok() {
                             continue;
                         }
                     }
+                    if started.elapsed() > wait {
+                        return Err(CliError::Runtime(format!(
+                            "timed out locking {}",
+                            path.display()
+                        )));
+                    }
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                // A directory we cannot write is degraded, not unusable: the
-                // edit still happens, it is just not serialised against a peer.
-                Err(_) => return Lock { path, held: false },
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::PermissionDenied
+                        && denied < DENIED_RETRIES =>
+                {
+                    denied += 1;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(CliError::runtime("could not lock settings", error)),
             }
         }
-        Lock { path, held: false }
     }
 }
 
 impl Drop for Lock {
     fn drop(&mut self) {
-        if self.held {
-            let _ = std::fs::remove_file(&self.path);
-        }
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -212,21 +278,29 @@ pub(super) fn write_owners(path: &Path, owners: &Owners) -> Result<(), CliError>
 
 /// Drop every claim whose owner is gone.
 pub(super) fn sweep(claim: &mut Claim, owners_path: &Path) {
-    claim.holders.retain(|holder| {
-        if holder.start_time.is_none() {
-            // No start time means liveness cannot be proven; fall back to age.
-            return holder.is_alive() && !marker_is_stale(owners_path);
-        }
-        holder.is_alive()
+    claim.holders.retain(|holder| match holder.proven_alive() {
+        Some(alive) => alive,
+        // Liveness cannot be proven; fall back to age, or a holder whose lock
+        // cannot be read would pin the file for good.
+        None => holder.pid_alive() && !marker_is_stale(owners_path),
     });
+}
+
+/// Drop every holder, for `unwrap`, and the locks the dead ones left behind.
+pub(super) fn clear(claim: &mut Claim) {
+    for holder in claim.holders.drain(..) {
+        if let Some(lock) = holder.lock {
+            paths::reap_if_dead(&lock);
+        }
+    }
 }
 
 /// Point `key` at `value`, recording this process as an owner.
 ///
 /// Returns whether the file was changed, so a caller can stay quiet when there
 /// was nothing to do.
-pub fn claim(target: &Target, key: &str, value: &str, port: u16) -> Result<bool, CliError> {
-    let _lock = Lock::acquire(target.lock_path());
+pub fn claim(target: &Target, key: &str, value: &str) -> Result<bool, CliError> {
+    let _lock = Lock::acquire(target.lock_path())?;
     let owners_path = target.owners_path();
     let mut owners = read_owners(&owners_path);
 
@@ -252,7 +326,7 @@ pub fn claim(target: &Target, key: &str, value: &str, port: u16) -> Result<bool,
         claim.original = current.clone();
     }
     claim.holders.retain(|h| h.pid != std::process::id());
-    claim.holders.push(Holder::me(Some(port)));
+    claim.holders.push(Holder::me(&target.settings));
     owners.keys.insert(key.to_string(), claim);
 
     let changed = current.as_deref() != Some(value);
@@ -284,17 +358,26 @@ pub enum Released {
 /// `force` is `unwrap`: the user is asking for their settings back, so every
 /// claim is dropped and the restore happens regardless of who else is running.
 pub fn release(target: &Target, key: &str, force: bool) -> Result<Released, CliError> {
-    let _lock = Lock::acquire(target.lock_path());
+    let _lock = Lock::acquire(target.lock_path())?;
     let owners_path = target.owners_path();
     let mut owners = read_owners(&owners_path);
+    // One lock covers every key this process holds in the file, so it goes
+    // with the last of them — including when an `unwrap` dropped this one.
+    let mine = |c: &Claim| c.holders.iter().any(|h| h.pid == std::process::id());
     let Some(mut claim) = owners.keys.remove(key) else {
+        if !owners.keys.values().any(mine) {
+            let_go(&target.settings);
+        }
         return Ok(Released::NotOurs);
     };
     sweep(&mut claim, &owners_path);
     if force {
-        claim.holders.clear();
+        clear(&mut claim);
     } else {
         claim.holders.retain(|h| h.pid != std::process::id());
+    }
+    if !owners.keys.values().any(mine) {
+        let_go(&target.settings);
     }
 
     if !claim.holders.is_empty() {
@@ -361,10 +444,23 @@ mod tests {
     }
 
     #[test]
+    fn a_first_claim_in_a_new_directory_has_a_liveness_lock() {
+        let scratch = Scratch::new("first-lock");
+        let target = scratch.target();
+        assert!(!target.settings.parent().unwrap().exists());
+        claim(&target, "ANTHROPIC_BASE_URL", "http://127.0.0.1:8817").unwrap();
+        let owners = read_owners(&target.owners_path());
+        let holder = &owners.keys["ANTHROPIC_BASE_URL"].holders[0];
+        assert!(holder.lock.is_some());
+        assert_eq!(holder.proven_alive(), Some(true));
+        release(&target, "ANTHROPIC_BASE_URL", false).unwrap();
+    }
+
+    #[test]
     fn a_claim_writes_the_url_and_a_release_takes_it_back_out() {
         let scratch = Scratch::new("roundtrip");
         let target = scratch.target();
-        assert!(claim(&target, "ANTHROPIC_BASE_URL", "http://127.0.0.1:8817", 8817).unwrap());
+        assert!(claim(&target, "ANTHROPIC_BASE_URL", "http://127.0.0.1:8817").unwrap());
         assert_eq!(
             value_at(&target, "ANTHROPIC_BASE_URL").as_deref(),
             Some("http://127.0.0.1:8817")
@@ -391,7 +487,7 @@ mod tests {
         )
         .unwrap();
 
-        claim(&target, "ANTHROPIC_BASE_URL", "http://127.0.0.1:8817", 8817).unwrap();
+        claim(&target, "ANTHROPIC_BASE_URL", "http://127.0.0.1:8817").unwrap();
         release(&target, "ANTHROPIC_BASE_URL", false).unwrap();
 
         assert_eq!(
@@ -420,7 +516,7 @@ mod tests {
         .unwrap();
 
         // Session one, still running: a live holder that is not this process.
-        claim(&target, "ANTHROPIC_BASE_URL", "http://127.0.0.1:8817", 8817).unwrap();
+        claim(&target, "ANTHROPIC_BASE_URL", "http://127.0.0.1:8817").unwrap();
         let owners_path = target.owners_path();
         let mut owners = read_owners(&owners_path);
         let first = owners.keys.get_mut("ANTHROPIC_BASE_URL").unwrap();
@@ -429,7 +525,7 @@ mod tests {
         write_owners(&owners_path, &owners).unwrap();
 
         // Session two claims a different port and then exits.
-        claim(&target, "ANTHROPIC_BASE_URL", "http://127.0.0.1:8818", 8818).unwrap();
+        claim(&target, "ANTHROPIC_BASE_URL", "http://127.0.0.1:8818").unwrap();
         assert_eq!(
             release(&target, "ANTHROPIC_BASE_URL", false).unwrap(),
             Released::StillInUse,
@@ -467,7 +563,7 @@ mod tests {
                 holders: vec![Holder {
                     pid: 0,
                     start_time: Some(1),
-                    port: Some(9999),
+                    lock: None,
                 }],
             },
         );
@@ -491,6 +587,103 @@ mod tests {
         }
     }
 
+    /// A peer at `lock`, under a pid that is certainly running (1 is init on
+    /// Unix): only the lock can tell whether the session itself is.
+    fn add_peer(target: &Target, lock: PathBuf) {
+        let owners_path = target.owners_path();
+        let mut owners = read_owners(&owners_path);
+        owners
+            .keys
+            .get_mut("ANTHROPIC_BASE_URL")
+            .unwrap()
+            .holders
+            .push(Holder {
+                pid: 1,
+                start_time: None,
+                lock: Some(lock),
+            });
+        write_owners(&owners_path, &owners).unwrap();
+    }
+
+    fn claimed(scratch: &Scratch) -> Target {
+        let target = scratch.target();
+        std::fs::create_dir_all(target.settings.parent().unwrap()).unwrap();
+        std::fs::write(
+            &target.settings,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://original.example"}}"#,
+        )
+        .unwrap();
+        claim(&target, "ANTHROPIC_BASE_URL", "http://127.0.0.1:9998").unwrap();
+        target
+    }
+
+    /// A session killed with its window closed leaves its lock file, held by
+    /// no one. On Windows and macOS that used to read as alive for twelve
+    /// hours, and the file stayed pointed at the proxy.
+    #[test]
+    fn a_killed_peers_claim_does_not_pin_the_file() {
+        let scratch = Scratch::new("killed");
+        let target = claimed(&scratch);
+        let lock = sibling(&target.settings, "peer.held");
+        std::fs::write(&lock, "").unwrap();
+        add_peer(&target, lock.clone());
+
+        assert_eq!(
+            release(&target, "ANTHROPIC_BASE_URL", false).unwrap(),
+            Released::Restored
+        );
+        assert_eq!(
+            value_at(&target, "ANTHROPIC_BASE_URL").as_deref(),
+            Some("https://original.example")
+        );
+        assert!(!lock.exists(), "the corpse's lock is cleared away");
+    }
+
+    #[test]
+    fn a_live_peers_claim_keeps_the_file() {
+        let scratch = Scratch::new("live-peer");
+        let target = claimed(&scratch);
+        let lock = sibling(&target.settings, "peer.held");
+        paths::hold(&lock).unwrap();
+        add_peer(&target, lock.clone());
+
+        assert_eq!(
+            release(&target, "ANTHROPIC_BASE_URL", false).unwrap(),
+            Released::StillInUse
+        );
+        paths::let_go(&lock);
+    }
+
+    /// A holder whose lock cannot be read, and with no start time to go by, is
+    /// believed only until the claim goes stale, as one with no lock is. Read
+    /// as alive for good, it would pin the file for good.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_lock_ages_out_rather_than_pinning_the_file() {
+        let scratch = Scratch::new("unreadable");
+        let target = claimed(&scratch);
+        // A path through a file: opening it fails, and not as missing.
+        add_peer(&target, target.settings.join("held"));
+        let owners_path = target.owners_path();
+        let claim = read_owners(&owners_path).keys["ANTHROPIC_BASE_URL"].clone();
+
+        let mut fresh = claim.clone();
+        sweep(&mut fresh, &owners_path);
+        assert_eq!(fresh.holders.len(), 2, "believed while fresh");
+
+        let day_ago = std::time::SystemTime::now() - Duration::from_secs(24 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&owners_path)
+            .unwrap()
+            .set_modified(day_ago)
+            .unwrap();
+        let mut stale = claim;
+        sweep(&mut stale, &owners_path);
+        assert_eq!(stale.holders.len(), 1, "only this live process is left");
+        let_go(&target.settings);
+    }
+
     #[test]
     fn releasing_something_we_never_claimed_is_not_an_error() {
         let scratch = Scratch::new("notours");
@@ -507,9 +700,18 @@ mod tests {
         std::fs::create_dir_all(target.settings.parent().unwrap()).unwrap();
         std::fs::write(&target.settings, r#"{"env":"not an object"}"#).unwrap();
         assert!(
-            claim(&target, "ANTHROPIC_BASE_URL", "http://127.0.0.1:8817", 8817).is_err(),
+            claim(&target, "ANTHROPIC_BASE_URL", "http://127.0.0.1:8817").is_err(),
             "a file we do not understand is left alone"
         );
+    }
+
+    #[test]
+    fn a_lock_error_is_reported_before_editing_settings() {
+        let scratch = Scratch::new("lock-error");
+        let path = scratch.0.join("file");
+        std::fs::write(&path, "keep").unwrap();
+        assert!(Lock::acquire(path.join("settings.lock")).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "keep");
     }
 
     #[test]
@@ -517,9 +719,56 @@ mod tests {
         let scratch = Scratch::new("lock");
         let path = scratch.0.join("l.lock");
         {
-            let _held = Lock::acquire(path.clone());
+            let _held = Lock::acquire(path.clone()).unwrap();
             assert!(path.exists(), "the lock file is the lock");
         }
         assert!(!path.exists(), "and it is gone once dropped");
+    }
+
+    /// A lock a session left as it crashed, not yet stale when the next wrap
+    /// arrives. That wrap waits it out and breaks it; it used to give up after
+    /// five seconds, and a wrap started within half a minute of a crash
+    /// refused to run.
+    #[test]
+    fn a_crashed_sessions_fresh_lock_is_waited_out_not_reported() {
+        let scratch = Scratch::new("crashed-lock");
+        std::fs::create_dir_all(&scratch.0).unwrap();
+        let path = scratch.0.join("l.lock");
+        let file = std::fs::File::create(&path).unwrap();
+        let almost_stale =
+            std::time::SystemTime::now() - (LOCK_STALE_AFTER - Duration::from_secs(1));
+        file.set_modified(almost_stale).unwrap();
+        drop(file);
+        let begun = std::time::Instant::now();
+        let held = Lock::acquire(path.clone()).expect("the dead lock is broken");
+        assert!(begun.elapsed() < LOCK_WAIT, "{:?}", begun.elapsed());
+        drop(held);
+        assert!(!path.exists());
+    }
+
+    /// A stale lock that cannot be removed -- on Windows, one another process
+    /// holds open without delete sharing; here, a directory -- is reported
+    /// once the wait is up. It used to be retried at once, past the deadline
+    /// check, for ever.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_lock_that_cannot_be_removed_times_out_instead_of_spinning() {
+        let scratch = Scratch::new("stuck-lock");
+        let path = scratch.0.join("l.lock");
+        std::fs::create_dir_all(path.join("inside")).unwrap();
+        let old = std::time::SystemTime::now() - 2 * LOCK_STALE_AFTER;
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let begun = std::time::Instant::now();
+        let result = Lock::acquire_within(path.clone(), Duration::from_millis(300));
+        assert!(result.is_err(), "a lock that cannot be broken is not taken");
+        assert!(
+            begun.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            begun.elapsed()
+        );
+        assert!(path.exists(), "and nothing was removed");
     }
 }

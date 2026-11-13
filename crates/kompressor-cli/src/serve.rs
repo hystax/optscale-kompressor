@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
@@ -229,8 +230,24 @@ pub async fn run_stdio(config: Config) -> CliResult {
     result
 }
 
-/// Bind and serve until interrupted.
-pub async fn run(config: Config, surfaces: Surfaces, listen: Option<String>) -> CliResult {
+/// How a supervising `kompressor wrap` may stop this process, beyond signals.
+#[derive(Default)]
+pub struct Supervision {
+    /// Stop when [`STOP_LINE`] arrives on standard input.
+    pub stop_on_stdin: bool,
+    /// After standard input closes, stop once no live client marker is left in
+    /// this directory.
+    pub stop_when_unused: Option<PathBuf>,
+}
+
+/// Bind and serve until interrupted, or until the supervisor asks it to stop
+/// (see [`Supervision`]).
+pub async fn run(
+    config: Config,
+    surfaces: Surfaces,
+    listen: Option<String>,
+    supervision: Supervision,
+) -> CliResult {
     init_logging(&config.log);
     let listen = listen.unwrap_or_else(|| config.server.listen.clone());
     let grace = config.server.shutdown_grace;
@@ -321,7 +338,7 @@ pub async fn run(config: Config, surfaces: Surfaces, listen: Option<String>) -> 
     let upkeep = maintenance(core.clone(), shutdown_rx);
     let mut serve_error = None;
     tokio::select! {
-        _ = shutdown_signal() => {},
+        _ = shutdown_signal(supervision) => {},
         result = servers.join_next() => {
             serve_error = Some(format!("listener stopped unexpectedly: {result:?}"));
         }
@@ -388,27 +405,188 @@ fn listener_groups(
     groups
 }
 
-async fn shutdown_signal() {
+/// The line `kompressor wrap` writes to a supervised proxy's standard input to
+/// stop it. See [`stdin_stop`].
+pub const STOP_LINE: &str = "stop";
+
+async fn shutdown_signal(supervision: Supervision) {
     let interrupt = async {
         tokio::signal::ctrl_c()
             .await
             .expect("ctrl-c handler installs");
     };
-    #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut sig) => {
-                sig.recv().await;
-            }
-            Err(_) => std::future::pending::<()>().await,
+    let requested = async {
+        if supervision.stop_on_stdin {
+            stdin_stop(supervision.stop_when_unused).await;
+        } else {
+            std::future::pending::<()>().await;
         }
     };
-    #[cfg(not(unix))]
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        let Ok(mut term) = signal(SignalKind::terminate()) else {
+            return std::future::pending::<()>().await;
+        };
+        // The terminal closing. Not under `nohup`, which ignores it so the
+        // proxy outlives the terminal: a handler of ours would undo that.
+        let mut hup = if hangup_ignored() {
+            None
+        } else {
+            signal(SignalKind::hangup()).ok()
+        };
+        let hangup = async {
+            match &mut hup {
+                Some(hup) => {
+                    hup.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = hangup => {}
+        }
+    };
+    // Ctrl-Break, the console window closing, and the system shutting down —
+    // which a service hears too. Not logoff: a service hears that whenever
+    // anyone logs off. While these listen, tokio holds the process for the few
+    // seconds Windows allows, which the statistics drain runs in.
+    #[cfg(windows)]
+    let terminate = async {
+        use tokio::signal::windows::{ctrl_break, ctrl_close, ctrl_shutdown};
+        let (Ok(mut brk), Ok(mut close), Ok(mut shutdown)) =
+            (ctrl_break(), ctrl_close(), ctrl_shutdown())
+        else {
+            return std::future::pending::<()>().await;
+        };
+        tokio::select! {
+            _ = brk.recv() => {}
+            _ = close.recv() => {}
+            _ = shutdown.recv() => {}
+        }
+    };
+    #[cfg(not(any(unix, windows)))]
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
         _ = interrupt => {}
         _ = terminate => {}
+        _ = requested => {}
+    }
+}
+
+/// Whether SIGHUP was ignored when this process started, as `nohup` leaves it.
+///
+/// Read from `/proc`, so Linux only. Elsewhere it counts as ignored, which
+/// keeps the platform's default rather than guessing.
+#[cfg(unix)]
+fn hangup_ignored() -> bool {
+    std::fs::read_to_string("/proc/self/status").map_or(true, |status| hangup_ignored_in(&status))
+}
+
+/// [`hangup_ignored`] for a given `/proc/<pid>/status`: bit 0 of `SigIgn` is
+/// SIGHUP, signal 1.
+#[cfg(unix)]
+fn hangup_ignored_in(status: &str) -> bool {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("SigIgn:"))
+        .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+        .is_none_or(|mask| mask & 1 != 0)
+}
+
+/// Is this line from the supervisor a request to stop?
+///
+/// Read as bytes, not as `str` lines: a line that is not UTF-8 is not a stop,
+/// but it must not end the listener either, or every later `stop` is lost.
+/// A leading byte-order mark is ignored. A .NET supervisor's
+/// `Process.StandardInput` writes one when the console encoding is UTF-8, and
+/// `str::trim` does not remove U+FEFF, so `\u{feff}stop` used to leave the
+/// proxy running for good.
+fn is_stop_line(line: &[u8]) -> bool {
+    let line = line.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(line);
+    std::str::from_utf8(line).is_ok_and(|text| text.trim() == STOP_LINE)
+}
+
+/// Resolve when the supervising `kompressor wrap` writes [`STOP_LINE`].
+///
+/// This is how a wrap session stops the proxy it started, on every platform:
+/// Windows has no SIGTERM, there is no admin endpoint, and a pipe only the
+/// parent holds is a stop button nothing else can press.
+///
+/// End of input is *not* a request to stop. It is the supervisor exiting while
+/// other wrap sessions still use this proxy, or being killed, and taking the
+/// proxy down then would cut the others off mid-turn. Without `unused` it
+/// leaves this pending for ever. With it, the proxy has no owner left, so it
+/// watches the client markers in that directory and stops once no live session
+/// remains: otherwise nothing would ever stop it, and on Windows it runs with
+/// no window until logoff.
+///
+/// Read on a plain thread rather than through `tokio::io::stdin`, which reads
+/// on the blocking pool: a read still pending there holds up the runtime's
+/// shutdown after a Ctrl-C for as long as the supervisor keeps the pipe open.
+async fn stdin_stop(unused: Option<PathBuf>) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        let mut stdin = std::io::stdin().lock();
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match stdin.read_until(b'\n', &mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) if is_stop_line(&line) => {
+                    let _ = tx.send(());
+                    return;
+                }
+                Ok(_) => continue,
+            }
+        }
+    });
+    // The sender is dropped on end of input, which resolves this with an
+    // error. That is the case above, not a stop.
+    if rx.await.is_ok() {
+        return;
+    }
+    match unused {
+        Some(dir) => stop_when_unused(&dir).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// How often an orphaned proxy looks for live client markers.
+const UNUSED_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+/// How many polls in a row must find none before it stops. More than one,
+/// because a session that is starting registers its marker before it checks
+/// for a running proxy, and one empty look can fall between two sessions.
+const UNUSED_POLLS: u32 = 2;
+
+/// Resolve once no live session holds a marker in `dir`, for
+/// [`UNUSED_POLLS`] consecutive looks.
+async fn stop_when_unused(dir: &std::path::Path) {
+    let me = std::process::id();
+    tracing::info!(
+        clients = %dir.display(),
+        "the supervising wrap has gone; stopping once no session uses this proxy"
+    );
+    let mut empty = 0;
+    loop {
+        tokio::time::sleep(UNUSED_POLL).await;
+        let dir = dir.to_path_buf();
+        let live =
+            tokio::task::spawn_blocking(move || crate::wrap::proxy::live_clients_in(&dir, me))
+                .await
+                .unwrap_or(1);
+        if live > 0 {
+            empty = 0;
+            continue;
+        }
+        empty += 1;
+        if empty >= UNUSED_POLLS {
+            tracing::info!("no session uses this proxy any more; stopping");
+            return;
+        }
     }
 }
 
@@ -449,6 +627,29 @@ mod tests {
         config.refs.backend = RefsBackend::Memory;
         config.stats.enabled = false;
         config
+    }
+
+    #[test]
+    fn a_stop_line_is_recognised_with_any_line_ending_and_a_bom() {
+        for line in [
+            &b"stop"[..],
+            b"stop\n",
+            b"stop\r\n",
+            b"  stop  \r\n",
+            b"\xEF\xBB\xBFstop\r\n",
+        ] {
+            assert!(is_stop_line(line), "{line:?} is a stop");
+        }
+        for line in [
+            &b""[..],
+            b"\n",
+            b"stopp\n",
+            b"please stop\n",
+            b"\xFF\xFEs\x00t\x00o\x00p\x00\n",
+            b"\xEF\xBB\xBF\xEF\xBB\xBFstop\n",
+        ] {
+            assert!(!is_stop_line(line), "{line:?} is not a stop");
+        }
     }
 
     #[tokio::test]
@@ -687,5 +888,18 @@ mod tests {
     fn an_unparseable_listen_address_is_a_usage_error() {
         let err = "not:an:address".parse::<SocketAddr>();
         assert!(err.is_err());
+    }
+
+    /// `nohup` leaves SIGHUP ignored, and the proxy must then outlive the
+    /// terminal as asked rather than stop with it.
+    #[cfg(unix)]
+    #[test]
+    fn a_hangup_nohup_ignored_is_left_alone() {
+        let status = |ignored: &str| format!("Name:\tkompressor\nSigIgn:\t{ignored}\nSigCgt:\t0\n");
+        assert!(hangup_ignored_in(&status("0000000000000001")));
+        assert!(hangup_ignored_in(&status("0000000000001001")));
+        assert!(!hangup_ignored_in(&status("0000000000001000")));
+        // Unreadable counts as ignored: the default is kept, not guessed at.
+        assert!(hangup_ignored_in("Name:\tkompressor\n"));
     }
 }

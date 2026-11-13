@@ -1016,19 +1016,50 @@ impl Config {
         if local.is_file() {
             return Some(local);
         }
-        let xdg = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-            .map(|base| base.join("kompressor").join("config.toml"));
-        if let Some(xdg) = xdg
-            && xdg.is_file()
+        if let Some(user) = Self::user_config_in(|name| std::env::var_os(name))
+            && user.is_file()
         {
-            return Some(xdg);
+            return Some(user);
         }
         None
     }
 
-    /// Where a Linux package installs the system configuration.
+    /// The per-user configuration file for a given environment: under
+    /// `$XDG_CONFIG_HOME`, else `~/.config`.
+    ///
+    /// `~` is `HOME` on Unix and the user profile on Windows. PowerShell and cmd
+    /// do not set `HOME` at all, and reading only that meant the per-user file
+    /// was never found there: every command silently ran on the defaults —
+    /// relative `./data` stores in whatever directory it was started from —
+    /// while the same command in Git Bash, which does set `HOME`, read the
+    /// file. `~/.config` rather than `%APPDATA%` because it is the path every
+    /// document here names, and the macOS install already chose it over the
+    /// platform's own convention.
+    ///
+    /// An empty variable counts as unset, as the XDG specification says: an
+    /// empty `XDG_CONFIG_HOME` used to resolve to a *relative* `kompressor/`.
+    fn user_config_in(
+        env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> Option<std::path::PathBuf> {
+        let set = |name: &str| {
+            env(name)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        };
+        let home = || {
+            if cfg!(windows) {
+                set("USERPROFILE").or_else(|| set("HOME"))
+            } else {
+                set("HOME")
+            }
+        };
+        set("XDG_CONFIG_HOME")
+            .or_else(|| home().map(|home| home.join(".config")))
+            .map(|base| base.join("kompressor").join("config.toml"))
+    }
+
+    /// Where a package installs the system configuration: `/etc/kompressor` on
+    /// Linux, `%ProgramData%\kompressor` for the Windows service.
     ///
     /// Deliberately **not** part of [`Self::discover`]. Reading it there would
     /// make `kompressor compress` on a developer machine behave differently
@@ -1037,8 +1068,23 @@ impl Config {
     /// existed. Commands that are *about the running service* opt in instead;
     /// `kompressor stats` is the one that does.
     pub fn system_path() -> Option<std::path::PathBuf> {
-        let system = PathBuf::from("/etc/kompressor/config.toml");
+        let system = Self::system_path_in(|name| std::env::var_os(name))?;
         system.is_file().then_some(system)
+    }
+
+    /// [`Self::system_path`] for a given environment, before the existence check.
+    fn system_path_in(
+        env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> Option<std::path::PathBuf> {
+        if cfg!(windows) {
+            // Not `/etc/...`: without a drive letter that is `C:\etc`, which
+            // any local user may create.
+            env("ProgramData")
+                .filter(|value| !value.is_empty())
+                .map(|base| PathBuf::from(base).join("kompressor").join("config.toml"))
+        } else {
+            Some(PathBuf::from("/etc/kompressor/config.toml"))
+        }
     }
 
     pub fn load(path: Option<&std::path::Path>) -> Result<Config, ConfigError> {
@@ -1770,6 +1816,85 @@ mod tests {
                 config.proxy.min_tokens,
             ),
             before
+        );
+    }
+
+    /// An environment holding exactly `vars`, so the lookup can be tested
+    /// without `set_var`, which this crate's `forbid(unsafe_code)` rules out.
+    fn env_of(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name| vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.into())
+    }
+
+    #[test]
+    fn xdg_config_home_outranks_the_home_directory() {
+        let env = env_of(&[
+            ("XDG_CONFIG_HOME", "/xdg"),
+            ("HOME", "/home/u"),
+            ("USERPROFILE", "/profile"),
+        ]);
+        assert_eq!(
+            Config::user_config_in(env),
+            Some(PathBuf::from("/xdg/kompressor/config.toml"))
+        );
+    }
+
+    /// An empty `XDG_CONFIG_HOME` is unset, not a relative `kompressor/`.
+    #[test]
+    fn an_empty_xdg_config_home_is_ignored() {
+        let env = env_of(&[("XDG_CONFIG_HOME", ""), ("HOME", "/home/u")]);
+        let found = Config::user_config_in(env).expect("a home to fall back on");
+        assert!(found.is_absolute() || cfg!(windows), "{found:?}");
+        assert!(found.ends_with(".config/kompressor/config.toml"));
+    }
+
+    /// PowerShell and cmd leave `HOME` unset. Reading only `HOME`, the
+    /// per-user file was never found there.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_the_user_config_is_under_the_profile() {
+        let env = env_of(&[("USERPROFILE", r"C:\Users\u")]);
+        assert_eq!(
+            Config::user_config_in(env),
+            Some(PathBuf::from(r"C:\Users\u\.config\kompressor\config.toml"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_unix_the_user_config_is_under_home() {
+        let env = env_of(&[("HOME", "/home/u"), ("USERPROFILE", "/elsewhere")]);
+        assert_eq!(
+            Config::user_config_in(env),
+            Some(PathBuf::from("/home/u/.config/kompressor/config.toml"))
+        );
+    }
+
+    #[test]
+    fn with_no_home_at_all_there_is_no_user_config() {
+        assert_eq!(Config::user_config_in(env_of(&[])), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_system_config_is_under_program_data() {
+        let env = env_of(&[("ProgramData", r"C:\ProgramData")]);
+        assert_eq!(
+            Config::system_path_in(env),
+            Some(PathBuf::from(r"C:\ProgramData\kompressor\config.toml"))
+        );
+        assert_eq!(Config::system_path_in(env_of(&[])), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_unix_system_config_is_under_etc() {
+        assert_eq!(
+            Config::system_path_in(env_of(&[])),
+            Some(PathBuf::from("/etc/kompressor/config.toml"))
         );
     }
 

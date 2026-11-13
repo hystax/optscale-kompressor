@@ -134,6 +134,13 @@ test-cache-replay: ## Price a captured run through the proxy: make test-cache-re
 	KOMPRESSOR_REPLAY_BODIES="$(BODIES)" KOMPRESSOR_REPLAY_DETAIL=1 $(CARGO) test --release \
 	  -p kompressor-proxy --test cachesavings a_captured_run -- --nocapture
 
+.PHONY: replay-diff
+replay-diff: release ## Byte-compare upstream traffic of two binaries on a capture: make replay-diff BODIES=… BASE_BIN=…
+	@[ -n "$(BODIES)" ] && [ -n "$(BASE_BIN)" ] || { echo "set BODIES (a kompressor-bodies.jsonl) and BASE_BIN (the binary to compare against)" >&2; exit 2; }
+	python3 scripts/bench/replay-bodies.py --bin "$(BASE_BIN)" --capture "$(BODIES)" --out target/replay/base
+	python3 scripts/bench/replay-bodies.py --bin ./$(RELEASE_BIN) --capture "$(BODIES)" --out target/replay/head
+	python3 scripts/bench/replay-bodies.py --compare target/replay/base target/replay/head
+
 .PHONY: bench
 bench: release ## Replay the committed corpus and gate on the recorded baseline
 	./$(RELEASE_BIN) bench replay --corpus $(CORPUS) --compare $(BASELINE) --check-determinism
@@ -269,6 +276,25 @@ macos-pkg-docker: ## macOS .pkg built in a container, so the host needs only Doc
 	docker build -f scripts/build/Dockerfile.macos -t kompressor-macos-builder .
 	docker run --rm -u "$$(id -u):$$(id -g)" -e MACOS_ARCH=$(MACOS_ARCH) \
 		-v "$(CURDIR):/src" kompressor-macos-builder
+
+.PHONY: win-builder
+win-builder:
+	docker build -f scripts/build/Dockerfile.windows -t kompressor-windows-builder \
+		--build-arg WITH_JSIGN=$(if $(WIN_SIGN_CMD),1,0) scripts/build
+
+# Optional Authenticode signing, see scripts/build/windows-sign.sh. Passed by
+# name only, so secrets never appear on a command line; unset ones are skipped.
+WIN_SIGN_ENV := -e WIN_SIGN_CMD -e WIN_SIGN_PFX -e WIN_SIGN_PASSWORD -e WIN_SIGN_TSA
+
+.PHONY: win
+win: win-builder ## Windows x86_64 .exe built in a container (signed if WIN_SIGN_* is set)
+	docker run --rm -u "$$(id -u):$$(id -g)" -v "$(CURDIR):/src" $(WIN_SIGN_ENV) \
+		kompressor-windows-builder ./scripts/build/windows.sh exe
+
+.PHONY: win-installer
+win-installer: win-builder ## Windows installer (setup .exe), built in the same container
+	docker run --rm -u "$$(id -u):$$(id -g)" -v "$(CURDIR):/src" $(WIN_SIGN_ENV) \
+		kompressor-windows-builder ./scripts/build/windows.sh installer
 
 .PHONY: docker
 docker: ## Container image from the static binary

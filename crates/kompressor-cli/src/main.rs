@@ -151,6 +151,15 @@ struct ServeCmd {
     /// Serve the LLM reverse proxy.
     #[arg(long)]
     proxy: bool,
+    /// Stop when a `stop` line arrives on standard input. Passed by
+    /// `kompressor wrap`, which holds the other end of the pipe.
+    #[arg(long, hide = true)]
+    stop_on_stdin: bool,
+    /// Once standard input closes, stop as soon as no live client marker is
+    /// left in this directory. Passed by `kompressor wrap` with
+    /// `--stop-on-stdin`, so a proxy whose owner is gone does not run for ever.
+    #[arg(long, hide = true, value_name = "DIR", requires = "stop_on_stdin")]
+    stop_when_unused: Option<std::path::PathBuf>,
 }
 
 #[derive(Args)]
@@ -463,7 +472,15 @@ fn run(cli: Cli) -> CliResult {
                 .enable_all()
                 .build()
                 .map_err(|e| CliError::runtime("could not start the runtime", e))?;
-            runtime.block_on(serve::run(config, surfaces, args.listen))
+            runtime.block_on(serve::run(
+                config,
+                surfaces,
+                args.listen,
+                serve::Supervision {
+                    stop_on_stdin: args.stop_on_stdin,
+                    stop_when_unused: args.stop_when_unused,
+                },
+            ))
         }
         Command::Mcp(McpCmd::Serve(args)) => {
             let config =

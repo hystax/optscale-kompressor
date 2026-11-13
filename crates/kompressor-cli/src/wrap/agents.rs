@@ -288,7 +288,7 @@ pub const AGENTS: &[Agent] = &[
     Agent {
         name: "codex",
         binary: "codex",
-        about: "OpenAI Codex CLI (OpenAI Responses), via its config file",
+        about: "OpenAI Codex CLI (OpenAI Responses), via a -c flag or its config file",
         // Deliberately empty. Codex ignores OPENAI_BASE_URL — measured on
         // 0.155.1, where a wrapped session sent every request straight to the
         // provider — and setting a variable nothing reads is how this command
@@ -300,9 +300,10 @@ pub const AGENTS: &[Agent] = &[
         mcp: None,
         wiring: Wiring::Launch,
         note: Some(
-            "codex is wrapped by editing its config file, not the environment: \
-             OPENAI_BASE_URL has no effect on it. The block is removed when this \
-             session exits; `kompressor unwrap codex` removes one left behind.",
+            "codex ignores OPENAI_BASE_URL, so it is pointed at the proxy with \
+             `-c openai_base_url` under a ChatGPT login, and with a block in its \
+             config file under an API key. That block is removed when this session \
+             exits; `kompressor unwrap codex` removes one left behind.",
         ),
     },
     Agent {

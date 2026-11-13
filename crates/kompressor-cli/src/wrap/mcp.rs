@@ -260,11 +260,12 @@ mod tests {
         assert!(pinned.ends_with("data/refs.db"));
 
         // An absolute path is the operator's decision and is passed through.
-        config.refs.path = PathBuf::from("/var/lib/kompressor/refs.db");
-        assert_eq!(
-            anchored(&config).unwrap().refs.path,
-            PathBuf::from("/var/lib/kompressor/refs.db")
-        );
+        // Built from the temp directory rather than written as
+        // `/var/lib/...`: that has no drive letter, so on Windows it is
+        // relative and gets anchored like any other.
+        let absolute = std::env::temp_dir().join("kompressor").join("refs.db");
+        config.refs.path = absolute.clone();
+        assert_eq!(anchored(&config).unwrap().refs.path, absolute);
     }
 
     #[test]

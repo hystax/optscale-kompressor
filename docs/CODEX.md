@@ -72,7 +72,12 @@ below still works and is still what the older recipe used.
 
 ## What the wrap writes
 
-`kompressor wrap codex` adds two marker-delimited blocks to
+Under a ChatGPT login, nothing: `wrap` passes `-c openai_base_url=…` on codex's
+command line instead, for the reason under
+[Using a ChatGPT subscription](#using-a-chatgpt-subscription). It does remove
+a block a killed session left in the file, unless a live session holds it.
+
+Under an API key, `kompressor wrap codex` adds two marker-delimited blocks to
 `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`) and removes them
 when the session exits:
 
@@ -94,7 +99,7 @@ supports_websockets = false
 # --- end kompressor wrap ---
 ```
 
-Four things about that are deliberate:
+Five things about that are deliberate:
 
 - **Two blocks, head and foot.** A bare TOML key belongs to the table that
   precedes it, so a top-level key appended after your `[model_providers.…]`
@@ -102,14 +107,15 @@ Four things about that are deliberate:
 - **The edit is textual, not a TOML round-trip.** Everything outside the
   markers is preserved byte for byte, including your comments and your
   ordering, which a parse-and-re-render could not promise.
-- **Both `model_provider` and `openai_base_url`.** They cover different
-  callers. `model_provider` selects our mount for an API-key session.
-  `openai_base_url` overrides the *built-in* provider, which is the one a
-  ChatGPT-subscription session uses regardless of `model_provider` — so
-  without it a subscriber bypasses the proxy entirely.
+- **Both `model_provider` and `openai_base_url`.** `model_provider` selects
+  our mount; `openai_base_url` points the *built-in* provider here too, so
+  nothing in the session reaches OpenAI past the proxy.
 - **A key you already set is a refusal, not an overwrite.** TOML rejects
   duplicate keys, so appending ours would not win the argument; it would stop
   codex reading the file at all. The wrap declines and names the key.
+- **`env_key` or `requires_openai_auth`.** For a key stored by
+  `codex login --with-api-key` the wrap writes `requires_openai_auth = true`
+  instead of `env_key`: each finds only its own kind of key (codex 0.164.0).
 
 If a session is killed before it can clean up, `kompressor unwrap codex`
 removes the blocks. Concurrent wraps are reference-counted: the last one out
@@ -129,11 +135,17 @@ is your call, not this document's.
 
 `kompressor wrap codex` handles this case too, and two things make it work.
 
-**The `openai_base_url` key.** Codex routes subscription traffic through its
-built-in `openai` provider regardless of `model_provider`, so the custom
-provider block alone would not catch it. The top-level override does. Measured:
-with that key alone and no provider block, codex sent `POST /v1/responses` to
-the configured port.
+**The `openai_base_url` key, as a flag.** Codex routes subscription traffic
+through its built-in `openai` provider regardless of `model_provider`, so the
+custom provider block alone would not catch it. The top-level override does.
+`wrap` passes it on codex's command line, `-c openai_base_url="http://…/v1"`,
+and does not touch `config.toml` for a ChatGPT login. That is not a matter of
+taste: measured on codex 0.164.0, the same key written into `config.toml` makes
+codex send an API key (`sk-…`) of its own in place of the plan's token, and
+api.openai.com refuses that key with `401 … Missing scopes:
+api.responses.write`. As a flag, codex keeps the plan's token and adds a
+`chatgpt-account-id` header. Leaving the file alone also keeps the Codex
+desktop app, which reads the same file, off the proxy.
 
 **An upstream that follows the credential.** A ChatGPT plan puts the same
 Responses body on a different host under a different prefix:
@@ -172,14 +184,21 @@ api_family = "passthrough"
 forward_auth = true
 ```
 
-> **One part of this is inferred rather than measured.** Every mechanism above
-> was confirmed end to end on codex 0.155.1 — the config keys, the routing, the
-> transport, the family detection, the removal. The *subscription credential
-> itself* was not: this machine has codex in API-key mode, and the OAuth flow
-> needs a browser. The claim that codex prefers its built-in provider under a
-> ChatGPT login comes from headroom's implementation notes, not from a
-> measurement here. If codex returns 401 through the proxy while a direct run
-> works, that is the assumption to doubt first.
+> **What a subscription request looks like.** Measured on codex 0.164.0 under a
+> ChatGPT login, given the flag: a WebSocket on `/v1/responses`, or
+> `POST /v1/responses`, carrying the plan's token (a JWT) and a
+> `chatgpt-account-id` header. The agent string is `codex-tui/…` in a terminal
+> (`codex_cli_rs/…` up to 0.162) and `codex_exec/…` for `codex exec`. The proxy
+> treats a request as a subscription when it carries that header, or a known
+> Codex agent string, and no API key.
+>
+> `401 … Missing scopes: api.responses.write` means a request reached
+> api.openai.com with an API key that may not use the Responses API. Either
+> codex was given `openai_base_url` in its config file under a ChatGPT login
+> (above) — the next `wrap codex` removes a block left by an older `wrap`, as
+> does `kompressor unwrap codex` —
+> or it is logged in with a restricted key: give that key write access to the
+> Responses API in the OpenAI dashboard, or use an unrestricted one.
 
 There is one cost you cannot avoid on this path. `openai_base_url` overrides
 the built-in provider's URL but cannot disable its WebSocket preference, and
@@ -189,8 +208,8 @@ goes through the provider block, does not.
 
 ## Permanent setup
 
-`kompressor wrap codex` is per-session: it edits the config, runs the agent and
-puts the file back. To leave compression on for every codex session, run
+`kompressor wrap codex` is per-session: it points codex at the proxy, runs it,
+and leaves nothing behind. To leave compression on for every codex session, run
 `kompressor serve` as a service and write the codex side once.
 
 Needs **OptScale Kompressor 0.3.0 or newer**. Earlier versions cannot read codex's
@@ -254,11 +273,21 @@ Check which you have:
 python3 -c "import json,pathlib;print(json.loads((pathlib.Path.home()/'.codex/auth.json').read_text()).get('auth_mode'))"
 ```
 
-**`chatgpt` (a ChatGPT plan).** One key, at the very top of
-`~/.codex/config.toml`, before any `[section]`:
+**`chatgpt` (a ChatGPT plan).** One key, given on codex's command line, not in
+`~/.codex/config.toml`: from codex 0.164.0 the key in the file makes codex send
+an API key instead of the plan's token, and every request fails with
+`401 … Missing scopes: api.responses.write` (see
+[Using a ChatGPT subscription](#using-a-chatgpt-subscription)). A shell alias
+does it for every session:
 
-```toml
-openai_base_url = "http://127.0.0.1:8817/v1"
+```bash
+alias codex='codex -c openai_base_url="http://127.0.0.1:8817/v1"'
+```
+
+or, in a PowerShell profile (`notepad $PROFILE`):
+
+```powershell
+function codex { codex.exe -c 'openai_base_url="http://127.0.0.1:8817/v1"' @args }
 ```
 
 That is the whole change, and the omissions are deliberate. Do **not** add
@@ -282,9 +311,10 @@ env_key = "OPENAI_API_KEY"
 supports_websockets = false
 ```
 
-The id cannot be `openai` — codex refuses to redefine a built-in provider. Do
-not add `requires_openai_auth`: on a custom provider it makes codex demand an
-OAuth login for local-proxy traffic.
+The id cannot be `openai` — codex refuses to redefine a built-in provider.
+For a key stored by `codex login --with-api-key`, use
+`requires_openai_auth = true` instead of `env_key`, which reads only the
+environment.
 
 ### 3. Keep it running
 
@@ -308,7 +338,7 @@ systemctl --user enable --now kompressor.service
 
 ### 4. Undoing it
 
-Delete the keys you added from `~/.codex/config.toml`. A block left behind by
+Delete the keys you added from `~/.codex/config.toml`, or the alias. A block left behind by
 an interrupted `kompressor wrap` is removed by `kompressor unwrap codex`, which
 is safe to run whether or not one is there.
 
@@ -719,6 +749,7 @@ sequential. Ask it what matched, not what came last.
 | `404` from the proxy on non-model calls | Only the codex mount is configured | Add the `/backend-api` passthrough mount |
 | `Error loading config.toml: model_providers contains reserved built-in provider IDs` | Provider named `openai` | Rename it, e.g. `kproxy` |
 | Large payload remains uncompressed with `refs_emitted = 0` | Its elided fragment exceeds `max_ref_bytes` | Raise `engine.max_ref_bytes` if the store can hold it |
-| `401` through the proxy, works directly | Credential not reaching the upstream | `forward_auth = true` on the mount. Do not add `requires_openai_auth` — on a custom provider it makes codex demand an OAuth login |
+| `401` through the proxy, works directly | Credential not reaching the upstream | `forward_auth = true` on the mount |
+| `Missing environment variable: OPENAI_API_KEY` under an API-key login | The provider block has `env_key`, and the key is stored in `auth.json` | `requires_openai_auth = true` in place of `env_key`; `wrap` writes that itself |
 | `codex` will not start: duplicate key | `wrap` refused, or a block was left behind | `kompressor unwrap codex`, then remove your own `model_provider` / `openai_base_url` if you set one |
 | Blocks left in `config.toml` after a crash | The session could not clean up | `kompressor unwrap codex` |

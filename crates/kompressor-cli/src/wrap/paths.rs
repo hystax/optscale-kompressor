@@ -98,13 +98,98 @@ pub fn ensure_dir(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)
 }
 
+/// Files this process keeps locked for as long as it runs: see [`hold`].
+static HELD: std::sync::Mutex<Vec<(PathBuf, std::fs::File)>> = std::sync::Mutex::new(Vec::new());
+
+/// Lock `path`, creating it, and keep it locked until [`let_go`] or exit.
+///
+/// This is how a session proves to its peers that it is alive, on every
+/// platform: the operating system drops the lock when the process ends, however
+/// it ends — a closed window, `taskkill /F`, `SIGKILL`, a crash — and a reused
+/// pid cannot inherit it. A pid check could do neither outside Linux.
+///
+/// Holding the same path twice is a no-op. A peer checking on the file locks it
+/// for an instant, and deletes it if it got there before we did, so both are
+/// retried for a moment rather than reported.
+pub fn hold(path: &Path) -> std::io::Result<()> {
+    const ATTEMPTS: u32 = 20;
+    let mut held = HELD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if held.iter().any(|(p, _)| p == path) {
+        return Ok(());
+    }
+    for attempt in 1..=ATTEMPTS {
+        let opened = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path);
+        match opened.map(|file| (file.try_lock(), file)) {
+            // Still there under our lock: one a peer deleted meanwhile would be
+            // a lock no one can find.
+            Ok((Ok(()), file)) if path.exists() => {
+                held.push((path.to_path_buf(), file));
+                return Ok(());
+            }
+            Ok((Ok(()) | Err(std::fs::TryLockError::WouldBlock), _)) => {}
+            Ok((Err(std::fs::TryLockError::Error(error)), _)) => return Err(error),
+            // A file a peer is deleting cannot be opened until it is gone.
+            Err(error) if attempt == ATTEMPTS => return Err(error),
+            Err(_) => {}
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        format!("{} is held by another process", path.display()),
+    ))
+}
+
+/// Release a lock taken with [`hold`] and remove its file, while still locked
+/// as in [`reap_if_dead`], so no one can take it in between.
+pub fn let_go(path: &Path) {
+    let mut held = HELD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = std::fs::remove_file(path);
+    held.retain(|(p, _)| p != path);
+}
+
+/// Whether the process that [`hold`]s `path` is still running, removing the
+/// file if not: `Some(false)` for a file nobody holds any more, or none at
+/// all; `None` when it could not be checked, for the caller to fall back on
+/// the pid.
+///
+/// The file is removed while this still has it locked. Removed after, a
+/// session taking it in between would be left holding a deleted file, alive
+/// and invisible; this way [`hold`] either waits for the lock or finds the
+/// file gone and makes a new one.
+pub fn reap_if_dead(path: &Path) -> Option<bool> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(false),
+        Err(_) => return None,
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = std::fs::remove_file(path);
+            drop(file);
+            Some(false)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => Some(true),
+        Err(std::fs::TryLockError::Error(_)) => None,
+    }
+}
+
 /// A process identity that survives PID reuse.
 ///
-/// A bare PID is not enough: pids wrap around, and a marker left by a session
-/// killed yesterday can name a pid that belongs to something entirely unrelated
-/// today. Pairing it with the process's start time makes the record falsifiable
-/// — if the pid exists but started later than the marker claims, the marker is
-/// a corpse.
+/// The fallback for a record that names no lock: one written by a version
+/// before [`hold`], or where the lock could not be taken. A bare PID is not enough: pids wrap around, and a marker left by a
+/// session killed yesterday can name a pid that belongs to something entirely
+/// unrelated today. Pairing it with the process's start time makes the record
+/// falsifiable — if the pid exists but started later than the marker claims,
+/// the marker is a corpse.
 ///
 /// Read from `/proc`, which is Linux-specific. Elsewhere there is no start time
 /// and `is_alive` degrades to a pid check plus the staleness bound in
@@ -214,6 +299,28 @@ mod tests {
                 "a start time that does not match means the pid was reused"
             );
         }
+    }
+
+    #[test]
+    fn a_held_file_reads_alive_and_an_abandoned_one_dead() {
+        let dir = std::env::temp_dir().join(format!("kompressor-hold-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session");
+        assert_eq!(reap_if_dead(&path), Some(false), "no file, no holder");
+
+        hold(&path).unwrap();
+        hold(&path).unwrap(); // a second hold is a no-op, not a conflict
+        assert_eq!(reap_if_dead(&path), Some(true));
+        assert!(path.exists(), "a live holder's file is left alone");
+
+        let_go(&path);
+        assert!(!path.exists());
+
+        // What a killed session leaves: the file, with no one holding it.
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(reap_if_dead(&path), Some(false));
+        assert!(!path.exists(), "and it is cleared away");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
