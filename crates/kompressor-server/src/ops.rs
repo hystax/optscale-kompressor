@@ -58,7 +58,7 @@ async fn readyz(State(state): State<Arc<ServerState>>) -> Response {
     let store_ok = matches!(
         tokio::time::timeout(
             READY_TIMEOUT,
-            tokio::task::spawn_blocking(move || core.refs().stats()),
+            tokio::task::spawn_blocking(move || core.refs().ping()),
         )
         .await,
         Ok(Ok(Ok(_)))
@@ -98,9 +98,7 @@ async fn readyz(State(state): State<Arc<ServerState>>) -> Response {
 
 /// Prometheus exposition.
 async fn render_metrics(State(state): State<Arc<ServerState>>) -> Response {
-    let core = state.core.clone();
-    let store = tokio::task::spawn_blocking(move || core.refs().stats()).await;
-    if let Ok(Ok(store)) = store {
+    if let Some(store) = state.store_sample().await {
         crate::metrics::sample_gauges(
             store.live_refs,
             store.live_bytes,

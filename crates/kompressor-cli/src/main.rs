@@ -279,6 +279,24 @@ enum StatsReport {
     },
     /// The most recent fragment-store sample.
     Store,
+    /// What the provider billed and what its prompt cache saved, by model:
+    /// fresh input, cache reads, five-minute and one-hour writes, output, and
+    /// the input priced in input-equivalent tokens against an uncached
+    /// baseline. Keep-warm pings are counted apart.
+    Cache,
+    /// Why messages were left uncompressed, ranked by the tokens they hold,
+    /// and how each engine run ended (compressed, discarded, timed out...).
+    Skips,
+    /// One row per conversation: turns, pings, cache use, cost, engine credit
+    /// and retrieval debit.
+    Conversations {
+        /// Rows to print.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// cost, turns, saved (least net saving first) or recent.
+        #[arg(long, default_value = "cost", value_parser = ["cost", "turns", "saved", "recent"])]
+        sort: String,
+    },
     /// One self-contained HTML page: headline, trend, types, retrievals.
     ///
     /// Written to stdout, so `kompressor stats report > report.html`. No
@@ -402,6 +420,17 @@ fn run(cli: Cli) -> CliResult {
                     StatsReport::Retrievals => stats::Report::Retrievals,
                     StatsReport::Request { id } => stats::Report::Request { id },
                     StatsReport::Store => stats::Report::Store,
+                    StatsReport::Cache => stats::Report::Cache,
+                    StatsReport::Skips => stats::Report::Skips,
+                    StatsReport::Conversations { limit, sort } => stats::Report::Conversations {
+                        limit,
+                        order: match sort.as_str() {
+                            "turns" => kompressor_stats::breakdown::ConversationOrder::Turns,
+                            "saved" => kompressor_stats::breakdown::ConversationOrder::Saved,
+                            "recent" => kompressor_stats::breakdown::ConversationOrder::Recent,
+                            _ => kompressor_stats::breakdown::ConversationOrder::Cost,
+                        },
+                    },
                     StatsReport::Report { bucket } => stats::Report::Html { bucket },
                 },
                 stats_path: args.stats_path,

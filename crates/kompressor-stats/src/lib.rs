@@ -49,6 +49,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod breakdown;
 pub mod config;
 pub mod error;
 pub mod events;
