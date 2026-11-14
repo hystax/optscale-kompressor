@@ -2327,6 +2327,7 @@ kompressor unwrap AGENT
 kompressor serve        [--api] [--mcp] [--proxy] [--listen ADDR] [--config PATH]
 kompressor mcp serve    [--config PATH]
 kompressor compress     [FILE|-] [--mode M] [--role R] [--type T] [--config PATH] [--json] [--explain]
+                        [--show-output] [--color auto|always|never]
 kompressor detect       [FILE|-] [--role R] [--config PATH] [--json]
 kompressor retrieve     REF [--lines A:B | --pointer P | --grep RE] [--refs PATH] [--config PATH]
                         [--tenant T] [--json]
@@ -2360,6 +2361,23 @@ accounted-guard decision. It exists because every one of those is otherwise
 invisible: "why did this payload not compress" is the question an operator
 actually has, and without an answer the usual next step is to guess at a
 threshold.
+
+`--show-output` adds the compressed payload to standard error, one numbered
+line per output line, with the omission markers and their handles picked out
+and the rest read by the detector's verdict: JSON tokens, log levels, diff
+lines, `path:line:` search hits, and comments, strings and keywords in code and
+configuration. It needs no `--explain`, and with `--json` it is the only thing
+on standard error.
+
+Colour (`--color`, default `auto`) applies to standard error alone. `auto`
+colours a terminal unless `NO_COLOR` or `TERM=dumb` says otherwise, and honours
+`CLICOLOR_FORCE`. The report is the same text either way, with styles wrapped
+around parts of it and stripped again when colour is off, so a pipe sees
+exactly what it saw before colour existed. Standard output, and everything
+`--json` prints, is never coloured. Payload text shown on standard error —
+marker excerpts and every `--show-output` line — has its control characters
+replaced with visible stand-ins (`␛`, `␍`), so a payload cannot drive the
+terminal it is shown in; standard output still carries the payload verbatim.
 
 ### 14.1 `wrap`: running an agent behind the proxy
 

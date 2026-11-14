@@ -15,6 +15,7 @@ mod bench;
 mod compress;
 mod error;
 mod explain;
+mod highlight;
 mod input;
 mod report;
 mod retrieve;
@@ -187,6 +188,15 @@ struct CompressCmd {
     /// the compressed payload on standard output stays pipeable.
     #[arg(long)]
     explain: bool,
+    /// Also show the compressed payload on standard error, numbered and
+    /// highlighted: omission markers and their handles, plus JSON, log, diff,
+    /// search, code and config structure. Standard output is unchanged.
+    #[arg(long)]
+    show_output: bool,
+    /// Colour on standard error: auto (a terminal, unless NO_COLOR or
+    /// TERM=dumb), always or never. Standard output is never coloured.
+    #[arg(long, value_enum, default_value_t = highlight::ColorWhen::Auto)]
+    color: highlight::ColorWhen,
 }
 
 #[derive(Args)]
@@ -392,6 +402,8 @@ fn run(cli: Cli) -> CliResult {
             forced: args.forced_type,
             json: args.json,
             explain: args.explain,
+            show_output: args.show_output,
+            color: args.color,
         }),
         Command::Detect(args) => compress::detect(compress::DetectArgs {
             file: args.file,

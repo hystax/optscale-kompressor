@@ -229,6 +229,8 @@ kompressor-server = { path = "../kompressor-server" }
 kompressor-mcp = { path = "../kompressor-mcp" }
 kompressor-proxy = { path = "../kompressor-proxy", default-features = false }
 
+anstream = { workspace = true }
+anstyle = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
 reqwest = { workspace = true }

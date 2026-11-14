@@ -477,8 +477,12 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:8817     # Anthropic Messages: the ro
 ### One file, with an explanation
 
 ```bash
-kompressor compress build.log --explain
+kompressor compress build.log --explain --show-output
 ```
+
+`--explain` says why, `--show-output` shows the result with its omission markers
+highlighted; both go to standard error, coloured on a terminal, so the payload
+on standard output stays pipeable.
 
 Defaults are a working single-tenant setup: no config file, SQLite for fragments
 and statistics under `./data`, no authentication, `recoverable` mode. A config
