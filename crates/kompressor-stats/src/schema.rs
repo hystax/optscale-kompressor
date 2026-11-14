@@ -456,6 +456,18 @@ fn set_pragmas(conn: &Connection, read_only: bool) -> Result<(), StatsError> {
         conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
     }
     conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+    if read_only {
+        // Report queries sort and group whole windows (percentiles, per-request
+        // joins): keep those temporary B-trees in memory, give the page cache
+        // room for a day of rows, and map the file rather than copying pages
+        // through read(2). All three are per-connection settings and change
+        // nothing about the file.
+        conn.execute_batch(
+            "PRAGMA temp_store=MEMORY;
+             PRAGMA cache_size=-16384;
+             PRAGMA mmap_size=268435456;",
+        )?;
+    }
     Ok(())
 }
 

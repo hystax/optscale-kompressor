@@ -21,6 +21,7 @@ use kompressor_engine::refs::RefId;
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The default size cap on live fragments.
 pub const DEFAULT_MAX_BYTES: u64 = 1024 * 1024 * 1024;
@@ -82,7 +83,15 @@ SELECT fragment, kind, request_id, created_at, last_accessed, ttl_seconds, max_l
 FROM refs WHERE tenant = ?1 AND ref = ?2
 ";
 
-const SQL_DELETE_ONE: &str = "DELETE FROM refs WHERE tenant = ?1 AND ref = ?2";
+const SQL_DELETE_ONE: &str = "DELETE FROM refs WHERE tenant = ?1 AND ref = ?2 RETURNING bytes";
+
+/// The stored size of one row, read before an upsert so the byte counter can
+/// charge the difference rather than the whole fragment again.
+const SQL_BYTES_OF: &str = "SELECT bytes FROM refs WHERE tenant = ?1 AND ref = ?2";
+
+/// Every row's bytes, live or not: what [`SqliteRefStore`] seeds its byte
+/// counter from, and reconciles it against on each purge.
+const SQL_TOTAL_BYTES: &str = "SELECT coalesce(sum(bytes), 0) FROM refs";
 
 /// The liveness predicate is repeated in SQL rather than filtered in Rust so a
 /// touch cannot resurrect an entry the absolute cap already killed.
@@ -103,17 +112,24 @@ DELETE FROM refs WHERE (tenant, ref) IN (
 )
 ";
 
-const SQL_LIVE_BYTES: &str = "
-SELECT coalesce(sum(bytes), 0) FROM refs
-WHERE last_accessed + ttl_seconds >= ?1 AND created_at + max_lifetime >= ?1
+/// Total and live bytes in one pass: the cap is enforced against the live
+/// figure, and the total re-seeds the byte counter the scan was run to check.
+const SQL_CAP_BYTES: &str = "
+SELECT coalesce(sum(bytes), 0),
+       coalesce(sum(CASE WHEN last_accessed + ttl_seconds >= ?1
+                          AND created_at + max_lifetime >= ?1 THEN bytes ELSE 0 END), 0)
+FROM refs
 ";
+
+/// The cheapest statement that still proves the table is readable.
+const SQL_PING: &str = "SELECT count(*) FROM (SELECT 1 FROM refs LIMIT 1)";
 
 /// Eviction order is last access first, with the key as a tie-break: one
 /// compression stores its whole batch in the same second, and without the
 /// tie-break which member of that batch dies would vary run to run.
 ///
 /// **Live rows only, and that is load-bearing.** The byte cap is enforced
-/// against `SQL_LIVE_BYTES`, which excludes expired rows; an expired row among
+/// against the live half of `SQL_CAP_BYTES`, which excludes expired rows; an expired row among
 /// the candidates had its bytes subtracted from a total that never included
 /// them, so the loop stopped early and left the store over its cap. Measured:
 /// cap 100, one expired 100-byte row and two live 60-byte rows, eviction
@@ -166,6 +182,17 @@ pub struct SqliteRefStore {
     conn: Mutex<Connection>,
     clock: Clock,
     max_bytes: Option<u64>,
+    /// An upper bound on the bytes of every row, expired ones included,
+    /// maintained by this process's own writes and only changed while `conn`
+    /// is locked.
+    ///
+    /// It exists so a put does not have to sum the whole table to learn that
+    /// the store is nowhere near its cap: live bytes can never exceed stored
+    /// bytes, so a bound under the cap settles the question with no scan. The
+    /// exact scan still runs once the bound crosses the cap, and re-seeds it.
+    /// Another process writing the same file is not seen here; the purge pass
+    /// re-reads the true total, which bounds how long that can mislead.
+    stored_bytes: AtomicU64,
 }
 
 impl SqliteRefStore {
@@ -253,11 +280,22 @@ impl SqliteRefStore {
     ) -> Result<SqliteRefStore, StoreError> {
         configure(&conn)?;
         migrate(&conn)?;
+        let stored: i64 = conn.query_row(SQL_TOTAL_BYTES, [], |row| row.get(0))?;
         Ok(SqliteRefStore {
             conn: Mutex::new(conn),
             clock: options.clock,
             max_bytes: options.max_bytes,
+            stored_bytes: AtomicU64::new(stored.max(0) as u64),
         })
+    }
+
+    /// Take `bytes` off the stored-bytes bound, never below zero.
+    fn release(&self, bytes: i64) {
+        // Every caller holds the connection lock, which is what serialises
+        // writes to the bound, so a load and a store cannot interleave.
+        let held = self.stored_bytes.load(Ordering::Relaxed);
+        self.stored_bytes
+            .store(held.saturating_sub(bytes.max(0) as u64), Ordering::Relaxed);
     }
 
     /// Evict by last access until live bytes sit under 90% of the cap.
@@ -265,8 +303,17 @@ impl SqliteRefStore {
         let Some(cap) = self.max_bytes else {
             return Ok(());
         };
+        // Live bytes are a subset of stored bytes, so a bound under the cap
+        // answers without reading the table.
+        if self.stored_bytes.load(Ordering::Relaxed) <= cap {
+            return Ok(());
+        }
         let now = clamp_i64(now);
-        let live: i64 = conn.query_row(SQL_LIVE_BYTES, params![now], |row| row.get(0))?;
+        let (total, live): (i64, i64) = conn.query_row(SQL_CAP_BYTES, params![now], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        self.stored_bytes
+            .store(total.max(0) as u64, Ordering::Relaxed);
         let mut remaining = live.max(0) as u64;
         if remaining <= cap {
             return Ok(());
@@ -298,8 +345,11 @@ impl SqliteRefStore {
                     if remaining <= target {
                         break;
                     }
-                    delete.execute(params![tenant, id])?;
+                    delete
+                        .query_row(params![tenant, id], |row| row.get::<_, i64>(0))
+                        .optional()?;
                     remaining = remaining.saturating_sub(bytes.max(0) as u64);
+                    self.release(bytes);
                 }
             }
             tx.commit()?;
@@ -325,6 +375,7 @@ impl RefStore for SqliteRefStore {
         }
         let now = self.clock.now();
         let mut conn = self.conn.lock();
+        let mut added: i64 = 0;
         {
             // One transaction for the batch: a request's elisions become
             // retrievable together, and fsync cost is paid once rather than per
@@ -332,7 +383,16 @@ impl RefStore for SqliteRefStore {
             let tx = conn.transaction()?;
             {
                 let mut stmt = tx.prepare_cached(SQL_UPSERT)?;
+                let mut sized = tx.prepare_cached(SQL_BYTES_OF)?;
                 for (id, fragment) in refs {
+                    // A point read on the primary key: a re-store, which is
+                    // most of them on a long conversation, charges only the
+                    // difference (normally none) instead of the whole fragment.
+                    let previous: i64 = sized
+                        .query_row(params![tenant.as_str(), id.body()], |row| row.get(0))
+                        .optional()?
+                        .unwrap_or(0);
+                    added += fragment.len() as i64 - previous.max(0);
                     stmt.execute(params![
                         tenant.as_str(),
                         id.body(),
@@ -348,6 +408,12 @@ impl RefStore for SqliteRefStore {
                 }
             }
             tx.commit()?;
+        }
+        // Charged only after the commit: a batch that rolled back stored nothing.
+        if added >= 0 {
+            self.stored_bytes.fetch_add(added as u64, Ordering::Relaxed);
+        } else {
+            self.release(-added);
         }
         self.enforce_byte_cap(&mut conn, now)?;
         Ok(())
@@ -400,7 +466,14 @@ impl RefStore for SqliteRefStore {
         if is_expired(&record, max_lifetime, now) {
             let expired_at = expires_at(&record, max_lifetime);
             let mut stmt = conn.prepare_cached(SQL_DELETE_ONE)?;
-            stmt.execute(params![tenant.as_str(), id.body()])?;
+            if let Some(bytes) = stmt
+                .query_row(params![tenant.as_str(), id.body()], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .optional()?
+            {
+                self.release(bytes);
+            }
             return Ok(Lookup::Expired { expired_at });
         }
         if touch {
@@ -444,8 +517,21 @@ impl RefStore for SqliteRefStore {
                 break;
             }
         }
+        // The periodic sweep is where the bound is made exact again: it is off
+        // the request path, and it also picks up rows another process wrote or
+        // deleted.
+        let stored: i64 = conn.query_row(SQL_TOTAL_BYTES, [], |row| row.get(0))?;
+        self.stored_bytes
+            .store(stored.max(0) as u64, Ordering::Relaxed);
         self.enforce_byte_cap(&mut conn, now)?;
         Ok(removed)
+    }
+
+    fn ping(&self) -> Result<(), StoreError> {
+        let conn = self.conn.lock();
+        conn.prepare_cached(SQL_PING)?
+            .query_row([], |row| row.get::<_, i64>(0))?;
+        Ok(())
     }
 
     fn stats(&self) -> Result<StoreStats, StoreError> {
@@ -580,6 +666,98 @@ mod tests {
             live_bytes <= 100,
             "cap is 100 and eviction left {live_bytes} live bytes"
         );
+    }
+
+    fn stored(store: &SqliteRefStore) -> u64 {
+        store.stored_bytes.load(Ordering::Relaxed)
+    }
+
+    /// The bound charges a re-store the difference, not the whole fragment
+    /// again: on a long conversation every turn re-stores the same handles,
+    /// and a bound that grew with each turn would make the scan it exists to
+    /// skip run on every put.
+    #[test]
+    fn re_storing_a_fragment_does_not_grow_the_byte_bound() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteRefStore::open(dir.path().join("refs.db")).unwrap();
+        let tenant = Tenant::new("t");
+        let body = "x".repeat(100);
+        for _ in 0..10 {
+            store
+                .put_many(&tenant, &[(ref_for(&body), body.clone())], &meta())
+                .unwrap();
+        }
+        assert_eq!(stored(&store), 100);
+        assert!(store.ping().is_ok());
+    }
+
+    /// A reopened store seeds its bound from the file, so rows written by an
+    /// earlier run still count against the cap without a scan per put.
+    #[test]
+    fn a_reopened_store_still_enforces_the_cap_on_rows_it_did_not_write() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("refs.db");
+        let tenant = Tenant::new("t");
+        {
+            let store = SqliteRefStore::open_with(
+                &path,
+                SqliteOptions {
+                    clock: Clock::system(),
+                    max_bytes: None,
+                },
+            )
+            .unwrap();
+            for fill in ["a", "b", "c"] {
+                let body = fill.repeat(100);
+                store
+                    .put_many(&tenant, &[(ref_for(&body), body.clone())], &meta())
+                    .unwrap();
+            }
+        }
+        let store = SqliteRefStore::open_with(
+            &path,
+            SqliteOptions {
+                clock: Clock::system(),
+                max_bytes: Some(200),
+            },
+        )
+        .unwrap();
+        assert_eq!(stored(&store), 300);
+        let body = "d".repeat(10);
+        store
+            .put_many(&tenant, &[(ref_for(&body), body.clone())], &meta())
+            .unwrap();
+        let live = store.stats().unwrap().live_bytes;
+        assert!(live <= 180, "cap 200 evicts to 90%, left {live}");
+        assert_eq!(stored(&store), live, "the scan re-seeds the bound");
+    }
+
+    /// The purge pass makes the bound exact again, whatever drifted.
+    #[test]
+    fn a_purge_re_reads_the_true_total() {
+        let dir = TempDir::new().unwrap();
+        let clock = ManualClock::at(100);
+        let store = SqliteRefStore::open_with(
+            dir.path().join("refs.db"),
+            SqliteOptions {
+                clock: clock.clock(),
+                max_bytes: None,
+            },
+        )
+        .unwrap();
+        let tenant = Tenant::new("t");
+        let body = "x".repeat(50);
+        store
+            .put_many(
+                &tenant,
+                &[(ref_for(&body), body.clone())],
+                &meta().with_ttl(1),
+            )
+            .unwrap();
+        store.stored_bytes.store(10_000, Ordering::Relaxed);
+        clock.set(200);
+        assert_eq!(store.purge_expired(200).unwrap(), 1);
+        assert_eq!(stored(&store), 0);
     }
 
     #[test]

@@ -369,6 +369,10 @@ impl<S: RefStore> RefStore for CachedRefStore<S> {
         self.inner.purge_expired(now)
     }
 
+    fn ping(&self) -> Result<(), StoreError> {
+        self.inner.ping()
+    }
+
     fn stats(&self) -> Result<StoreStats, StoreError> {
         // Deliberately the inner store's numbers alone: the cache holds copies,
         // and counting them would double-count everything already written

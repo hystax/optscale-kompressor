@@ -28,6 +28,12 @@ pub enum Report {
         id: String,
     },
     Store,
+    Cache,
+    Skips,
+    Conversations {
+        limit: usize,
+        order: kompressor_stats::breakdown::ConversationOrder,
+    },
     /// One self-contained HTML page, to stdout.
     Html {
         bucket: Bucket,
@@ -530,6 +536,39 @@ pub fn stats(args: StatsArgs) -> CliResult {
             .map_err(|e| CliError::runtime("building the report", e))?;
             print!("{}", crate::report::render(&data));
         }
+        Report::Cache => {
+            let report = source
+                .only_local("cache")?
+                .cache_billing(tenant, from, to)
+                .map_err(|e| CliError::runtime("reading cache usage", e))?;
+            if args.json {
+                print_json(&report)?;
+            } else {
+                print_cache(&report);
+            }
+        }
+        Report::Skips => {
+            let report = source
+                .only_local("skips")?
+                .skips(tenant, from, to)
+                .map_err(|e| CliError::runtime("reading skip reasons", e))?;
+            if args.json {
+                print_json(&report)?;
+            } else {
+                print_skips(&report);
+            }
+        }
+        Report::Conversations { limit, order } => {
+            let report = source
+                .only_local("conversations")?
+                .conversations(tenant, from, to, order, limit)
+                .map_err(|e| CliError::runtime("reading conversations", e))?;
+            if args.json {
+                print_json(&report)?;
+            } else {
+                print_conversations(&report);
+            }
+        }
         Report::Store => {
             let sample = source
                 .only_local("store")?
@@ -560,6 +599,176 @@ pub fn stats(args: StatsArgs) -> CliResult {
         }
     }
     Ok(())
+}
+
+/// `stats cache` as a table. Cost is in input-equivalent tokens: what the
+/// input would have cost had every token been billed at the fresh price is the
+/// baseline, and "saved" is the cache's discount on it, writes included.
+fn print_cache(report: &kompressor_stats::breakdown::CacheBilling) {
+    use kompressor_stats::breakdown::Billed;
+    let header = || {
+        println!(
+            "{:<28} {:>7} {:>6} {:>13} {:>13} {:>11} {:>11} {:>11} {:>6} {:>14} {:>7}",
+            "model",
+            "reqs",
+            "pings",
+            "uncached",
+            "cache read",
+            "write 5m",
+            "write 1h",
+            "output",
+            "read%",
+            "cost (in-eq)",
+            "saved%"
+        );
+    };
+    let line = |name: &str, reqs: u64, pings: u64, b: &Billed| {
+        println!(
+            "{:<28} {:>7} {:>6} {:>13} {:>13} {:>11} {:>11} {:>11} {:>5.1}% {:>14.0} {:>6.1}%",
+            truncate(name, 28),
+            reqs,
+            pings,
+            b.uncached,
+            b.read,
+            b.write_5m,
+            b.write_1h,
+            b.output,
+            b.read_share * 100.0,
+            b.cost,
+            b.saved_share * 100.0
+        );
+    };
+    if report.models.is_empty() {
+        println!("no proxy requests in this window");
+        return;
+    }
+    header();
+    for model in &report.models {
+        let unnamed;
+        let name = if model.model.is_empty() {
+            unnamed = format!("(no model: {})", model.api_family);
+            unnamed.as_str()
+        } else {
+            model.model.as_str()
+        };
+        line(name, model.client_requests, 0, &model.clients);
+        if model.pings > 0 {
+            line("  keep-warm pings", 0, model.pings, &model.ping_usage);
+        }
+    }
+    let requests: u64 = report.models.iter().map(|m| m.client_requests).sum();
+    let pings: u64 = report.models.iter().map(|m| m.pings).sum();
+    line("total", requests, pings, &report.total);
+    println!(
+        "\nuncached baseline {:.0} input-equivalent tokens; the cache billed {:.0} ({:.1}% saved). \
+         Pings cost {:.0}.",
+        report.total.baseline,
+        report.total.cost,
+        report.total.saved_share * 100.0,
+        report.pings.cost
+    );
+}
+
+/// `stats skips` as a table.
+fn print_skips(report: &kompressor_stats::breakdown::SkipReport) {
+    println!("compressions        {}", report.compressions);
+    println!(
+        "messages            {} total, {} compressed, {} skipped ({} in the frozen prefix)",
+        report.messages_total,
+        report.messages_compressed,
+        report.messages_skipped,
+        report.frozen_messages
+    );
+    println!("skipped tokens      {}", report.skipped_tokens);
+    if !report.reasons.is_empty() {
+        println!(
+            "\n{:<28} {:>10} {:>14} {:>7}",
+            "reason", "messages", "tokens", "share"
+        );
+        for reason in &report.reasons {
+            println!(
+                "{:<28} {:>10} {:>14} {:>6.1}%",
+                truncate(&reason.reason, 28),
+                reason.messages,
+                reason.tokens,
+                reason.token_share * 100.0
+            );
+        }
+    }
+    if !report.outcomes.is_empty() {
+        println!(
+            "\n{:<28} {:>10} {:>14} {:>14}",
+            "outcome", "requests", "tokens in", "removed"
+        );
+        for outcome in &report.outcomes {
+            println!(
+                "{:<28} {:>10} {:>14} {:>14}",
+                truncate(&outcome.outcome, 28),
+                outcome.requests,
+                outcome.tokens_in,
+                outcome.saved
+            );
+        }
+    }
+}
+
+/// `stats conversations` as a table.
+fn print_conversations(report: &kompressor_stats::breakdown::ConversationReport) {
+    if report.conversations.is_empty() {
+        println!("no conversations in this window");
+        return;
+    }
+    println!(
+        "{:<16} {:<18} {:>8} {:>6} {:>5} {:>6} {:>14} {:>6} {:>7} {:>12} {:>10} {:>12}  model",
+        "conversation",
+        "started",
+        "minutes",
+        "turns",
+        "pings",
+        "errors",
+        "cost (in-eq)",
+        "read%",
+        "saved%",
+        "removed",
+        "retrieved",
+        "net"
+    );
+    for c in &report.conversations {
+        println!(
+            "{:<16} {:<18} {:>8.1} {:>6} {:>5} {:>6} {:>14.0} {:>5.1}% {:>6.1}% {:>12} {:>10} {:>12}  {}",
+            c.conversation,
+            crate::report::stamp(c.first_ms),
+            (c.last_ms - c.first_ms) as f64 / 60_000.0,
+            c.client_turns,
+            c.pings,
+            c.errors,
+            c.billed.cost,
+            c.billed.read_share * 100.0,
+            c.billed.saved_share * 100.0,
+            c.saved_gross,
+            c.retrieved_tokens,
+            c.saved_net,
+            c.models.join(", ")
+        );
+    }
+    if report.total > report.conversations.len() {
+        println!(
+            "... {} of {} conversations shown; --limit to see more",
+            report.conversations.len(),
+            report.total
+        );
+    }
+}
+
+/// `value` cut to `width` characters, marked when cut.
+fn truncate(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        value.to_string()
+    } else {
+        let mut cut: String = value.chars().take(width.saturating_sub(1)).collect();
+        cut.push('…');
+        cut
+    }
 }
 
 /// Parse a window bound.
