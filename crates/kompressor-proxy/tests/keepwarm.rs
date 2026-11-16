@@ -149,8 +149,21 @@ async fn a_turn_that_ended_is_not_kept_warm() {
 }
 
 #[tokio::test]
-async fn it_is_off_unless_asked_for() {
+async fn it_is_on_by_default() {
     let harness = Harness::with(|config| {
+        config.proxy.cache_keep_warm_interval = INTERVAL;
+    })
+    .await;
+    answering(&harness, "tool_use", 4000).await;
+    harness.post("/v1/messages", &conversation(1)).await;
+    tokio::time::sleep(INTERVAL + INTERVAL / 2).await;
+    assert_eq!(pings(&harness).await.len(), 1);
+}
+
+#[tokio::test]
+async fn it_can_be_turned_off() {
+    let harness = Harness::with(|config| {
+        config.proxy.cache_keep_warm = false;
         config.proxy.cache_keep_warm_interval = INTERVAL;
     })
     .await;
@@ -211,6 +224,7 @@ async fn a_one_hour_request_is_not_kept_warm() {
 #[tokio::test]
 async fn it_can_be_turned_on_for_anthropic_alone() {
     let harness = Harness::with(|config| {
+        config.proxy.cache_keep_warm = false;
         config.proxy.cache_keep_warm_interval = INTERVAL;
         config.proxy.providers.insert(
             "anthropic".into(),

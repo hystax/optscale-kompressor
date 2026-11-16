@@ -397,6 +397,15 @@ accounting guard refused the result:
 kompressor compress mystery.txt --explain
 ```
 
+Add `--show-output` to see the compressed payload itself on standard error,
+numbered, with every omission marker and its handle highlighted. Colour goes to
+standard error only, when it is a terminal (`--color always|never` to choose);
+the payload on standard output is never touched:
+
+```bash
+kompressor compress mystery.txt --explain --show-output
+```
+
 Fetch a fragment back without a server, narrowing it so you pay for what you
 need rather than the whole thing:
 

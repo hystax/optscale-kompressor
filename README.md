@@ -396,12 +396,12 @@ installed service, and otherwise starts one with the first config it finds:
 not from the command. The packaged configuration (`/etc/kompressor/config.toml`
 on Linux, `~/.config/kompressor/config.toml` on macOS) turns on tail-only
 compression and the adaptive one-hour TTL under `[proxy.providers.anthropic]`.
-Keep-warm is off everywhere until you turn it on, because it is the one thing
-the proxy sends that no client asked for:
+Keep-warm is on by default for Anthropic traffic. It is the one thing the
+proxy sends that no client asked for, so to turn it off:
 
 ```toml
 [proxy.providers.anthropic]
-cache_keep_warm = true
+cache_keep_warm = false
 ```
 
 With no config file at all, Claude Code traffic runs on the deployment defaults,
@@ -480,8 +480,12 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:8817     # Anthropic Messages: the ro
 ### One file, with an explanation
 
 ```bash
-kompressor compress build.log --explain
+kompressor compress build.log --explain --show-output
 ```
+
+`--explain` says why, `--show-output` shows the result with its omission markers
+highlighted; both go to standard error, coloured on a terminal, so the payload
+on standard output stays pipeable.
 
 Defaults are a working single-tenant setup: no config file, SQLite for fragments
 and statistics under `./data`, no authentication, `recoverable` mode. A config

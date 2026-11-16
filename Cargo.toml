@@ -106,6 +106,10 @@ rusqlite = { version = "0.42", features = ["bundled"] }
 
 # --- cli / config ---
 clap = { version = "4", features = ["derive", "env"] }
+# Colour on standard error for `compress --explain`. Both already come in with
+# clap's own coloured help, so naming them adds no crate to the build.
+anstream = "1"
+anstyle = "1"
 toml = "1"
 humantime-serde = "1"
 

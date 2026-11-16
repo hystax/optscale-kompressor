@@ -284,6 +284,151 @@ fn explain_in_json_carries_the_same_report_as_one_field() {
     assert!(!value["explain"]["markers"].as_array().unwrap().is_empty());
 }
 
+/// Standard output and standard error of one `compress` run.
+fn compress_streams(args: &[&str], stdin: &str) -> (Vec<u8>, String) {
+    let assert = kompressor()
+        .env_remove("NO_COLOR")
+        .env_remove("CLICOLOR")
+        .env_remove("CLICOLOR_FORCE")
+        .arg("compress")
+        .args(args)
+        .write_stdin(stdin.to_string())
+        .assert()
+        .success();
+    let output = assert.get_output();
+    (
+        output.stdout.clone(),
+        String::from_utf8(output.stderr.clone()).unwrap(),
+    )
+}
+
+/// `text` without its SGR colour sequences.
+fn strip_sgr(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            for d in chars.by_ref() {
+                if d == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[test]
+fn colour_never_touches_standard_output() {
+    let payload = varying_log();
+    let (plain, _) = compress_streams(&[], &payload);
+    for args in [
+        &["--explain"][..],
+        &["--explain", "--color", "always"],
+        &["--show-output", "--color", "always"],
+        &["--explain", "--show-output", "--color", "always"],
+        &["--explain", "--show-output", "--color", "never"],
+    ] {
+        let (stdout, _) = compress_streams(args, &payload);
+        assert_eq!(stdout, plain, "standard output changed under {args:?}");
+    }
+}
+
+#[test]
+fn a_coloured_report_is_the_plain_report_with_colour_added() {
+    let payload = varying_log();
+    let (_, plain) = compress_streams(&["--explain", "--color", "never"], &payload);
+    let (_, coloured) = compress_streams(&["--explain", "--color", "always"], &payload);
+    let (_, auto) = compress_streams(&["--explain"], &payload);
+    assert!(
+        !plain.contains('\u{1b}'),
+        "never means no escapes: {plain:?}"
+    );
+    assert!(coloured.contains("\u{1b}["), "always means colour");
+    assert_eq!(strip_sgr(&coloured), plain);
+    assert_eq!(
+        auto, plain,
+        "auto on a pipe is plain, so existing scripts see what they always saw"
+    );
+}
+
+#[test]
+fn auto_colour_follows_clicolor_force_and_json_is_never_coloured() {
+    let payload = varying_log();
+    let forced = kompressor()
+        .env_remove("NO_COLOR")
+        .env("CLICOLOR_FORCE", "1")
+        .args(["compress", "--explain"])
+        .write_stdin(payload.clone())
+        .assert()
+        .success();
+    let stderr = String::from_utf8(forced.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("\u{1b}["), "auto honours CLICOLOR_FORCE");
+
+    let (stdout, stderr) = compress_streams(
+        &["--json", "--explain", "--show-output", "--color", "always"],
+        &payload,
+    );
+    assert!(
+        !stdout.contains(&0x1b),
+        "JSON on standard output stays plain"
+    );
+    let value: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(value["explain"]["strategy"], "log");
+    assert!(
+        strip_sgr(&stderr).starts_with("output       "),
+        "with --json the view alone goes to standard error: {stderr}"
+    );
+}
+
+#[test]
+fn show_output_numbers_the_payload_and_picks_out_markers() {
+    let payload = varying_log();
+    let (stdout, stderr) = compress_streams(&["--show-output", "--color", "always"], &payload);
+    let output = String::from_utf8(stdout).unwrap();
+    let view = strip_sgr(&stderr);
+    let mut lines = view.lines();
+    assert!(
+        lines.next().unwrap().contains("read as log"),
+        "the detector's verdict picks the reading: {view}"
+    );
+    let shown: Vec<String> = lines
+        .map(|l| l.split_once(" │ ").map_or("", |(_, t)| t).to_string())
+        .collect();
+    let expected: Vec<&str> = output.trim_end_matches('\n').split('\n').collect();
+    assert_eq!(shown, expected, "each view line is the payload's line");
+    // Bold yellow opens every marker span.
+    assert!(
+        stderr.contains("\u{1b}[1m\u{1b}[33m["),
+        "markers are highlighted: {stderr:?}"
+    );
+
+    let json =
+        r#"[{"id": 1, "name": "alpha", "ok": true}, {"id": 2, "name": "beta", "ok": false}]"#;
+    let (_, stderr) = compress_streams(
+        &["--show-output", "--type", "json", "--color", "always"],
+        json,
+    );
+    assert!(strip_sgr(&stderr).contains("read as json"));
+}
+
+#[test]
+fn a_payload_cannot_send_its_own_escapes_to_the_terminal() {
+    // Under the size gate, so it passes through untouched.
+    let payload = "title\u{1b}]0;pwned\u{7}\nclear\u{1b}[2J";
+    let (stdout, stderr) = compress_streams(&["--show-output", "--color", "never"], payload);
+    assert_eq!(
+        stdout,
+        payload.as_bytes(),
+        "standard output is the payload, verbatim"
+    );
+    assert!(!stderr.contains('\u{1b}'), "{stderr:?}");
+    assert!(stderr.contains("title␛]0;pwned␇"));
+    assert!(stderr.contains("clear␛[2J"));
+}
+
 #[test]
 fn check_config_accepts_the_built_in_defaults_and_prints_them_back() {
     kompressor()

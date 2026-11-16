@@ -1292,6 +1292,8 @@ dependencies = [
 name = "kompressor-cli"
 version = "2.1.3"
 dependencies = [
+ "anstream",
+ "anstyle",
  "assert_cmd",
  "axum",
  "clap",
