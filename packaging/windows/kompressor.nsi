@@ -1,16 +1,18 @@
 ; kompressor Windows installer, built by scripts/build/windows.sh with makensis.
 ;
 ; Two modes, chosen on the first page:
-;   * for the current user (default): kompressor.exe in
+;   * for the current user: kompressor.exe in
 ;     %LOCALAPPDATA%\Programs\kompressor and on the user's PATH; HKCU only, no
 ;     elevation, no config, nothing started;
-;   * as a system service: Program Files, the system PATH, HKLM, a default
-;     config in %ProgramData%\kompressor and an automatic service (WinSW runs
-;     `kompressor serve`). Needs elevation: the installer restarts itself
-;     through UAC with /SYSTEM. Always Program Files (/D= is ignored), so
-;     users cannot replace what the service runs.
+;   * as a system service (default, the box is ticked): Program Files, the
+;     system PATH, HKLM, a default config in %ProgramData%\kompressor and an
+;     automatic service (WinSW runs `kompressor serve`). Needs elevation:
+;     the installer restarts itself through UAC with /SYSTEM. Always Program
+;     Files (/D= is ignored), so users cannot replace what the service runs.
+;     Unticking the box gives the user mode.
 ; An existing install keeps its mode; switching means uninstalling first.
-; Silent: /S for the user mode, /S /SYSTEM from an elevated prompt for the service.
+; Silent: /S for the user mode (a silent install never asks for elevation),
+; /S /SYSTEM from an elevated prompt for the service.
 ;
 ; Defines: VERSION, VERSION_NUM (numeric part), EXE, WINSW, ROOT, LICENSE and
 ; GUIDE (CRLF copies), OUTFILE; SIGN when signing. Build-time paths use forward
@@ -281,10 +283,11 @@ Function ModePage
     ${If} $0 == error
         Abort
     ${EndIf}
-    ${NSD_CreateLabel} 0 0 100% 30u "By default kompressor is installed for you only, in your AppData folder, without administrator rights, and you run it yourself from PowerShell."
+    ${NSD_CreateLabel} 0 0 100% 30u "By default kompressor is installed as a system service. Untick the box to install it for you only, in your AppData folder, without administrator rights; then you run it yourself from PowerShell."
     Pop $0
     ${NSD_CreateCheckbox} 0 40u 100% 12u "Install as a system service (all users, starts with Windows)"
     Pop $CheckSystem
+    ${NSD_Check} $CheckSystem
     ${NSD_CreateLabel} 12u 56u 100% 36u "Installs into Program Files, writes a default configuration to ProgramData and registers the OptScale Kompressor service. Asks for administrator rights."
     Pop $0
     nsDialogs::Show
