@@ -396,12 +396,12 @@ installed service, and otherwise starts one with the first config it finds:
 not from the command. The packaged configuration (`/etc/kompressor/config.toml`
 on Linux, `~/.config/kompressor/config.toml` on macOS) turns on tail-only
 compression and the adaptive one-hour TTL under `[proxy.providers.anthropic]`.
-Keep-warm is off everywhere until you turn it on, because it is the one thing
-the proxy sends that no client asked for:
+Keep-warm is on by default for Anthropic traffic. It is the one thing the
+proxy sends that no client asked for, so to turn it off:
 
 ```toml
 [proxy.providers.anthropic]
-cache_keep_warm = true
+cache_keep_warm = false
 ```
 
 With no config file at all, Claude Code traffic runs on the deployment defaults,
