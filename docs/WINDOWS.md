@@ -14,10 +14,10 @@ anyway**.
 
 The first page asks how to install:
 
-* **For you only** (the default), with no administrator rights:
+* **For you only** (untick the system service box), with no administrator rights:
   `%LOCALAPPDATA%\Programs\kompressor`, on your `PATH`. Nothing is started; you
   run it yourself.
-* **As a system service**, with administrator rights: `C:\Program Files\kompressor`,
+* **As a system service** (the default), with administrator rights: `C:\Program Files\kompressor`,
   on the system `PATH`, configured in `%ProgramData%\kompressor\config.toml`,
   and started now and with Windows. See [The service](#the-service).
 
