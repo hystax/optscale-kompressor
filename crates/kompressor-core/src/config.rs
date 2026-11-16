@@ -461,7 +461,9 @@ pub struct ProxyConfig {
     /// it, and the field is not added again for that upstream and model.
     pub prompt_cache_retention: PromptCacheRetention,
     /// Keep an Anthropic conversation's cached prefix alive while the client
-    /// is busy running a tool. **Off by default.**
+    /// is busy running a tool. **On by default**; only Anthropic Messages
+    /// traffic is ever pinged, so this is in effect Anthropic's default, and
+    /// `false` here or under `[proxy.providers.anthropic]` turns it off.
     ///
     /// An agent that waits on a long build or test run outlives the provider's
     /// five-minute cache entry, and its next request writes the whole
@@ -521,8 +523,11 @@ pub struct ProxyConfig {
     /// 43 and 60 minutes outran four pings and re-wrote 97,535 tokens at the
     /// one-hour price, about $0.76, where the pings to bridge them would have
     /// cost about $0.12; trailing pings after a conversation's last request
-    /// came to $0.03–$0.11 a run across the three final runs. Now the same 11
-    /// as [`Self::cache_keep_warm_max_pings`], which also caps it.
+    /// came to $0.03–$0.11 a run across the three final runs. It ships at 4
+    /// again (about 20 minutes) with keep-warm on by default, so a deployment
+    /// that never chose the feature does not leave conversations that have
+    /// ended pinging for 50 minutes; [`Self::cache_keep_warm_max_pings`] also
+    /// caps it.
     pub cache_keep_warm_background_pings: u32,
     /// How many retrieve rounds may be **answered** in one request.
     ///
@@ -875,10 +880,10 @@ impl Default for ProxyConfig {
             frozen_prefix: FrozenPrefix::Marker,
             cache_ttl: CacheTtl::Default,
             prompt_cache_retention: PromptCacheRetention::Default,
-            cache_keep_warm: false,
+            cache_keep_warm: true,
             cache_keep_warm_interval: Duration::from_secs(270),
             cache_keep_warm_max_pings: 11,
-            cache_keep_warm_background_pings: 11,
+            cache_keep_warm_background_pings: 4,
             retrieve_execution: RetrieveExecution::Server,
             retrieve_max_rounds: 3,
             retrieve_max_tokens_per_request: 16_384,
@@ -1974,8 +1979,16 @@ mod tests {
     }
 
     #[test]
-    fn keep_warm_is_off_by_default_and_reachable_from_the_environment() {
+    fn keep_warm_is_on_by_default_and_reachable_from_the_environment() {
         let mut config = Config::default();
+        assert!(config.proxy.cache_keep_warm);
+        assert_eq!(
+            config.proxy.cache_keep_warm_interval,
+            Duration::from_secs(270)
+        );
+        assert_eq!(config.proxy.cache_keep_warm_max_pings, 11);
+        assert_eq!(config.proxy.cache_keep_warm_background_pings, 4);
+        config.apply_env(&[("KOMPRESSOR__PROXY__CACHE_KEEP_WARM".into(), "false".into())]);
         assert!(!config.proxy.cache_keep_warm);
         config.apply_env(&[
             ("KOMPRESSOR__PROXY__CACHE_KEEP_WARM".into(), "true".into()),
@@ -1994,7 +2007,7 @@ mod tests {
             Duration::from_secs(240)
         );
         assert_eq!(config.proxy.cache_keep_warm_max_pings, 5);
-        assert_eq!(config.proxy.cache_keep_warm_background_pings, 11);
+        assert_eq!(config.proxy.cache_keep_warm_background_pings, 4);
         config.apply_env(&[(
             "KOMPRESSOR__PROXY__CACHE_KEEP_WARM_BACKGROUND_PINGS".into(),
             "0".into(),
