@@ -82,6 +82,17 @@ svg.chart text { fill: var(--muted); font-size: 11px; }
 svg.chart .axis { stroke: var(--line); }
 .bar { display: inline-block; height: 8px; background: var(--accent); border-radius: 2px; vertical-align: middle; }
 .note { color: var(--muted); font-size: 13px; margin: 6px 0 0; }
+.verdict { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; padding: 16px; border-radius: 8px;
+  border: 1px solid var(--line); border-left-width: 6px; background: var(--panel); margin: 14px 0; }
+.verdict strong { font-size: 20px; }
+.verdict.ok { border-left-color: var(--good); } .verdict.warn { border-left-color: var(--warn); } .verdict.bad { border-left-color: var(--bad); }
+.area { margin: 18px 0 4px; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+a.check { display: block; color: inherit; text-decoration: none; border-left-width: 4px; }
+a.check:hover, a.check:focus { background: var(--soft); }
+a.check.ok { border-left-color: var(--good); } a.check.warn { border-left-color: var(--warn); }
+a.check.bad { border-left-color: var(--bad); } a.check.info { border-left-color: var(--line); }
+.pill { font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 9px; border: 1px solid currentColor; float: right; }
+.check .limits { display: block; margin-top: 4px; font-size: 12px; }
 #error { color: var(--bad); }
 #status { color: var(--muted); margin: 0; }
 [hidden] { display: none !important; }
@@ -118,13 +129,17 @@ svg.chart .axis { stroke: var(--line); }
 "use strict";
 const SETTINGS = /*SETTINGS*/{};
 const VIEWS = [
+  { id: "health", title: "Health", api: "stats/health" },
   { id: "trends", title: "Trends", api: "stats/trends" },
   { id: "yield", title: "Compression yield", api: "stats/yield" },
   { id: "timeline", title: "Conversation timeline", api: "stats/timeline" },
   { id: "store", title: "Store health", api: "stats/store-health" },
   { id: "keepwarm", title: "Keep-warm return", api: "stats/keepwarm" },
+  { id: "cache-loss", title: "Cache loss vs compression", api: "stats/cache-loss" },
   { id: "upstream", title: "Upstream health", api: "stats/upstream" },
+  { id: "traffic", title: "Traffic", api: "stats/traffic" },
   { id: "engine", title: "Engine", api: "stats/engine" },
+  { id: "quality", title: "Data quality", api: "stats/quality" },
 ];
 const view = VIEWS.find(v => v.id === SETTINGS.view) || VIEWS[0];
 const $ = id => document.getElementById(id);
@@ -160,9 +175,11 @@ for (const v of VIEWS) {
 // ------------------------------------------------------------- controls
 const WINDOWS = view.id === "trends"
   ? ["4w", "13w", "26w", "52w", "104w"]
-  : ["1h", "6h", "24h", "7d", "30d", "90d"];
+  : view.id === "health"
+    ? ["5m", "15m", "1h", "6h", "24h", "7d"]
+    : ["1h", "6h", "24h", "7d", "30d", "90d"];
 const windowSelect = $("window");
-const initialWindow = SETTINGS.window || (view.id === "trends" ? "26w" : "24h");
+const initialWindow = SETTINGS.window || (view.id === "trends" ? "26w" : view.id === "health" ? "1h" : "24h");
 for (const w of new Set([...WINDOWS, initialWindow])) {
   const option = document.createElement("option");
   option.value = option.textContent = w;
@@ -369,6 +386,241 @@ const css = name => getComputedStyle(document.documentElement).getPropertyValue(
 
 // ------------------------------------------------------------- views
 const RENDER = {};
+
+const LEVEL_TEXT = { ok: "OK", warn: "Warn", bad: "Bad", info: "Info" };
+const AREAS = [
+  ["upstream", "Upstream"], ["engine", "Engine"], ["retrieval", "Retrieval"], ["store", "Ref store"], ["data", "Statistics"],
+];
+function checkValue(c) {
+  if (c.value == null) return "–";
+  if (c.unit === "share") return pct(c.value, c.value < 0.1 ? 2 : 1);
+  if (c.unit === "ms") return ms(c.value);
+  if (c.unit === "bytes") return bytes(c.value);
+  return n(c.value);
+}
+function checkLimit(c, v) { return c.unit === "share" ? pct(v, 0) : c.unit === "ms" ? ms(v) : n(v); }
+function ago(t) {
+  if (t == null) return "never";
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  return (s < 120 ? s + " s" : s < 7200 ? Math.round(s / 60) + " min" : s < 172800 ? (s / 3600).toFixed(1) + " h" : Math.round(s / 86400) + " d") + " ago";
+}
+/** A dashboard link that keeps the window when the target can show it. */
+function viewLink(id) {
+  const target = VIEWS.find(v => v.id === id);
+  if (!target) return "#";
+  const u = new URL(withTenant(pagePath(target)), location.origin);
+  if (target.id !== "trends" && windowMs(windowSelect.value) <= 7776000000) u.searchParams.set("window", windowSelect.value);
+  return u.pathname + u.search;
+}
+/** One judged check as a tile linking to the dashboard that explains it. */
+function checkCard(c) {
+  const op = c.below ? " < " : " ≥ ";
+  return el("a", { class: "tile check " + c.level, href: viewLink(c.view), title: "Open the " + c.view + " dashboard" },
+    el("div", { class: "label" }, c.title, " ", el("span", { class: "pill " + (c.level === "info" ? "muted" : c.level === "ok" ? "good" : c.level) }, LEVEL_TEXT[c.level])),
+    el("div", { class: "value " + (c.level === "ok" || c.level === "info" ? "" : c.level) }, checkValue(c)),
+    el("small", {}, c.detail),
+    c.warn != null || c.bad != null
+      ? el("small", { class: "limits" }, [c.warn != null ? "warn" + op + checkLimit(c, c.warn) : null, c.bad != null ? "bad" + op + checkLimit(c, c.bad) : null].filter(Boolean).join(" · "))
+      : null);
+}
+function checkGroups(checks, areas) {
+  return areas.flatMap(([area, title]) => {
+    const list = checks.filter(c => c.area === area);
+    return list.length ? [el("h2", { class: "area" }, title), el("div", { class: "tiles" }, list.map(checkCard))] : [];
+  });
+}
+RENDER.health = d => {
+  const judged = d.checks.filter(c => c.level === "warn" || c.level === "bad");
+  const headline = { ok: "Everything looks healthy", warn: "Needs attention", bad: "Unhealthy" }[d.level] || d.level;
+  const engineBy = new Map(d.engine_timeline.map(p => [p.bucket_ms, p.p95_ms]));
+  const points = d.upstream_timeline.map(p => ({
+    x: shortTime(p.bucket_ms), ok: p.requests - p.failed, rl: p.rate_limited, se: p.server_error,
+    other: p.failed - p.rate_limited - p.server_error, p95: engineBy.get(p.bucket_ms),
+  }));
+  const s = d.server;
+  return [
+    el("div", { class: "verdict " + d.level, role: "status" },
+      el("strong", { class: d.level === "ok" ? "good" : d.level }, headline),
+      el("span", { class: "muted" }, judged.length
+        ? judged.map(c => c.title + " (" + checkValue(c) + ")").join(" · ")
+        : "No check is past its threshold in this window."),
+      el("span", { class: "muted", style: "margin-left:auto" },
+        "Last request " + ago(d.last_request_ms) + " · last compression " + ago(d.last_compression_ms) +
+        " · v" + s.version + " · up " + secs(s.uptime_s) + " · mode " + s.mode)),
+    ...checkGroups(d.checks, AREAS),
+    section("Requests and failures",
+      chart(points, [
+        { key: "ok", label: "Answered", color: css("--fresh") },
+        { key: "other", label: "Other failures", color: css("--warn") },
+        { key: "rl", label: "429", color: css("--ping") },
+        { key: "se", label: "5xx", color: css("--bad") },
+      ], { fmt: n, line: { key: "p95", label: "Engine p95", color: css("--accent"), fmt: ms } }),
+      note("Bars count proxied requests per interval, keep-warm pings included; the line is the compression engine's p95 in the same interval.")),
+    section("Recent incidents", table([
+      ["From", r => time(r.from_ms), { text: true }],
+      ["Lasted", r => ms(r.to_ms - r.from_ms)],
+      ["Failures", r => n(r.failures)],
+      ["Statuses", r => Object.entries(r.statuses).map(([k, v]) => k + " × " + v).join(", "), { text: true }],
+      ["Upstreams", r => r.upstreams.join(", "), { text: true }],
+    ], d.incidents, { empty: "No run of 429, 5xx or unanswered requests in this window." })),
+    section("Latest failed requests", table([
+      ["Time", r => time(r.time_ms), { text: true }],
+      ["Status", r => r.status == null ? "none" : r.status],
+      ["Upstream", r => r.upstream, { text: true }],
+      ["Model", r => r.model || "(pass-through)", { text: true }],
+      ["Attempts", r => n(r.attempts)],
+      ["Error", r => r.error || "", { text: true }],
+    ], d.failures, { empty: "No failed requests in this window." })),
+    d.truncated ? note("Part of this window was read from the newest rows only; pick a shorter window for exact figures.") : null,
+  ];
+};
+
+const GROUP_TEXT = { compressed: "Compression rewrote messages", unchanged: "Engine ran, changed nothing", no_engine: "No engine run" };
+RENDER["cache-loss"] = d => {
+  const [comp, unch, none] = d.groups;
+  const rate = g => g ? pct(g.loss_rate) : "–";
+  const net = d.removed_cost_floor - d.excess.cost;
+  const points = d.timeline.map(p => ({
+    x: shortTime(p.bucket_ms), cl: p.compressed_losses, ck: p.compressed_turns - p.compressed_losses,
+    ol: p.other_losses, ok: p.other_turns - p.other_losses,
+  }));
+  return [
+    tiles([
+      ["Loss rate, compressed turns", rate(comp), n(comp.losses) + " of " + n(comp.turns) + " turns", comp.loss_rate > (d.baseline_rate || 0) + 0.05 ? "bad" : ""],
+      ["Baseline loss rate", pct(d.baseline_rate), "turns compression did not touch"],
+      ["Excess losses (estimate)", n(d.excess.events), tok(d.excess.cost) + " input-equivalent", d.excess.events > 0 ? "warn" : "good"],
+      ["Likely: freeze lifted", n(d.likely.events), n(d.freeze_lifted_turns) + " turns had the freeze lifted · " + tok(d.likely.cost), d.likely.events > 0 ? "warn" : ""],
+      ["Upper bound", n(d.with_compression.events), tok(d.with_compression.cost) + " input-equivalent"],
+      ["Removed by compression", tok(d.removed_tokens), "worth at least " + tok(d.removed_cost_floor) + " at cache-read rates"],
+      ["Net, conservative", tok(net), "removed (floor) − excess loss cost", net >= 0 ? "good" : "bad"],
+      ["TTL losses (not compression)", n(d.ttl_losses), tok(d.ttl_loss_cost) + " input-equivalent"],
+    ]),
+    section("Compared client turns by what the engine did", table([
+      ["Group", r => GROUP_TEXT[r.group] || r.group, { text: true }],
+      ["Turns", r => n(r.turns)],
+      ["Prefix-change losses", r => n(r.losses)],
+      ["Loss rate", r => pct(r.loss_rate)],
+      ["Lost tokens", r => tok(r.lost_tokens)],
+      ["Loss cost", r => tok(r.loss_cost)],
+      ["Removed tokens", r => tok(r.removed_tokens)],
+    ], d.groups),
+      note("A turn is compared when the cache walk could check it against the previous one (a hit, partial or miss on the Cache page). " +
+        "TTL losses are left out: an idle cache expires whatever the engine did. The baseline is the loss rate of turns compression did not touch; " +
+        "losses on compressed turns above it are the excess. A freeze lifted means this run froze fewer messages than the conversation's previous run, " +
+        "so it was free to rewrite cached ones.")),
+    section("Turns and prefix-change losses",
+      chart(points, [
+        { key: "ck", label: "Compressed, kept prefix", color: css("--read") },
+        { key: "cl", label: "Compressed, lost prefix", color: css("--bad") },
+        { key: "ok", label: "Other, kept prefix", color: css("--fresh") },
+        { key: "ol", label: "Other, lost prefix", color: css("--warn") },
+      ], { fmt: n })),
+    section("Conversations with compressed turns (" + n(d.conversations_total) + "), costliest losses first", table([
+      ["Conversation", r => r.conversation, { text: true }],
+      ["Model", r => r.model || "–", { text: true }],
+      ["Turns", r => n(r.turns)],
+      ["Compressed", r => n(r.compressed_turns)],
+      ["Freeze lifted", r => n(r.freeze_lifts)],
+      ["Losses", r => n(r.losses)],
+      ["Lost tokens", r => tok(r.lost_tokens)],
+      ["Loss cost", r => tok(r.loss_cost)],
+      ["Removed", r => tok(r.removed_tokens)],
+    ], d.conversations, { pick: openTimeline, empty: "No compressed turns in this window." })),
+    section("Latest losses on compressed turns", table([
+      ["Time", r => time(r.time_ms), { text: true }],
+      ["Conversation", r => r.conversation, { text: true }],
+      ["Messages", r => n(r.messages)],
+      ["Rewritten", r => n(r.compressed_messages)],
+      ["Frozen (before)", r => n(r.frozen) + " (" + n(r.previous_frozen) + ")"],
+      ["Freeze lifted", r => r.freeze_lifted ? "yes" : "no", { text: true }],
+      ["Expected / read", r => tok(r.expected) + " / " + tok(r.read)],
+      ["Lost", r => tok(r.lost_tokens)],
+      ["Cost", r => tok(r.loss_cost)],
+      ["Removed", r => tok(r.removed_tokens)],
+    ], d.losses, { pick: openTimeline, empty: "No prefix was lost on a compressed turn in this window." })),
+    d.truncated ? note("Only the newest 200,000 proxied rows were read.") : null,
+  ];
+};
+
+const CLASS_TEXT = { model: "Model calls", keep_warm: "Keep-warm pings", websocket: "WebSocket upgrades", passthrough: "Pass-through" };
+const KIND_CLASS = { expected: "", client: "warn", upstream: "bad" };
+RENDER.traffic = d => {
+  const cls = name => d.classes.find(c => c.class === name) || { requests: 0, share: null };
+  const points = d.timeline.map(p => ({ x: shortTime(p.bucket_ms), model: p.model, ping: p.keep_warm, ws: p.websocket, pass: p.passthrough }));
+  const errPoints = d.timeline.map(p => ({ x: shortTime(p.bucket_ms), client: p.client, upstream: p.upstream }));
+  const outcomes = [...new Set(d.classes.flatMap(c => Object.keys(c.outcomes)))];
+  return [
+    tiles([
+      ["Requests", n(d.requests), n(cls("model").requests) + " model calls"],
+      ["Pass-through share", pct(cls("passthrough").share), n(cls("passthrough").requests) + " relayed unread"],
+      ["Real error share", pct(d.real_error_share, 2), n(d.real_failures) + " upstream failures of model calls and pings", d.real_error_share > 0.02 ? "bad" : "good"],
+      ["Naive error share", pct(d.naive_error_share, 2), n(d.naive_failures) + " rows outside 2xx or with an error"],
+      ["Noise", pct(d.noise_share, 1), n(d.noise) + " 304s, 101s and redirects"],
+      ["Client-side failures", n(d.client_failures), "refused 4xx and client disconnects", d.client_failures ? "warn" : ""],
+    ]),
+    section("Requests per interval, by class",
+      chart(points, [
+        { key: "model", label: "Model calls", color: css("--accent") },
+        { key: "ping", label: "Keep-warm", color: css("--ping") },
+        { key: "ws", label: "WebSocket", color: css("--write") },
+        { key: "pass", label: "Pass-through", color: css("--fresh") },
+      ], { fmt: n })),
+    section("Failures per interval",
+      chart(errPoints, [
+        { key: "upstream", label: "Upstream (429, 5xx, no answer, broken stream)", color: css("--bad") },
+        { key: "client", label: "Client side (4xx, disconnects)", color: css("--warn") },
+      ], { fmt: n })),
+    section("Class by outcome", table([
+      ["Class", r => CLASS_TEXT[r.class] || r.class, { text: true }],
+      ["Requests", r => n(r.requests)],
+      ["Share", r => pct(r.share)],
+      ...outcomes.map(o => [o.replace(/_/g, " "), r => n(r.outcomes[o] || 0)]),
+      ["Prompt tokens", r => tok(r.prompt_tokens)],
+    ], d.classes.filter(c => c.requests)),
+      note("Expected: ok, not modified (304), redirect, switching (101). Client side: refused (4xx other than 429), client disconnect. " +
+        "Upstream: rate limited (429), server error (5xx), no answer, broken (a 2xx whose stream failed). " +
+        "The real error share counts only upstream failures, and only over model calls and pings; the naive share is what a status-class count reports over every row.")),
+    section("By upstream, API family and status (" + n(d.endpoints_total) + " groups)", table([
+      ["Class", r => CLASS_TEXT[r.class] || r.class, { text: true }],
+      ["Upstream", r => r.upstream, { text: true }],
+      ["API family", r => r.api_family, { text: true }],
+      ["Status", r => r.status == null ? "none" : r.status],
+      ["Outcome", r => el("span", { class: KIND_CLASS[r.kind] || "" }, r.outcome.replace(/_/g, " ")), { text: true }],
+      ["Requests", r => n(r.requests)],
+      ["Last", r => time(r.last_ms), { text: true }],
+    ], d.endpoints)),
+    section("Error messages", table([
+      ["Message", r => r.message, { text: true }],
+      ["Outcome", r => r.outcome.replace(/_/g, " "), { text: true }],
+      ["Requests", r => n(r.requests)],
+      ["Last", r => time(r.last_ms), { text: true }],
+    ], d.errors, { empty: "No error text in this window." }),
+      note("Digits are folded to # so one message with different ids or sizes counts once.")),
+  ];
+};
+
+const QUALITY_AREAS = [["requests", "Proxied requests"], ["engine", "Engine runs"], ["retrieval", "Retrievals"], ["limits", "What the database cannot hold"]];
+RENDER.quality = d => {
+  const judged = d.checks.filter(c => c.level === "warn" || c.level === "bad");
+  const headline = { ok: "The figures can be trusted", warn: "Some figures are incomplete", bad: "Figures are unreliable" }[d.level] || d.level;
+  return [
+    el("div", { class: "verdict " + d.level, role: "status" },
+      el("strong", { class: d.level === "ok" ? "good" : d.level }, headline),
+      el("span", { class: "muted" }, judged.length ? judged.map(c => c.title + " (" + checkValue(c) + ")").join(" · ") : "Every judged column is filled as expected."),
+      el("span", { class: "muted", style: "margin-left:auto" },
+        "Raw rows from " + time(d.raw_from_ms) + " · retention " + (d.retention_days ? d.retention_days + " days" : "off") +
+        " · archived through " + (d.archived_through || "none yet"))),
+    ...checkGroups(d.checks, QUALITY_AREAS),
+    section("Rows in this window", table([
+      ["Table", r => r.table, { text: true }],
+      ["Rows", r => n(r.rows)],
+      ["First", r => time(r.first_ms), { text: true }],
+      ["Last", r => time(r.last_ms), { text: true }],
+      ["Within one report's limit", r => r.over_limit ? el("span", { class: "warn" }, "no — truncated") : "yes", { text: true }],
+    ], d.tables)),
+    note("Coverage checks turn warn and bad below their limits; columns this build never writes are shown as Info, not as failures."),
+  ];
+};
 
 RENDER.trends = d => {
   const t = d.totals, m = t.metrics;

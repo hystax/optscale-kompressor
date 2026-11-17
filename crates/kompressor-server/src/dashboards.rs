@@ -1,12 +1,16 @@
-//! The second set of dashboards: trends, compression yield, a conversation
-//! timeline, store health, keep-warm return, upstream health and the engine.
+//! The second set of dashboards: a health overview, trends, compression
+//! yield, a conversation timeline, store health, keep-warm return, cache
+//! losses set against compression, upstream health, traffic composition, the
+//! engine and data quality.
 //!
 //! Each view has a JSON route under each version prefix —
-//! `/v1/stats/{trends,yield,store-health,keepwarm,upstream,engine}` — and one
+//! `/v1/stats/{health,trends,yield,store-health,keepwarm,cache-loss,upstream,traffic,engine,quality}`
+//! — and one
 //! shared page that draws whichever view it was opened on. The timeline has no
 //! route of its own: it draws a conversation's turns from
 //! `/v1/stats/analysis?conversation=`, which already carries them. On the
-//! statistics listener the pages are at `/trends`, `/yield`, `/timeline`,
+//! statistics listener the pages are at `/health`, `/trends`, `/yield`,
+//! `/timeline`, `/cache-loss`, `/traffic`, `/quality`,
 //! `/store`, `/keepwarm`, `/upstream` and `/engine`.
 //!
 //! Credentials, tenant scoping, formats and the page-shell rule are the cache
@@ -26,10 +30,14 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use kompressor_stats::cache::compression::CompressionCacheReport;
 use kompressor_stats::cache::keepwarm::KeepWarmReport;
 use kompressor_stats::dashboards::{
     EngineReport, StoreHealth, StoredRef, TrendBucket, TrendsReport, UpstreamReport, YieldReport,
 };
+use kompressor_stats::health::{HealthReport, Runtime};
+use kompressor_stats::quality::{QualityReport, QualityRuntime};
+use kompressor_stats::traffic::TrafficReport;
 use kompressor_store::{RefCensus, Tenant};
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +54,9 @@ pub const MAX_TREND_WINDOW: Duration = Duration::from_secs(730 * 86_400);
 pub const DEFAULT_TREND_WINDOW: &str = "26w";
 /// The window the other views use when the caller names none.
 pub const DEFAULT_WINDOW: &str = "24h";
+/// The health view looks at the last hour unless told otherwise: it answers
+/// "is it fine now", not "how was the day".
+pub const DEFAULT_HEALTH_WINDOW: &str = "1h";
 /// Conversations the keep-warm view lists by default, and the most it will.
 pub const DEFAULT_CONVERSATIONS: usize = 50;
 pub const MAX_CONVERSATIONS: usize = 500;
@@ -55,34 +66,46 @@ pub const DEFAULT_REFRESH: u32 = 30;
 /// Which dashboard a route serves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum View {
+    Health,
     Trends,
     Yield,
     Timeline,
     Store,
     KeepWarm,
+    CacheLoss,
     Upstream,
+    Traffic,
     Engine,
+    Quality,
 }
 
 impl View {
-    pub(crate) const ALL: [View; 7] = [
+    pub(crate) const ALL: [View; 11] = [
+        View::Health,
         View::Trends,
         View::Yield,
         View::Timeline,
         View::Store,
         View::KeepWarm,
+        View::CacheLoss,
         View::Upstream,
+        View::Traffic,
         View::Engine,
+        View::Quality,
     ];
 
     /// The page's path on the statistics listener.
     pub(crate) fn page_path(self) -> &'static str {
         match self {
+            View::Health => "/health",
             View::Trends => "/trends",
             View::Yield => "/yield",
             View::Timeline => "/timeline",
             View::Store => "/store",
             View::KeepWarm => "/keepwarm",
+            View::CacheLoss => "/cache-loss",
+            View::Traffic => "/traffic",
+            View::Quality => "/quality",
             View::Upstream => "/upstream",
             View::Engine => "/engine",
         }
@@ -91,11 +114,15 @@ impl View {
     /// The JSON route under a version prefix.
     fn api_path(self) -> &'static str {
         match self {
+            View::Health => "/stats/health",
             View::Trends => "/stats/trends",
             View::Yield => "/stats/yield",
             View::Timeline => "/stats/timeline",
             View::Store => "/stats/store-health",
             View::KeepWarm => "/stats/keepwarm",
+            View::CacheLoss => "/stats/cache-loss",
+            View::Traffic => "/stats/traffic",
+            View::Quality => "/stats/quality",
             View::Upstream => "/stats/upstream",
             View::Engine => "/stats/engine",
         }
@@ -103,11 +130,15 @@ impl View {
 
     fn name(self) -> &'static str {
         match self {
+            View::Health => "health",
             View::Trends => "trends",
             View::Yield => "yield",
             View::Timeline => "timeline",
             View::Store => "store",
             View::KeepWarm => "keepwarm",
+            View::CacheLoss => "cache-loss",
+            View::Traffic => "traffic",
+            View::Quality => "quality",
             View::Upstream => "upstream",
             View::Engine => "engine",
         }
@@ -189,6 +220,8 @@ impl DashboardQuery {
     fn window(&self, view: View) -> Result<(String, Duration), ApiError> {
         let default = if view == View::Trends {
             DEFAULT_TREND_WINDOW
+        } else if view == View::Health {
+            DEFAULT_HEALTH_WINDOW
         } else {
             DEFAULT_WINDOW
         };
@@ -263,6 +296,14 @@ pub struct EngineResponse {
     pub server: ServerInfo,
     #[serde(flatten)]
     pub report: EngineReport,
+}
+
+/// The health view adds the process's own figures, as the engine view does.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HealthResponse {
+    pub server: ServerInfo,
+    #[serde(flatten)]
+    pub report: HealthReport,
 }
 
 /// The store-health view adds the store's configured limits.
@@ -373,6 +414,47 @@ async fn respond(
     };
 
     match view {
+        View::Health => {
+            let (census, truncated) = census(&state, &tenant).await?;
+            let server = server_info(&state);
+            let runtime = Runtime {
+                now_ms: now,
+                stats_dropped: server.stats_dropped,
+                inflight_limit: server.inflight_limit,
+                inflight_free: server.inflight_free,
+                store_max_bytes: state.core.config().refs.max_bytes,
+            };
+            let report: HealthReport = state
+                .with_stats(move |r| {
+                    r.health(&tenant, from_ms, to_ms, &census, truncated, &runtime)
+                })
+                .await?;
+            let report = HealthResponse { server, report };
+            Ok(answer(format, view, now, window, report))
+        }
+        View::CacheLoss => {
+            let report: CompressionCacheReport = state
+                .with_stats(move |r| r.compression_cache(&tenant, from_ms, to_ms, conversations))
+                .await?;
+            Ok(answer(format, view, now, window, report))
+        }
+        View::Traffic => {
+            let report: TrafficReport = state
+                .with_stats(move |r| r.traffic(&tenant, from_ms, to_ms))
+                .await?;
+            Ok(answer(format, view, now, window, report))
+        }
+        View::Quality => {
+            let runtime = QualityRuntime {
+                now_ms: now,
+                stats_dropped: state.core.stats().dropped(),
+                retention_days: state.core.config().stats.retention_days,
+            };
+            let report: QualityReport = state
+                .with_stats(move |r| r.quality(&tenant, from_ms, to_ms, &runtime))
+                .await?;
+            Ok(answer(format, view, now, window, report))
+        }
         View::Trends => {
             let report: TrendsReport = state
                 .with_stats(move |r| r.trends(&tenant, from_ms, to_ms, bucket))
@@ -519,6 +601,7 @@ mod tests {
         assert_eq!(query.conversations().unwrap(), DEFAULT_CONVERSATIONS);
         assert_eq!(query.window(View::Trends).unwrap().0, DEFAULT_TREND_WINDOW);
         assert_eq!(query.window(View::Engine).unwrap().0, DEFAULT_WINDOW);
+        assert_eq!(query.window(View::Health).unwrap().0, DEFAULT_HEALTH_WINDOW);
 
         let with = |tweak: fn(&mut DashboardQuery)| {
             let mut query = DashboardQuery::default();
