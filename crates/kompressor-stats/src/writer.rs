@@ -44,7 +44,8 @@ pub(crate) enum Msg {
 
 struct SinkInner {
     tx: SyncSender<Msg>,
-    dropped: AtomicU64,
+    // shared with the writer thread, which counts events lost to a failed commit
+    dropped: Arc<AtomicU64>,
 }
 
 /// A cloneable handle for recording events. Cheap to clone, safe to share.
@@ -73,7 +74,8 @@ impl StatsSink {
         }
     }
 
-    /// Events lost to a full or dead queue since start: `stats_dropped_total`.
+    /// Events lost since start, to a full or dead queue or to a batch whose
+    /// commit failed: `stats_dropped_total`.
     ///
     /// Worth exporting rather than merely logging. A report drawn from a period
     /// with a non-zero drop count is an undercount of everything, and the only
@@ -132,7 +134,7 @@ pub fn capturing_sink(capacity: usize) -> (StatsSink, CapturedEvents) {
         StatsSink {
             inner: Some(Arc::new(SinkInner {
                 tx,
-                dropped: AtomicU64::new(0),
+                dropped: Arc::new(AtomicU64::new(0)),
             })),
         },
         CapturedEvents { rx },
@@ -168,7 +170,7 @@ pub(crate) fn detached_sink(capacity: usize) -> (StatsSink, Receiver<Msg>) {
         StatsSink {
             inner: Some(Arc::new(SinkInner {
                 tx,
-                dropped: AtomicU64::new(0),
+                dropped: Arc::new(AtomicU64::new(0)),
             })),
         },
         rx,
@@ -443,15 +445,26 @@ pub fn spawn(config: &StatsConfig) -> Result<(StatsSink, StatsHandle), StatsErro
     let flush_interval = config.flush_interval;
     let batch_max = config.batch_max.max(1);
     let retention = config.clone();
+    let dropped = Arc::new(AtomicU64::new(0));
+    let thread_dropped = Arc::clone(&dropped);
     let thread = std::thread::Builder::new()
         .name("kompressor-stats".to_string())
-        .spawn(move || run(writer, rx, flush_interval, batch_max, retention))
+        .spawn(move || {
+            run(
+                writer,
+                rx,
+                flush_interval,
+                batch_max,
+                retention,
+                &thread_dropped,
+            )
+        })
         .map_err(StatsError::Thread)?;
 
     let sink = StatsSink {
         inner: Some(Arc::new(SinkInner {
             tx: tx.clone(),
-            dropped: AtomicU64::new(0),
+            dropped,
         })),
     };
     Ok((
@@ -475,6 +488,7 @@ fn run(
     flush_interval: Duration,
     batch_max: usize,
     retention: StatsConfig,
+    dropped: &AtomicU64,
 ) {
     let mut batch: Vec<Event> = Vec::with_capacity(batch_max);
     let mut deadline = Instant::now() + flush_interval;
@@ -505,7 +519,7 @@ fn run(
             Ok(Msg::Event(event)) => {
                 batch.push(*event);
                 if batch.len() >= batch_max {
-                    log_failure(commit(&mut writer, &mut batch));
+                    log_failure(commit(&mut writer, &mut batch, dropped));
                     deadline = Instant::now() + flush_interval;
                 }
             }
@@ -513,29 +527,38 @@ fn run(
                 // the queue is FIFO, so everything sent before this message is
                 // already in `batch`: acknowledging after the commit is an
                 // honest "it is durable"
-                let result = commit(&mut writer, &mut batch);
+                let result = commit(&mut writer, &mut batch, dropped);
                 let report = result.as_ref().map(|_| ()).map_err(StatsError::to_string);
                 log_failure(result);
                 let _ = ack.send(report);
                 deadline = Instant::now() + flush_interval;
             }
             Ok(Msg::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
-                log_failure(commit(&mut writer, &mut batch));
+                log_failure(commit(&mut writer, &mut batch, dropped));
                 return;
             }
             Err(RecvTimeoutError::Timeout) => {
-                log_failure(commit(&mut writer, &mut batch));
+                log_failure(commit(&mut writer, &mut batch, dropped));
                 deadline = Instant::now() + flush_interval;
             }
         }
     }
 }
 
-fn commit(writer: &mut StatsWriter, batch: &mut Vec<Event>) -> Result<(), StatsError> {
+fn commit(
+    writer: &mut StatsWriter,
+    batch: &mut Vec<Event>,
+    dropped: &AtomicU64,
+) -> Result<(), StatsError> {
     if batch.is_empty() {
         return Ok(());
     }
     let result = writer.write_batch(batch).map(|_| ());
+    if result.is_err() {
+        // those events are gone for good: count them, so the drop metric covers
+        // a failed commit as well as a full queue
+        dropped.fetch_add(batch.len() as u64, Ordering::Relaxed);
+    }
     // the batch is cleared either way: retrying a transaction SQLite rejected
     // would stall the queue behind a row that is never going to be accepted,
     // and blocking the queue is the one failure mode this crate must not have
