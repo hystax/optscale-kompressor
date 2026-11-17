@@ -577,9 +577,10 @@ That leaves `target/windows/kompressor-<version>-x86_64-setup.exe` beside the
 bare `kompressor-<version>-x86_64-windows.exe`. The installer asks on its first
 page how to install:
 
-* **for the current user** (the default) — no administrator rights. The binary
+* **for the current user** — no administrator rights. The binary
   goes to `%LOCALAPPDATA%\Programs\kompressor`, which is added to your `PATH`.
-* **as a system service** — asks for administrator rights. The binary always
+* **as a system service** (the default; untick the box for the user install) —
+  asks for administrator rights. The binary always
   goes to `Program Files\kompressor` (no folder choice), which is added to the
   system `PATH`; a default config is written to `%ProgramData%\kompressor\config.toml`;
   and the *OptScale Kompressor* service, run by [WinSW](https://github.com/winsw/winsw)
@@ -587,13 +588,23 @@ page how to install:
 
 Either way it registers an uninstaller under *Installed apps*, which takes the
 binary and the `PATH` entry back out (and the service), keeps the config and the
-data, and lists where they are on its last page. `/S` installs silently for the user;
+data, and lists where they are on its last page. `/S` installs silently for the user (a silent install never asks for elevation);
 `/S /SYSTEM`, from an elevated prompt, installs the service.
 
 Without the installer, `cargo install --path crates/kompressor-cli --locked`
 builds it on Windows itself. [`WINDOWS.md`](WINDOWS.md) is the step-by-step
 version, including where to put the config so the loader finds it — `~` there
 is `%USERPROFILE%`, since PowerShell and cmd do not set `HOME`.
+
+**Claude Desktop and the Codex app on Windows** need the proxy running all the
+time, which is what the service is for; its configuration already enables both.
+Claude Desktop goes through the intercept listener on `127.0.0.1:8840`: copy
+`%ProgramData%\kompressor\ca\ca.pem` out of its administrator-only folder and
+set `HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS` and `CLAUDE_CODE_TETHER_LIVE=0` in
+`%USERPROFILE%\.claude\settings.json`. The Codex app takes
+`openai_base_url = "http://127.0.0.1:8817/backend-api/codex"` at the top of
+`%USERPROFILE%\.codex\config.toml`, which the Codex CLI reads too. Both are
+written out, with checks and caveats, in [`WINDOWS.md`](WINDOWS.md) §5 and §6.
 
 ### Upgrading
 
