@@ -58,6 +58,7 @@ use crate::StatsError;
 use crate::live::bucket_for;
 use crate::reader::{StatsReader, ratio};
 
+pub mod compression;
 pub mod keepwarm;
 
 /// Anthropic's default cache lifetime.

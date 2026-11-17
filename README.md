@@ -640,9 +640,15 @@ accept the same `from`/`to` pair. Analysis uses retained raw events; daily
 archives cannot reconstruct turn history. Token reduction remains an estimate
 per request, not a monetary saving or a count of unique content.
 
-Seven more pages sit beside those on the statistics listener, linked from each
+Eleven more pages sit beside those on the statistics listener, linked from each
 other and from every page's **Dashboards** link:
 
+- `/health`: one verdict for the last hour (or any window) — upstream incidents
+  (429, 5xx, no answer) and failure bursts, refused (4xx) and retried requests,
+  engine p95 and slots busy now, retrieval misses and budget-withheld asks, ref
+  store fill against its cap, and dropped statistics — each judged ok, warn or
+  bad against a fixed threshold and linked to the dashboard that explains it.
+  The Live page links to it.
 - `/trends`: weekly (or daily, or monthly) net tokens removed, prompt-cache
   saving, input cost, conversations and errors for up to two years. It reads the
   daily archive as well as raw rows, so it reaches past the raw-row retention,
@@ -659,11 +665,33 @@ other and from every page's **Dashboards** link:
 - `/keepwarm`: what the keep-warm pings cost against the rewrites they avoided,
   by pause length and per conversation, with the pings sent after a
   conversation's last turn and the TTL losses no ping covered.
+- `/cache-loss`: whether compression costs the prompt cache more than it
+  saves. Compared client turns are split into those whose engine run rewrote
+  messages, those it ran on and left alone, and those it never saw; the
+  prefix-change loss rate of the untouched turns is the baseline, losses on
+  compressed turns above it are the *excess* (the estimate), every loss on a
+  compressed turn the upper bound, and a loss after the freeze was lifted (the
+  run froze fewer messages than the conversation's previous one) the *likely*
+  case. TTL losses are left out. The excess cost is set against what the
+  removed tokens were worth at cache-read rates, the least they saved.
 - `/upstream`: status classes, 429s, 5xx and unanswered requests by upstream
   and model, latency percentiles, incidents (three or more such failures within
   a minute of each other) and the latest failures.
+- `/traffic`: what the proxy relays — model calls, keep-warm pings, WebSocket
+  upgrades and pass-through — and each row's outcome: expected (2xx, 304, 101,
+  redirects), client side (other 4xx, client disconnects) or upstream (429,
+  5xx, no answer, a broken stream). It shows the real error share (upstream
+  failures of model calls and pings) beside the naive one a status-class count
+  would report, by upstream, API family and status, with the error messages.
 - `/engine`: where compression time goes, by content type, prompt size, outcome
   and surface, the slowest runs, the engine slots in use and dropped stats events.
+- `/quality`: how far the other pages can be trusted — the share of rows that
+  carry provider usage, a conversation, upstream timing and run context; engine
+  runs with an outcome and skip reasons; retrievals tied to a request; requests
+  filed with more than one run; dropped statistics, a window reaching past
+  retention, the archive's last day, and tables too busy to read whole.
+  Columns this build never writes (such as the uncompressed-prompt measurement)
+  are shown as information, not as failures.
 
 ### Statistics JSON API for automation
 
@@ -684,6 +712,10 @@ statistics listener (`server.stats_listen`) as well.
 | `GET /v1/stats/yield?window=24h` | tokens removed per content type (estimated by message share) and retrieval asks per fragment kind |
 | `GET /v1/stats/store-health?window=24h` | the ref store's census by kind, age and expiry, its size over time, minted versus asked handles, expired and missing asks |
 | `GET /v1/stats/keepwarm?window=24h&conversations=50` | keep-warm ping cost against avoided rewrites, by pause length and per conversation |
+| `GET /v1/stats/health?window=1h` | ok / warn / bad verdict with each judged check, its thresholds and the dashboard behind it, a request/failure timeline, recent incidents and failures |
+| `GET /v1/stats/cache-loss?window=24h&conversations=50` | prefix-change losses by what the engine did to the turn, baseline rate, excess / likely / upper-bound losses with their cost, removed tokens at cache-read rates, conversations and the latest suspect losses |
+| `GET /v1/stats/traffic?window=24h` | rows by class and outcome, real vs naive error share, noise share, by upstream / API family / status, grouped error messages, a timeline |
+| `GET /v1/stats/quality?window=24h` | coverage checks (ok / warn / bad, or info for columns not written), rows per table in the window, the oldest raw row, retention and the last archived day |
 | `GET /v1/stats/upstream?window=24h` | status mix, latency and failures by upstream and model, incidents, latest failures |
 | `GET /v1/stats/engine?window=24h` | engine time by content type, prompt size, outcome and surface, slowest runs, process slots |
 | `GET /v1/stats/summary`, `histogram`, `by_type`, `retrievals`, `requests?request_id=`, `store` | the aggregate reports `kompressor stats` prints |

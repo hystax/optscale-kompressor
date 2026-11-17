@@ -57,12 +57,15 @@ pub mod context;
 pub mod dashboards;
 pub mod error;
 pub mod events;
+pub mod health;
 pub mod history;
 pub mod insights;
 pub mod live;
+pub mod quality;
 pub mod reader;
 pub mod retention;
 pub mod schema;
+pub mod traffic;
 pub mod writer;
 
 pub use config::{

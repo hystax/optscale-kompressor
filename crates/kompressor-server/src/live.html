@@ -146,6 +146,7 @@ pre { background: var(--bg); border-color: var(--line); }
     <div class="controls" id="windows"></div>
     <a id="analysis-link" href="#">Analysis</a>
     <a id="cache-link" href="#">Cache</a>
+    <a id="health-link" href="#">Health</a>
     <a id="dashboards-link" href="#">Dashboards</a>
     <a id="refs-link" href="#" hidden>Ref store</a>
     <button id="download" type="button" title="Download this view as JSON Lines">Download JSONL</button>
@@ -430,13 +431,21 @@ function schedule() {
   if (!state.paused) state.timer = setTimeout(poll, state.refresh * 1000);
 }
 
+// Keep the chosen window in the address bar so a reload (F5) or a shared
+// link reopens the same view; the server reads it back into SETTINGS.
+function syncUrl() {
+  const params = new URLSearchParams(location.search);
+  params.set("window", state.window);
+  history.replaceState(null, "", location.pathname + "?" + params.toString() + location.hash);
+}
+
 function windows() {
   const host = $("windows");
   host.replaceChildren();
   for (const w of WINDOWS.includes(state.window) ? WINDOWS : [...WINDOWS, state.window]) {
     const b = el("button", w);
     b.setAttribute("aria-pressed", String(w === state.window));
-    b.addEventListener("click", () => { state.window = w; windows(); clearTimeout(state.timer); poll(); });
+    b.addEventListener("click", () => { state.window = w; windows(); syncUrl(); clearTimeout(state.timer); poll(); });
     host.append(b);
   }
 }
@@ -471,16 +480,16 @@ windows();
 poll();
 </script>
 <script>
-// The dashboards sit at /trends on the statistics listener and at
-// /v1/stats/trends (or /v2/...) on the API.
-(() => {
-  const link = document.getElementById("dashboards-link");
+// The dashboards sit at /trends (and the health overview at /health) on the
+// statistics listener and at /v1/stats/trends (or /v2/...) on the API.
+for (const [id, name] of [["dashboards-link", "trends"], ["health-link", "health"]]) {
+  const link = document.getElementById(id);
   const version = /^\/v[12]\//.exec(location.pathname);
-  const url = new URL(version ? version[0] + "stats/trends" : "/trends", location.origin);
+  const url = new URL(version ? version[0] + "stats/" + name : "/" + name, location.origin);
   const tenant = new URLSearchParams(location.search).get("tenant");
   if (tenant) url.searchParams.set("tenant", tenant);
   link.href = url.pathname + url.search;
-})();
+}
 </script>
 </body>
 </html>
