@@ -8,6 +8,32 @@ opened before the installation does not see it yet) and type:
 
 That lists every command.
 
+It listens on two local ports:
+
+    127.0.0.1:8817  for clients pointed at a base URL: Claude Code,
+                    the Codex CLI and the Codex app
+    127.0.0.1:8840  for Claude Desktop only (an HTTPS proxy)
+
+
+Installed as a system service (the default)
+-------------------------------------------
+
+The proxy is already running and starts with Windows. Its configuration,
+written for you, is
+
+    %ProgramData%\kompressor\config.toml
+
+and already covers Claude Code, Claude Desktop and Codex. Check it with:
+
+    Get-Service kompressor
+    kompressor check-config --config "$env:ProgramData\kompressor\config.toml"
+
+After editing it, restart the service from an administrator PowerShell:
+
+    Restart-Service kompressor
+
+Logs: %ProgramData%\kompressor\logs\kompressor-service.err.log
+
 
 Run a coding agent through it
 -----------------------------
@@ -15,60 +41,88 @@ Run a coding agent through it
     kompressor wrap claude
     kompressor wrap codex
 
-kompressor wrap --list shows every agent it knows. wrap starts the proxy,
-points the agent at it, runs the agent, and puts everything back when the
-agent exits.
+kompressor wrap --list shows every agent it knows. wrap uses the service
+when it is running (otherwise it starts a proxy), points the agent at it,
+runs the agent, and puts everything back when the agent exits.
 
 
-Run the proxy on its own
-------------------------
+Claude Desktop (Code tab)
+-------------------------
 
-For a client that wrap does not start, such as a desktop app:
+Claude Desktop ignores base URLs, so it goes through the HTTPS proxy on port
+8840, which decrypts api.anthropic.com with a local certificate authority.
+Your Claude login is kept.
 
-    kompressor serve --proxy --api
+1. From an administrator PowerShell, copy the certificate (never ca.key)
+   somewhere Claude can read it:
 
-and point the client at http://127.0.0.1:8817. Ctrl-C stops it. The proxy
-forwards only to the upstreams its configuration names, and the example
-below names none: docs/WINDOWS.md in the repository (link at the end),
-section 2, has one that does.
+    Copy-Item "$env:ProgramData\kompressor\ca\ca.pem" "$env:USERPROFILE\.claude\kompressor-ca.pem"
 
-If kompressor was installed as a system service, that proxy is already
-running and starts with Windows; wrap uses it.
+2. Back up %USERPROFILE%\.claude\settings.json and add to its "env" object:
+
+    "HTTPS_PROXY": "http://127.0.0.1:8840",
+    "NODE_EXTRA_CA_CERTS": "C:/Users/YOU/.claude/kompressor-ca.pem",
+    "CLAUDE_CODE_TETHER_LIVE": "0"
+
+   Remove ANTHROPIC_BASE_URL from it if present. Save as UTF-8 without a
+   byte-order mark.
+
+3. Quit Claude Desktop from its tray icon, reopen it, start a new Code
+   session.
+
+Only the Code tab is covered; regular Claude chat is not intercepted.
+docs/WINDOWS.md section 5 has a script that does step 2 and a check.
 
 
-Configuration
--------------
+Codex desktop app
+-----------------
 
-Without a configuration file kompressor runs on built-in defaults and keeps
-its data in a "data" folder in the directory it is started from. To keep it
-in one place, create
+Put this line at the very top of %USERPROFILE%\.codex\config.toml, before
+any [section], and restart the app:
+
+    openai_base_url = "http://127.0.0.1:8817/backend-api/codex"
+
+Not yet measured for the app. The Codex CLI reads the same file: if either
+reports "401 ... Missing scopes: api.responses.write", remove the line and
+use "kompressor wrap codex" for the CLI. The ChatGPT chat app cannot be
+routed. docs/WINDOWS.md section 6 has the details.
+
+
+Installed for you only
+----------------------
+
+Nothing runs until you start it, and there is no configuration file: without
+one kompressor keeps its data in a "data" folder in the directory it is
+started from and forwards to no upstreams. docs/WINDOWS.md section 2 writes
+a complete one to
 
     %USERPROFILE%\.config\kompressor\config.toml
 
-with, for example:
-
-    [refs]
-    backend = "sqlite"
-    path = "C:/Users/you/AppData/Local/kompressor/refs.db"
-
-    [stats]
-    enabled = true
-    path = "C:/Users/you/AppData/Local/kompressor/stats.db"
-
-Paths must be absolute and use forward slashes.
+Paths in it must be absolute and use forward slashes.
 
     kompressor check-config
 
-shows the configuration your own commands use. The service reads its own,
-%ProgramData%\kompressor\config.toml; to see that one:
+shows the configuration your own commands use. For Claude Desktop and the
+Codex app keep a proxy open in a terminal while you use them (Ctrl-C stops
+it):
 
-    kompressor check-config --config "$env:ProgramData\kompressor\config.toml"
+    kompressor serve --proxy --api
 
-After editing it, restart the service: Restart-Service kompressor, from an
-administrator PowerShell.
+and use %LOCALAPPDATA%\kompressor\ca\ca.pem as NODE_EXTRA_CA_CERTS, without
+copying it. Or reinstall as a system service, which runs all the time.
+
+
+Is it working?
+--------------
+
+    curl.exe -sf http://127.0.0.1:8817/healthz
+    kompressor stats summary
+
+Lines with "message":"compressed" in the log mean traffic goes through it.
 
 
 Documentation
 -------------
 
+https://github.com/hystax/optscale-kompressor/blob/main/docs/WINDOWS.md
 https://github.com/hystax/optscale-kompressor#readme

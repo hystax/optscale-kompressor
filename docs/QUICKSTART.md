@@ -686,6 +686,16 @@ builds it on Windows itself. [`WINDOWS.md`](WINDOWS.md) is the step-by-step
 version, including where to put the config so the loader finds it — `~` there
 is `%USERPROFILE%`, since PowerShell and cmd do not set `HOME`.
 
+**Claude Desktop and the Codex app on Windows** need the proxy running all the
+time, which is what the service is for; its configuration already enables both.
+Claude Desktop goes through the intercept listener on `127.0.0.1:8840`: copy
+`%ProgramData%\kompressor\ca\ca.pem` out of its administrator-only folder and
+set `HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS` and `CLAUDE_CODE_TETHER_LIVE=0` in
+`%USERPROFILE%\.claude\settings.json`. The Codex app takes
+`openai_base_url = "http://127.0.0.1:8817/backend-api/codex"` at the top of
+`%USERPROFILE%\.codex\config.toml`, which the Codex CLI reads too. Both are
+written out, with checks and caveats, in [`WINDOWS.md`](WINDOWS.md) §5 and §6.
+
 ### Upgrading
 
 Installing a newer package over an older one. Both routes keep your
