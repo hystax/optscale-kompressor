@@ -88,8 +88,8 @@ use "kompressor wrap codex" for the CLI. The ChatGPT chat app cannot be
 routed. docs/WINDOWS.md section 6 has the details.
 
 
-Installed for you only
-----------------------
+Installed for the current user only
+-----------------------------------
 
 Nothing runs until you start it, and there is no configuration file: without
 one kompressor keeps its data in a "data" folder in the directory it is

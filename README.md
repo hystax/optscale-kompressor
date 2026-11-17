@@ -320,6 +320,38 @@ and the Codex app.
 
 ## Quick start
 
+<a id="quick-start-install"></a>
+### Install a prebuilt package
+
+No Rust toolchain needed: download the package for your platform from the
+[latest release](https://github.com/hystax/optscale-kompressor/releases/latest)
+and check it against `SHA256SUMS` from the same page
+(`sha256sum --check --ignore-missing SHA256SUMS`).
+
+| Platform | File | Install |
+| --- | --- | --- |
+| Debian, Ubuntu | `kompressor_<version>-1_amd64.deb` | `sudo apt install ./kompressor_*-1_amd64.deb` |
+| RHEL, Fedora | `kompressor-<version>-1.x86_64.rpm` | `sudo dnf install ./kompressor-*-1.x86_64.rpm` |
+| Any Linux x86_64 | `kompressor-<version>-x86_64-linux-musl` (static) | `install -m 755 kompressor-*-x86_64-linux-musl ~/.local/bin/kompressor` |
+| macOS (Apple silicon and Intel) | `kompressor-<version>-universal2.pkg` | `sudo installer -pkg kompressor-*-universal2.pkg -target /` |
+| Windows x86_64 | `kompressor-<version>-x86_64-setup.exe` | run it; see [docs/WINDOWS.md](docs/WINDOWS.md) |
+
+Older glibc systems can use the `-static` `.deb` / `.rpm` builds instead. With
+the [GitHub CLI](https://cli.github.com) the download is one command, for
+example:
+
+```bash
+gh release download --repo hystax/optscale-kompressor -p 'kompressor_*-1_amd64.deb' -p SHA256SUMS
+```
+
+Then check it runs:
+
+```bash
+kompressor version
+```
+
+To build from source instead, see [Install](#install).
+
 ### Codex
 
 ```bash
