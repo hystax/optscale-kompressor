@@ -655,6 +655,9 @@ for (const id of tabIds) {
       $(other + "-tab").tabIndex = other === id ? 0 : -1;
     }
     $("detail").hidden = id !== "efficiency" || !selected;
+    // The tab lives in the fragment (the server refuses unknown query
+    // parameters) so a reload reopens it.
+    history.replaceState(null, "", location.pathname + location.search + (id === "efficiency" ? "" : "#" + id));
     loadExtra(id);
   };
 }
@@ -870,6 +873,10 @@ $("comparison-form").onsubmit = e => {
 for (const id of ["baseline-from", "baseline-to"]) $(id).oninput = () => {
   baselineEdited = true;
 };
+{
+  const tab = location.hash.slice(1);
+  if (tab !== activeTab && tabIds.includes(tab)) $(tab + "-tab").click();
+}
 load();
 </script><script>
 // The dashboards sit at /trends on the statistics listener and at
