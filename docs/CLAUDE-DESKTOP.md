@@ -4,7 +4,8 @@ Route the unmodified Claude Desktop **Code tab** through Kompressor using its
 built-in intercept listener. Desktop retains its normal subscription login and
 OAuth credentials; no separate API key is needed. Normal plan limits and any
 enabled extra usage still apply. This guide covers Linux with systemd user
-services.
+services; on Windows follow [`WINDOWS.md`](WINDOWS.md) §5, and see
+[On Windows](#on-windows) below for what differs.
 
 Validated 2026-10-21 with Desktop's bundled Claude Code **2.1.295**.
 
@@ -199,7 +200,6 @@ home path; JSON does not expand shell variables.
 ```
 
 Remove any previous `ANTHROPIC_BASE_URL` override from these Desktop settings.
-`NODE_EXTRA_CA_CERTS` is required in this setup because Claude must trust the
 `HTTPS_PROXY` is what makes this work at all. Desktop overwrites
 `ANTHROPIC_BASE_URL` when it spawns a session, so there is no base URL to set —
 but it leaves the proxy and CA variables alone, and honours them.
@@ -308,6 +308,33 @@ Finally, remove the certificate authority from any trust store it was installed
 in, and delete `ca_path`. A local CA that outlives the experiment that needed it
 is the part of this worth being tidy about; the fingerprint in the startup log
 identifies the right one.
+
+## On Windows
+
+The mechanism is the same; the paths and the permissions differ.
+[`WINDOWS.md`](WINDOWS.md) §5 has the commands.
+
+* **The service already runs the listener.** The Windows installer's default
+  mode registers a service whose configuration carries `[proxy.intercept]` and
+  both mounts, so step 1 is done. Its CA is generated in
+  `%ProgramData%\kompressor\ca` on the first start.
+* **That folder is closed to ordinary users**: only administrators, SYSTEM and
+  the service can open it, because `ca.key` lives there. Copy `ca.pem` — never
+  `ca.key` — from an administrator PowerShell to a path the user can read, such
+  as `%USERPROFILE%\.claude\kompressor-ca.pem`, and name that copy in
+  `NODE_EXTRA_CA_CERTS`. With the per-user install the CA is under
+  `%LOCALAPPDATA%\kompressor\ca` and can be named in place.
+* **Settings** are in `%USERPROFILE%\.claude\settings.json`. Write it as UTF-8
+  without a byte-order mark: Windows PowerShell 5.1's `Set-Content -Encoding
+  utf8` adds one and Claude then rejects the file. In JSON, either double the
+  backslashes of the CA path or use forward slashes.
+* **Restarting Desktop** means quitting it from the tray icon; closing the
+  window leaves it running with the old environment.
+* **Checking** uses `curl.exe`, not `curl`, which in Windows PowerShell 5.1 is
+  `Invoke-WebRequest`; the service's log is
+  `%ProgramData%\kompressor\logs\kompressor-service.err.log`.
+
+This has not yet been measured on Windows.
 
 ## Regular Chat is separate
 
