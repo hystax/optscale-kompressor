@@ -313,7 +313,8 @@ make release
 `make macos-pkg-docker`, `make win` and `make win-installer` build packages; each
 says what it needs if a tool is missing. [docs/QUICKSTART.md](docs/QUICKSTART.md) covers running it as a service,
 [docs/MACOS.md](docs/MACOS.md) covers the macOS paths, and
-[docs/WINDOWS.md](docs/WINDOWS.md) the Windows ones.
+[docs/WINDOWS.md](docs/WINDOWS.md) the Windows ones, including Claude Desktop
+and the Codex app.
 
 ---
 
