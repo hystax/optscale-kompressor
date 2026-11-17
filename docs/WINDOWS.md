@@ -27,7 +27,7 @@ The first page asks how to install:
   configuration in `%ProgramData%\kompressor\config.toml`, and the service
   started now and with Windows. Choose this for Claude Desktop and the Codex app:
   they need a proxy that is always there. See [The service](#the-service).
-* **For you only** (untick the box), with no administrator rights:
+* **Current user only** (untick the box), with no administrator rights:
   `%LOCALAPPDATA%\Programs\kompressor`, on your `PATH`. No configuration is
   written and nothing is started: `wrap` starts a proxy per session, and you
   write the configuration yourself (§2).
@@ -47,13 +47,13 @@ the service.
 
 **Or build it** from a checkout, with [rustup](https://rustup.rs) (Rust 1.95+,
 MSVC toolchain) and the *Desktop development with C++* build tools, and continue
-as for *For you only*:
+as for *Current user only*:
 
 ```powershell
 cargo install --path crates/kompressor-cli --locked
 ```
 
-## 2. Configure it (for you only)
+## 2. Configure it (current user only)
 
 Skip this with the service: it has its own configuration, and `wrap` uses the
 service when it is running.
@@ -340,7 +340,7 @@ A build from a checkout: `cargo install … --force` to upgrade,
 
 ## Where things are
 
-| | for you only | as a service |
+| | current user only | as a service |
 |---|---|---|
 | binary | `%LOCALAPPDATA%\Programs\kompressor\kompressor.exe` | `C:\Program Files\kompressor\kompressor.exe` |
 | config | `%USERPROFILE%\.config\kompressor\config.toml` | `%ProgramData%\kompressor\config.toml` |

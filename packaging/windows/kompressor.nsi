@@ -283,7 +283,7 @@ Function ModePage
     ${If} $0 == error
         Abort
     ${EndIf}
-    ${NSD_CreateLabel} 0 0 100% 30u "By default kompressor is installed as a system service. Untick the box to install it for you only, in your AppData folder, without administrator rights; then you run it yourself from PowerShell."
+    ${NSD_CreateLabel} 0 0 100% 30u "By default kompressor is installed as a system service. Untick the box to install it for the current user only, in your AppData folder, without administrator rights; then you run it yourself from PowerShell."
     Pop $0
     ${NSD_CreateCheckbox} 0 40u 100% 12u "Install as a system service (all users, starts with Windows)"
     Pop $CheckSystem
