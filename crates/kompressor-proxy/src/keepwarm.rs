@@ -364,6 +364,26 @@ pub(crate) fn background_wait(body: &Value) -> Option<Wait> {
     Some(Wait::Watch(until))
 }
 
+/// [`background_wait`] read from the request as the client wrote it, when
+/// compression changed it on the way out; from `sent` when it did not, or when
+/// `client` does not parse.
+///
+/// The ping repeats `sent`, because that is what the provider cached, but the
+/// wait is a fact about the conversation, and compression may have cut the
+/// lines it is read from. Cross-turn dedup folds a notification's repeated
+/// system-reminder boilerplate, and its `<task-id>` line goes with it, so a
+/// `[Monitor expired …]` that reaches the provider names no watch. Measured on
+/// the 18-trial keep-warm check of 2026-11-17 on 2.0.12 (`21-19-08`):
+/// train-fasttext and compile-compcert each answered after their watch's
+/// expiry notice, the deduped notice ended nothing, and three pings each went
+/// to a finished trial for the watch's ten minutes.
+pub(crate) fn client_background_wait(client: Option<&[u8]>, sent: &Value) -> Option<Wait> {
+    match client.and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok()) {
+        Some(original) => background_wait(&original),
+        None => background_wait(sent),
+    }
+}
+
 /// Record every watch `text` starts, with the lifetime it states, if it does.
 fn watch_lifetimes(text: &str, watches: &mut HashMap<String, Option<Duration>>) {
     for (at, _) in text.match_indices(WATCH_STARTED) {
@@ -1003,6 +1023,51 @@ mod tests {
         assert_eq!(wake(7200).max_pings(interval, 11), 11);
         assert_eq!(Wait::Wake(None).max_pings(interval, 11), 11);
         assert_eq!(Wait::Task.max_pings(interval, 11), 11);
+    }
+
+    #[test]
+    fn a_watch_expiry_compression_folded_is_read_from_the_client_body() {
+        // As 2.0.12 forwarded it on the 2026-11-17 keep-warm check: cross-turn
+        // dedup folded the reminder boilerplate, `<task-id>` line included.
+        let reminder = "<system-reminder>\n[SYSTEM NOTIFICATION - NOT USER INPUT]\n\
+            This is an automated background-task event, NOT a message from the user.\n";
+        let started = json!({"role": "user", "content": [{"type": "tool_result",
+            "tool_use_id": "toolu_1",
+            "content": "Monitor started (task b8hgxv4tt, expires in 10m unless the source \
+                ends first; you get one notice at expiry)."}]});
+        let expired = |head: &str| {
+            json!({"role": "user", "content": format!(
+                "{head}<event>[Monitor expired after 10m with 2 events delivered. \
+                 Re-arm it if you still need the watch.]</event>\n\
+                 </task-notification>\n</system-reminder>")})
+        };
+        let client = with_messages(json!([
+            started.clone(),
+            expired(&format!(
+                "{reminder}\n<task-notification>\n<task-id>b8hgxv4tt</task-id>\n\
+                 <summary>Monitor event: \"fasttext training results\"</summary>\n"
+            )),
+        ]));
+        let sent = with_messages(json!([
+            started,
+            expired(
+                "<system-reminder>\n[... 8 lines omitted; shown in full earlier in this conversation]\n"
+            ),
+        ]));
+
+        // the hazard: the forwarded body alone still reads a running watch
+        assert_eq!(
+            background_wait(&sent),
+            Some(Wait::Watch(Some(Duration::from_secs(600))))
+        );
+        let bytes = serde_json::to_vec(&client).unwrap();
+        assert_eq!(client_background_wait(Some(&bytes), &sent), None);
+        // an unchanged body is read as sent, and an unreadable one falls back
+        assert_eq!(client_background_wait(None, &client), None);
+        assert_eq!(
+            client_background_wait(Some(b"not json"), &sent),
+            Some(Wait::Watch(Some(Duration::from_secs(600))))
+        );
     }
 
     #[test]
