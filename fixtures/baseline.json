@@ -1,14 +1,14 @@
 {
   "format": 4,
-  "coverage_pct": 43.9486,
+  "coverage_pct": 43.9394,
   "claimed_pct": 63.3731,
   "payloads": 894,
   "chars_in": 3821424,
-  "chars_out": 2141962,
+  "chars_out": 2142314,
   "billed": {
-    "coverage_pct": 45.0754,
+    "coverage_pct": 45.0672,
     "chars_in": 15886252.0,
-    "chars_out": 8725468.1,
+    "chars_out": 8726770.5,
     "cache_read_rate": 0.1
   },
   "buckets": {
@@ -29,9 +29,9 @@
     "html": {
       "payloads": 6,
       "chars_in": 62743,
-      "chars_out": 20797,
-      "saved_pct": 66.8537,
-      "billed_out": 47200.9
+      "chars_out": 21149,
+      "saved_pct": 66.2927,
+      "billed_out": 48503.3
     },
     "listing": {
       "payloads": 49,
@@ -873,7 +873,7 @@
     "2df72ba7227ba885": [
       "html",
       7934,
-      1094
+      1446
     ],
     "2e0926e57f629b64": [
       "untouched:text",
@@ -4617,11 +4617,11 @@
     "ids": []
   },
   "timing": {
-    "ms_per_kb": 0.2893,
-    "p50_ms": 0.2104,
-    "p95_ms": 5.8853,
-    "max_ms": 34.9229,
-    "mean_ms": 1.2078
+    "ms_per_kb": 0.3602,
+    "p50_ms": 0.2581,
+    "p95_ms": 7.3753,
+    "max_ms": 47.7757,
+    "mean_ms": 1.5038
   },
   "violations": {}
 }
