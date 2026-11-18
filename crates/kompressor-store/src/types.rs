@@ -18,7 +18,7 @@ pub const DEFAULT_LIFETIME_MULTIPLIER: u64 = 8;
 /// The default absolute lifetime, measured from `created_at`.
 pub const DEFAULT_MAX_LIFETIME_SECONDS: u64 = DEFAULT_TTL_SECONDS * DEFAULT_LIFETIME_MULTIPLIER;
 
-/// The isolation boundary. `""` is the anonymous single-tenant deployment.
+/// The isolation boundary. `\"\"` is the anonymous single-tenant deployment.
 ///
 /// The tenant is part of the *key*, never a field compared after a row comes
 /// back. A handle that leaks across tenants therefore addresses a row that does
@@ -81,6 +81,10 @@ pub struct PutMeta {
     pub ttl_seconds: u64,
     /// The cap on total life, from `created_at`, that bounds the sliding window.
     pub max_lifetime_seconds: u64,
+    /// Optional original creation timestamp to preserve the absolute lifetime
+    /// when re-storing a fragment that may have been evicted from a cache.
+    /// When `None`, the fragment is treated as new.
+    pub created_at: Option<u64>,
 }
 
 impl PutMeta {
@@ -91,6 +95,7 @@ impl PutMeta {
             request_id: None,
             ttl_seconds: DEFAULT_TTL_SECONDS,
             max_lifetime_seconds: DEFAULT_MAX_LIFETIME_SECONDS,
+            created_at: None,
         }
     }
 
@@ -110,6 +115,13 @@ impl PutMeta {
     /// Set the absolute lifetime independently of the idle window.
     pub fn with_max_lifetime(mut self, max_lifetime_seconds: u64) -> PutMeta {
         self.max_lifetime_seconds = max_lifetime_seconds;
+        self
+    }
+
+    /// Carry the original creation timestamp so a re-store does not restart
+    /// the absolute lifetime (used by caches that may have dropped the entry).
+    pub fn with_created_at(mut self, created_at: u64) -> PutMeta {
+        self.created_at = Some(created_at);
         self
     }
 }
@@ -154,14 +166,14 @@ impl fmt::Debug for RefRecord {
     /// formatted a record — places nobody audits for secrets. Making the type
     /// incapable of printing its own body is cheaper than remembering not to.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RefRecord")
-            .field("id", &self.id)
-            .field("fragment_bytes", &self.fragment.len())
-            .field("kind", &self.kind)
-            .field("request_id", &self.request_id)
-            .field("created_at", &self.created_at)
-            .field("last_accessed", &self.last_accessed)
-            .field("ttl_seconds", &self.ttl_seconds)
+        f.debug_struct(\"RefRecord\")
+            .field(\"id\", &self.id)
+            .field(\"fragment_bytes\", &self.fragment.len())
+            .field(\"kind\", &self.kind)
+            .field(\"request_id\", &self.request_id)
+            .field(\"created_at\", &self.created_at)
+            .field(\"last_accessed\", &self.last_accessed)
+            .field(\"ttl_seconds\", &self.ttl_seconds)
             .finish()
     }
 }
@@ -169,9 +181,9 @@ impl fmt::Debug for RefRecord {
 /// The outcome of a point read.
 ///
 /// `Expired` is deliberately not folded into `Miss`. The caller answers a model
-/// that asked for a marker by name, and "we held this and let it go" earns a
-/// different reply — and a different stats row — from "this handle was never
-/// ours", which is what a cross-tenant or hallucinated handle looks like.
+/// that asked for a marker by name, and \"we held this and let it go\" earns a
+/// different reply — and a different stats row — from \"this handle was never
+/// ours\", which is what a cross-tenant or hallucinated handle looks like.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Lookup {
     /// The fragment, live at the time of the read.
@@ -220,11 +232,11 @@ pub struct StoreStats {
 #[non_exhaustive]
 pub enum StoreError {
     /// The SQLite driver refused the statement.
-    #[error("sqlite: {0}")]
+    #[error(\"sqlite: {0}\")]
     Sqlite(#[from] rusqlite::Error),
 
     /// A schema migration failed; the database is left at the previous version.
-    #[error("refs schema migration to version {version} failed: {source}")]
+    #[error(\"refs schema migration to version {version} failed: {source}\")]
     Migration {
         /// The migration that failed.
         version: u32,
@@ -238,7 +250,7 @@ pub enum StoreError {
     /// `detail` is a fixed string and the fragment is never attached: a row is
     /// most likely unreadable *because* its bytes are unexpected, which is
     /// exactly when quoting them into a log is most dangerous.
-    #[error("stored row for handle {id} is unreadable: {detail}")]
+    #[error(\"stored row for handle {id} is unreadable: {detail}\")]
     CorruptRow {
         /// The handle, as stored.
         id: String,
@@ -251,7 +263,7 @@ pub enum StoreError {
 ///
 /// The idle window slides with every touching read; the absolute lifetime does
 /// not move, so whichever comes first wins. Saturating arithmetic keeps an
-/// absurd TTL (`u64::MAX`, "never expire") from wrapping into a timestamp in
+/// absurd TTL (`u64::MAX`, \"never expire\") from wrapping into a timestamp in
 /// the past, which would expire the entry immediately — the exact opposite of
 /// what was asked for.
 pub fn expires_at(record: &RefRecord, max_lifetime_seconds: u64) -> u64 {
