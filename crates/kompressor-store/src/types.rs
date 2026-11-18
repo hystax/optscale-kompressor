@@ -321,6 +321,15 @@ pub trait RefStore: Send + Sync {
     /// against an explicit instant.
     fn purge_expired(&self, now: u64) -> Result<u64, StoreError>;
 
+    /// Whether the store answers at all, as cheaply as it can be asked.
+    ///
+    /// For readiness probes, which run every few seconds and need a yes or no,
+    /// not the count [`Self::stats`] scans the whole store for. The default is
+    /// that scan, for stores where it is cheap anyway.
+    fn ping(&self) -> Result<(), StoreError> {
+        self.stats().map(|_| ())
+    }
+
     /// Live rows and bytes.
     fn stats(&self) -> Result<StoreStats, StoreError>;
 

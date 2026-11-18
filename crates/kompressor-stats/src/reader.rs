@@ -407,7 +407,7 @@ impl DailyRollup {
 
 /// Read-only access to `stats.db`.
 pub struct StatsReader {
-    conn: Connection,
+    pub(crate) conn: Connection,
     /// Whether `retrieval_events` has the `withheld` column, which schema v10
     /// adds.
     ///
@@ -471,7 +471,7 @@ impl StatsReader {
     /// `withheld = 0` where the column exists, and the constant true where it
     /// does not — so a query reads "the asks that reached the store" on either
     /// shape. See [`StatsReader::has_withheld`].
-    fn served(&self) -> &'static str {
+    pub(crate) fn served(&self) -> &'static str {
         if self.has_withheld {
             "withheld = 0"
         } else {

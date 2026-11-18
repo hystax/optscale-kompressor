@@ -81,14 +81,17 @@ impl StatsWriter {
         // delete the archive and rebuild it from nothing — turning the one
         // surviving copy into zero. Refuse instead: there is nothing to
         // recompute from, and the existing archive is already the answer.
+        let (start, end) = day_bounds_ms(&tx, day)?;
         let raw: i64 = tx.query_row(
-            "SELECT EXISTS (
-               SELECT 1 FROM optimization_events
-                WHERE date(time_ms/1000,'unixepoch') = ?1
-               UNION ALL
-               SELECT 1 FROM retrieval_events
-                WHERE date(time_ms/1000,'unixepoch') = ?1)",
-            params![day],
+            &format!(
+                "SELECT EXISTS (
+                   SELECT 1 FROM optimization_events WHERE {}
+                   UNION ALL
+                   SELECT 1 FROM retrieval_events WHERE {})",
+                on_day("optimization_events", "", 1),
+                on_day("retrieval_events", "", 1),
+            ),
+            params![start, end],
             |row| row.get(0),
         )?;
         if raw == 0 {
@@ -99,9 +102,10 @@ impl StatsWriter {
         for table in ["optimization_events", "retrieval_events"] {
             tx.execute(
                 &format!(
-                    "UPDATE {table} SET rolled_up = 1 WHERE date(time_ms/1000,'unixepoch') = ?1"
+                    "UPDATE {table} SET rolled_up = 1 WHERE {}",
+                    on_day(table, "", 1)
                 ),
-                params![day],
+                params![start, end],
             )?;
         }
         tx.commit()?;
@@ -173,21 +177,23 @@ fn rollup_on(
     day: &str,
     include_rolled: bool,
 ) -> Result<usize, StatsError> {
+    let (start, end) = day_bounds_ms(conn, day)?;
     Ok(conn.execute(
-        "INSERT INTO daily_rollups
+        &format!(
+            "INSERT INTO daily_rollups
                  (day, tenant, mode, surface, requests, tokens_in, tokens_out,
                   retrievals, retrieval_hits, retrieved_tokens)
              SELECT day, tenant, mode, surface,
                     SUM(requests), SUM(tokens_in), SUM(tokens_out),
                     SUM(retrievals), SUM(hits), SUM(retrieved)
              FROM (
-               SELECT date(time_ms/1000,'unixepoch') AS day, tenant, mode, surface,
+               SELECT ?1 AS day, tenant, mode, surface,
                       1 AS requests, tokens_in AS tokens_in, tokens_out AS tokens_out,
                       0 AS retrievals, 0 AS hits, 0 AS retrieved
                  FROM optimization_events
-                WHERE date(time_ms/1000,'unixepoch') = ?1 AND (?2 OR rolled_up = 0)
+                WHERE {} AND (?2 OR rolled_up = 0)
                UNION ALL
-               SELECT date(r.time_ms/1000,'unixepoch') AS day, r.tenant,
+               SELECT ?1 AS day, r.tenant,
                       COALESCE((SELECT o.mode FROM optimization_events o
                                 WHERE o.tenant = r.tenant AND o.request_id = r.request_id
                                 ORDER BY o.time_ms, o.id LIMIT 1), 'unknown') AS mode,
@@ -195,7 +201,7 @@ fn rollup_on(
                       1 AS retrievals, r.found AS hits,
                       CASE WHEN r.found = 1 THEN r.returned_tokens ELSE 0 END AS retrieved
                  FROM retrieval_events r
-                WHERE date(r.time_ms/1000,'unixepoch') = ?1 AND (?2 OR r.rolled_up = 0)
+                WHERE {} AND (?2 OR r.rolled_up = 0)
              )
              GROUP BY day, tenant, mode, surface
              ON CONFLICT(day, tenant, mode, surface) DO UPDATE SET
@@ -205,7 +211,10 @@ fn rollup_on(
                retrievals = daily_rollups.retrievals + excluded.retrievals,
                retrieval_hits = daily_rollups.retrieval_hits + excluded.retrieval_hits,
                retrieved_tokens = daily_rollups.retrieved_tokens + excluded.retrieved_tokens",
-        params![day, include_rolled],
+            on_day("optimization_events", "", 3),
+            on_day("retrieval_events", "r.", 3),
+        ),
+        params![day, include_rolled, start, end],
     )?)
 }
 
@@ -220,18 +229,20 @@ fn requests_rollup_on(
     day: &str,
     include_rolled: bool,
 ) -> Result<usize, StatsError> {
+    let (start, end) = day_bounds_ms(conn, day)?;
     Ok(conn.execute(
-        "INSERT INTO daily_requests
+        &format!(
+            "INSERT INTO daily_requests
              (day, tenant, requests, prompt_tokens, cache_read_tokens,
               cache_write_tokens, completion_tokens)
-         SELECT date(time_ms/1000,'unixepoch') AS day, tenant,
+         SELECT ?1 AS day, tenant,
                 COUNT(*),
                 COALESCE(SUM(prompt_tokens), 0),
                 COALESCE(SUM(cache_read_tokens), 0),
                 COALESCE(SUM(cache_write_tokens), 0),
                 COALESCE(SUM(completion_tokens), 0)
            FROM proxy_requests
-          WHERE date(time_ms/1000,'unixepoch') = ?1 AND (?2 OR rolled_up = 0)
+          WHERE {} AND (?2 OR rolled_up = 0)
           GROUP BY day, tenant
          ON CONFLICT(day, tenant) DO UPDATE SET
            requests = daily_requests.requests + excluded.requests,
@@ -239,7 +250,9 @@ fn requests_rollup_on(
            cache_read_tokens = daily_requests.cache_read_tokens + excluded.cache_read_tokens,
            cache_write_tokens = daily_requests.cache_write_tokens + excluded.cache_write_tokens,
            completion_tokens = daily_requests.completion_tokens + excluded.completion_tokens",
-        params![day, include_rolled],
+            on_day("proxy_requests", "", 3),
+        ),
+        params![day, include_rolled, start, end],
     )?)
 }
 
@@ -262,15 +275,52 @@ fn conversations_rollup_on(
     day: &str,
     include_rolled: bool,
 ) -> Result<usize, StatsError> {
+    let (start, end) = day_bounds_ms(conn, day)?;
     Ok(conn.execute(
-        "INSERT OR IGNORE INTO daily_conversations (day, tenant, conversation)
-         SELECT date(time_ms/1000,'unixepoch'), tenant, conversation
-           FROM proxy_requests
-          WHERE date(time_ms/1000,'unixepoch') = ?1
-            AND conversation IS NOT NULL
-            AND (?2 OR rolled_up = 0)",
-        params![day, include_rolled],
+        &format!(
+            "INSERT OR IGNORE INTO daily_conversations (day, tenant, conversation)
+             SELECT ?1, tenant, conversation
+               FROM proxy_requests
+              WHERE {}
+                AND conversation IS NOT NULL
+                AND (?2 OR rolled_up = 0)",
+            on_day("proxy_requests", "", 3),
+        ),
+        params![day, include_rolled, start, end],
     )?)
+}
+
+/// `[midnight, next midnight)` of `day` (`YYYY-MM-DD`, UTC) in epoch
+/// milliseconds.
+///
+/// The rollups used to select a day with `date(time_ms/1000,'unixepoch') = ?`,
+/// which no index can serve, so every statement of every day in a pass read
+/// the whole table inside the one write transaction the writer waits behind.
+/// For the non-negative timestamps the proxy records the range is the same
+/// set of rows: `date()` of the truncated second falls on `day` exactly when
+/// the millisecond does.
+fn day_bounds_ms(conn: &rusqlite::Connection, day: &str) -> Result<(i64, i64), StatsError> {
+    Ok(conn.query_row(
+        "SELECT CAST(strftime('%s', ?1) AS INTEGER) * 1000,
+                CAST(strftime('%s', ?1, '+1 day') AS INTEGER) * 1000",
+        params![day],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?)
+}
+
+/// The rows of `table` (aliased by `alias`, `""` or `"r."`) inside the day
+/// whose bounds are bound at `?{first}` and `?{first + 1}`.
+///
+/// The `tenant IN (SELECT DISTINCT tenant ...)` term carries no filtering of
+/// its own: it gives the planner the leading column of the `(tenant, time_ms)`
+/// index, so each tenant's day is a range seek and the only full read is of
+/// the small index, not the table.
+fn on_day(table: &str, alias: &str, first: usize) -> String {
+    format!(
+        "{alias}tenant IN (SELECT DISTINCT tenant FROM {table}) \
+         AND {alias}time_ms >= ?{first} AND {alias}time_ms < ?{next}",
+        next = first + 1
+    )
 }
 
 /// Midnight UTC after `day`, in epoch milliseconds — the exclusive upper bound

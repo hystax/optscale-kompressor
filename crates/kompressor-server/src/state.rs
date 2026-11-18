@@ -2,11 +2,12 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kompressor_core::AppCore;
 use kompressor_stats::StatsError;
 use kompressor_stats::reader::StatsReader;
+use kompressor_store::StoreStats;
 use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::sync::Semaphore;
 
@@ -21,6 +22,22 @@ use crate::error::ApiError;
 /// a pathological payload, not a busy server.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Statistics queries that may run at once, each on its own read-only
+/// connection.
+///
+/// One shared connection serialised every stats endpoint, so a long cache or
+/// analysis report held the live page — which polls every two seconds —
+/// behind it. WAL lets readers proceed side by side; the bound keeps a burst of
+/// dashboards from opening a connection per request.
+const STATS_READERS: usize = 4;
+
+/// How long one store sample answers `/metrics`.
+///
+/// The sample sums every row of the ref store under the lock the proxy writes
+/// through; a scraper every few seconds, or several scrapers, should not pay
+/// that each time. `store_samples` in stats.db is sampled on a similar period.
+const STORE_SAMPLE_TTL: Duration = Duration::from_secs(10);
+
 /// Everything a request handler needs, built once at startup.
 pub struct ServerState {
     /// Configuration, tenants, and the compress/retrieve operations themselves.
@@ -32,8 +49,11 @@ pub struct ServerState {
     queue_timeout: Duration,
     /// Opened on first use, because a server can start before the statistics
     /// writer has created the file it will read.
-    stats: Mutex<Option<StatsReader>>,
+    /// Idle read-only connections, at most [`STATS_READERS`], opened on demand.
+    stats: Mutex<Vec<StatsReader>>,
+    stats_slots: Arc<Semaphore>,
     stats_path: Option<PathBuf>,
+    store_sample: Mutex<Option<(Instant, StoreStats)>>,
 }
 
 impl ServerState {
@@ -47,11 +67,36 @@ impl ServerState {
             // `max_inflight_compressions` bounds every surface together.
             inflight: core.engine_slots().clone(),
             queue_timeout: config.server.queue_timeout,
-            stats: Mutex::new(None),
+            stats: Mutex::new(Vec::new()),
+            stats_slots: Arc::new(Semaphore::new(STATS_READERS)),
             stats_path,
+            store_sample: Mutex::new(None),
             core,
         };
         Arc::new(state)
+    }
+
+    /// The whole-store figures for `/metrics`, re-read at most once per
+    /// [`STORE_SAMPLE_TTL`].
+    pub(crate) async fn store_sample(self: &Arc<Self>) -> Option<StoreStats> {
+        if let Some((at, stats)) = *self
+            .store_sample
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            && at.elapsed() < STORE_SAMPLE_TTL
+        {
+            return Some(stats);
+        }
+        let core = self.core.clone();
+        let fresh = tokio::task::spawn_blocking(move || core.refs().stats())
+            .await
+            .ok()?
+            .ok()?;
+        *self
+            .store_sample
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((Instant::now(), fresh));
+        Some(fresh)
     }
 
     /// The renderer behind `/metrics`.
@@ -87,19 +132,34 @@ impl ServerState {
             ));
         };
 
+        // Waiting here, not on a blocking thread: a queue of stats requests
+        // must not occupy the pool the engine and the store also run on.
+        let Ok(_slot) = state.stats_slots.clone().acquire_owned().await else {
+            return Err(ApiError::Internal("statistics readers closed".to_string()));
+        };
         let joined = tokio::task::spawn_blocking(move || {
-            // A poisoned lock means a previous query panicked. The connection
-            // is read-only and a panic cannot have left it half-written, so
-            // recovering beats making every later stats request fail.
-            let mut guard = state
+            // A poisoned lock means a previous query panicked while taking or
+            // returning a connection. The connections are read-only and a
+            // panic cannot have left one half-written, so recovering beats
+            // making every later stats request fail.
+            let idle = state
+                .stats
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop();
+            let reader = match idle {
+                Some(reader) => reader,
+                None => StatsReader::open(&path)?,
+            };
+            let result = f(&reader);
+            let mut pool = state
                 .stats
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if guard.is_none() {
-                *guard = Some(StatsReader::open(&path)?);
+            if pool.len() < STATS_READERS {
+                pool.push(reader);
             }
-            let reader = guard.as_ref().expect("just opened");
-            f(reader)
+            result
         })
         .await;
 
