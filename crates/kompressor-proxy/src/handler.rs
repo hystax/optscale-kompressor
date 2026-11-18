@@ -499,9 +499,10 @@ fn keep_warm_for(
             interval: proxy.cache_keep_warm_interval,
             max_pings: wait.max_pings(
                 proxy.cache_keep_warm_interval,
-                proxy
-                    .cache_keep_warm_background_pings
-                    .min(proxy.cache_keep_warm_max_pings),
+                wait.cap(
+                    proxy.cache_keep_warm_background_pings,
+                    proxy.cache_keep_warm_max_pings,
+                ),
             ),
         });
     Some(KeepWarmPlan {

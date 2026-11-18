@@ -35,8 +35,11 @@
 //! agent can also give its final answer with a job still running, and then no
 //! request ever comes. Those waits get their own cap,
 //! [`ProxyConfig::cache_keep_warm_background_pings`], and a wait on `Monitor`
-//! watches alone stops at the longest one's stated lifetime ("expires in 10m"),
-//! as a wake's stops at its due time. In the second keep-warm
+//! watches alone stops at the longest one's stated lifetime ("expires in 10m").
+//! A wake whose due time is known bounds the wait whatever else is running,
+//! and is no dead end — the client comes back when it fires, even after a
+//! final answer — so it stops at its due time under
+//! [`ProxyConfig::cache_keep_warm_max_pings`] alone. In the second keep-warm
 //! run they were 13 of the 30 pauses past five minutes; any other `end_turn`
 //! may be the last turn the conversation has, and is not kept warm.
 //!
@@ -259,8 +262,8 @@ pub(crate) enum Wait {
     /// the tool's answer did not say.
     Wake(Option<Duration>),
     /// Only `Monitor` watches, the longest of which expires this long after it
-    /// started (and any pending wake is due within it), or `None` when one did
-    /// not say.
+    /// started, or `None` when one did not say or a wake that did not say
+    /// when it is due is pending beside them.
     Watch(Option<Duration>),
 }
 
@@ -278,6 +281,17 @@ impl Wait {
                 pings.max(1).min(cap)
             }
             _ => cap,
+        }
+    }
+
+    /// The cap [`Self::max_pings`] takes: `max` for a wake due at a known
+    /// time, which is no dead end — the client comes back when it fires, even
+    /// after a final answer — and so needs no tighter cap than its due time;
+    /// `background` (at most `max`) for any other wait, which may be one.
+    pub(crate) fn cap(&self, background: u32, max: u32) -> u32 {
+        match self {
+            Wait::Wake(Some(_)) => max,
+            _ => background.min(max),
         }
     }
 }
@@ -346,6 +360,16 @@ pub(crate) fn background_wait(body: &Value) -> Option<Wait> {
             }
         });
     }
+    // A wake due at a known time brings the client back by then, whatever else
+    // is running: a task's notification can only bring it back sooner, and that
+    // request cancels the timer. So the wake bounds the wait, not the task.
+    // Measured on the 18-trial keep-warm check of 2026-11-18 on 2.0.12
+    // (`10-20-42`): crack-7z-hash answered with a cracker still running and a
+    // 1840 s wake set, the task capped the wait at four pings, and the wake came
+    // 657 s after the last one to write 52,852 tokens again at the one-hour price.
+    if wake_pending && wake_due.is_some() {
+        return Some(Wait::Wake(wake_due));
+    }
     let running: Vec<&String> = started.iter().filter(|id| !reported.contains(id)).collect();
     if running.is_empty() {
         return wake_pending.then_some(Wait::Wake(wake_due));
@@ -353,15 +377,13 @@ pub(crate) fn background_wait(body: &Value) -> Option<Wait> {
     if running.iter().any(|id| !watches.contains_key(*id)) {
         return Some(Wait::Task);
     }
-    // Only watches: the wait lasts as long as the longest of them lives, or a
-    // pending wake, whichever is later. Any one that did not say leaves it open.
-    let mut until = running.iter().try_fold(Duration::ZERO, |longest, id| {
+    // Only watches: the wait lasts as long as the longest of them lives. Any one
+    // that did not say leaves it open, as does a pending wake here, which did
+    // not say when it is due either.
+    let until = running.iter().try_fold(Duration::ZERO, |longest, id| {
         watches[*id].map(|life: Duration| longest.max(life))
     });
-    if wake_pending {
-        until = until.zip(wake_due).map(|(watch, wake)| watch.max(wake));
-    }
-    Some(Wait::Watch(until))
+    Some(Wait::Watch(until.filter(|_| !wake_pending)))
 }
 
 /// [`background_wait`] read from the request as the client wrote it, when
@@ -1080,7 +1102,46 @@ mod tests {
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_2",
                 "content": "Next wakeup scheduled for 15:17:00 (in 620s)."}]},
         ]));
-        assert_eq!(background_wait(&body), Some(Wait::Task));
+        assert_eq!(
+            background_wait(&body),
+            Some(Wait::Wake(Some(Duration::from_secs(620)))),
+            "the client is back when the wake fires, or sooner"
+        );
+        let unsaid = with_messages(json!([
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1",
+                "content": "Command running in background with ID: aaa111."}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_2",
+                "content": "Next wakeup scheduled for 15:17:00."}]},
+        ]));
+        assert_eq!(background_wait(&unsaid), Some(Wait::Task));
+    }
+
+    #[test]
+    fn a_wake_due_past_the_background_cap_is_kept_warm_until_it_is_due() {
+        // crack-7z-hash in `10-20-42`: a cracker still running, a 1840 s wake,
+        // and a final answer before it.
+        let body = with_messages(json!([
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1",
+                "content": "Command running in background with ID: bxfn37gdo. Output is being written to: /tmp/x.output. You will be notified when it completes."}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_2", "name": "ScheduleWakeup",
+                "input": {"delaySeconds": 1800, "noop": true, "prompt": "Check john 7z cracking progress", "reason": "slow hash"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_2",
+                "content": "Next wakeup scheduled for 13:00:00 (in 1840s). If you owe the user a status update this tick, write it now as ordinary response text; then end the turn."}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Done. Solution: honeybear"}]},
+        ]));
+        let wait = background_wait(&body).unwrap();
+        assert_eq!(wait, Wait::Wake(Some(Duration::from_secs(1840))));
+        let interval = Duration::from_secs(270);
+        assert_eq!(wait.max_pings(interval, wait.cap(4, 11)), 7);
+        assert_eq!(Wait::Wake(Some(Duration::from_secs(9000))).cap(4, 11), 11);
+        assert_eq!(Wait::Wake(None).cap(4, 11), 4);
+        assert_eq!(Wait::Task.cap(4, 11), 4);
+        assert_eq!(Wait::Watch(Some(Duration::from_secs(600))).cap(4, 11), 4);
+        assert_eq!(
+            Wait::Task.cap(20, 11),
+            11,
+            "the background cap never exceeds the other"
+        );
     }
 
     #[test]
