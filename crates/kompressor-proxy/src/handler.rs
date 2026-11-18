@@ -274,6 +274,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         &state,
         family,
         &prepared,
+        &decoded,
         &route.url,
         &upstream_headers,
         &request_id,
@@ -455,6 +456,7 @@ fn keep_warm_for(
     state: &ProxyState,
     family: Option<ApiFamily>,
     prepared: &Prepared,
+    client: &Bytes,
     url: &str,
     upstream_headers: &HeaderMap,
     request_id: &str,
@@ -487,8 +489,11 @@ fn keep_warm_for(
         upstream,
         conversation,
     )?;
+    // Read from what the client sent, not what compression made of it: see
+    // `client_background_wait`. Parsed again only when the two differ.
+    let rewritten = (prepared.body != *client).then_some(client.as_ref());
     let background = (proxy.cache_keep_warm_background_pings > 0)
-        .then(|| crate::keepwarm::background_wait(sent))
+        .then(|| crate::keepwarm::client_background_wait(rewritten, sent))
         .flatten()
         .map(|wait| crate::keepwarm::Schedule {
             interval: proxy.cache_keep_warm_interval,
