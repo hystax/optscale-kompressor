@@ -272,6 +272,51 @@ pub struct RequestOptions<'a> {
     /// The provider's real prices for a promotion, when the caller knows them.
     /// `None` prices it from `cache_hit_per_mille` as the rule always has.
     pub cache_pricing: Option<CachePricing>,
+    /// The reads this conversation has already replaced as stale, by
+    /// [`read_key`]. `Some` switches the read lifecycle from deciding on every
+    /// run to **replaying decisions**.
+    ///
+    /// Marking a read stale needs a *later* write, so the lifecycle is the one
+    /// transform whose output for a message depends on what follows it: left
+    /// to decide on every run, appending a turn rewrites an earlier one, inside
+    /// a prefix the provider has cached. With a ledger a read is replaced if
+    /// and only if its key is here, so the output for messages `0..k` depends
+    /// on those messages and on the ledger alone — and the ledger grows only
+    /// on a run with [`Self::may_decide`] set, which the caller sets on the
+    /// one turn where the provider's cache is already lost and a rewrite costs
+    /// nothing. `None` is the lifecycle as it always was.
+    pub stale_ledger: Option<&'a BTreeSet<u64>>,
+    /// Whether this run may add to the ledger: classify the reads against the
+    /// writes that follow them and replace the stale ones. Read only when
+    /// [`Self::stale_ledger`] is `Some`. The keys of every read this run
+    /// replaced, old and new, come back in
+    /// [`CompressStats::stale_read_keys`].
+    pub may_decide: bool,
+}
+
+/// What names one message of a conversation for [`RequestOptions::stale_ledger`]:
+/// its position, its role, the tool and file it came from, and its text as the
+/// client sent it. The same on every turn that carries the message, and — FNV-1a,
+/// no per-process seed — in every process.
+pub fn read_key(index: usize, message: &Message) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        // A separator no field can contain, so adjacent fields cannot trade bytes.
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    feed(&(index as u64).to_le_bytes());
+    feed(message.role.as_bytes());
+    feed(message.meta.tool_name.as_deref().unwrap_or("").as_bytes());
+    feed(message.meta.file_path.as_deref().unwrap_or("").as_bytes());
+    for text in texts_of(&message.content) {
+        feed(text.as_bytes());
+    }
+    hash
 }
 
 impl Default for RequestOptions<'_> {
@@ -292,6 +337,8 @@ impl Default for RequestOptions<'_> {
             cache_hit_per_mille: 1000,
             outside_tokens: 0,
             cache_pricing: None,
+            stale_ledger: None,
+            may_decide: false,
         }
     }
 }
@@ -701,6 +748,11 @@ pub struct CompressStats {
     /// therefore be taken once.
     #[serde(skip_serializing)]
     pub kept_inline_refs: Vec<RefId>,
+    /// The [`read_key`] of every read this run replaced as stale, when it ran
+    /// with a [`RequestOptions::stale_ledger`]: the ledger's next value.
+    /// Empty without one.
+    #[serde(skip_serializing)]
+    pub stale_read_keys: Vec<u64>,
     pub protected_ref_reasons: BTreeSet<String>,
     pub protected_ref_messages: u32,
     pub router_version: &'static str,
@@ -843,7 +895,20 @@ pub fn compress_messages(
     // prefix: the same history decides it the same way on every later turn.
     let mut elided_before: BTreeSet<RefId> = BTreeSet::new();
 
-    let read_states = if opts.enable_stale_read {
+    // With a ledger, reads are classified only on a run allowed to decide;
+    // every other run replays what the ledger holds and looks no further.
+    let ledger = req.stale_ledger.filter(|_| opts.enable_stale_read);
+    // Taken before anything is rewritten: a key names the message as it arrived.
+    let read_keys: Vec<u64> = if ledger.is_some() {
+        messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| read_key(index, message))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let read_states = if opts.enable_stale_read && (ledger.is_none() || req.may_decide) {
         let view: Vec<ReadMessage> = messages
             .iter()
             .map(|m| ReadMessage {
@@ -917,7 +982,8 @@ pub fn compress_messages(
 
         // A file read a later edit invalidated is factually wrong, and the model
         // cannot tell. Replacing it is worth more than compressing it.
-        let stale = matches!(read_states.get(&index), Some(ReadState::Stale));
+        let stale = matches!(read_states.get(&index), Some(ReadState::Stale))
+            || ledger.is_some_and(|decided| decided.contains(&read_keys[index]));
         let mut compressed_here = false;
         let mut applied: Vec<Kind> = Vec::new();
         let gated_before = refs.gated();
@@ -928,10 +994,26 @@ pub fn compress_messages(
         let before_compression = (!req.keep_inline.is_empty() || !elided_before.is_empty())
             .then(|| messages[index].content.clone());
 
+        // A tool result that arrives as one block is the same read as one
+        // that arrives as a string, and is how Anthropic delivers nearly all
+        // of them. Reached only with a ledger: without one the lifecycle keeps
+        // the reach it always had. A block pinned for a reason no cache state
+        // lifts — a citation, a signature — is left alone.
+        let stale_text: Option<String> = match &messages[index].content {
+            // Nothing is copied for a message that is not being replaced.
+            _ if !stale => None,
+            MessageContent::Text(text) => Some(text.clone()),
+            MessageContent::Blocks(slots) if ledger.is_some() && slots.len() == 1 => {
+                let slot = &slots[0];
+                let lifted = slot.protection == Protection::WhileCached
+                    && req.prefix_cache == PrefixCache::Cold;
+                (!slot.protected || lifted).then(|| slot.text.clone())
+            }
+            _ => None,
+        };
         if stale
             && refs.is_enabled()
-            && let MessageContent::Text(text) = &messages[index].content
-            && text.len() <= refs.max_ref_bytes()
+            && let Some(text) = stale_text.filter(|text| text.len() <= refs.max_ref_bytes())
         {
             let mark = refs.mark();
             let path = messages[index]
@@ -939,9 +1021,12 @@ pub fn compress_messages(
                 .file_path
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
-            let marker = stale_read_marker(&path, text, refs);
-            if chars_len(&marker) < chars_len(text) {
-                messages[index].content = MessageContent::Text(marker);
+            let marker = stale_read_marker(&path, &text, refs);
+            if chars_len(&marker) < chars_len(&text) {
+                match &mut messages[index].content {
+                    MessageContent::Blocks(slots) => slots[0].text = marker,
+                    content => *content = MessageContent::Text(marker),
+                }
                 applied.push(Kind::StaleRead);
                 compressed_here = true;
             } else {
@@ -1317,6 +1402,12 @@ pub fn compress_messages(
         }
 
         seen.push(&messages[index].content.joined_text());
+
+        // After the promotion above, which can put a fetched read back whole:
+        // the ledger holds what was replaced, not what was once classified.
+        if ledger.is_some() && compressed_here && applied.contains(&Kind::StaleRead) {
+            stats.stale_read_keys.push(read_keys[index]);
+        }
 
         if compressed_here {
             stats.compressed_messages += 1;
@@ -1997,6 +2088,161 @@ mod tests {
         }
         assert_eq!(stats.by_type.get("stale_read"), Some(&1));
         assert!(!refs.is_empty());
+    }
+
+    /// One run with a ledger: the conversation as the engine left it, and the
+    /// ledger's next value.
+    fn with_ledger(
+        mut messages: Vec<Message>,
+        decided: &BTreeSet<u64>,
+        may_decide: bool,
+    ) -> (Vec<Message>, BTreeSet<u64>) {
+        let opts = EngineOptions::default();
+        let mut refs = opts.collector();
+        let stats = compress_messages(
+            &mut messages,
+            &opts,
+            &RequestOptions {
+                stale_ledger: Some(decided),
+                may_decide,
+                ..RequestOptions::default()
+            },
+            &mut refs,
+        );
+        (messages, stats.stale_read_keys.into_iter().collect())
+    }
+
+    fn is_stale_marker(message: &Message) -> bool {
+        message
+            .content
+            .joined_text()
+            .starts_with("[Read content stale: src/a.rs")
+    }
+
+    /// The property the ledger exists for: a run that may not decide leaves a
+    /// read alone however plainly a later write invalidates it, so appending a
+    /// turn cannot rewrite an earlier one.
+    #[test]
+    fn with_a_ledger_a_read_is_replaced_only_once_a_deciding_run_has_said_so() {
+        let conversation = read_then_write("ok", false);
+        let none = BTreeSet::new();
+
+        let (warm, decided) = with_ledger(conversation.clone(), &none, false);
+        assert!(!is_stale_marker(&warm[0]), "a warm run decides nothing");
+        assert!(decided.is_empty());
+
+        let (cold, decided) = with_ledger(conversation.clone(), &none, true);
+        assert!(is_stale_marker(&cold[0]), "the deciding run replaces it");
+        assert_eq!(
+            decided.iter().copied().collect::<Vec<_>>(),
+            vec![read_key(0, &conversation[0])]
+        );
+
+        // Every later run replays it, to the byte, and decides nothing new.
+        let (replayed, again) = with_ledger(conversation.clone(), &decided, false);
+        assert_eq!(replayed, cold);
+        assert_eq!(again, decided);
+    }
+
+    /// What `0..k` compresses to must not depend on what follows `k`. Checked
+    /// at every length, with a second read the ledger does not hold sitting
+    /// in front of a write that would otherwise invalidate it.
+    #[test]
+    fn replaying_a_ledger_is_prefix_monotonic() {
+        let mut conversation = read_then_write("ok", false);
+        conversation.push(Message::text("user", "and the other file?"));
+        let mut second = read_then_write("ok", false);
+        for message in &mut second {
+            message.meta.file_path = Some("src/b.rs".into());
+        }
+        conversation.extend(second);
+        conversation.push(Message::text("user", "thanks"));
+
+        // Decided when only the first read had been written over.
+        let (_, decided) = with_ledger(conversation[..2].to_vec(), &BTreeSet::new(), true);
+        assert_eq!(decided.len(), 1);
+
+        let (whole, _) = with_ledger(conversation.clone(), &decided, false);
+        assert!(is_stale_marker(&whole[0]));
+        assert!(
+            !whole[3]
+                .content
+                .joined_text()
+                .starts_with("[Read content stale"),
+            "the second read was invalidated on a warm turn and stays as it was"
+        );
+        for length in 1..conversation.len() {
+            let (shorter, _) = with_ledger(conversation[..length].to_vec(), &decided, false);
+            assert_eq!(shorter[..], whole[..length], "the first {length} messages");
+        }
+    }
+
+    /// A key names a message by where it sits and what it said, so a ledger
+    /// entry cannot attach to another message at the same index.
+    #[test]
+    fn a_ledger_entry_belongs_to_one_message() {
+        let conversation = read_then_write("ok", false);
+        let key = read_key(0, &conversation[0]);
+        let mut edited = conversation[0].clone();
+        edited.content = MessageContent::Text("y = 2\n".repeat(200));
+        assert_ne!(read_key(0, &edited), key, "other text");
+        assert_ne!(read_key(1, &conversation[0]), key, "another position");
+        let mut other_file = conversation[0].clone();
+        other_file.meta.file_path = Some("src/b.rs".into());
+        assert_ne!(read_key(0, &other_file), key, "another file");
+
+        let stray: BTreeSet<u64> = [key].into();
+        let (out, decided) = with_ledger(vec![edited.clone()], &stray, false);
+        assert_eq!(out[0], edited_as_compressed_without_a_ledger(&edited));
+        assert!(decided.is_empty());
+    }
+
+    fn edited_as_compressed_without_a_ledger(message: &Message) -> Message {
+        let opts = EngineOptions::default();
+        let mut refs = opts.collector();
+        let mut messages = vec![message.clone()];
+        compress_messages(&mut messages, &opts, &RequestOptions::default(), &mut refs);
+        messages.remove(0)
+    }
+
+    /// Anthropic delivers a tool result as blocks. One unpinned block is the
+    /// same read as a string; one pinned for good — a citation — is not ours.
+    #[test]
+    fn with_a_ledger_a_read_delivered_as_one_block_is_replaced() {
+        let as_block = |protected: bool| {
+            let mut conversation = read_then_write("ok", false);
+            conversation[0].content = MessageContent::Blocks(vec![TextSlot {
+                text: "x = 1\n".repeat(200),
+                protected,
+                protection: Protection::Always,
+            }]);
+            conversation
+        };
+        let (out, decided) = with_ledger(as_block(false), &BTreeSet::new(), true);
+        assert!(is_stale_marker(&out[0]));
+        assert!(matches!(&out[0].content, MessageContent::Blocks(slots) if slots.len() == 1));
+        assert_eq!(decided.len(), 1);
+
+        let pinned = as_block(true);
+        let (out, decided) = with_ledger(pinned.clone(), &BTreeSet::new(), true);
+        assert_eq!(out[0], pinned[0]);
+        assert!(decided.is_empty());
+
+        // Without a ledger the lifecycle keeps the reach it always had.
+        let opts = EngineOptions::default();
+        let mut refs = opts.collector();
+        let mut legacy = as_block(false);
+        compress_messages(&mut legacy, &opts, &RequestOptions::default(), &mut refs);
+        assert!(!is_stale_marker(&legacy[0]));
+    }
+
+    /// A write that failed invalidates nothing on a deciding run either.
+    #[test]
+    fn a_deciding_run_still_ignores_a_write_that_failed() {
+        let failed = read_then_write("ERROR: permission denied; file unchanged", false);
+        let (out, decided) = with_ledger(failed, &BTreeSet::new(), true);
+        assert!(!is_stale_marker(&out[0]));
+        assert!(decided.is_empty());
     }
 
     fn read_then_write(write_result: &str, tool_error: bool) -> Vec<Message> {

@@ -682,6 +682,13 @@ RENDER.prefix = d => {
     section("Predicting a lapse on the request that finds it", coldTable(asked),
       note("Each request of a conversation the provider had served from cache, scored as it arrived: predicted cold when it had been idle longer than the lifetime its previous request asked for, plus the margin. " +
         "Read from cache is the expensive mistake — acting on that prediction would have rewritten a live prefix.")),
+    section("Recompactions on a lapsed cache", tiles([
+      ["On the provider's answer", n(d.recompactions.observed), "it had read nothing and written nothing"],
+      ["On idle time", n(d.recompactions.predicted), "predicted on the turn that found it"],
+      ["Predicted wrongly", n(d.recompactions.predicted_wrong), "then served from cache: a live prefix rewritten", d.recompactions.predicted_wrong ? "bad" : "good"],
+      ["Conversations", n(d.recompactions.conversations), n(d.recompactions.stale_reads) + " stale reads replaced"],
+    ]),
+      note("With proxy.cold_recompact on, the turn that finds the provider's cache gone rewrites the whole conversation, and what it decided is replayed on every later turn. Three wrong predictions in an hour end prediction until restart.")),
     assumed.length ? section("The same, where the request names no lifetime", coldTable(assumed),
       note("The lifetime is assumed, not asked for, so every row is one guess about the provider's retention.")) : null,
   ].filter(Boolean);

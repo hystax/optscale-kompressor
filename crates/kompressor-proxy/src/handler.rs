@@ -25,8 +25,8 @@ use tracing::Instrument;
 
 use kompressor_core::auth::{Credentials, Identity};
 use kompressor_core::config::{
-    CacheTtl, FrozenPrefix, PromptCacheKey, PromptCacheRetention, ProxyConfig, RetrieveExecution,
-    RetrieveTool, ToolsOrder, Upstream,
+    CacheTtl, ColdRecompact, FrozenPrefix, PromptCacheKey, PromptCacheRetention, ProxyConfig,
+    RetrieveExecution, RetrieveTool, ToolsOrder, Upstream,
 };
 use kompressor_core::{AppCore, RequestInfo};
 use kompressor_engine::estimate_tokens;
@@ -591,6 +591,9 @@ struct Prepared {
     observation: Option<kompressor_stats::context::PrefixObservation>,
     /// The conversation's opening, for `prompt_cache_key`.
     opening: Option<u64>,
+    /// This turn found the provider's cache gone and was recompacted, with
+    /// how many stale reads the conversation's ledger now holds.
+    recompacted: Option<(crate::recompact::Cold, usize)>,
 }
 
 impl Prepared {
@@ -602,6 +605,7 @@ impl Prepared {
             one_hour: false,
             observation: None,
             opening: None,
+            recompacted: None,
             body,
             json: None,
             saved_tokens: 0,
@@ -709,6 +713,7 @@ fn passthrough_with_stable_tools(
         one_hour: false,
         observation: None,
         opening: None,
+        recompacted: None,
     }
 }
 
@@ -942,13 +947,62 @@ fn observe_prefix(
         &identified.incoming,
         outgoing.as_ref().unwrap_or(&identified.incoming),
     );
-    prepared.observation = Some(crate::drift::observation(
+    let mut observation = crate::drift::observation(
         family,
         &identified.incoming,
         compared,
         identified.text_bytes,
         identified.idle,
-    ));
+    );
+    if let Some((kind, held)) = prepared.recompacted {
+        observation.recompacted = Some(kind.as_str().to_string());
+        observation.ledger_reads = u32::try_from(held).unwrap_or(u32::MAX);
+    }
+    prepared.observation = Some(observation);
+}
+
+/// Whether this request finds its conversation's provider cache gone, and
+/// how that is known, under `proxy.cold_recompact`. See [`crate::recompact`].
+///
+/// `None` with the setting off, under any freeze but `first_seen` — lowering
+/// the freeze for good is what makes a recompaction hold on later turns — and
+/// for every request of a conversation whose cache is, as far as can be told,
+/// alive.
+fn cold_turn(
+    state: &ProxyState,
+    family: Option<ApiFamily>,
+    found: &Identified,
+) -> Option<crate::recompact::Cold> {
+    use crate::recompact::Cold;
+    let proxy = &state.core.config_for(family.map(ApiFamily::provider)).proxy;
+    if proxy.cold_recompact == ColdRecompact::Off || proxy.frozen_prefix != FrozenPrefix::FirstSeen
+    {
+        return None;
+    }
+    // The provider's own answer first: evidence, where the rest is inference.
+    if state.prefixes.state(found.fingerprint) == PrefixCache::Cold {
+        return Some(Cold::Observed);
+    }
+    if proxy.cold_recompact != ColdRecompact::Predicted
+        || family != Some(ApiFamily::AnthropicMessages)
+        || !state.recompact.predicting()
+    {
+        return None;
+    }
+    // The lifetime the conversation's last request asked for. Unknown when
+    // this process has not seen one, and then nothing is predicted.
+    let lifetime = match state.drift.previous_one_hour(found.fingerprint)? {
+        true => Duration::from_secs(3_600),
+        false => Duration::from_secs(300),
+    };
+    state
+        .prefixes
+        .predicted_cold(
+            found.fingerprint,
+            found.messages,
+            lifetime + proxy.cold_recompact_margin,
+        )
+        .then_some(Cold::Predicted)
 }
 
 /// Decide what to send, then stamp the conversation's cache identity on it.
@@ -976,6 +1030,10 @@ async fn prepare(
     let fingerprint = identified.as_ref().map(|found| found.fingerprint);
     // Refcounted: kept to tell a body forwarded as it arrived from a rewrite.
     let original = body.clone();
+    // Before `long_ttl` below, which moves the message count this reads.
+    let cold = identified
+        .as_ref()
+        .and_then(|found| cold_turn(state, family, found));
     // Decided once, here: under `adaptive` the question itself moves the
     // conversation's state. Anthropic only; the TTL is its field.
     let long_ttl = family == Some(ApiFamily::AnthropicMessages)
@@ -1003,8 +1061,21 @@ async fn prepare(
         provider,
         fingerprint,
         long_ttl,
+        cold,
     )
     .await;
+    if let Some(found) = identified.as_ref()
+        && state
+            .core
+            .config_for(family.map(ApiFamily::provider))
+            .proxy
+            .cold_recompact
+            != ColdRecompact::Off
+    {
+        state
+            .prefixes
+            .note_messages(found.fingerprint, found.messages);
+    }
     if prepared.prefix.is_none() {
         prepared.prefix = fingerprint;
     }
@@ -1077,6 +1148,8 @@ async fn prepare_inner(
     // Whether this request will ask for one-hour cache entries, decided before
     // compression so a promotion is priced at the write it will cost.
     long_ttl: bool,
+    // This request finds the provider's cache gone; see `cold_turn`.
+    cold: Option<crate::recompact::Cold>,
 ) -> Prepared {
     // This provider's settings: `proxy.providers` applied over the defaults.
     let config = state.core.config_for(family.map(ApiFamily::provider));
@@ -1157,8 +1230,14 @@ async fn prepare_inner(
             // Opus rates, re-writing a 20,000-token suffix to remove a
             // 2,000-token read needs ~125 further turns to break even, against
             // sessions that run 20 to 70.
+            //
+            // `cold_recompact` is what lets the two be had together: the
+            // replacement is then decided only on a turn whose cache is
+            // already lost and replayed on every other, so `first_seen` no
+            // longer has to withhold it.
             enable_stale_read: (!proxy.stale_read
-                || proxy.frozen_prefix == FrozenPrefix::FirstSeen)
+                || (proxy.frozen_prefix == FrozenPrefix::FirstSeen
+                    && proxy.cold_recompact == ColdRecompact::Off))
                 .then_some(false),
             ..Default::default()
         }),
@@ -1169,8 +1248,16 @@ async fn prepare_inner(
     // pinned, goes out whole, and is compressed the turn after — the very
     // rewrite this exists to prevent. Read without recording, because the
     // floor is set by the first request that gets past the gate.
+    //
+    // A turn that finds the cache gone thaws everything: nothing is cached to
+    // keep, and what it sends is what every later turn will send. The floor
+    // itself is lowered only once that body is on its way (below), so a turn
+    // that falls open here leaves the conversation exactly as it was.
+    let recompacting = cold.filter(|_| conversation.is_some());
     if proxy.frozen_prefix == FrozenPrefix::FirstSeen
-        && let Some(held) = conversation.and_then(|key| state.prefixes.held_floor(key))
+        && let Some(held) = recompacting
+            .map(|_| 0)
+            .or_else(|| conversation.and_then(|key| state.prefixes.held_floor(key)))
         && held < walk.frozen_message_count
     {
         thaw_the_uncached_tail(&mut walk, held);
@@ -1231,6 +1318,7 @@ async fn prepare_inner(
     // `PrefixTracker::floor`.
     let frozen = match proxy.frozen_prefix {
         FrozenPrefix::Marker => walk.frozen_message_count,
+        FrozenPrefix::FirstSeen if recompacting.is_some() => 0,
         FrozenPrefix::FirstSeen => fingerprint
             .map(|key| state.prefixes.floor(key, walk.frozen_message_count))
             // Nothing frozen means no prefix to have an opinion about, and the
@@ -1309,7 +1397,15 @@ async fn prepare_inner(
 
     let messages = std::mem::take(&mut walk.messages);
 
-    let compressed = compress_with_deadline(
+    // With `cold_recompact` on the read lifecycle replays this conversation's
+    // ledger on every turn, and decides only on the one being recompacted.
+    let ledger = (proxy.cold_recompact != ColdRecompact::Off
+        && proxy.frozen_prefix == FrozenPrefix::FirstSeen)
+        .then_some(conversation)
+        .flatten()
+        .map(|key| state.recompact.reads(key));
+
+    let compressed = compress_with_ledger(
         state,
         identity,
         messages,
@@ -1341,9 +1437,11 @@ async fn prepare_inner(
         ),
         conversation,
         proxy.compress_timeout,
+        ledger,
+        recompacting.is_some(),
     )
     .await;
-    let Some((messages, saved)) = compressed else {
+    let Some((messages, saved, stale_reads)) = compressed else {
         return passthrough_with_stable_tools(proxy, options.mode, family, body, stream, model);
     };
     walk.messages = messages;
@@ -1414,6 +1512,20 @@ async fn prepare_inner(
                 injected_tool = injected,
                 "compressed"
             );
+            // The commit point of a recompaction: this body is what the
+            // provider will cache, so from here the conversation has no
+            // freeze and its ledger holds what this turn replaced.
+            let recompacted = recompacting.zip(fingerprint).map(|(kind, key)| {
+                state.prefixes.lower_floor(key);
+                let held = state.recompact.commit(key, &stale_reads);
+                tracing::info!(
+                    request_id,
+                    how = kind.as_str(),
+                    stale_reads = held,
+                    "the provider's cache was gone; recompacted the whole conversation"
+                );
+                (kind, held)
+            });
             Prepared {
                 body: out,
                 json: Some(value),
@@ -1427,6 +1539,7 @@ async fn prepare_inner(
                 one_hour: false,
                 observation: None,
                 opening: None,
+                recompacted,
             }
         }
         Err(error) => {
@@ -1512,6 +1625,54 @@ pub(crate) async fn compress_with_deadline(
     identity: &Identity,
     messages: Vec<Message>,
     frozen_message_count: usize,
+    prefix_cache: PrefixCache,
+    options: &kompressor_engine::EngineOptions,
+    request_id: &str,
+    family: ApiFamily,
+    model: Option<&str>,
+    provider: &str,
+    keep_inline: Vec<RefId>,
+    fetches: Vec<(RefId, u32)>,
+    cache_hit_per_mille: u32,
+    outside_tokens: u32,
+    cache_pricing: Option<kompressor_engine::messages::CachePricing>,
+    conversation: Option<u64>,
+    timeout: Duration,
+) -> Option<(Vec<Message>, u32)> {
+    compress_with_ledger(
+        state,
+        identity,
+        messages,
+        frozen_message_count,
+        prefix_cache,
+        options,
+        request_id,
+        family,
+        model,
+        provider,
+        keep_inline,
+        fetches,
+        cache_hit_per_mille,
+        outside_tokens,
+        cache_pricing,
+        conversation,
+        timeout,
+        None,
+        false,
+    )
+    .await
+    .map(|(messages, saved, _)| (messages, saved))
+}
+
+/// [`compress_with_deadline`], with the conversation's stale-read ledger: the
+/// reads to replace, and whether this run may decide more. Also returns the
+/// keys of the reads it replaced. See [`crate::recompact`].
+#[allow(clippy::too_many_arguments)]
+async fn compress_with_ledger(
+    state: &ProxyState,
+    identity: &Identity,
+    messages: Vec<Message>,
+    frozen_message_count: usize,
     // Whether the provider is still serving that prefix from cache. Decided by
     // the caller from what the provider reported last time; see `prefixcache`.
     prefix_cache: PrefixCache,
@@ -1536,7 +1697,9 @@ pub(crate) async fn compress_with_deadline(
     // with no conversation of its own, which then keeps nothing pinned.
     conversation: Option<u64>,
     timeout: Duration,
-) -> Option<(Vec<Message>, u32)> {
+    ledger: Option<std::collections::BTreeSet<u64>>,
+    may_decide: bool,
+) -> Option<(Vec<Message>, u32, Vec<u64>)> {
     let core = state.core.clone();
     let prefixes = state.prefixes.clone();
     let identity = identity.clone();
@@ -1605,6 +1768,8 @@ pub(crate) async fn compress_with_deadline(
             cache_hit_per_mille,
             outside_tokens,
             cache_pricing,
+            ledger.as_ref(),
+            may_decide,
         );
         let retained = core.retain(&identity, computed, &request_id, &options);
         Some((
@@ -1647,7 +1812,7 @@ pub(crate) async fn compress_with_deadline(
                 .stats
                 .tokens_in
                 .saturating_sub(outcome.stats.tokens_out);
-            Some((messages, saved))
+            Some((messages, saved, outcome.stats.stale_read_keys))
         }
         // Queued past the deadline: the closure declined to start. A deadline
         // that ran out is a timeout wherever it ran out, so it is counted with
@@ -2490,6 +2655,9 @@ pub(crate) struct Recorder {
     pub(crate) keep_warm: Option<KeepWarmPlan>,
     /// How the model stopped, where the path that relayed it could tell.
     pub(crate) stop_reason: Option<String>,
+    /// Set when this request was recompacted on a *predicted* lapse, so the
+    /// provider's answer can be held against the prediction.
+    predicted_cold: Option<Arc<crate::recompact::Recompact>>,
 }
 
 impl Recorder {
@@ -2556,6 +2724,10 @@ impl Recorder {
             prefix: prepared.prefix,
             keep_warm: None,
             stop_reason: None,
+            predicted_cold: prepared
+                .recompacted
+                .filter(|(kind, _)| *kind == crate::recompact::Cold::Predicted)
+                .map(|_| state.recompact.clone()),
         }
     }
 
@@ -2633,6 +2805,19 @@ impl Recorder {
                 .pointer("/cache_creation/ephemeral_1h_input_tokens")
                 .and_then(Value::as_u64)
                 .map(|tokens| tokens as u32);
+        }
+        // A lapse was predicted and the whole conversation rewritten on it.
+        // If the provider read from cache after all, the entry was alive and
+        // the rewrite cost what it was meant to save.
+        if let Some(recompact) = self.predicted_cold.take()
+            && self.event.cache_read_tokens.is_some_and(|read| read > 0)
+        {
+            tracing::warn!(
+                request_id = %self.event.request_id,
+                cache_read = self.event.cache_read_tokens,
+                "a predicted cache lapse was served from cache"
+            );
+            recompact.wrong_prediction();
         }
         // Filed only when this request actually froze a prefix. `None` for
         // cache reads means the response carried no usage at all, which is not

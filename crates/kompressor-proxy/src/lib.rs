@@ -75,6 +75,7 @@ pub mod mode;
 mod nonstream;
 mod piggyback;
 pub mod prefixcache;
+pub mod recompact;
 mod retention;
 pub mod retrieve;
 pub mod route;
@@ -121,6 +122,8 @@ pub struct ProxyState {
     /// The tool order and beta tokens each conversation's first request
     /// established, for `proxy.tools_order` and `proxy.sticky_beta`.
     pub(crate) stabilizer: Arc<stabilize::Stabilizer>,
+    /// What each conversation's cold turns decided, for `proxy.cold_recompact`.
+    pub(crate) recompact: Arc<recompact::Recompact>,
 }
 
 impl ProxyState {
@@ -144,6 +147,7 @@ impl ProxyState {
             retention: Arc::new(retention::Rejections::default()),
             drift: Arc::new(drift::DriftTracker::default()),
             stabilizer: Arc::new(stabilize::Stabilizer::default()),
+            recompact: Arc::new(recompact::Recompact::default()),
         }
     }
 
@@ -156,6 +160,12 @@ impl ProxyState {
     /// Exposed on the same terms as `failopen`: for `/metrics` and for tests.
     pub fn prefixes(&self) -> Arc<prefixcache::PrefixTracker> {
         self.prefixes.clone()
+    }
+
+    /// What each conversation's cold turns decided, and how its lapse
+    /// predictions have fared. Exposed on the same terms as `prefixes`.
+    pub fn recompact(&self) -> Arc<recompact::Recompact> {
+        self.recompact.clone()
     }
 
     /// The keep-warm timers. Exposed on the same terms as `prefixes`.

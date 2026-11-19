@@ -107,6 +107,18 @@ pub struct PrefixObservation {
     /// seconds, where the request says: Anthropic's five minutes or an hour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifetime_s: Option<u32>,
+    /// Set when this turn found the provider's cache gone and the whole
+    /// conversation was recompacted (`proxy.cold_recompact`): `observed` when
+    /// the provider's last answer said so, `predicted` when the idle time did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recompacted: Option<String>,
+    /// Stale reads the conversation's ledger held after that recompaction.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub ledger_reads: u32,
+}
+
+fn is_zero(count: &u32) -> bool {
+    *count == 0
 }
 
 /// The client changed its system prompt.

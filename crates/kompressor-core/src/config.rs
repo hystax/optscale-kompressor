@@ -395,6 +395,36 @@ pub enum PromptCacheRetention {
     Extended,
 }
 
+/// What to do on the turn that finds a conversation's provider cache gone.
+///
+/// A request that arrives after the cache has lapsed is written to the cache
+/// again at the write price whatever it contains, so it is the one turn on
+/// which rewriting the whole conversation costs nothing: the frozen prefix can
+/// be compressed, and a file read a later edit invalidated can be replaced.
+/// What that turn decides is recorded per conversation and replayed on every
+/// later turn, so the bytes it wrote are the bytes sent from then on.
+///
+/// Acts only under `frozen_prefix = "first_seen"`, which is what lets a
+/// conversation's freeze be lowered for good; under `marker` it does nothing.
+/// With it on, `first_seen` no longer withholds the stale-read replacement:
+/// that is decided on these turns and on no other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ColdRecompact {
+    /// A lapse is handled as it always was. The shipped default.
+    #[default]
+    Off,
+    /// Recompact when the provider's last answer showed the cache gone: it
+    /// read nothing and wrote nothing.
+    Observed,
+    /// Also when this request arrives longer after the conversation's last one
+    /// than the cache lifetime that one asked for, plus
+    /// `cold_recompact_margin`. Anthropic Messages only, where the lifetime is
+    /// in the request. Three wrong predictions in an hour turn it off for the
+    /// life of the process.
+    Predicted,
+}
+
 /// The order tool definitions go upstream in.
 ///
 /// A provider renders the tool list ahead of the conversation, so a client
@@ -546,6 +576,15 @@ pub struct ProxyConfig {
     /// never sent in this conversation is never added. Anthropic Messages
     /// only.
     pub sticky_beta: bool,
+    /// What to do on the turn that finds the provider's cache gone. See
+    /// [`ColdRecompact`].
+    pub cold_recompact: ColdRecompact,
+    /// How far past the cache lifetime a request must arrive before
+    /// `cold_recompact = "predicted"` calls the cache gone. A wrong call
+    /// rewrites a live prefix, so the margin is what keeps a slow clock or a
+    /// late response from being read as a lapse.
+    #[serde(with = "humantime_serde")]
+    pub cold_recompact_margin: Duration,
     /// Keep an Anthropic conversation's cached prefix alive while the client
     /// is busy running a tool. **On by default**; only Anthropic Messages
     /// traffic is ever pinged, so this is in effect Anthropic's default, and
@@ -877,6 +916,8 @@ pub struct ProviderOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sticky_beta: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cold_recompact: Option<ColdRecompact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_keep_warm: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_read: Option<bool>,
@@ -910,6 +951,7 @@ impl ProviderOverrides {
             prompt_cache_key,
             tools_order,
             sticky_beta,
+            cold_recompact,
             cache_keep_warm,
             stale_read
         );
@@ -978,6 +1020,8 @@ impl Default for ProxyConfig {
             prompt_cache_key: PromptCacheKey::Client,
             tools_order: ToolsOrder::Client,
             sticky_beta: false,
+            cold_recompact: ColdRecompact::Off,
+            cold_recompact_margin: Duration::from_secs(60),
             cache_keep_warm: true,
             cache_keep_warm_interval: Duration::from_secs(270),
             cache_keep_warm_max_pings: 11,
@@ -1535,6 +1579,22 @@ impl Config {
                     _ => self.proxy.tools_order,
                 };
             }
+            "cold_recompact" => {
+                // A typo leaves the setting alone: it changes what is rewritten.
+                self.proxy.cold_recompact = match value.to_ascii_lowercase().as_str() {
+                    "off" => ColdRecompact::Off,
+                    "observed" => ColdRecompact::Observed,
+                    "predicted" => ColdRecompact::Predicted,
+                    _ => self.proxy.cold_recompact,
+                };
+            }
+            "cold_recompact_margin" => match parse_duration(value) {
+                Some(margin) => self.proxy.cold_recompact_margin = margin,
+                None => tracing::warn!(
+                    value,
+                    "KOMPRESSOR__PROXY__COLD_RECOMPACT_MARGIN is not a duration; ignored"
+                ),
+            },
             "sticky_beta" => {
                 self.proxy.sticky_beta =
                     parse_bool_setting("proxy.sticky_beta", value, self.proxy.sticky_beta);
@@ -2104,6 +2164,38 @@ mod tests {
         assert!(!openai.proxy.sticky_beta);
 
         assert!(toml::from_str::<Config>("[proxy]\ntools_order = \"sorted\"\n").is_err());
+    }
+
+    #[test]
+    fn cold_recompaction_is_off_by_default_and_set_per_provider_or_from_the_environment() {
+        let mut config = Config::default();
+        assert_eq!(config.proxy.cold_recompact, ColdRecompact::Off);
+        assert_eq!(config.proxy.cold_recompact_margin, Duration::from_secs(60));
+
+        config.apply_env(&[
+            (
+                "KOMPRESSOR__PROXY__COLD_RECOMPACT".into(),
+                "predicted".into(),
+            ),
+            (
+                "KOMPRESSOR__PROXY__COLD_RECOMPACT_MARGIN".into(),
+                "2m".into(),
+            ),
+        ]);
+        assert_eq!(config.proxy.cold_recompact, ColdRecompact::Predicted);
+        assert_eq!(config.proxy.cold_recompact_margin, Duration::from_secs(120));
+        // A typo leaves the setting alone.
+        config.apply_env(&[("KOMPRESSOR__PROXY__COLD_RECOMPACT".into(), "always".into())]);
+        assert_eq!(config.proxy.cold_recompact, ColdRecompact::Predicted);
+
+        let parsed: Config =
+            toml::from_str("[proxy.providers.anthropic]\ncold_recompact = \"observed\"\n").unwrap();
+        assert_eq!(parsed.proxy.cold_recompact, ColdRecompact::Off);
+        let anthropic = parsed
+            .for_provider("anthropic")
+            .expect("anthropic has overrides");
+        assert_eq!(anthropic.proxy.cold_recompact, ColdRecompact::Observed);
+        assert!(toml::from_str::<Config>("[proxy]\ncold_recompact = \"always\"\n").is_err());
     }
 
     #[test]

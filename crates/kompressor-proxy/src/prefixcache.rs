@@ -280,6 +280,9 @@ pub struct PrefixTracker {
     /// Client requests seen per conversation, so a fetch can be placed in time.
     /// Bounded like `retrieved`, and for the same reason.
     turns: Mutex<HashMap<u64, u64>>,
+    /// Extra idle time per conversation, set only by
+    /// [`PrefixTracker::age_for_test`]. Empty outside tests.
+    aged: Mutex<HashMap<u64, Duration>>,
     /// Age past which a prefix is assumed lapsed. Zero disables the age rule
     /// and leaves only observed evidence, which is the shipped default: a TTL
     /// is a guess about someone else's eviction policy, and guessing `Cold` is
@@ -430,6 +433,7 @@ impl PrefixTracker {
             lineages: Mutex::new(HashMap::new()),
             retrieved: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
+            aged: Mutex::new(HashMap::new()),
             ttl,
         }
     }
@@ -831,6 +835,77 @@ impl PrefixTracker {
         let seen = self.seen.lock().ok()?;
         let entry = seen.get(&fingerprint)?;
         Some((entry.at.elapsed(), entry.was_warm))
+    }
+
+    /// Whether this request is arriving after the conversation's cache entry
+    /// must have expired: the provider has served it from cache before, the
+    /// request continues it, and it has been idle — since its last response or
+    /// keep-warm read — for longer than `lifetime`.
+    ///
+    /// An inference, where [`Self::state`] reports evidence. It is the only
+    /// way to act on the turn that *finds* a lapse: the provider's own answer
+    /// arrives with that turn's response, after its prefix has been written
+    /// again. `lifetime` is the caller's — what the conversation's last
+    /// request asked for, plus a margin — because a wrong `true` rewrites a
+    /// live prefix. Read-only.
+    ///
+    /// `messages` must exceed what the conversation has carried: a request
+    /// that does not is another conversation opening with the same bytes, as
+    /// in [`Self::long_ttl`].
+    pub fn predicted_cold(&self, fingerprint: u64, messages: usize, lifetime: Duration) -> bool {
+        let Ok(seen) = self.seen.lock() else {
+            return false;
+        };
+        let aged = self
+            .aged
+            .lock()
+            .ok()
+            .and_then(|aged| aged.get(&fingerprint).copied())
+            .unwrap_or_default();
+        seen.get(&fingerprint).is_some_and(|entry| {
+            entry.was_warm && messages > entry.most_messages && entry.at.elapsed() + aged > lifetime
+        })
+    }
+
+    /// Have [`Self::predicted_cold`] read this conversation as idle for `by`
+    /// longer than it has been. Zero undoes it.
+    ///
+    /// For tests, which cannot wait out a five-minute cache lifetime and
+    /// cannot move an `Instant` backwards on a machine that booted a minute
+    /// ago. Nothing in the proxy calls it.
+    #[doc(hidden)]
+    pub fn age_for_test(&self, fingerprint: u64, by: Duration) {
+        if let Ok(mut aged) = self.aged.lock() {
+            if by.is_zero() {
+                aged.remove(&fingerprint);
+            } else {
+                aged.insert(fingerprint, by);
+            }
+        }
+    }
+
+    /// Record how many messages this conversation's request carried, for
+    /// [`Self::predicted_cold`] to compare the next one with.
+    pub fn note_messages(&self, fingerprint: u64, messages: usize) {
+        if let Ok(mut seen) = self.seen.lock()
+            && let Some(entry) = seen.get_mut(&fingerprint)
+        {
+            entry.most_messages = entry.most_messages.max(messages);
+        }
+    }
+
+    /// Lower the conversation's freeze to nothing, for good.
+    ///
+    /// Called once a recompaction of the whole conversation has gone upstream:
+    /// the provider now holds every message in its compressed form, so
+    /// freezing any of them again would send the client's originals and miss.
+    /// The floor may fall and never rises, so this holds from here on.
+    pub fn lower_floor(&self, fingerprint: u64) {
+        if let Ok(mut seen) = self.seen.lock()
+            && let Some(entry) = seen.get_mut(&fingerprint)
+        {
+            entry.floor = Some(0);
+        }
     }
 
     /// A keep-warm ping just read this conversation's prefix from cache.

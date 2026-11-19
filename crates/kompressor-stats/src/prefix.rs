@@ -179,6 +179,23 @@ pub struct ColdScore {
     pub recall: f64,
 }
 
+/// Turns that found the provider's cache gone and were recompacted
+/// (`proxy.cold_recompact`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Recompactions {
+    /// On the provider's own answer: it had read nothing and written nothing.
+    pub observed: u64,
+    /// On idle time past the cache lifetime.
+    pub predicted: u64,
+    /// Predicted, and the provider then read from cache: a live prefix
+    /// rewritten.
+    pub predicted_wrong: u64,
+    /// Conversations recompacted at least once.
+    pub conversations: u64,
+    /// Stale reads replaced, summed over each conversation's ledger.
+    pub stale_reads: u64,
+}
+
 /// Everything the prefix view shows, for one tenant and one window.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PrefixReport {
@@ -202,6 +219,7 @@ pub struct PrefixReport {
     pub losses: LossAttribution,
     pub volatile: VolatileSummary,
     pub cold: Vec<ColdScore>,
+    pub recompactions: Recompactions,
 }
 
 /// The earliest changed segment and the side that changed it.
@@ -295,6 +313,8 @@ impl StatsReader {
         let mut volatile_conversations: HashSet<&str> = HashSet::new();
         let mut scores: BTreeMap<(String, u32, bool, u32), ColdScore> = BTreeMap::new();
         let mut by_request: HashMap<&str, &PrefixObservation> = HashMap::new();
+        // The largest ledger each conversation reported: a ledger only grows.
+        let mut ledgers: HashMap<&str, u32> = HashMap::new();
 
         for row in &observed {
             let seen = &row.observation;
@@ -336,6 +356,21 @@ impl StatsReader {
                         slot.proxy_turns += 1;
                     }
                 }
+            }
+
+            if let Some(kind) = seen.recompacted.as_deref() {
+                if kind == "predicted" {
+                    report.recompactions.predicted += 1;
+                    if row.read.is_some_and(|read| read > 0) {
+                        report.recompactions.predicted_wrong += 1;
+                    }
+                } else {
+                    report.recompactions.observed += 1;
+                }
+                let held = ledgers
+                    .entry(row.conversation.as_deref().unwrap_or(""))
+                    .or_default();
+                *held = (*held).max(seen.ledger_reads);
             }
 
             if let Some(volatile) = seen.volatile {
@@ -384,6 +419,8 @@ impl StatsReader {
             }
         }
         report.volatile.conversations = volatile_conversations.len() as u64;
+        report.recompactions.conversations = ledgers.len() as u64;
+        report.recompactions.stale_reads = ledgers.values().map(|held| u64::from(*held)).sum();
 
         let (losses, losses_truncated) = self.cache_losses(tenant, from_ms, to_ms)?;
         report.truncated |= losses_truncated;

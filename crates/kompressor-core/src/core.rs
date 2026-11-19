@@ -239,6 +239,8 @@ impl AppCore {
             // This surface sees messages alone; nothing outside them to price.
             outside_tokens: 0,
             cache_pricing: None,
+            stale_ledger: None,
+            may_decide: false,
         };
         let computed = Computed {
             stats: compress_messages(messages, options, &req, &mut refs),
@@ -284,6 +286,11 @@ impl AppCore {
         // The provider's prices for a promotion, when the caller knows them.
         // `None` prices it from `cache_hit_per_mille`.
         cache_pricing: Option<kompressor_engine::messages::CachePricing>,
+        // The stale reads this conversation has already replaced, and whether
+        // this run may add to them. `None` is the read lifecycle as it always
+        // was; see `RequestOptions::stale_ledger`.
+        stale_ledger: Option<&std::collections::BTreeSet<u64>>,
+        may_decide: bool,
     ) -> Computed {
         let started = Instant::now();
         let time_ms = now_ms();
@@ -298,6 +305,8 @@ impl AppCore {
             cache_hit_per_mille,
             outside_tokens,
             cache_pricing,
+            stale_ledger,
+            may_decide,
         };
         let stats = compress_messages(messages, options, &req, &mut refs);
         Computed {
@@ -1069,6 +1078,8 @@ mod tests {
             1000,
             0,
             None,
+            None,
+            false,
         );
         assert!(
             computed.stats.tokens_out < computed.stats.tokens_in,

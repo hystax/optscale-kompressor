@@ -353,6 +353,51 @@ fn a_predicted_lapse_is_scored_against_what_the_provider_read() {
     assert_eq!((openai(3_600).predicted, openai(3_600).missed), (0, 1));
 }
 
+#[test]
+fn recompactions_are_counted_by_how_the_lapse_was_known() {
+    let (dir, conn) = database();
+    let turn = |kind: &str, ledger_reads| PrefixObservation {
+        compared: true,
+        recompacted: Some(kind.to_string()),
+        ledger_reads,
+        ..PrefixObservation::default()
+    };
+    // (conversation, cache read, observation)
+    let rows = [
+        ("a", 0, turn("observed", 1)),
+        ("a", 0, turn("predicted", 3)),
+        ("b", 0, turn("predicted", 2)),
+        // Predicted, and served from cache after all.
+        ("b", 9_000, turn("predicted", 2)),
+        ("c", 9_000, compared(0, 0)),
+    ];
+    for (index, (conversation, read, observation)) in rows.into_iter().enumerate() {
+        insert(
+            &conn,
+            Row {
+                time: index as i64 * SEC,
+                conversation,
+                family: "anthropic_messages",
+                read,
+                write: 100,
+                observation: Some(observation),
+            },
+        );
+    }
+    drop(conn);
+    let seen = report(&dir).recompactions;
+    assert_eq!(
+        (seen.observed, seen.predicted, seen.predicted_wrong),
+        (1, 3, 1)
+    );
+    assert_eq!(seen.conversations, 2);
+    assert_eq!(
+        seen.stale_reads,
+        3 + 2,
+        "each conversation's ledger once, at its largest"
+    );
+}
+
 /// The reader never migrates, so a database only an older build has written
 /// has no observations to read. That is an empty report, not a failure.
 #[test]

@@ -22,6 +22,8 @@ pub(crate) fn context(config: &Config) -> RunContext {
             "prompt_cache_key":p.prompt_cache_key,
             "tools_order":p.tools_order,
             "sticky_beta":p.sticky_beta,
+            "cold_recompact":p.cold_recompact,
+            "cold_recompact_margin_ms":p.cold_recompact_margin.as_millis(),
             "cache_keep_warm":p.cache_keep_warm,
             "cache_keep_warm_interval_ms":p.cache_keep_warm_interval.as_millis(),
             "cache_keep_warm_max_pings":p.cache_keep_warm_max_pings,

@@ -737,6 +737,16 @@ impl DriftTracker {
             .map(|entry| entry.incoming.messages_count)
     }
 
+    /// Whether the conversation's previous request asked for one-hour cache
+    /// entries: the lifetime a lapse is predicted against.
+    pub(crate) fn previous_one_hour(&self, conversation: u64) -> Option<bool> {
+        self.entries
+            .lock()
+            .ok()?
+            .get(&conversation)
+            .map(|entry| entry.one_hour)
+    }
+
     /// Conversations remembered. For tests and for `/metrics`.
     pub fn tracked(&self) -> usize {
         self.entries.lock().map_or(0, |entries| entries.len())
@@ -785,6 +795,9 @@ pub(crate) fn observation(
             .then_some(compared.previous_one_hour)
             .flatten()
             .map(|one_hour| if one_hour { 3_600 } else { 300 }),
+        // Stamped by the caller, which knows what the turn did.
+        recompacted: None,
+        ledger_reads: 0,
     }
 }
 
