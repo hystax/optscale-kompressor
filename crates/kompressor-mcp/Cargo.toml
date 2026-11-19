@@ -13,7 +13,7 @@ kompressor-engine = { path = "../kompressor-engine" }
 kompressor-stats = { path = "../kompressor-stats" }
 kompressor-store = { path = "../kompressor-store" }
 
-rmcp = { version = "3.3.0", features = ["server", "macros", "transport-streamable-http-server", "transport-io"] }
+rmcp = { version = "3.11.0", features = ["server", "macros", "transport-streamable-http-server", "transport-io"] }
 schemars = "1"
 
 axum = { workspace = true }
