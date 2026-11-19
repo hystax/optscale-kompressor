@@ -115,6 +115,59 @@ fn carries_handle(line: &str) -> bool {
     !refs_in(line).is_empty()
 }
 
+/// A run shorter than this may not hide a field: see [`is_field`].
+///
+/// A long run is a re-read — a file, a listing, a log shown again — and the
+/// reader knows what it was. A short one is a few lines of a record that
+/// otherwise differs, and there the count on the marker says nothing about
+/// *which* lines went.
+const MIN_FIELD_RUN_LINES: usize = 12;
+
+/// Whether `line` is one named value of a record: `<name>value</name>`, whole,
+/// on its own line.
+///
+/// A short fold never hides one. The marker carries a count and no place, which
+/// is honest for boilerplate — the reader does not need to know which preamble
+/// was repeated — and is not for a field, because a record is read by its
+/// fields and one that is missing reads as absent, or gets guessed.
+///
+/// Measured on a terminal-bench run (claude-opus-5-5, 2026-11-19,
+/// `crack-7z-hash`). Claude Code reports a background monitor with a
+/// `<task-notification>` of a `<task-id>`, a `<summary>` and an `<event>`. Two
+/// monitors expired with the same event text, so the second notification
+/// shipped with its id and summary and `[... 3 lines omitted; shown in full
+/// earlier in this conversation]` where the event and the closing tags had
+/// been. The event said the monitor expired with nothing delivered; the model
+/// replied that the event "just confirms the crack finished".
+fn is_field(line: &str) -> bool {
+    let line = line.trim();
+    let Some(rest) = line.strip_prefix('<') else {
+        return false;
+    };
+    let name_len = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.')))
+        .unwrap_or(rest.len());
+    let name = &rest[..name_len];
+    if name.is_empty() {
+        return false;
+    }
+    // The opening tag ends at the first `>`; attributes may sit before it.
+    let Some(open_end) = rest.find('>') else {
+        return false;
+    };
+    if !matches!(rest.as_bytes().get(name_len), Some(b'>' | b' ' | b'\t')) {
+        return false;
+    }
+    let Some(value) = rest[open_end + 1..]
+        .strip_suffix('>')
+        .and_then(|r| r.strip_suffix(name))
+        .and_then(|r| r.strip_suffix("</"))
+    else {
+        return false;
+    };
+    !is_blank(value)
+}
+
 impl SeenText {
     /// Record what a message shipped, so later messages can point at it.
     pub fn push(&mut self, text: &str) {
@@ -198,6 +251,18 @@ impl SeenText {
                             .iter()
                             .map(|origin| self.run_length(&lines, at, *origin))
                             .max()
+                    })
+                    // A short run stops before the first field it would
+                    // hide: see [`is_field`]. The lines are this message's
+                    // own, so the cut is the same whichever origin won.
+                    .map(|run| {
+                        if run >= MIN_FIELD_RUN_LINES {
+                            return run;
+                        }
+                        lines[at..at + run]
+                            .iter()
+                            .position(|l| is_field(l))
+                            .unwrap_or(run)
                     })
                     .filter(|run| *run >= MIN_RUN_LINES)
             } else {
@@ -310,6 +375,91 @@ mod tests {
         seen.push(&read);
         let out = seen.fold(&read, &opts()).unwrap_or_else(|| read.clone());
         assert_eq!(refs_in(&out).len(), 12, "{out}");
+    }
+
+    /// The background-task notification Claude Code injects, as it reached the
+    /// proxy in the 2026-11-19 terminal-bench run (`crack-7z-hash`).
+    fn notification(task: &str, summary: &str, event: &str) -> String {
+        format!(
+            "<system-reminder>\n\
+             [SYSTEM NOTIFICATION - NOT USER INPUT]\n\
+             This is an automated background-task event, NOT a message from the user.\n\
+             Do NOT interpret this as user acknowledgement, confirmation, or response to any pending question.\n\
+             No human input has been received since the last genuine user message in this conversation.\n\
+             \n\
+             <task-notification>\n\
+             <task-id>{task}</task-id>\n\
+             <summary>Monitor event: \"{summary}\"</summary>\n\
+             <event>{event}</event>\n\
+             </task-notification>\n\
+             </system-reminder>"
+        )
+    }
+
+    const EXPIRED: &str = "[Monitor expired after 10m with no events delivered. Re-arm it if you \
+                           still need the watch — and widen the filter if silence was unexpected.]";
+
+    #[test]
+    fn a_short_fold_never_hides_a_field_of_a_record() {
+        // A second monitor expired the same way as the first. Its `<event>`
+        // line and the two closing tags were an earlier message's last three
+        // lines, so they shipped as one pointer — and the model, shown a
+        // notification with a summary and no event, answered "that monitor
+        // event just confirms the crack finished". It said the opposite.
+        let mut seen = SeenText::default();
+        seen.push(&notification(
+            "b12r2d0lo",
+            "7z password cracked in john potfile",
+            EXPIRED,
+        ));
+        let second = notification(
+            "bdsi6quzw",
+            "7z wordlist crack result or completion",
+            EXPIRED,
+        );
+        let out = seen
+            .fold(&second, &opts())
+            .unwrap_or_else(|| second.clone());
+        assert!(
+            out.contains(&format!("<event>{EXPIRED}</event>")),
+            "the event is what the notification is for:\n{out}"
+        );
+        // The preamble is not a field, and is still folded.
+        assert!(out.contains("shown in full earlier"), "{out}");
+        assert!(!out.contains("NOT a message from the user"), "{out}");
+    }
+
+    #[test]
+    fn a_long_repeat_made_of_fields_is_still_folded() {
+        // A re-read of a file that happens to be markup is a re-read: the run
+        // is long, the reader knows what it was, and nothing is ambiguous.
+        let pom: String = (0..40)
+            .map(|i| {
+                format!("    <dependency-{i}>org.example:artifact-{i}:1.{i}.0</dependency-{i}>\n")
+            })
+            .collect();
+        let mut seen = SeenText::default();
+        seen.push(&pom);
+        let out = seen.fold(&pom, &opts()).expect("a re-read is folded");
+        assert!(chars_len(&out) < chars_len(&pom) / 4, "{out}");
+    }
+
+    #[test]
+    fn what_counts_as_a_field() {
+        assert!(is_field("<status>killed</status>"));
+        assert!(is_field("  <event>[Monitor expired]</event>  "));
+        assert!(is_field("<a:b-c attr=\"1\">x</a:b-c>"));
+        for not in [
+            "<task-notification>",
+            "</task-notification>",
+            "<empty></empty>",
+            "<a>x</b>",
+            "plain prose with <b>markup</b> inside it",
+            "< notatag>x</ notatag>",
+            "",
+        ] {
+            assert!(!is_field(not), "{not:?}");
+        }
     }
 
     #[test]
