@@ -255,6 +255,17 @@ pub fn stale_read_marker(path: &str, content: &str, refs: &mut RefCollector) -> 
     format!("[Read content stale: {path} {inner}]")
 }
 
+/// What a read becomes when a later read of the same file contains it.
+///
+/// It says where the content is now, because the model may otherwise fetch the
+/// handle for bytes that are already on screen further down. The handle is
+/// kept all the same: the file can have changed outside the conversation, and
+/// then the two reads are not the same text.
+pub fn superseded_read_marker(path: &str, content: &str, refs: &mut RefCollector) -> String {
+    let inner = omission_marker("read", 1, content, refs, "");
+    format!("[Read superseded: {path} was read again later in this conversation {inner}]")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

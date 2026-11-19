@@ -32,6 +32,7 @@ use kompressor_core::{AppCore, RequestInfo};
 use kompressor_engine::estimate_tokens;
 use kompressor_engine::messages::{Message, PrefixCache};
 use kompressor_engine::options::EngineOptionsPatch;
+use kompressor_engine::read_lifecycle::{Maturity, ReadDecision, ReadPolicy};
 use kompressor_engine::refs::{RefId, refs_in};
 use kompressor_stats::events::{Event, ProxyRequestEvent, Surface};
 use kompressor_wire::{ApiFamily, Walk, detect_family, walker_for};
@@ -1403,7 +1404,19 @@ async fn prepare_inner(
         && proxy.frozen_prefix == FrozenPrefix::FirstSeen)
         .then_some(conversation)
         .flatten()
-        .map(|key| state.recompact.reads(key));
+        .map(|key| {
+            // Staleness is always decided on a recompacted turn; what else
+            // is, is the operator's.
+            let decide = recompacting.map(|_| ReadPolicy {
+                superseded: proxy.superseded_reads,
+                matured: proxy.matured_reads.then_some(Maturity {
+                    quiesce_turns: proxy.matured_quiesce_turns,
+                    max_hold_turns: proxy.matured_max_hold_turns,
+                    min_bytes: proxy.matured_min_bytes,
+                }),
+            });
+            (state.recompact.reads(key), decide)
+        });
 
     let compressed = compress_with_ledger(
         state,
@@ -1438,7 +1451,6 @@ async fn prepare_inner(
         conversation,
         proxy.compress_timeout,
         ledger,
-        recompacting.is_some(),
     )
     .await;
     let Some((messages, saved, stale_reads)) = compressed else {
@@ -1658,15 +1670,14 @@ pub(crate) async fn compress_with_deadline(
         conversation,
         timeout,
         None,
-        false,
     )
     .await
     .map(|(messages, saved, _)| (messages, saved))
 }
 
-/// [`compress_with_deadline`], with the conversation's stale-read ledger: the
-/// reads to replace, and whether this run may decide more. Also returns the
-/// keys of the reads it replaced. See [`crate::recompact`].
+/// [`compress_with_deadline`], with the conversation's read ledger: what has
+/// been decided about its file reads, and what this run may decide. Also
+/// returns the decisions the run acted on. See [`crate::recompact`].
 #[allow(clippy::too_many_arguments)]
 async fn compress_with_ledger(
     state: &ProxyState,
@@ -1697,9 +1708,11 @@ async fn compress_with_ledger(
     // with no conversation of its own, which then keeps nothing pinned.
     conversation: Option<u64>,
     timeout: Duration,
-    ledger: Option<std::collections::BTreeSet<u64>>,
-    may_decide: bool,
-) -> Option<(Vec<Message>, u32, Vec<u64>)> {
+    ledger: Option<(
+        std::collections::BTreeMap<u64, ReadDecision>,
+        Option<ReadPolicy>,
+    )>,
+) -> Option<(Vec<Message>, u32, Vec<(u64, ReadDecision)>)> {
     let core = state.core.clone();
     let prefixes = state.prefixes.clone();
     let identity = identity.clone();
@@ -1768,8 +1781,12 @@ async fn compress_with_ledger(
             cache_hit_per_mille,
             outside_tokens,
             cache_pricing,
-            ledger.as_ref(),
-            may_decide,
+            ledger.as_ref().map(
+                |(decided, decide)| kompressor_engine::messages::ReadLedger {
+                    decided,
+                    decide: *decide,
+                },
+            ),
         );
         let retained = core.retain(&identity, computed, &request_id, &options);
         Some((
@@ -1812,7 +1829,7 @@ async fn compress_with_ledger(
                 .stats
                 .tokens_in
                 .saturating_sub(outcome.stats.tokens_out);
-            Some((messages, saved, outcome.stats.stale_read_keys))
+            Some((messages, saved, outcome.stats.read_decisions))
         }
         // Queued past the deadline: the closure declined to start. A deadline
         // that ran out is a timeout wherever it ran out, so it is counted with

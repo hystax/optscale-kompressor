@@ -34,10 +34,12 @@
 //! all — and [`MAX_WRONG`] within [`WINDOW`] switch prediction off for the
 //! life of the process.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use kompressor_engine::read_lifecycle::ReadDecision;
 
 /// Conversations remembered, the same bound the prefix tracker keeps.
 const REMEMBER: usize = 4096;
@@ -67,8 +69,8 @@ impl Cold {
 #[derive(Default)]
 struct Ledger {
     at: Option<Instant>,
-    /// Reads replaced as stale, by `read_key`.
-    reads: BTreeSet<u64>,
+    /// What was decided about each read, by `read_key`.
+    reads: BTreeMap<u64, ReadDecision>,
     /// How many cold turns have been recompacted.
     epoch: u32,
 }
@@ -83,9 +85,10 @@ pub struct Recompact {
 }
 
 impl Recompact {
-    /// The reads this conversation has replaced. Empty, not absent, for one
-    /// that has replaced none: the engine is in ledger mode either way.
-    pub(crate) fn reads(&self, conversation: u64) -> BTreeSet<u64> {
+    /// What this conversation has decided about its reads. Empty, not absent,
+    /// for one that has decided nothing: the engine is in ledger mode either
+    /// way.
+    pub(crate) fn reads(&self, conversation: u64) -> BTreeMap<u64, ReadDecision> {
         self.ledgers
             .lock()
             .ok()
@@ -97,12 +100,13 @@ impl Recompact {
             .unwrap_or_default()
     }
 
-    /// Record a recompaction that went upstream: the reads it replaced join
-    /// the ledger. Returns how many the ledger now holds.
+    /// Record a recompaction that went upstream: what it decided joins the
+    /// ledger. Returns how many reads the ledger now holds.
     ///
-    /// A read once replaced stays replaced, so this only adds. `replaced` is
-    /// the engine's whole answer for the turn, replays included.
-    pub(crate) fn commit(&self, conversation: u64, replaced: &[u64]) -> usize {
+    /// A decision is never taken back and only ever strengthened, so this
+    /// adds, or replaces an entry with a stronger one. `decided` is the
+    /// engine's whole answer for the turn, replays included.
+    pub(crate) fn commit(&self, conversation: u64, decided: &[(u64, ReadDecision)]) -> usize {
         let Ok(mut ledgers) = self.ledgers.lock() else {
             return 0;
         };
@@ -117,7 +121,13 @@ impl Recompact {
         }
         let ledger = ledgers.entry(conversation).or_default();
         ledger.at = Some(Instant::now());
-        ledger.reads.extend(replaced.iter().copied());
+        for (key, decision) in decided {
+            ledger
+                .reads
+                .entry(*key)
+                .and_modify(|held| *held = (*held).max(*decision))
+                .or_insert(*decision);
+        }
         ledger.epoch += 1;
         ledger.reads.len()
     }
@@ -182,15 +192,24 @@ mod tests {
 
     #[test]
     fn a_ledger_only_grows_and_counts_its_cold_turns() {
+        use ReadDecision::{Matured, Stale, Superseded};
         let state = Recompact::default();
         assert!(state.reads(1).is_empty());
         assert_eq!(state.epoch(1), 0);
-        assert_eq!(state.commit(1, &[10, 20]), 2);
-        // The next cold turn replays both and decides one more.
-        assert_eq!(state.commit(1, &[10, 20, 30]), 3);
-        // One that replaced nothing new still forgets nothing.
-        assert_eq!(state.commit(1, &[]), 3);
-        assert_eq!(state.reads(1).into_iter().collect::<Vec<_>>(), [10, 20, 30]);
+        assert_eq!(state.commit(1, &[(10, Stale), (20, Matured)]), 2);
+        // The next cold turn replays both, finds the matured one has since
+        // been read again in full, and decides one more.
+        assert_eq!(
+            state.commit(1, &[(10, Stale), (20, Superseded), (30, Matured)]),
+            3
+        );
+        // One that decided nothing new forgets nothing, and a weaker answer
+        // does not weaken what is held.
+        assert_eq!(state.commit(1, &[(20, Matured)]), 3);
+        assert_eq!(
+            state.reads(1).into_iter().collect::<Vec<_>>(),
+            [(10, Stale), (20, Superseded), (30, Matured)]
+        );
         assert_eq!(state.epoch(1), 3);
         assert!(
             state.reads(2).is_empty(),
@@ -216,7 +235,7 @@ mod tests {
     fn the_table_stays_bounded() {
         let state = Recompact::default();
         for conversation in 0..(REMEMBER as u64 + 16) {
-            state.commit(conversation, &[1]);
+            state.commit(conversation, &[(1, ReadDecision::Stale)]);
         }
         assert_eq!(state.tracked(), REMEMBER);
     }

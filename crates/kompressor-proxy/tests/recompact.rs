@@ -320,3 +320,181 @@ async fn under_the_marker_freeze_the_setting_does_nothing() {
     }));
     assert_eq!(harness.state.recompact().tracked(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// superseded and matured reads
+// ---------------------------------------------------------------------------
+
+/// A conversation that reads files and edits nothing: one `Read` per entry of
+/// `reads` — its arguments and what came back — then `turns` exchanges.
+fn reading(reads: &[(Value, String)], turns: usize) -> Value {
+    let mut messages = vec![json!({"role": "user", "content": "Look into the handlers."})];
+    for (index, (input, content)) in reads.iter().enumerate() {
+        let id = format!("r{index}");
+        messages.push(json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": id, "name": "Read", "input": input}
+        ]}));
+        messages.push(json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": id, "content": content}
+        ]}));
+    }
+    for turn in 0..turns {
+        messages.push(json!({"role": "assistant", "content": [
+            {"type": "text", "text": format!("Step {turn} is done.")}
+        ]}));
+        messages.push(json!({"role": "user", "content": [
+            {"type": "text", "text": format!("Go on with step {}.", turn + 1)}
+        ]}));
+    }
+    let last = messages.len() - 1;
+    messages[last]["content"][0]["cache_control"] = json!({"type": "ephemeral"});
+    json!({"model": "claude-opus-5-5", "max_tokens": 1024, "messages": messages})
+}
+
+/// Written, read back, lost, then the cold turn and three warm ones, over
+/// `body(turns)` for seven consecutive values of `turns` from `from`. Returns
+/// what went upstream, the cold turn fourth.
+async fn through_a_lapse(
+    harness: &Harness,
+    from: usize,
+    body: impl Fn(usize) -> Value,
+) -> Vec<Value> {
+    answering(harness, &[(0, 30_000), (30_000, 200), (0, 0), (0, 31_000)]).await;
+    for turns in from..from + 7 {
+        harness.post(MESSAGES, &body(turns)).await;
+    }
+    harness.upstream_json().await
+}
+
+/// Every message the cold turn sent goes out unchanged on the turns after it.
+fn assert_held(sent: &[Value]) {
+    let cold = sent_messages(&sent[3]);
+    for later in &sent[4..] {
+        assert_eq!(sent_messages(later)[..cold.len()], cold[..]);
+    }
+}
+
+#[tokio::test]
+async fn a_read_a_later_read_contains_is_replaced_on_the_cold_turn_and_stays_so() {
+    let harness = Harness::with(|config| {
+        first_seen(ColdRecompact::Observed)(config);
+        config.proxy.superseded_reads = true;
+    })
+    .await;
+    let reads = [
+        (
+            json!({"file_path": "src/a.rs", "offset": 40, "limit": 20}),
+            file(),
+        ),
+        (json!({"file_path": "src/a.rs"}), file()),
+    ];
+    let sent = through_a_lapse(&harness, 0, |turns| reading(&reads, turns)).await;
+
+    for warm in &sent[..3] {
+        assert_eq!(
+            the_read(warm),
+            file(),
+            "nothing is decided while the cache is alive"
+        );
+    }
+    let first = the_read(&sent[3]);
+    assert!(
+        first.starts_with("[Read superseded: src/a.rs was read again later"),
+        "{first}"
+    );
+    assert!(first.contains("ref:k_"));
+    let second = sent[3]["messages"][4]["content"][0]["content"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        !second.starts_with("[Read superseded"),
+        "the later read is the one kept"
+    );
+    assert_held(&sent);
+}
+
+#[tokio::test]
+async fn a_partial_read_does_not_supersede_the_whole_file() {
+    let harness = Harness::with(|config| {
+        first_seen(ColdRecompact::Observed)(config);
+        config.proxy.superseded_reads = true;
+    })
+    .await;
+    let reads = [
+        (json!({"file_path": "src/a.rs"}), file()),
+        (
+            json!({"file_path": "src/a.rs", "offset": 40, "limit": 20}),
+            file(),
+        ),
+    ];
+    let sent = through_a_lapse(&harness, 0, |turns| reading(&reads, turns)).await;
+    assert!(!the_read(&sent[3]).starts_with("[Read superseded"));
+}
+
+fn handlers() -> String {
+    (0..12)
+        .map(|n| {
+            let steps: String = (0..40)
+                .map(|step| format!("    let stage_{step} = transform_{n}_{step}(input, state)?;\n"))
+                .collect();
+            format!(
+                "pub fn handler_{n}(input: &Request, state: &mut State) -> Result<Reply, Error> {{\n\
+                 {steps}    Ok(build_{n}(stage_39))\n}}\n\n"
+            )
+        })
+        .collect()
+}
+
+/// The Anthropic profile: source is left alone, because a body elided from a
+/// file in use is fetched straight back.
+fn maturing(matured: bool) -> impl FnOnce(&mut Config) {
+    move |config| {
+        first_seen(ColdRecompact::Observed)(config);
+        config.engine.enable_code_aware = false;
+        config.proxy.matured_reads = matured;
+    }
+}
+
+#[cfg(feature = "code-aware")]
+#[tokio::test]
+async fn a_read_left_alone_is_compressed_as_source_on_the_cold_turn_and_stays_so() {
+    let harness = Harness::with(maturing(true)).await;
+    let reads = [(json!({"file_path": "src/handlers.rs"}), handlers())];
+    // Six exchanges have passed by the first of these turns: the file has
+    // been quiet for long enough well before the cache lapses.
+    let sent = through_a_lapse(&harness, 6, |turns| reading(&reads, turns)).await;
+
+    for warm in &sent[..3] {
+        assert_eq!(
+            the_read(warm),
+            handlers(),
+            "left whole while the cache is alive"
+        );
+    }
+    let matured = the_read(&sent[3]);
+    assert!(
+        matured.len() < handlers().len() / 2,
+        "{} bytes",
+        matured.len()
+    );
+    assert!(matured.contains("pub fn handler_7("), "the signatures stay");
+    assert!(
+        matured.contains("body lines omitted from handler_7"),
+        "{matured}"
+    );
+    assert_held(&sent);
+}
+
+#[cfg(feature = "code-aware")]
+#[tokio::test]
+async fn a_read_still_in_use_and_one_with_the_setting_off_are_left_whole() {
+    // Quiet for only three exchanges when the cache lapses.
+    let harness = Harness::with(maturing(true)).await;
+    let reads = [(json!({"file_path": "src/handlers.rs"}), handlers())];
+    let sent = through_a_lapse(&harness, 0, |turns| reading(&reads, turns)).await;
+    assert_eq!(the_read(&sent[3]), handlers());
+
+    let harness = Harness::with(maturing(false)).await;
+    let sent = through_a_lapse(&harness, 6, |turns| reading(&reads, turns)).await;
+    assert_eq!(the_read(&sent[3]), handlers());
+}

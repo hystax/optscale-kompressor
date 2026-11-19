@@ -585,6 +585,36 @@ pub struct ProxyConfig {
     /// late response from being read as a lapse.
     #[serde(with = "humantime_serde")]
     pub cold_recompact_margin: Duration,
+    /// On a recompacted turn, also replace a file read that a later read of
+    /// the same file contains. **Off by default**, and does nothing unless
+    /// [`Self::cold_recompact`] is on.
+    ///
+    /// An agent that reads lines 40 to 60 of a file and later reads the whole
+    /// of it carries the twenty lines twice for the rest of the session. The
+    /// earlier read is replaced by a marker that says the file was read again
+    /// and keeps a handle to what it held. Decided only where the walker can
+    /// tell which lines each read asked for — Anthropic Messages, for a read
+    /// tool taking a path, an `offset` and a `limit`.
+    pub superseded_reads: bool,
+    /// On a recompacted turn, also compress as source a file read nothing has
+    /// touched for [`Self::matured_quiesce_turns`] assistant turns. **Off by
+    /// default**, and does nothing unless [`Self::cold_recompact`] is on.
+    ///
+    /// Function bodies go behind handles and signatures stay, whatever
+    /// `enable_code_aware` says for the provider: a profile turns that off
+    /// because a body elided from a file in use is fetched straight back, and
+    /// a file the conversation has finished with is where it is not.
+    pub matured_reads: bool,
+    /// Assistant turns a file must go unread and unwritten before a read of it
+    /// is matured. Five is where Headroom's audit of its own traffic put it
+    /// (the next touch of a file came a median of four turns later); it has
+    /// not been measured here.
+    pub matured_quiesce_turns: u32,
+    /// Assistant turns after which a read is matured however recently its file
+    /// was touched again.
+    pub matured_max_hold_turns: u32,
+    /// The smallest read worth maturing, in bytes.
+    pub matured_min_bytes: usize,
     /// Keep an Anthropic conversation's cached prefix alive while the client
     /// is busy running a tool. **On by default**; only Anthropic Messages
     /// traffic is ever pinged, so this is in effect Anthropic's default, and
@@ -918,6 +948,10 @@ pub struct ProviderOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cold_recompact: Option<ColdRecompact>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_reads: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matured_reads: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_keep_warm: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_read: Option<bool>,
@@ -952,6 +986,8 @@ impl ProviderOverrides {
             tools_order,
             sticky_beta,
             cold_recompact,
+            superseded_reads,
+            matured_reads,
             cache_keep_warm,
             stale_read
         );
@@ -1022,6 +1058,11 @@ impl Default for ProxyConfig {
             sticky_beta: false,
             cold_recompact: ColdRecompact::Off,
             cold_recompact_margin: Duration::from_secs(60),
+            superseded_reads: false,
+            matured_reads: false,
+            matured_quiesce_turns: 5,
+            matured_max_hold_turns: 25,
+            matured_min_bytes: 2_048,
             cache_keep_warm: true,
             cache_keep_warm_interval: Duration::from_secs(270),
             cache_keep_warm_max_pings: 11,
@@ -1595,6 +1636,32 @@ impl Config {
                     "KOMPRESSOR__PROXY__COLD_RECOMPACT_MARGIN is not a duration; ignored"
                 ),
             },
+            "superseded_reads" => {
+                self.proxy.superseded_reads = parse_bool_setting(
+                    "proxy.superseded_reads",
+                    value,
+                    self.proxy.superseded_reads,
+                );
+            }
+            "matured_reads" => {
+                self.proxy.matured_reads =
+                    parse_bool_setting("proxy.matured_reads", value, self.proxy.matured_reads);
+            }
+            "matured_quiesce_turns" => {
+                if let Ok(turns) = value.parse() {
+                    self.proxy.matured_quiesce_turns = turns;
+                }
+            }
+            "matured_max_hold_turns" => {
+                if let Ok(turns) = value.parse() {
+                    self.proxy.matured_max_hold_turns = turns;
+                }
+            }
+            "matured_min_bytes" => {
+                if let Ok(bytes) = value.parse() {
+                    self.proxy.matured_min_bytes = bytes;
+                }
+            }
             "sticky_beta" => {
                 self.proxy.sticky_beta =
                     parse_bool_setting("proxy.sticky_beta", value, self.proxy.sticky_beta);
@@ -2164,6 +2231,58 @@ mod tests {
         assert!(!openai.proxy.sticky_beta);
 
         assert!(toml::from_str::<Config>("[proxy]\ntools_order = \"sorted\"\n").is_err());
+    }
+
+    #[test]
+    fn the_read_decisions_are_off_by_default_and_set_per_provider_or_from_the_environment() {
+        let mut config = Config::default();
+        assert!(!config.proxy.superseded_reads && !config.proxy.matured_reads);
+        assert_eq!(
+            (
+                config.proxy.matured_quiesce_turns,
+                config.proxy.matured_max_hold_turns,
+                config.proxy.matured_min_bytes
+            ),
+            (5, 25, 2_048)
+        );
+        config.apply_env(&[
+            ("KOMPRESSOR__PROXY__SUPERSEDED_READS".into(), "true".into()),
+            ("KOMPRESSOR__PROXY__MATURED_READS".into(), "true".into()),
+            (
+                "KOMPRESSOR__PROXY__MATURED_QUIESCE_TURNS".into(),
+                "8".into(),
+            ),
+            (
+                "KOMPRESSOR__PROXY__MATURED_MAX_HOLD_TURNS".into(),
+                "40".into(),
+            ),
+            ("KOMPRESSOR__PROXY__MATURED_MIN_BYTES".into(), "4096".into()),
+        ]);
+        assert!(config.proxy.superseded_reads && config.proxy.matured_reads);
+        assert_eq!(
+            (
+                config.proxy.matured_quiesce_turns,
+                config.proxy.matured_max_hold_turns,
+                config.proxy.matured_min_bytes
+            ),
+            (8, 40, 4_096)
+        );
+        // Not a number: left alone.
+        config.apply_env(&[(
+            "KOMPRESSOR__PROXY__MATURED_QUIESCE_TURNS".into(),
+            "soon".into(),
+        )]);
+        assert_eq!(config.proxy.matured_quiesce_turns, 8);
+
+        let parsed: Config = toml::from_str(
+            "[proxy.providers.anthropic]\nsuperseded_reads = true\nmatured_reads = true\n",
+        )
+        .unwrap();
+        assert!(!parsed.proxy.matured_reads);
+        let anthropic = parsed
+            .for_provider("anthropic")
+            .expect("anthropic has overrides");
+        assert!(anthropic.proxy.superseded_reads && anthropic.proxy.matured_reads);
     }
 
     #[test]

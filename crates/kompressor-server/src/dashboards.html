@@ -686,7 +686,7 @@ RENDER.prefix = d => {
       ["On the provider's answer", n(d.recompactions.observed), "it had read nothing and written nothing"],
       ["On idle time", n(d.recompactions.predicted), "predicted on the turn that found it"],
       ["Predicted wrongly", n(d.recompactions.predicted_wrong), "then served from cache: a live prefix rewritten", d.recompactions.predicted_wrong ? "bad" : "good"],
-      ["Conversations", n(d.recompactions.conversations), n(d.recompactions.stale_reads) + " stale reads replaced"],
+      ["Conversations", n(d.recompactions.conversations), n(d.recompactions.stale_reads) + " reads rewritten (stale, superseded or matured)"],
     ]),
       note("With proxy.cold_recompact on, the turn that finds the provider's cache gone rewrites the whole conversation, and what it decided is replayed on every later turn. Three wrong predictions in an hour end prediction until restart.")),
     assumed.length ? section("The same, where the request names no lifetime", coldTable(assumed),

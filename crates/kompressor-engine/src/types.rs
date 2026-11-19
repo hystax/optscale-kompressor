@@ -124,6 +124,12 @@ pub enum Kind {
     Factored,
     /// A file Read whose content a later edit invalidated.
     StaleRead,
+    /// A file Read a later Read of the same file contains.
+    SupersededRead,
+    /// A file Read nothing has touched for a while, compressed as source
+    /// whatever the provider's profile says. Reported beside the types the
+    /// compression itself applied.
+    MaturedRead,
     /// A span an earlier message in the same conversation already showed.
     CrossTurn,
 }
@@ -145,6 +151,8 @@ impl Kind {
             Kind::Reformat => "reformat",
             Kind::Factored => "factored",
             Kind::StaleRead => "stale_read",
+            Kind::SupersededRead => "superseded_read",
+            Kind::MaturedRead => "matured_read",
             Kind::CrossTurn => "cross_turn",
         }
     }

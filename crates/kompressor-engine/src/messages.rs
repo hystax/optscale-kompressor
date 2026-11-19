@@ -12,10 +12,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::crossturn::SeenText;
 use crate::detect::detect_result;
-use crate::markers::stale_read_marker;
+use crate::markers::{stale_read_marker, superseded_read_marker};
 use crate::options::EngineOptions;
 use crate::pipeline::compress_content;
-use crate::read_lifecycle::{ReadMessage, ReadState, classify_reads, reports_failure};
+use crate::read_lifecycle::{
+    LedgerMessage, ReadDecision, ReadMessage, ReadPolicy, ReadState, classify_reads, decide_reads,
+    reports_failure,
+};
 use crate::refs::{RefCollector, RefId, refs_in};
 use crate::text::chars_len;
 use crate::tokens::estimate_tokens;
@@ -171,6 +174,12 @@ pub struct MessageMeta {
     /// mark the read before it stale.
     #[serde(default)]
     pub tool_error: bool,
+    /// The lines of [`Self::file_path`] a read asked for, as the half-open
+    /// range `[first, past)` with lines counted from 1. `None` where the call
+    /// did not say in a way the walker understands, which is then a read that
+    /// covers no other and that no other is known to cover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_range: Option<(u64, u64)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,29 +281,37 @@ pub struct RequestOptions<'a> {
     /// The provider's real prices for a promotion, when the caller knows them.
     /// `None` prices it from `cache_hit_per_mille` as the rule always has.
     pub cache_pricing: Option<CachePricing>,
-    /// The reads this conversation has already replaced as stale, by
-    /// [`read_key`]. `Some` switches the read lifecycle from deciding on every
-    /// run to **replaying decisions**.
-    ///
-    /// Marking a read stale needs a *later* write, so the lifecycle is the one
-    /// transform whose output for a message depends on what follows it: left
-    /// to decide on every run, appending a turn rewrites an earlier one, inside
-    /// a prefix the provider has cached. With a ledger a read is replaced if
-    /// and only if its key is here, so the output for messages `0..k` depends
-    /// on those messages and on the ledger alone — and the ledger grows only
-    /// on a run with [`Self::may_decide`] set, which the caller sets on the
-    /// one turn where the provider's cache is already lost and a rewrite costs
-    /// nothing. `None` is the lifecycle as it always was.
-    pub stale_ledger: Option<&'a BTreeSet<u64>>,
-    /// Whether this run may add to the ledger: classify the reads against the
-    /// writes that follow them and replace the stale ones. Read only when
-    /// [`Self::stale_ledger`] is `Some`. The keys of every read this run
-    /// replaced, old and new, come back in
-    /// [`CompressStats::stale_read_keys`].
-    pub may_decide: bool,
+    /// What this conversation has already decided about its file reads, and
+    /// whether this run may decide more. `Some` switches the read lifecycle
+    /// from deciding on every run to **replaying decisions**; see
+    /// [`ReadLedger`]. `None` is the lifecycle as it always was.
+    pub read_ledger: Option<ReadLedger<'a>>,
 }
 
-/// What names one message of a conversation for [`RequestOptions::stale_ledger`]:
+/// A conversation's decisions about its file reads, for
+/// [`RequestOptions::read_ledger`].
+///
+/// Marking a read stale needs a *later* write; calling it superseded needs a
+/// later read, and matured, later turns. So the lifecycle is the one transform
+/// whose output for a message depends on what follows it: left to decide on
+/// every run, appending a turn rewrites an earlier one, inside a prefix the
+/// provider has cached. With a ledger a read is rewritten if and only if its
+/// [`read_key`] is in `decided`, so the output for messages `0..k` depends on
+/// those messages and on the ledger alone — and the ledger grows only on a run
+/// with `decide` set, which the caller sets on the one turn where the
+/// provider's cache is already lost and a rewrite costs nothing.
+#[derive(Clone, Copy, Debug)]
+pub struct ReadLedger<'a> {
+    /// What earlier deciding runs decided, by [`read_key`].
+    pub decided: &'a BTreeMap<u64, ReadDecision>,
+    /// `Some` on a run that may decide: classify every read against what
+    /// follows it and add to the ledger. Staleness is always decided on such
+    /// a run; the policy says what else is. The run's decisions, replays
+    /// included, come back in [`CompressStats::read_decisions`].
+    pub decide: Option<ReadPolicy>,
+}
+
+/// What names one message of a conversation for a [`ReadLedger`]:
 /// its position, its role, the tool and file it came from, and its text as the
 /// client sent it. The same on every turn that carries the message, and — FNV-1a,
 /// no per-process seed — in every process.
@@ -337,8 +354,7 @@ impl Default for RequestOptions<'_> {
             cache_hit_per_mille: 1000,
             outside_tokens: 0,
             cache_pricing: None,
-            stale_ledger: None,
-            may_decide: false,
+            read_ledger: None,
         }
     }
 }
@@ -748,11 +764,11 @@ pub struct CompressStats {
     /// therefore be taken once.
     #[serde(skip_serializing)]
     pub kept_inline_refs: Vec<RefId>,
-    /// The [`read_key`] of every read this run replaced as stale, when it ran
-    /// with a [`RequestOptions::stale_ledger`]: the ledger's next value.
-    /// Empty without one.
+    /// Every read this run rewrote under a [`ReadLedger`], by [`read_key`],
+    /// with what was decided about it: the ledger's next value. Empty without
+    /// one.
     #[serde(skip_serializing)]
-    pub stale_read_keys: Vec<u64>,
+    pub read_decisions: Vec<(u64, ReadDecision)>,
     pub protected_ref_reasons: BTreeSet<String>,
     pub protected_ref_messages: u32,
     pub router_version: &'static str,
@@ -895,9 +911,9 @@ pub fn compress_messages(
     // prefix: the same history decides it the same way on every later turn.
     let mut elided_before: BTreeSet<RefId> = BTreeSet::new();
 
-    // With a ledger, reads are classified only on a run allowed to decide;
-    // every other run replays what the ledger holds and looks no further.
-    let ledger = req.stale_ledger.filter(|_| opts.enable_stale_read);
+    // With a ledger nothing is classified here: its decisions are replayed,
+    // and added to only on a run allowed to decide.
+    let ledger = req.read_ledger.filter(|_| opts.enable_stale_read);
     // Taken before anything is rewritten: a key names the message as it arrived.
     let read_keys: Vec<u64> = if ledger.is_some() {
         messages
@@ -908,7 +924,40 @@ pub fn compress_messages(
     } else {
         Vec::new()
     };
-    let read_states = if opts.enable_stale_read && (ledger.is_none() || req.may_decide) {
+    let mut decisions: BTreeMap<usize, ReadDecision> = BTreeMap::new();
+    if let Some(ledger) = ledger {
+        for (index, key) in read_keys.iter().enumerate() {
+            if let Some(decision) = ledger.decided.get(key) {
+                decisions.insert(index, *decision);
+            }
+        }
+        if let Some(policy) = ledger.decide {
+            let view: Vec<LedgerMessage> = messages
+                .iter()
+                .map(|m| LedgerMessage {
+                    tool_name: m.meta.tool_name.as_deref(),
+                    path: m.meta.file_path.as_deref(),
+                    protected: m.meta.cache_control || m.meta.protected,
+                    failed: m.meta.tool_error
+                        || (m.meta.file_path.is_some()
+                            && reports_failure(&m.content.joined_text())),
+                    range: m.meta.read_range,
+                    assistant: m.role.eq_ignore_ascii_case("assistant"),
+                    bytes: m.content.text_len(),
+                })
+                .collect();
+            // A decision is never taken back, and only ever strengthened: a
+            // read compressed as matured that an edit has since invalidated
+            // becomes stale, on a turn where rewriting it again is free.
+            for (index, decision) in decide_reads(&view, &policy) {
+                decisions
+                    .entry(index)
+                    .and_modify(|held| *held = (*held).max(decision))
+                    .or_insert(decision);
+            }
+        }
+    }
+    let read_states = if opts.enable_stale_read && ledger.is_none() {
         let view: Vec<ReadMessage> = messages
             .iter()
             .map(|m| ReadMessage {
@@ -982,8 +1031,19 @@ pub fn compress_messages(
 
         // A file read a later edit invalidated is factually wrong, and the model
         // cannot tell. Replacing it is worth more than compressing it.
-        let stale = matches!(read_states.get(&index), Some(ReadState::Stale))
-            || ledger.is_some_and(|decided| decided.contains(&read_keys[index]));
+        let decision = decisions.get(&index).copied();
+        // Replaced outright, and by which marker: wrong content, or content
+        // that is on screen again further down.
+        let replace_as = if matches!(read_states.get(&index), Some(ReadState::Stale))
+            || decision == Some(ReadDecision::Stale)
+        {
+            Some(Kind::StaleRead)
+        } else if decision == Some(ReadDecision::Superseded) {
+            Some(Kind::SupersededRead)
+        } else {
+            None
+        };
+        let stale = replace_as.is_some();
         let mut compressed_here = false;
         let mut applied: Vec<Kind> = Vec::new();
         let gated_before = refs.gated();
@@ -1021,18 +1081,38 @@ pub fn compress_messages(
                 .file_path
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
-            let marker = stale_read_marker(&path, &text, refs);
+            let marker = if replace_as == Some(Kind::SupersededRead) {
+                superseded_read_marker(&path, &text, refs)
+            } else {
+                stale_read_marker(&path, &text, refs)
+            };
             if chars_len(&marker) < chars_len(&text) {
                 match &mut messages[index].content {
                     MessageContent::Blocks(slots) => slots[0].text = marker,
                     content => *content = MessageContent::Text(marker),
                 }
-                applied.push(Kind::StaleRead);
+                applied.extend(replace_as);
                 compressed_here = true;
             } else {
                 refs.rollback(mark);
             }
         }
+
+        // A read nothing has touched for a while is compressed as source
+        // whatever the profile says. A profile turns that off because a body
+        // elided from a file in use is fetched straight back; a file the
+        // conversation has finished with is the case where it is not.
+        let matured = decision == Some(ReadDecision::Matured);
+        let matured_opts;
+        let opts_here: &EngineOptions = if matured {
+            matured_opts = EngineOptions {
+                enable_code_aware: true,
+                ..opts.clone()
+            };
+            &matured_opts
+        } else {
+            opts
+        };
 
         if !compressed_here {
             let ctx_index = index;
@@ -1046,7 +1126,7 @@ pub fn compress_messages(
                         file_path: None,
                     };
                     let (out, kind) =
-                        compress_content(text, &role, opts, None, refs, &ctx, &mut applied);
+                        compress_content(text, &role, opts_here, None, refs, &ctx, &mut applied);
                     if let Some(kind) = kind {
                         let out = out.into_owned();
                         *text = out;
@@ -1086,7 +1166,7 @@ pub fn compress_messages(
                         let (out, kind) = compress_content(
                             &slot.text,
                             &role,
-                            opts,
+                            opts_here,
                             None,
                             refs,
                             &ctx,
@@ -1165,7 +1245,9 @@ pub fn compress_messages(
             refs.fragment(*id)
                 .map_or(0, |fragment| estimate_tokens(fragment, &role))
         };
-        let read_again: Vec<RefId> = if applied.contains(&Kind::StaleRead) {
+        let read_again: Vec<RefId> = if applied.contains(&Kind::StaleRead)
+            || applied.contains(&Kind::SupersededRead)
+        {
             Vec::new()
         } else {
             stashed_here
@@ -1405,8 +1487,20 @@ pub fn compress_messages(
 
         // After the promotion above, which can put a fetched read back whole:
         // the ledger holds what was replaced, not what was once classified.
-        if ledger.is_some() && compressed_here && applied.contains(&Kind::StaleRead) {
-            stats.stale_read_keys.push(read_keys[index]);
+        if ledger.is_some() && compressed_here {
+            let made = if applied.contains(&Kind::StaleRead) {
+                Some(ReadDecision::Stale)
+            } else if applied.contains(&Kind::SupersededRead) {
+                Some(ReadDecision::Superseded)
+            } else {
+                matured.then_some(ReadDecision::Matured)
+            };
+            if let Some(made) = made {
+                stats.read_decisions.push((read_keys[index], made));
+                if made == ReadDecision::Matured {
+                    applied.push(Kind::MaturedRead);
+                }
+            }
         }
 
         if compressed_here {
@@ -2094,22 +2188,24 @@ mod tests {
     /// ledger's next value.
     fn with_ledger(
         mut messages: Vec<Message>,
-        decided: &BTreeSet<u64>,
+        decided: &BTreeMap<u64, ReadDecision>,
         may_decide: bool,
-    ) -> (Vec<Message>, BTreeSet<u64>) {
+    ) -> (Vec<Message>, BTreeMap<u64, ReadDecision>) {
         let opts = EngineOptions::default();
         let mut refs = opts.collector();
         let stats = compress_messages(
             &mut messages,
             &opts,
             &RequestOptions {
-                stale_ledger: Some(decided),
-                may_decide,
+                read_ledger: Some(ReadLedger {
+                    decided,
+                    decide: may_decide.then(ReadPolicy::default),
+                }),
                 ..RequestOptions::default()
             },
             &mut refs,
         );
-        (messages, stats.stale_read_keys.into_iter().collect())
+        (messages, stats.read_decisions.into_iter().collect())
     }
 
     fn is_stale_marker(message: &Message) -> bool {
@@ -2125,7 +2221,7 @@ mod tests {
     #[test]
     fn with_a_ledger_a_read_is_replaced_only_once_a_deciding_run_has_said_so() {
         let conversation = read_then_write("ok", false);
-        let none = BTreeSet::new();
+        let none = BTreeMap::new();
 
         let (warm, decided) = with_ledger(conversation.clone(), &none, false);
         assert!(!is_stale_marker(&warm[0]), "a warm run decides nothing");
@@ -2134,8 +2230,11 @@ mod tests {
         let (cold, decided) = with_ledger(conversation.clone(), &none, true);
         assert!(is_stale_marker(&cold[0]), "the deciding run replaces it");
         assert_eq!(
-            decided.iter().copied().collect::<Vec<_>>(),
-            vec![read_key(0, &conversation[0])]
+            decided
+                .iter()
+                .map(|(key, made)| (*key, *made))
+                .collect::<Vec<_>>(),
+            vec![(read_key(0, &conversation[0]), ReadDecision::Stale)]
         );
 
         // Every later run replays it, to the byte, and decides nothing new.
@@ -2159,7 +2258,7 @@ mod tests {
         conversation.push(Message::text("user", "thanks"));
 
         // Decided when only the first read had been written over.
-        let (_, decided) = with_ledger(conversation[..2].to_vec(), &BTreeSet::new(), true);
+        let (_, decided) = with_ledger(conversation[..2].to_vec(), &BTreeMap::new(), true);
         assert_eq!(decided.len(), 1);
 
         let (whole, _) = with_ledger(conversation.clone(), &decided, false);
@@ -2191,7 +2290,7 @@ mod tests {
         other_file.meta.file_path = Some("src/b.rs".into());
         assert_ne!(read_key(0, &other_file), key, "another file");
 
-        let stray: BTreeSet<u64> = [key].into();
+        let stray: BTreeMap<u64, ReadDecision> = [(key, ReadDecision::Stale)].into();
         let (out, decided) = with_ledger(vec![edited.clone()], &stray, false);
         assert_eq!(out[0], edited_as_compressed_without_a_ledger(&edited));
         assert!(decided.is_empty());
@@ -2218,13 +2317,13 @@ mod tests {
             }]);
             conversation
         };
-        let (out, decided) = with_ledger(as_block(false), &BTreeSet::new(), true);
+        let (out, decided) = with_ledger(as_block(false), &BTreeMap::new(), true);
         assert!(is_stale_marker(&out[0]));
         assert!(matches!(&out[0].content, MessageContent::Blocks(slots) if slots.len() == 1));
         assert_eq!(decided.len(), 1);
 
         let pinned = as_block(true);
-        let (out, decided) = with_ledger(pinned.clone(), &BTreeSet::new(), true);
+        let (out, decided) = with_ledger(pinned.clone(), &BTreeMap::new(), true);
         assert_eq!(out[0], pinned[0]);
         assert!(decided.is_empty());
 
@@ -2236,11 +2335,254 @@ mod tests {
         assert!(!is_stale_marker(&legacy[0]));
     }
 
+    /// One run under a ledger with a policy and options of the caller's choosing.
+    fn deciding(
+        mut messages: Vec<Message>,
+        opts: &EngineOptions,
+        decided: &BTreeMap<u64, ReadDecision>,
+        decide: Option<ReadPolicy>,
+    ) -> (Vec<Message>, BTreeMap<u64, ReadDecision>, CompressStats) {
+        let mut refs = opts.collector();
+        let stats = compress_messages(
+            &mut messages,
+            opts,
+            &RequestOptions {
+                read_ledger: Some(ReadLedger { decided, decide }),
+                ..RequestOptions::default()
+            },
+            &mut refs,
+        );
+        let made = stats.read_decisions.iter().copied().collect();
+        (messages, made, stats)
+    }
+
+    /// A read as Anthropic delivers it: one block, with the lines it asked for.
+    fn block_read(path: &str, text: String, range: Option<(u64, u64)>) -> Message {
+        Message {
+            role: "user".into(),
+            content: MessageContent::Blocks(vec![TextSlot::new(text)]),
+            meta: MessageMeta {
+                tool_name: Some("Read".into()),
+                file_path: Some(path.into()),
+                read_range: range,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn assistant(text: &str) -> Message {
+        Message::text("assistant", text)
+    }
+
+    const SUPERSEDING: ReadPolicy = ReadPolicy {
+        superseded: true,
+        matured: None,
+    };
+
+    #[test]
+    fn a_read_a_later_read_contains_is_replaced_and_says_where_it_went() {
+        let file = "x = 1\n".repeat(200);
+        let conversation = vec![
+            block_read("src/a.rs", file.clone(), Some((40, 60))),
+            assistant("Let me see the whole file."),
+            block_read("src/a.rs", file.clone(), Some((1, 2_001))),
+            assistant("Now I understand."),
+        ];
+        let opts = EngineOptions::default();
+        let none = BTreeMap::new();
+
+        let (warm, made, _) = deciding(conversation.clone(), &opts, &none, None);
+        assert!(
+            !warm[0]
+                .content
+                .joined_text()
+                .starts_with("[Read superseded"),
+            "a warm run decides nothing"
+        );
+        assert!(made.is_empty());
+
+        let (cold, made, stats) = deciding(conversation.clone(), &opts, &none, Some(SUPERSEDING));
+        let marker = cold[0].content.joined_text();
+        assert!(
+            marker.starts_with("[Read superseded: src/a.rs was read again later"),
+            "{marker}"
+        );
+        assert!(marker.contains("ref:k_"), "and the original is retrievable");
+        assert_eq!(stats.by_type.get("superseded_read"), Some(&1));
+        assert_eq!(
+            made.values().copied().collect::<Vec<_>>(),
+            [ReadDecision::Superseded],
+            "the later read is the one that stays"
+        );
+        assert!(
+            !cold[2]
+                .content
+                .joined_text()
+                .starts_with("[Read superseded")
+        );
+
+        // Replayed to the byte, at every length — the read it pointed at need
+        // not have arrived yet for the decision to hold.
+        for length in 1..=conversation.len() {
+            let (shorter, _, _) = deciding(conversation[..length].to_vec(), &opts, &made, None);
+            assert_eq!(shorter[..], cold[..length], "the first {length} messages");
+        }
+
+        // Off unless the policy asks: a deciding run for staleness alone.
+        let (stale_only, made, _) = deciding(
+            conversation.clone(),
+            &opts,
+            &none,
+            Some(ReadPolicy::default()),
+        );
+        assert_eq!(stale_only[0], warm[0]);
+        assert!(made.is_empty());
+    }
+
+    /// Twelve functions of forty-odd lines each: bodies past the length the
+    /// code compressor elides.
+    fn source_file() -> String {
+        (0..12)
+            .map(|n| {
+                let steps: String = (0..40)
+                    .map(|step| {
+                        format!("    let stage_{step} = transform_{n}_{step}(input, state)?;\n")
+                    })
+                    .collect();
+                format!(
+                    "pub fn handler_{n}(input: &Request, state: &mut State) -> Result<Reply, Error> {{\n\
+                     {steps}    Ok(build_{n}(stage_39))\n}}\n\n"
+                )
+            })
+            .collect()
+    }
+
+    const MATURING: ReadPolicy = ReadPolicy {
+        superseded: false,
+        matured: Some(crate::read_lifecycle::Maturity {
+            quiesce_turns: 5,
+            max_hold_turns: 25,
+            min_bytes: 2_048,
+        }),
+    };
+
+    /// The profile that leaves source alone, as the Anthropic one does.
+    fn without_code_elision() -> EngineOptions {
+        EngineOptions {
+            enable_code_aware: false,
+            ..EngineOptions::default()
+        }
+    }
+
+    #[cfg(feature = "code-aware")]
+    #[test]
+    fn a_read_left_alone_long_enough_is_compressed_as_source_and_stays_so() {
+        let mut conversation = vec![block_read(
+            "src/handlers.rs",
+            source_file(),
+            Some((1, 2_001)),
+        )];
+        conversation.extend((0..5).map(|n| assistant(&format!("Working on step {n}."))));
+        let opts = without_code_elision();
+        let none = BTreeMap::new();
+
+        // What the profile makes of it with no decision taken.
+        let (plain, made, _) = deciding(conversation.clone(), &opts, &none, None);
+        assert!(made.is_empty());
+
+        // Four turns is not long enough.
+        let early = conversation[..5].to_vec();
+        let (unripe, made, _) = deciding(early, &opts, &none, Some(MATURING));
+        assert_eq!(unripe[0], plain[0]);
+        assert!(made.is_empty());
+
+        let (cold, made, stats) = deciding(conversation.clone(), &opts, &none, Some(MATURING));
+        let matured = cold[0].content.joined_text();
+        assert!(
+            matured.len() < plain[0].content.joined_text().len() / 2,
+            "the bodies went: {} of {}",
+            matured.len(),
+            plain[0].content.joined_text().len()
+        );
+        assert!(
+            matured.contains("pub fn handler_7("),
+            "the signatures stayed"
+        );
+        assert!(matured.contains("ref:k_"), "and each body is retrievable");
+        assert_eq!(stats.by_type.get("matured_read"), Some(&1));
+        assert_eq!(
+            made.values().copied().collect::<Vec<_>>(),
+            [ReadDecision::Matured]
+        );
+
+        // Replayed to the byte on a warm run, at every length.
+        for length in 1..=conversation.len() {
+            let (shorter, again, _) = deciding(conversation[..length].to_vec(), &opts, &made, None);
+            assert_eq!(shorter[..], cold[..length], "the first {length} messages");
+            assert_eq!(again, made);
+        }
+    }
+
+    /// A decision is never taken back, and a later deciding run can only
+    /// strengthen it: a matured read an edit has since invalidated is stale.
+    #[cfg(feature = "code-aware")]
+    #[test]
+    fn a_later_deciding_run_strengthens_a_decision_and_never_drops_one() {
+        let mut conversation = vec![block_read(
+            "src/handlers.rs",
+            source_file(),
+            Some((1, 2_001)),
+        )];
+        conversation.extend((0..5).map(|n| assistant(&format!("Working on step {n}."))));
+        let opts = without_code_elision();
+        let (_, matured, _) = deciding(
+            conversation.clone(),
+            &opts,
+            &BTreeMap::new(),
+            Some(MATURING),
+        );
+        assert_eq!(matured.len(), 1);
+
+        // The file is read again: it is no longer quiet, and the decision
+        // stands all the same.
+        let mut touched = conversation.clone();
+        touched.push(block_read(
+            "src/handlers.rs",
+            "fn tail() {}\n".repeat(4),
+            Some((300, 304)),
+        ));
+        let (_, kept, _) = deciding(touched, &opts, &matured, Some(MATURING));
+        assert_eq!(kept, matured);
+
+        // Then it is edited.
+        let mut edited = conversation.clone();
+        edited.push(Message {
+            role: "user".into(),
+            content: MessageContent::Text("The file was updated.".into()),
+            meta: MessageMeta {
+                tool_name: Some("Edit".into()),
+                file_path: Some("src/handlers.rs".into()),
+                ..Default::default()
+            },
+        });
+        let (out, stronger, _) = deciding(edited, &opts, &matured, Some(MATURING));
+        assert!(
+            out[0]
+                .content
+                .joined_text()
+                .starts_with("[Read content stale")
+        );
+        assert_eq!(
+            stronger.values().copied().collect::<Vec<_>>(),
+            [ReadDecision::Stale]
+        );
+    }
+
     /// A write that failed invalidates nothing on a deciding run either.
     #[test]
     fn a_deciding_run_still_ignores_a_write_that_failed() {
         let failed = read_then_write("ERROR: permission denied; file unchanged", false);
-        let (out, decided) = with_ledger(failed, &BTreeSet::new(), true);
+        let (out, decided) = with_ledger(failed, &BTreeMap::new(), true);
         assert!(!is_stale_marker(&out[0]));
         assert!(decided.is_empty());
     }

@@ -112,6 +112,8 @@ fn index_tool_calls(messages: &[Value]) -> ToolCallIndex {
                 ToolCall {
                     name: name.to_string(),
                     file_path,
+                    // Not read on this family: its read tools differ by harness.
+                    read_range: None,
                 },
             );
         }

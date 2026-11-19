@@ -35,7 +35,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Whether a Read still reflects the file.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize)]
@@ -173,6 +173,168 @@ pub fn classify_reads(
             )
         })
         .collect()
+}
+
+/// What a ledger says became of a read. Ordered by which wins when more than
+/// one applies: a read a later edit invalidated is wrong, which matters more
+/// than its being repeated, which matters more than its being old.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadDecision {
+    /// Nothing has touched the file for a while: compress the read as source.
+    Matured,
+    /// A later read of the same file contains this one: replace it.
+    Superseded,
+    /// A later write changed the file: replace it.
+    Stale,
+}
+
+impl ReadDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReadDecision::Matured => "matured",
+            ReadDecision::Superseded => "superseded",
+            ReadDecision::Stale => "stale",
+        }
+    }
+}
+
+/// When an untouched read counts as finished with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Maturity {
+    /// Assistant turns since anything read or wrote the file.
+    pub quiesce_turns: u32,
+    /// Assistant turns since the read itself, however recently the file was
+    /// touched again.
+    pub max_hold_turns: u32,
+    /// The smallest read worth the decision.
+    pub min_bytes: usize,
+}
+
+/// What a deciding run may decide, beyond staleness.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ReadPolicy {
+    /// Replace a read a later read of the same file contains.
+    pub superseded: bool,
+    /// Compress a read nothing has touched for this long.
+    pub matured: Option<Maturity>,
+}
+
+/// One message, as [`decide_reads`] needs it.
+pub struct LedgerMessage<'a> {
+    pub tool_name: Option<&'a str>,
+    pub path: Option<&'a str>,
+    /// The caller said not to touch it.
+    pub protected: bool,
+    /// The tool reported a failure: a write that changed nothing, or a read
+    /// that returned no file.
+    pub failed: bool,
+    /// The lines a read asked for, `[first, past)`.
+    pub range: Option<(u64, u64)>,
+    /// The model's own turn, which is what time is counted in.
+    pub assistant: bool,
+    /// The size of the result.
+    pub bytes: usize,
+}
+
+/// Decide, over a whole conversation, which reads are stale, superseded or
+/// matured. Only reads with a decision are returned, keyed by index.
+///
+/// Like [`classify_reads`] this looks *forward* from each read, so its answer
+/// for a message changes as the conversation grows. It is for a run that is
+/// allowed to rewrite history — the one turn on which the provider's cache is
+/// already lost — and its answers are then recorded and replayed, never taken
+/// again on a turn where they would cost a cached prefix.
+///
+/// A read is **superseded** when a later read of the same file, itself
+/// successful, asked for a range that contains this one's. Both ranges must be
+/// known: a read whose selection is not understood covers nothing and is
+/// covered by nothing. With no write in between, the later result holds every
+/// line this one does. (With a write after it, the read is stale, which wins.)
+///
+/// A read is **matured** when it is large enough and either the file has gone
+/// untouched — not read, not written — for `quiesce_turns` assistant turns, or
+/// the read itself is `max_hold_turns` old.
+pub fn decide_reads(
+    messages: &[LedgerMessage],
+    policy: &ReadPolicy,
+) -> BTreeMap<usize, ReadDecision> {
+    struct Read {
+        index: usize,
+        path: String,
+        range: Option<(u64, u64)>,
+        bytes: usize,
+        protected: bool,
+    }
+    let mut reads: Vec<Read> = Vec::new();
+    let mut writes: Vec<(usize, String)> = Vec::new();
+    // Assistant turns strictly before each message.
+    let mut turns_before: Vec<u32> = Vec::with_capacity(messages.len());
+    let mut turns = 0u32;
+
+    for (index, message) in messages.iter().enumerate() {
+        turns_before.push(turns);
+        if message.assistant {
+            turns += 1;
+        }
+        let Some(path) = message.path else { continue };
+        if message.failed {
+            continue;
+        }
+        let tool = message.tool_name.unwrap_or("").to_ascii_lowercase();
+        let path = normalize_path(path);
+        if READ_TOOLS.contains(&tool.as_str()) {
+            reads.push(Read {
+                index,
+                path,
+                range: message.range,
+                bytes: message.bytes,
+                protected: message.protected,
+            });
+        } else if WRITE_TOOLS.contains(&tool.as_str()) {
+            writes.push((index, path));
+        }
+    }
+
+    let mut decided = BTreeMap::new();
+    for read in reads.iter().filter(|read| !read.protected) {
+        if writes
+            .iter()
+            .any(|(index, path)| *index > read.index && *path == read.path)
+        {
+            decided.insert(read.index, ReadDecision::Stale);
+            continue;
+        }
+        let later = || {
+            reads
+                .iter()
+                .filter(|other| other.index > read.index && other.path == read.path)
+        };
+        let contained = |other: &Read| match (read.range, other.range) {
+            (Some((first, past)), Some((other_first, other_past))) => {
+                other_first <= first && past <= other_past
+            }
+            _ => false,
+        };
+        if policy.superseded && later().any(contained) {
+            decided.insert(read.index, ReadDecision::Superseded);
+            continue;
+        }
+        let Some(maturity) = policy.matured else {
+            continue;
+        };
+        if read.bytes < maturity.min_bytes {
+            continue;
+        }
+        // No write follows it, or it would be stale: the last touch is a read.
+        let last_touch = later().map(|other| other.index).max().unwrap_or(read.index);
+        let quiet = turns - turns_before[last_touch];
+        let held = turns - turns_before[read.index];
+        if quiet >= maturity.quiesce_turns || held >= maturity.max_hold_turns {
+            decided.insert(read.index, ReadDecision::Matured);
+        }
+    }
+    decided
 }
 
 #[cfg(test)]
@@ -399,5 +561,207 @@ mod tests {
             vec![0, 1],
             "keys come back in message order"
         );
+    }
+
+    fn turn<'a>() -> LedgerMessage<'a> {
+        LedgerMessage {
+            tool_name: None,
+            path: None,
+            protected: false,
+            failed: false,
+            range: None,
+            assistant: true,
+            bytes: 0,
+        }
+    }
+
+    fn call<'a>(tool: &'a str, path: &'a str, range: Option<(u64, u64)>) -> LedgerMessage<'a> {
+        LedgerMessage {
+            tool_name: Some(tool),
+            path: Some(path),
+            protected: false,
+            failed: false,
+            range,
+            assistant: false,
+            bytes: 10_000,
+        }
+    }
+
+    const WHOLE: Option<(u64, u64)> = Some((1, 2_001));
+    const BOTH: ReadPolicy = ReadPolicy {
+        superseded: true,
+        matured: Some(Maturity {
+            quiesce_turns: 5,
+            max_hold_turns: 25,
+            min_bytes: 2_048,
+        }),
+    };
+    const SUPERSEDED_ONLY: ReadPolicy = ReadPolicy {
+        superseded: true,
+        matured: None,
+    };
+
+    fn first(messages: &[LedgerMessage], policy: &ReadPolicy) -> Option<ReadDecision> {
+        decide_reads(messages, policy).get(&0).copied()
+    }
+
+    #[test]
+    fn a_later_read_supersedes_only_what_it_contains() {
+        let pair = |earlier, later| [call("Read", "a.rs", earlier), call("Read", "a.rs", later)];
+        let superseded = Some(ReadDecision::Superseded);
+        // Whole covers whole and any part; a part covers a part inside it.
+        assert_eq!(first(&pair(WHOLE, WHOLE), &SUPERSEDED_ONLY), superseded);
+        assert_eq!(
+            first(&pair(Some((40, 60)), WHOLE), &SUPERSEDED_ONLY),
+            superseded
+        );
+        assert_eq!(
+            first(&pair(Some((40, 60)), Some((30, 80))), &SUPERSEDED_ONLY),
+            superseded
+        );
+        assert_eq!(
+            first(&pair(Some((40, 60)), Some((40, 60))), &SUPERSEDED_ONLY),
+            superseded
+        );
+        // A part does not cover the whole, nor a range it only overlaps.
+        assert_eq!(first(&pair(WHOLE, Some((40, 60))), &SUPERSEDED_ONLY), None);
+        assert_eq!(
+            first(&pair(Some((40, 60)), Some((50, 90))), &SUPERSEDED_ONLY),
+            None
+        );
+        // A selection that is not understood covers nothing, and is covered
+        // by nothing.
+        assert_eq!(first(&pair(Some((40, 60)), None), &SUPERSEDED_ONLY), None);
+        assert_eq!(first(&pair(None, WHOLE), &SUPERSEDED_ONLY), None);
+        // The later read is never the superseded one.
+        assert_eq!(decide_reads(&pair(WHOLE, WHOLE), &SUPERSEDED_ONLY).len(), 1);
+    }
+
+    #[test]
+    fn superseding_needs_the_same_file_a_successful_read_and_the_setting() {
+        let other_file = [call("Read", "a.rs", WHOLE), call("Read", "b.rs", WHOLE)];
+        assert_eq!(first(&other_file, &SUPERSEDED_ONLY), None);
+
+        let mut failed = [call("Read", "a.rs", WHOLE), call("Read", "a.rs", WHOLE)];
+        failed[1].failed = true;
+        assert_eq!(
+            first(&failed, &SUPERSEDED_ONLY),
+            None,
+            "the second read returned no file"
+        );
+
+        let again = [call("Read", "a.rs", WHOLE), call("Read", "a.rs", WHOLE)];
+        assert_eq!(
+            first(&again, &ReadPolicy::default()),
+            None,
+            "off unless asked for"
+        );
+
+        let mut protected = [call("Read", "a.rs", WHOLE), call("Read", "a.rs", WHOLE)];
+        protected[0].protected = true;
+        assert_eq!(first(&protected, &SUPERSEDED_ONLY), None);
+
+        // The spellings findings.md #4 found colliding stay different files.
+        for (read, reread) in [
+            (".env", "env"),
+            ("src/a.rs", "../src/a.rs"),
+            ("/etc/x", "etc/x"),
+        ] {
+            let pair = [call("Read", read, WHOLE), call("Read", reread, WHOLE)];
+            assert_eq!(first(&pair, &BOTH), None, "{read} and {reread}");
+        }
+    }
+
+    #[test]
+    fn a_write_makes_the_read_before_it_stale_whatever_else_is_true() {
+        // Read, edit, read again: the first is stale, not superseded.
+        let between = [
+            call("Read", "a.rs", WHOLE),
+            call("Edit", "a.rs", None),
+            call("Read", "a.rs", WHOLE),
+        ];
+        let decided = decide_reads(&between, &BOTH);
+        assert_eq!(decided.get(&0), Some(&ReadDecision::Stale));
+        assert_eq!(decided.get(&2), None, "the read after the edit is current");
+
+        // A write that failed changes nothing: the re-read still supersedes.
+        let mut failed = [
+            call("Read", "a.rs", WHOLE),
+            call("Edit", "a.rs", None),
+            call("Read", "a.rs", WHOLE),
+        ];
+        failed[1].failed = true;
+        assert_eq!(first(&failed, &BOTH), Some(ReadDecision::Superseded));
+    }
+
+    /// A read followed by `quiet` assistant turns in which nothing touches it.
+    fn left_alone(quiet: usize) -> Vec<LedgerMessage<'static>> {
+        let mut messages = vec![call("Read", "a.rs", WHOLE)];
+        messages.extend((0..quiet).map(|_| turn()));
+        messages
+    }
+
+    #[test]
+    fn a_read_matures_once_its_file_has_gone_quiet() {
+        assert_eq!(first(&left_alone(4), &BOTH), None);
+        assert_eq!(first(&left_alone(5), &BOTH), Some(ReadDecision::Matured));
+
+        let mut small = left_alone(9);
+        small[0].bytes = 2_047;
+        assert_eq!(
+            first(&small, &BOTH),
+            None,
+            "too small to be worth a decision"
+        );
+        assert_eq!(
+            first(&left_alone(9), &SUPERSEDED_ONLY),
+            None,
+            "off unless asked for"
+        );
+
+        // Only assistant turns count: tool results and user text are not time.
+        let mut padded = left_alone(4);
+        padded.extend((0..10).map(|_| call("Bash", "", None)));
+        assert_eq!(first(&padded, &BOTH), None);
+    }
+
+    #[test]
+    fn touching_the_file_again_restarts_the_wait_until_the_hold_runs_out() {
+        // Read, four turns, a partial re-read, four more turns: quiet is four.
+        let mut touched = left_alone(4);
+        touched.push(call("Read", "a.rs", Some((10, 20))));
+        touched.extend((0..4).map(|_| turn()));
+        let decided = decide_reads(&touched, &BOTH);
+        assert_eq!(decided.get(&0), None, "the file was touched four turns ago");
+        assert_eq!(decided.get(&5), None, "and the re-read is small and fresh");
+
+        // One more turn and both have been quiet for five.
+        touched.push(turn());
+        assert_eq!(first(&touched, &BOTH), Some(ReadDecision::Matured));
+
+        // Touched every third turn it never goes quiet, and is released
+        // anyway once the read is twenty-five turns old.
+        let mut busy = vec![call("Read", "a.rs", WHOLE)];
+        for round in 0..8 {
+            busy.extend((0..3).map(|_| turn()));
+            busy.push(call("Read", "a.rs", Some((round, round + 5))));
+        }
+        assert_eq!(
+            first(&busy, &BOTH),
+            None,
+            "twenty-four turns held, three quiet"
+        );
+        busy.push(turn());
+        assert_eq!(first(&busy, &BOTH), Some(ReadDecision::Matured));
+    }
+
+    #[test]
+    fn the_stronger_decision_wins() {
+        assert!(ReadDecision::Stale > ReadDecision::Superseded);
+        assert!(ReadDecision::Superseded > ReadDecision::Matured);
+        // Old enough to mature and contained by a later read: superseded.
+        let mut both = left_alone(6);
+        both.push(call("Read", "a.rs", WHOLE));
+        assert_eq!(first(&both, &BOTH), Some(ReadDecision::Superseded));
     }
 }
