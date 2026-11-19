@@ -75,6 +75,7 @@ pub mod mode;
 mod nonstream;
 mod piggyback;
 pub mod prefixcache;
+mod reasoning;
 pub mod recompact;
 mod retention;
 pub mod retrieve;

@@ -23,6 +23,7 @@ pub(crate) fn context(config: &Config) -> RunContext {
             "tools_order":p.tools_order,
             "sticky_beta":p.sticky_beta,
             "tools_compact":p.tools_compact,
+            "reasoning_elide_models":p.reasoning_elide_models,
             "cold_recompact":p.cold_recompact,
             "superseded_reads":p.superseded_reads,
             "matured_reads":p.matured_reads,

@@ -92,6 +92,9 @@ pub struct Composition {
     /// requests it took them from.
     pub tools_compacted_bytes: u64,
     pub tools_compacted_requests: u64,
+    /// Bytes of earlier-turn reasoning `proxy.reasoning_elide_models` took
+    /// out, summed over the requests that carried it.
+    pub reasoning_elided_bytes: u64,
 }
 
 /// One segment's drift, and the losses put down to it.
@@ -339,6 +342,7 @@ impl StatsReader {
             entry.messages_bytes += u64::from(seen.messages_bytes);
             entry.text_bytes += u64::from(seen.text_bytes);
             entry.reasoning_bytes += u64::from(seen.reasoning_bytes);
+            entry.reasoning_elided_bytes += u64::from(seen.reasoning_elided_bytes);
             entry.tools_compacted_bytes += u64::from(seen.tools_compacted_bytes);
             entry.tools_compacted_requests += u64::from(seen.tools_compacted_bytes > 0);
             *tools_seen.entry(key).or_default() += u64::from(seen.tools_count);

@@ -802,6 +802,7 @@ pub(crate) fn observation(
         recompacted: None,
         ledger_reads: 0,
         tools_compacted_bytes: 0,
+        reasoning_elided_bytes: 0,
     }
 }
 

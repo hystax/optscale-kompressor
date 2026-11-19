@@ -119,6 +119,10 @@ pub struct PrefixObservation {
     /// definitions. Zero when the conversation is not compacted.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub tools_compacted_bytes: u32,
+    /// Bytes of earlier-turn reasoning `proxy.reasoning_elide_models` took
+    /// out of this request.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reasoning_elided_bytes: u32,
 }
 
 fn is_zero(count: &u32) -> bool {

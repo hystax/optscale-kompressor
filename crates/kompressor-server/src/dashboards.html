@@ -665,6 +665,7 @@ RENDER.prefix = d => {
       ["Tools", r => pct(r.tools_share)],
       ["System", r => pct(r.system_share)],
       ["Reasoning", r => pct(r.reasoning_share)],
+      ["Reasoning elided", r => r.reasoning_elided_bytes ? pct(share(r.reasoning_elided_bytes, r.body_bytes)) : "–"],
       ["Opaque conversation", r => pct(r.opaque_share)],
       ["Tools per request", r => r.tools_per_request.toFixed(1)],
       ["Deferring", r => pct(share(r.deferring_requests, r.requests))],

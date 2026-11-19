@@ -597,6 +597,8 @@ struct Prepared {
     recompacted: Option<(crate::recompact::Cold, usize)>,
     /// Bytes `proxy.tools_compact` took out of the tool definitions.
     tools_compacted_bytes: usize,
+    /// Bytes of earlier-turn reasoning taken out of the conversation.
+    reasoning_elided_bytes: usize,
 }
 
 impl Prepared {
@@ -610,6 +612,7 @@ impl Prepared {
             opening: None,
             recompacted: None,
             tools_compacted_bytes: 0,
+            reasoning_elided_bytes: 0,
             body,
             json: None,
             saved_tokens: 0,
@@ -719,6 +722,7 @@ fn passthrough_with_stable_tools(
         opening: None,
         recompacted: None,
         tools_compacted_bytes: 0,
+        reasoning_elided_bytes: 0,
     }
 }
 
@@ -891,6 +895,83 @@ fn prefix_identity(
     })
 }
 
+/// Leave out the reasoning of turns that are over, for a model the operator
+/// named in `proxy.reasoning_elide_models`. See [`crate::reasoning`].
+///
+/// Whatever is elided is retained before the body is changed, and a store
+/// that cannot retain it leaves the body as it was: a marker whose fragment
+/// is gone is worse than the reasoning it replaced.
+async fn elide_reasoning(
+    state: &ProxyState,
+    identity: &Identity,
+    mode: ProxyMode,
+    request_id: &str,
+    prepared: &mut Prepared,
+) {
+    let config = state
+        .core
+        .config_for(Some(ApiFamily::OpenAiChat.provider()));
+    let models = &config.proxy.reasoning_elide_models;
+    if models.is_empty() || mode.is_off() {
+        return;
+    }
+    let Some(model) = prepared.model.as_deref() else {
+        return;
+    };
+    if !crate::reasoning::listed(models, model) {
+        return;
+    }
+    let options = state.core.options_for_provider(
+        identity,
+        Some(ApiFamily::OpenAiChat.provider()),
+        Some(&EngineOptionsPatch {
+            mode: mode.engine_mode(),
+            ..Default::default()
+        }),
+    );
+    // Lossless promises to drop nothing, and this drops.
+    if options.is_lossless() {
+        return;
+    }
+    let mut value = match prepared.json.clone() {
+        Some(value) => value,
+        None => match serde_json::from_slice::<Value>(&prepared.body) {
+            Ok(value) => value,
+            Err(_) => return,
+        },
+    };
+    let mut refs = options.collector();
+    let elided = crate::reasoning::elide_past_turns(&mut value, &mut refs);
+    if elided.messages == 0 {
+        return;
+    }
+    let Ok(out) = serde_json::to_vec(&value) else {
+        return;
+    };
+    let (core, identity, request) = (state.core.clone(), identity.clone(), request_id.to_string());
+    let retained = tokio::task::spawn_blocking(move || {
+        core.retain_fragments(&identity, &refs, &request, &options)
+    })
+    .await
+    .unwrap_or(false);
+    if !retained {
+        state
+            .failopen
+            .record(Stage::Compress, &"elided reasoning could not be retained");
+        return;
+    }
+    tracing::debug!(
+        messages = elided.messages,
+        bytes = elided.bytes,
+        "left out the reasoning of earlier turns"
+    );
+    prepared.reasoning_elided_bytes = elided.bytes;
+    prepared.body = Bytes::from(out);
+    if prepared.json.is_some() {
+        prepared.json = Some(value);
+    }
+}
+
 /// Take the bookkeeping out of this request's tool schemas, under
 /// `proxy.tools_compact`, for a conversation whose policy says so. See
 /// [`crate::toolcompact`].
@@ -999,6 +1080,8 @@ fn observe_prefix(
         identified.text_bytes,
         identified.idle,
     );
+    observation.reasoning_elided_bytes =
+        u32::try_from(prepared.reasoning_elided_bytes).unwrap_or(u32::MAX);
     observation.tools_compacted_bytes =
         u32::try_from(prepared.tools_compacted_bytes).unwrap_or(u32::MAX);
     if let Some((kind, held)) = prepared.recompacted {
@@ -1134,6 +1217,9 @@ async fn prepare(
     if long_ttl {
         extend_cache_ttl(&mut prepared);
         prepared.one_hour = true;
+    }
+    if family == Some(ApiFamily::OpenAiChat) {
+        elide_reasoning(state, identity, mode, request_id, &mut prepared).await;
     }
     if let Some(identified) = identified.as_ref() {
         prepared.opening = Some(identified.opening);
@@ -1602,6 +1688,7 @@ async fn prepare_inner(
                 opening: None,
                 recompacted,
                 tools_compacted_bytes: 0,
+                reasoning_elided_bytes: 0,
             }
         }
         Err(error) => {

@@ -565,6 +565,24 @@ pub struct ProxyConfig {
     pub prompt_cache_key: PromptCacheKey,
     /// The order tool definitions go upstream in. See [`ToolsOrder`].
     pub tools_order: ToolsOrder,
+    /// The models whose earlier-turn reasoning is left out of the requests
+    /// that re-send it. **Empty by default**, and nothing is elided for a model
+    /// that is not named.
+    ///
+    /// Some providers return reasoning as plain text (`reasoning_content`, or
+    /// a `<think>` span) and bill it as input when the client sends it back.
+    /// For a model named here, an OpenAI Chat Completions request has the
+    /// reasoning of every assistant message *before its last user message*
+    /// replaced by a marker, with a handle in `recoverable` mode. A tool round
+    /// in progress keeps all of its reasoning, which is when a provider needs
+    /// it back.
+    ///
+    /// The step from one user turn to the next rewrites the turn just
+    /// finished, and so costs its cached prefix once per user turn. Name a
+    /// model only where its provider documents that earlier reasoning need not
+    /// be sent, and where conversations run long enough to repay that. An
+    /// entry ending in `*` matches by prefix.
+    pub reasoning_elide_models: Vec<String>,
     /// Take out of each tool's schema what says nothing to a model: the
     /// dialect, comments, an unreferenced identifier, a `title` that only
     /// restates a property's name. **Off by default.**
@@ -1071,6 +1089,7 @@ impl Default for ProxyConfig {
             prompt_cache_key: PromptCacheKey::Client,
             tools_order: ToolsOrder::Client,
             sticky_beta: false,
+            reasoning_elide_models: Vec::new(),
             tools_compact: false,
             cold_recompact: ColdRecompact::Off,
             cold_recompact_margin: Duration::from_secs(60),
@@ -1678,6 +1697,14 @@ impl Config {
                     self.proxy.matured_min_bytes = bytes;
                 }
             }
+            "reasoning_elide_models" => {
+                self.proxy.reasoning_elide_models = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                    .map(str::to_string)
+                    .collect();
+            }
             "tools_compact" => {
                 self.proxy.tools_compact =
                     parse_bool_setting("proxy.tools_compact", value, self.proxy.tools_compact);
@@ -2215,6 +2242,18 @@ mod tests {
         assert_eq!(config.proxy.prompt_cache_key, PromptCacheKey::Client);
         assert_eq!(config.proxy.tools_order, ToolsOrder::Client);
         assert!(!config.proxy.sticky_beta);
+        assert!(config.proxy.reasoning_elide_models.is_empty());
+        config.apply_env(&[(
+            "KOMPRESSOR__PROXY__REASONING_ELIDE_MODELS".into(),
+            "deepseek-reasoner, kimi-k2*,".into(),
+        )]);
+        assert_eq!(
+            config.proxy.reasoning_elide_models,
+            ["deepseek-reasoner", "kimi-k2*"]
+        );
+        let listed: Config =
+            toml::from_str("[proxy]\nreasoning_elide_models = [\"glm-4.6\"]\n").unwrap();
+        assert_eq!(listed.proxy.reasoning_elide_models, ["glm-4.6"]);
         assert!(!config.proxy.tools_compact);
         config.apply_env(&[("KOMPRESSOR__PROXY__TOOLS_COMPACT".into(), "true".into())]);
         assert!(config.proxy.tools_compact);
