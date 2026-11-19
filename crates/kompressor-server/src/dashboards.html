@@ -623,8 +623,8 @@ RENDER.prefix = d => {
     ["Margin", r => "+" + r.margin_s + " s"],
     ["Scored", r => n(r.scored)],
     ["Predicted cold", r => n(r.predicted)],
-    ["Read nothing", r => n(r.confirmed)],
-    ["Read from cache", r => r.wrong ? el("span", { class: "bad" }, n(r.wrong)) : "0"],
+    ["Lost its prefix", r => n(r.confirmed)],
+    ["Read it back", r => r.wrong ? el("span", { class: "bad" }, n(r.wrong)) : "0"],
     ["Missed", r => n(r.missed)],
     ["Precision", r => r.predicted ? pct(r.precision, 2) : "–"],
     ["Recall", r => r.confirmed + r.missed ? pct(r.recall) : "–"],
@@ -641,6 +641,7 @@ RENDER.prefix = d => {
     section("What moved, and what it cost", table([
       ["Segment", r => SEGMENT_TEXT[r.segment] || r.segment, { text: true }],
       ["Client changed it", r => n(r.client_turns)],
+      ["Put back", r => n(r.repaired_turns)],
       ["Losses", r => n(r.client_losses)],
       ["Tokens lost", r => tok(r.client_lost_tokens)],
       ["Cost", r => tok(r.client_cost)],
@@ -649,7 +650,7 @@ RENDER.prefix = d => {
       ["Tokens lost", r => tok(r.proxy_lost_tokens)],
       ["Cost", r => tok(r.proxy_cost)],
     ], d.drift),
-      note("Segments are listed in the order a provider renders them. A loss is put down to the earliest one that changed, because everything after the first changed byte is lost whatever else changed with it. " +
+      note("Segments are listed in the order a provider renders them. A loss is put down to the earliest one that changed, because everything after the first changed byte is lost whatever else changed with it. Put back counts client changes the proxy undid before they went upstream (a pinned tool order, a kept beta token); those are never blamed for a loss. " +
         "Cache markers, deferred tools and the string-or-single-block spelling of a message are left out of the comparison, as the provider leaves them out. Cost is in input-equivalent tokens.")),
     section("Every prefix-change loss, by what explains it", table([
       ["Explanation", r => r.label, { text: true }],
@@ -683,11 +684,12 @@ RENDER.prefix = d => {
       note("Counted on a conversation's first request and whenever its instructions or tools changed. A value that changes by itself sits ahead of the whole conversation in the cached prefix.")),
     section("Predicting a lapse on the request that finds it", coldTable(asked),
       note("Each request of a conversation the provider had served from cache, scored as it arrived: predicted cold when it had been idle longer than the lifetime its previous request asked for, plus the margin. " +
-        "Read from cache is the expensive mistake — acting on that prediction would have rewritten a live prefix.")),
+        "Whether it lapsed is the Cache page's reckoning: the request failed to read back what the one before it left. A read of the instructions and tools alone does not count as alive, since other conversations keep those cached. " +
+        "Read it back is the expensive mistake — acting on that prediction would have rewritten a live prefix. Turns that were themselves recompacted are left out: what they read says what was rewritten.")),
     section("Recompactions on a lapsed cache", tiles([
       ["On the provider's answer", n(d.recompactions.observed), "it had read nothing and written nothing"],
       ["On idle time", n(d.recompactions.predicted), "predicted on the turn that found it"],
-      ["Predicted wrongly", n(d.recompactions.predicted_wrong), "then served from cache: a live prefix rewritten", d.recompactions.predicted_wrong ? "bad" : "good"],
+      ["Predicted wrongly", n(d.recompactions.predicted_wrong), "the read reached past the instructions and tools: a live prefix rewritten", d.recompactions.predicted_wrong ? "bad" : "good"],
       ["Conversations", n(d.recompactions.conversations), n(d.recompactions.stale_reads) + " reads rewritten (stale, superseded or matured)"],
     ]),
       note("With proxy.cold_recompact on, the turn that finds the provider's cache gone rewrites the whole conversation, and what it decided is replayed on every later turn. Three wrong predictions in an hour end prediction until restart.")),

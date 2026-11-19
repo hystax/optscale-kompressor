@@ -108,7 +108,12 @@ fn hash_value(hash: &mut Fnv, value: &Value, opaque: bool) {
         Value::Object(object) => {
             hash.mark(b'{');
             for (key, item) in object {
-                if !opaque && key == "cache_control" {
+                // A marker, not a schema property that happens to share its
+                // name: the provider's is always `{"type": "ephemeral", …}`.
+                if !opaque
+                    && key == "cache_control"
+                    && item.get("type").and_then(Value::as_str) == Some("ephemeral")
+                {
                     continue;
                 }
                 hash.mark(b'k');
@@ -390,22 +395,25 @@ impl Segments {
                 collect_strings(value, &mut strings);
             }
         }
-        if family != ApiFamily::AnthropicMessages {
-            for item in items.iter().filter(|item| is_instruction(item)) {
-                hash_value(&mut system, item, false);
-                segments.system_bytes += size_of(item);
-                if let Some(content) = item.get("content") {
-                    collect_strings(content, &mut strings);
-                }
+        // On the OpenAI families the instructions are the conversation's
+        // leading system and developer items. One that arrives later is a
+        // turn like any other: appended, not a change to the opening.
+        let leading = if family == ApiFamily::AnthropicMessages {
+            0
+        } else {
+            items.iter().take_while(|item| is_instruction(item)).count()
+        };
+        for item in &items[..leading] {
+            hash_value(&mut system, item, false);
+            segments.system_bytes += size_of(item);
+            if let Some(content) = item.get("content") {
+                collect_strings(content, &mut strings);
             }
         }
         segments.hashes.system = system.0;
 
         let mut rest = Fnv::new();
-        let turns = items
-            .iter()
-            .filter(|item| family == ApiFamily::AnthropicMessages || !is_instruction(item));
-        for item in turns {
+        for item in &items[leading..] {
             let hash = hash_message(item);
             if segments.hashes.messages.len() < MESSAGES_KEPT {
                 segments.hashes.messages.push(hash);
@@ -468,6 +476,16 @@ impl Segments {
             scan_volatile(text.as_bytes(), &mut segments.volatile);
         }
         segments
+    }
+}
+
+impl Segments {
+    /// The same request with the beta tokens that actually go upstream, when
+    /// `proxy.sticky_beta` put back what the client left out.
+    pub(crate) fn with_beta(&self, headers: &HeaderMap) -> Segments {
+        let mut sent = self.clone();
+        sent.hashes.beta = beta_hash(headers);
+        sent
     }
 }
 
@@ -620,6 +638,8 @@ pub(crate) struct Compared {
     pub(crate) compared: bool,
     pub(crate) drift_in: u8,
     pub(crate) drift_out: u8,
+    /// Segments the client changed that went upstream unchanged all the same.
+    pub(crate) repaired: u8,
     pub(crate) history_in_at: Option<u32>,
     pub(crate) history_out_at: Option<u32>,
     /// Whether the previous request asked for one-hour entries.
@@ -702,10 +722,15 @@ impl DriftTracker {
             if history_is_ours {
                 drift_out |= DRIFT_HISTORY;
             }
+            // What the client changed and the provider never saw change: a
+            // reorder pinned back, a beta token put back. History is left
+            // out — nothing here restores a message the client rewrote.
+            let repaired = drift_in & !out & !DRIFT_HISTORY;
             result = Compared {
                 compared: true,
                 drift_in,
                 drift_out,
+                repaired,
                 history_in_at,
                 history_out_at: history_is_ours.then_some(history_out_at).flatten(),
                 previous_one_hour: Some(previous.one_hour),
@@ -780,6 +805,7 @@ pub(crate) fn observation(
         compared: compared.compared,
         drift_in: compared.drift_in,
         drift_out: compared.drift_out,
+        repaired: compared.repaired,
         history_in_at: compared.history_in_at,
         history_out_at: compared.history_out_at,
         body_bytes: clamp(incoming.body_bytes),
@@ -1058,6 +1084,62 @@ mod tests {
         assert_eq!(
             changed(&of("a-1, b-2").hashes, &of("a-1").hashes).0,
             DRIFT_BETA
+        );
+    }
+
+    /// A developer message the client appends on a later turn is a turn. It
+    /// must not read as the opening instructions having changed.
+    #[test]
+    fn an_instruction_item_that_arrives_later_is_an_appended_turn() {
+        let chat = |late: bool| {
+            let mut messages = vec![
+                json!({"role": "system", "content": "be brief"}),
+                json!({"role": "user", "content": "hello"}),
+            ];
+            if late {
+                messages.push(json!({"role": "assistant", "content": "hi"}));
+                messages.push(json!({"role": "developer", "content": "the user is on mobile"}));
+            }
+            json!({"model": "gpt-5.5", "messages": messages})
+        };
+        let of = |body: &Value| Segments::of(body, ApiFamily::OpenAiChat, &HeaderMap::new(), None);
+        let (one, two) = (of(&chat(false)), of(&chat(true)));
+        assert_eq!(changed(&one.hashes, &two.hashes).0, 0);
+        assert_eq!(two.hashes.messages_count, 3, "counted where it sits");
+    }
+
+    /// A client drift the proxy undid is recorded as repaired: the client did
+    /// change it, and the provider never saw it change.
+    #[test]
+    fn a_change_that_never_reached_upstream_is_repaired_not_drift_out() {
+        let tracker = DriftTracker::default();
+        let one = turn(json!([{"role": "user", "content": "hello"}]));
+        let mut reordered = one.clone();
+        reordered["tools"].as_array_mut().unwrap().reverse();
+        observe(&tracker, &one, &one);
+        // The client reordered; what went upstream is the first order.
+        let seen = observe(&tracker, &reordered, &one);
+        assert_eq!(seen.drift_in, DRIFT_TOOL_ORDER);
+        assert_eq!(seen.repaired, DRIFT_TOOL_ORDER);
+        assert_eq!(seen.drift_out, 0);
+        // Forwarded as sent, it is plain client drift.
+        let tracker = DriftTracker::default();
+        observe(&tracker, &one, &one);
+        let seen = observe(&tracker, &reordered, &reordered);
+        assert_eq!((seen.drift_in, seen.repaired), (DRIFT_TOOL_ORDER, 0));
+    }
+
+    #[test]
+    fn a_schema_property_named_like_the_marker_is_compared() {
+        let tool = |kind: &str| {
+            let mut body = turn(json!([]));
+            body["tools"][0]["input_schema"] =
+                json!({"type": "object", "properties": {"cache_control": {"type": kind}}});
+            anthropic(&body)
+        };
+        assert_eq!(
+            changed(&tool("string").hashes, &tool("integer").hashes).0,
+            DRIFT_TOOL_DEFS
         );
     }
 

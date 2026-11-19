@@ -1799,6 +1799,14 @@ impl Config {
                 "environment override refused: {refused}"
             )));
         }
+        // Zero would mature a read on the turn after it was made, which is
+        // the case the setting exists to wait out.
+        if self.proxy.matured_quiesce_turns == 0 || self.proxy.matured_max_hold_turns == 0 {
+            return Err(ConfigError::Invalid(
+                "proxy.matured_quiesce_turns and proxy.matured_max_hold_turns must be at least 1"
+                    .into(),
+            ));
+        }
         if self.refs.purge_interval.is_zero() {
             return Err(ConfigError::Invalid(
                 "refs.purge_interval must be greater than zero".into(),
@@ -2345,6 +2353,10 @@ mod tests {
             "soon".into(),
         )]);
         assert_eq!(config.proxy.matured_quiesce_turns, 8);
+        assert!(config.validate().is_ok());
+        // Zero turns is no wait at all, and is refused.
+        config.proxy.matured_quiesce_turns = 0;
+        assert!(config.validate().is_err());
 
         let parsed: Config = toml::from_str(
             "[proxy.providers.anthropic]\nsuperseded_reads = true\nmatured_reads = true\n",

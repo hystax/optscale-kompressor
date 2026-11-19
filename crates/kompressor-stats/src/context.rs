@@ -60,6 +60,7 @@ impl ProxyTiming {
 /// written before v15, or is one the proxy could not parse; either way it is
 /// "unknown", never "nothing drifted".
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PrefixObservation {
     /// Whether there was an earlier request of this conversation to compare
     /// with. False on a conversation's first request and on a branch (a
@@ -71,6 +72,11 @@ pub struct PrefixObservation {
     /// Segments that went upstream differently from the previous request
     /// although the client had not changed them: the proxy's own doing.
     pub drift_out: u8,
+    /// Segments in `drift_in` that went upstream unchanged all the same,
+    /// because the proxy put them back: a pinned tool order, a beta token
+    /// kept. The client changed them; the provider never saw it.
+    #[serde(skip_serializing_if = "is_zero_u8")]
+    pub repaired: u8,
     /// The first earlier message the client changed, when it changed one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_in_at: Option<u32>,
@@ -127,6 +133,25 @@ pub struct PrefixObservation {
 
 fn is_zero(count: &u32) -> bool {
     *count == 0
+}
+
+fn is_zero_u8(mask: &u8) -> bool {
+    *mask == 0
+}
+
+impl PrefixObservation {
+    /// Whether a cache read of `read` tokens reached into the conversation,
+    /// past the instructions and tool definitions in front of it.
+    ///
+    /// On Anthropic that opening is often shared: other conversations keep it
+    /// cached, so a conversation whose own entries have lapsed still reads it.
+    /// A read is evidence that *this conversation's* cache was alive only if
+    /// it goes further. The opening is sized at a token per three bytes of its
+    /// JSON, which errs high, plus the smallest prefix a provider caches.
+    pub fn read_reaches_messages(&self, read: u32) -> bool {
+        let opening = (u64::from(self.system_bytes) + u64::from(self.tools_bytes)) / 3;
+        u64::from(read) > opening + 1_024
+    }
 }
 
 /// The client changed its system prompt.

@@ -1361,10 +1361,13 @@ pub fn compress_messages(
                 let mut recovery_refs = refs.scratch();
                 let selective = repaid
                     .then(|| {
+                        // The options this message was compressed under: a
+                        // matured read with one body fetched back keeps the
+                        // rest of its bodies elided.
                         compress_preserving_code(
                             &original,
                             &role,
-                            opts,
+                            opts_here,
                             req,
                             &keep_all,
                             &mut recovery_refs,
@@ -1380,7 +1383,14 @@ pub fn compress_messages(
                 let mixed = !pinned.is_empty() && pinned.len() < here.len();
                 let mut pinned_refs = refs.scratch();
                 let pinned_shape = if mixed {
-                    compress_preserving_code(&original, &role, opts, req, &pinned, &mut pinned_refs)
+                    compress_preserving_code(
+                        &original,
+                        &role,
+                        opts_here,
+                        req,
+                        &pinned,
+                        &mut pinned_refs,
+                    )
                 } else {
                     None
                 };
@@ -1487,17 +1497,23 @@ pub fn compress_messages(
 
         // After the promotion above, which can put a fetched read back whole:
         // the ledger holds what was replaced, not what was once classified.
-        if ledger.is_some() && compressed_here {
-            let made = if applied.contains(&Kind::StaleRead) {
+        //
+        // A matured read is recorded whether or not the pass shrank it. What
+        // matters is that it was compressed under other options than the
+        // profile's: a later run has to use the same ones to arrive at the
+        // same bytes, and "the two sets happen to agree when nothing shrinks"
+        // is not something to rest a cached prefix on.
+        if ledger.is_some() {
+            let made = if compressed_here && applied.contains(&Kind::StaleRead) {
                 Some(ReadDecision::Stale)
-            } else if applied.contains(&Kind::SupersededRead) {
+            } else if compressed_here && applied.contains(&Kind::SupersededRead) {
                 Some(ReadDecision::Superseded)
             } else {
                 matured.then_some(ReadDecision::Matured)
             };
             if let Some(made) = made {
                 stats.read_decisions.push((read_keys[index], made));
-                if made == ReadDecision::Matured {
+                if made == ReadDecision::Matured && compressed_here {
                     applied.push(Kind::MaturedRead);
                 }
             }

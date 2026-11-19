@@ -38,7 +38,7 @@ fn insert(conn: &Connection, row: Row<'_>) {
         "INSERT INTO proxy_requests (time_ms, tenant, request_id, api_family, model, upstream,
            status, stream, prompt_tokens, cache_read_tokens, cache_write_tokens, conversation,
            total_ms, prefix_json)
-         VALUES (?1, '', ?2, ?3, 'm', 'u', 200, 1, 10, ?4, ?5, ?6, 100.0, ?7)",
+         VALUES (?1, '', ?2, ?3, 'm', 'u', 200, 1, ?8, ?4, ?5, ?6, 100.0, ?7)",
         params![
             row.time,
             format!("{}-{}", row.conversation, row.time),
@@ -48,6 +48,13 @@ fn insert(conn: &Connection, row: Row<'_>) {
             row.conversation,
             row.observation
                 .map(|seen| serde_json::to_string(&seen).unwrap()),
+            // Anthropic reports the uncached remainder; OpenAI the whole
+            // prompt, cached part included.
+            if row.family.starts_with("openai") {
+                30_000
+            } else {
+                10
+            },
         ],
     )
     .unwrap();
@@ -282,8 +289,12 @@ fn cold<'a>(
         .unwrap()
 }
 
+/// A conversation whose instructions and tools (13,000 tokens) other
+/// conversations keep cached, and whose own messages are what can lapse. Each
+/// turn says how long it had been idle and what it then read; a turn that
+/// reads only the shared opening has lost everything of its own.
 #[test]
-fn a_predicted_lapse_is_scored_against_what_the_provider_read() {
+fn a_predicted_lapse_is_scored_against_what_the_conversation_lost() {
     let (dir, conn) = database();
     let waited = |idle_s: u64, was_warm| PrefixObservation {
         compared: true,
@@ -292,15 +303,15 @@ fn a_predicted_lapse_is_scored_against_what_the_provider_read() {
         lifetime_s: Some(300),
         ..PrefixObservation::default()
     };
-    // (idle seconds, cache read, was warm)
+    // (idle seconds, cache read, cache write, was warm)
     let turns = [
-        (400, 0, true),     // lapsed, and predicted up to a 60 s margin
-        (310, 5_000, true), // still served: a wrong call at no margin
-        (10, 5_000, true),  // warm
-        (20, 0, true),      // gone with no pause: nothing predicts it
-        (900, 0, false),    // never warm: not a lapse, not scored
+        (0, 13_000, 20_000, false),  // the opening turn: nothing to lapse
+        (10, 33_000, 1_000, true),   // read back in full
+        (400, 13_000, 21_000, true), // lapsed: only the shared opening came back
+        (310, 34_000, 1_000, true),  // past the lifetime, and read back in full
+        (20, 13_000, 22_000, true),  // lost with no pause: nothing predicts it
     ];
-    for (index, (idle_s, read, was_warm)) in turns.into_iter().enumerate() {
+    for (index, (idle_s, read, write, was_warm)) in turns.into_iter().enumerate() {
         insert(
             &conn,
             Row {
@@ -308,35 +319,53 @@ fn a_predicted_lapse_is_scored_against_what_the_provider_read() {
                 conversation: "a",
                 family: "anthropic_messages",
                 read,
-                write: 100,
+                write,
                 observation: Some(waited(idle_s, was_warm)),
             },
         );
     }
-    // No lifetime on the wire: scored against each assumed one.
+    // A recompacted turn is not scored: what it read says what was rewritten.
     insert(
         &conn,
         Row {
-            time: 10 * SEC,
-            conversation: "o",
-            family: "openai_responses",
-            read: 0,
-            write: 0,
+            time: 5 * SEC,
+            conversation: "a",
+            family: "anthropic_messages",
+            read: 13_000,
+            write: 9_000,
             observation: Some(PrefixObservation {
-                lifetime_s: None,
-                ..waited(700, true)
+                recompacted: Some("predicted".into()),
+                ..waited(900, true)
             }),
         },
     );
+    // No lifetime on the wire: scored against each assumed one.
+    for (time, read, idle_s) in [(20 * SEC, 0, 0), (21 * SEC, 30_000, 5), (22 * SEC, 0, 700)] {
+        insert(
+            &conn,
+            Row {
+                time,
+                conversation: "o",
+                family: "openai_responses",
+                read,
+                write: 0,
+                observation: Some(PrefixObservation {
+                    lifetime_s: None,
+                    ..waited(idle_s, time > 20 * SEC)
+                }),
+            },
+        );
+    }
     drop(conn);
 
     let report = report(&dir);
     let at = |margin| cold(&report, "anthropic_messages", 300, margin);
     assert!(at(0).asked);
-    assert_eq!(at(0).scored, 4);
+    assert_eq!(at(0).scored, 4, "four warm turns that were not recompacted");
     assert_eq!(
         (at(0).predicted, at(0).confirmed, at(0).wrong, at(0).missed),
-        (2, 1, 1, 1)
+        (2, 1, 1, 1),
+        "a read of the shared opening alone is a lapse, not a live cache"
     );
     assert_eq!((at(0).precision, at(0).recall), (0.5, 0.5));
     assert_eq!(
@@ -375,8 +404,18 @@ fn recompactions_are_counted_by_how_the_lapse_was_known() {
         ("a", 0, turn("observed", 1)),
         ("a", 0, turn("predicted", 3)),
         ("b", 0, turn("predicted", 2)),
-        // Predicted, and served from cache after all.
+        // Predicted, and the read reached past the opening: it was alive.
         ("b", 9_000, turn("predicted", 2)),
+        // Predicted, and only the shared opening came back: a real lapse.
+        (
+            "d",
+            2_000,
+            PrefixObservation {
+                system_bytes: 3_000,
+                tools_bytes: 3_000,
+                ..turn("predicted", 1)
+            },
+        ),
         ("c", 9_000, compared(0, 0)),
     ];
     for (index, (conversation, read, observation)) in rows.into_iter().enumerate() {
@@ -396,12 +435,12 @@ fn recompactions_are_counted_by_how_the_lapse_was_known() {
     let seen = report(&dir).recompactions;
     assert_eq!(
         (seen.observed, seen.predicted, seen.predicted_wrong),
-        (1, 3, 1)
+        (1, 4, 1)
     );
-    assert_eq!(seen.conversations, 2);
+    assert_eq!(seen.conversations, 3);
     assert_eq!(
         seen.stale_reads,
-        3 + 2,
+        3 + 2 + 1,
         "each conversation's ledger once, at its largest"
     );
 }

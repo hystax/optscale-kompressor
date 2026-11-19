@@ -283,6 +283,11 @@ impl Guard {
         !named.is_empty()
     }
 
+    /// How many fields this request was given.
+    pub(crate) fn fields(&self) -> usize {
+        self.fields.len()
+    }
+
     /// `body` without the fields this upstream and model have refused.
     pub(crate) fn strip(&self, body: &Bytes, encoding: BodyEncoding) -> Option<Bytes> {
         strip_fields(body, encoding, self.limit, &self.refused_fields())

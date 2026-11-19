@@ -76,6 +76,17 @@ fn bare(name: &str) -> String {
         .collect()
 }
 
+/// Whether `title` is only one of `names` in another spelling: the same
+/// letters and digits, with nothing between them but spaces, `_` and `-`.
+/// Anything else in it — `C++` on a property named `c`, `I/O` on `io` — is
+/// something the name does not say.
+fn restates(title: &str, names: &[String]) -> bool {
+    title
+        .chars()
+        .all(|c| c.is_alphanumeric() || c.is_whitespace() || c == '_' || c == '-')
+        && names.contains(&bare(title))
+}
+
 /// Whether anything under `value` refers to a schema outside this document.
 fn refers_outside(value: &Value) -> bool {
     match value {
@@ -114,7 +125,7 @@ fn compact_schema(schema: &mut Value, named: &[String], root: Option<bool>) -> b
     if object
         .get("title")
         .and_then(Value::as_str)
-        .is_some_and(|title| named.contains(&bare(title)))
+        .is_some_and(|title| restates(title, named))
     {
         changed |= removed(object, "title");
     }
@@ -234,7 +245,11 @@ impl ToolPolicies {
         let Ok(mut decided) = self.decided.lock() else {
             return false;
         };
-        if let Some((_, policy)) = decided.get(&conversation) {
+        if let Some((used, policy)) = decided.get_mut(&conversation) {
+            // Refreshed on every use: what is evicted at the cap is the
+            // conversation idle longest, never one still under way, whose next
+            // request would be decided afresh and against it.
+            *used = Instant::now();
             return *policy;
         }
         if decided.len() >= REMEMBER
@@ -343,6 +358,12 @@ mod tests {
                 .is_none(),
             "another spelling of the name is still only the name"
         );
+        // Punctuation is not spelling: these say what their names do not.
+        let punctuated = json!({"name": "build", "input_schema": {"type": "object", "properties": {
+            "c": {"title": "C++", "type": "boolean"},
+            "io": {"title": "I/O", "type": "string"}
+        }}});
+        assert_eq!(compacted(punctuated.clone()), punctuated);
     }
 
     #[test]
@@ -552,6 +573,26 @@ mod tests {
         assert!(
             (0.015..0.03).contains(&saved),
             "{saved:.4} of {before_bytes} bytes"
+        );
+    }
+
+    /// At the cap the conversation idle longest goes, not the one decided
+    /// first: a long conversation still under way keeps its policy.
+    #[test]
+    fn a_conversation_still_in_use_is_not_the_one_evicted() {
+        let policies = ToolPolicies::default();
+        assert!(policies.compacting(0, 1, true));
+        for conversation in 1..REMEMBER as u64 {
+            policies.compacting(conversation, 1, true);
+        }
+        // The first one decided is used again, twenty messages in.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(policies.compacting(0, 20, true));
+        // The table is full; the next arrival evicts someone else.
+        policies.compacting(u64::MAX, 1, true);
+        assert!(
+            policies.compacting(0, 21, true),
+            "still compacted: an entry lost here would be re-decided as under way"
         );
     }
 

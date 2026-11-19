@@ -841,6 +841,25 @@ rows explicitly use the newest 200,000. Detailed timing is unavailable for old
 rows and the WebSocket relay. Comparisons are observational and do not measure
 task-quality preservation or prove causation.
 
+### Opt-in settings that edit the prefix
+
+Everything above leaves the client's instructions, tools and headers as it
+sent them. These do not, each is off by default, and none has been measured on
+live traffic yet: turn one on for a client the `/prefix` page shows needs it.
+All are `[proxy]` keys, most also settable per provider;
+[DESIGN.md §12.10](docs/DESIGN.md#1210-telling-a-live-provider-cache-from-a-lapsed-one)
+has the reasoning for each.
+
+| Setting | What it does |
+| --- | --- |
+| `tools_order = "pinned"` | sends a conversation's tools in the order its first request used, when a client reorders them between turns |
+| `sticky_beta = true` | re-sends the `anthropic-beta` tokens a conversation already sent when a later request leaves some out |
+| `prompt_cache_key = "conversation"` | names an OpenAI cache route from the conversation's opening where the client named none |
+| `tools_compact = true` | drops schema bookkeeping from tool definitions (`$schema`, `$comment`, a `title` that restates its property's name); about 2% of the tool block on Claude Code |
+| `cold_recompact = "observed"` or `"predicted"` | under `frozen_prefix = "first_seen"`, rewrites the whole conversation on the turn that finds the provider's cache gone, and replays what that turn decided on every turn after it |
+| `superseded_reads`, `matured_reads` | with `cold_recompact`: on that turn, also replace a file read a later read contains, and compress as source a read left alone for `matured_quiesce_turns` |
+| `reasoning_elide_models = ["…"]` | OpenAI Chat: for the models named, elides the plain-text reasoning of turns before the last user message. Rewrites the finished turn once per user turn |
+
 ---
 
 ## Not built yet
@@ -880,7 +899,7 @@ Good first issues are labelled
 | `make harbor-gates` | every live-agent benchmark gate, with no provider spend                                        |
 
 
-`cargo test --workspace` runs **1,403 tests** across ten crates; clippy and rustfmt
+`cargo test --workspace` runs **1,868 tests** across ten crates; clippy and rustfmt
 are clean. `make bench-save` and `make golden` move what the tests compare against,
 so both ask before they run.
 

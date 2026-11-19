@@ -29,9 +29,20 @@
 //! 2,000-token stale read needs ~125 further turns to break even, against
 //! sessions that run 20 to 70.
 //!
-//! The replacement in `messages::run` handles `MessageContent::Text` only, so
-//! it cannot fire for tool results that walk to `Blocks` — which is most of
+//! Left to decide on every run, the replacement in
+//! `messages::compress_messages` handles `MessageContent::Text` only, so it
+//! cannot fire for tool results that walk to `Blocks` — which is most of
 //! Anthropic's. The reach is narrower than the rule suggests.
+//!
+//! # Deciding once: the ledger
+//!
+//! [`decide_reads`] is the same forward look, for a caller that records what
+//! it decides and replays it (`messages::ReadLedger`). A run takes decisions
+//! only when told it may — on the one turn where the provider's cache is
+//! already lost — and every other run acts on the record alone, which makes
+//! the lifecycle prefix-monotonic between those turns. Under a ledger it also
+//! reaches a tool result delivered as one block, and it is what lets
+//! `first_seen` stop withholding the feature (`proxy.cold_recompact`).
 
 use std::collections::BTreeMap;
 

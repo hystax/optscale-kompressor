@@ -170,25 +170,38 @@ impl Outbound {
                 .unwrap_or_else(|| self.body.clone());
             return self.send_body(body).await;
         }
-        let response = self.send_body(self.body.clone()).await?;
-        if response.status() != StatusCode::BAD_REQUEST {
-            return Ok(response);
+        // Once per field this request was given: an upstream that reports one
+        // unknown parameter at a time refuses the second only after the first
+        // is gone, and the client sent neither.
+        let mut body = self.body.clone();
+        for _ in 0..=guard.fields() {
+            let response = self.send_body(body.clone()).await?;
+            if response.status() != StatusCode::BAD_REQUEST {
+                return Ok(response);
+            }
+            // An error is small; reading it is the only way to know whose it is.
+            let status = response.status();
+            let version = response.version();
+            let headers = response.headers().clone();
+            let bytes = response.bytes().await?;
+            // Stripped from the original each time: every field refused so
+            // far comes out, and a refusal that names nothing new ends it.
+            match guard
+                .refuse_named(&bytes)
+                .then(|| guard.strip(&self.body, self.encoding))
+                .flatten()
+            {
+                Some(stripped) if stripped != body => body = stripped,
+                _ => {
+                    let mut rebuilt = http::Response::new(bytes);
+                    *rebuilt.status_mut() = status;
+                    *rebuilt.version_mut() = version;
+                    *rebuilt.headers_mut() = headers;
+                    return Ok(reqwest::Response::from(rebuilt));
+                }
+            }
         }
-        // An error is small; reading it is the only way to know whose it is.
-        let status = response.status();
-        let version = response.version();
-        let headers = response.headers().clone();
-        let bytes = response.bytes().await?;
-        if guard.refuse_named(&bytes)
-            && let Some(stripped) = guard.strip(&self.body, self.encoding)
-        {
-            return self.send_body(stripped).await;
-        }
-        let mut rebuilt = http::Response::new(bytes);
-        *rebuilt.status_mut() = status;
-        *rebuilt.version_mut() = version;
-        *rebuilt.headers_mut() = headers;
-        Ok(reqwest::Response::from(rebuilt))
+        self.send_body(body).await
     }
 
     async fn send_body(&self, body: Bytes) -> reqwest::Result<reqwest::Response> {

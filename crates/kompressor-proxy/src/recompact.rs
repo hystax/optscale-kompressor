@@ -73,6 +73,10 @@ struct Ledger {
     reads: BTreeMap<u64, ReadDecision>,
     /// How many cold turns have been recompacted.
     epoch: u32,
+    /// A recompaction has gone upstream and the provider has not yet answered
+    /// it with usage. Until it does, what it reported before says nothing
+    /// about the prefix it now holds.
+    unsettled: bool,
 }
 
 /// Every conversation's ledger, and the record of predictions gone wrong.
@@ -89,15 +93,59 @@ impl Recompact {
     /// for one that has decided nothing: the engine is in ledger mode either
     /// way.
     pub(crate) fn reads(&self, conversation: u64) -> BTreeMap<u64, ReadDecision> {
+        let Ok(mut ledgers) = self.ledgers.lock() else {
+            return BTreeMap::new();
+        };
+        match ledgers.get_mut(&conversation) {
+            Some(ledger) => {
+                // Refreshed on every use. The freeze this ledger goes with is
+                // lowered for as long as the conversation is remembered; a
+                // ledger evicted while the conversation is still under way
+                // would leave every read it rewrote to go out whole again,
+                // inside a live prefix.
+                ledger.at = Some(Instant::now());
+                ledger.reads.clone()
+            }
+            None => BTreeMap::new(),
+        }
+    }
+
+    /// How many reads the ledger would hold after `decided` joined it.
+    pub(crate) fn would_hold(&self, conversation: u64, decided: &[(u64, ReadDecision)]) -> usize {
+        let Ok(ledgers) = self.ledgers.lock() else {
+            return decided.len();
+        };
+        let held = ledgers.get(&conversation);
+        held.map_or(0, |ledger| ledger.reads.len())
+            + decided
+                .iter()
+                .filter(|(key, _)| held.is_none_or(|ledger| !ledger.reads.contains_key(key)))
+                .count()
+    }
+
+    /// Whether the conversation's last recompaction is still unanswered.
+    ///
+    /// While it is, the conversation is not cold again whatever the tracker's
+    /// older evidence says: the turn after a recompaction whose response
+    /// carried no usage — a client that hung up, an upstream error — would
+    /// otherwise be recompacted a second time, deciding afresh over messages
+    /// the provider may just have cached. A second request in flight beside
+    /// the first is held off the same way.
+    pub(crate) fn unsettled(&self, conversation: u64) -> bool {
         self.ledgers
             .lock()
             .ok()
-            .and_then(|ledgers| {
-                ledgers
-                    .get(&conversation)
-                    .map(|ledger| ledger.reads.clone())
-            })
-            .unwrap_or_default()
+            .is_some_and(|ledgers| ledgers.get(&conversation).is_some_and(|l| l.unsettled))
+    }
+
+    /// The provider has answered this conversation with usage: what the
+    /// tracker now holds describes the recompacted prefix.
+    pub(crate) fn settled(&self, conversation: u64) {
+        if let Ok(mut ledgers) = self.ledgers.lock()
+            && let Some(ledger) = ledgers.get_mut(&conversation)
+        {
+            ledger.unsettled = false;
+        }
     }
 
     /// Record a recompaction that went upstream: what it decided joins the
@@ -129,6 +177,7 @@ impl Recompact {
                 .or_insert(*decision);
         }
         ledger.epoch += 1;
+        ledger.unsettled = true;
         ledger.reads.len()
     }
 
@@ -215,6 +264,47 @@ mod tests {
             state.reads(2).is_empty(),
             "another conversation's is its own"
         );
+    }
+
+    #[test]
+    fn a_recompaction_is_unsettled_until_the_provider_answers_it() {
+        let state = Recompact::default();
+        assert!(!state.unsettled(1), "nothing has been recompacted");
+        state.commit(1, &[(10, ReadDecision::Stale)]);
+        assert!(state.unsettled(1));
+        assert!(!state.unsettled(2));
+        state.settled(1);
+        assert!(!state.unsettled(1));
+        state.settled(9);
+        assert_eq!(
+            state.tracked(),
+            1,
+            "settling an unknown conversation records nothing"
+        );
+    }
+
+    #[test]
+    fn what_a_ledger_would_hold_counts_each_read_once() {
+        use ReadDecision::{Matured, Stale};
+        let state = Recompact::default();
+        assert_eq!(state.would_hold(1, &[(10, Stale), (20, Matured)]), 2);
+        state.commit(1, &[(10, Stale), (20, Matured)]);
+        assert_eq!(state.would_hold(1, &[(10, Stale), (30, Stale)]), 3);
+        assert_eq!(state.would_hold(1, &[]), 2);
+    }
+
+    /// At the cap the ledger idle longest goes, not the one committed first.
+    #[test]
+    fn a_ledger_still_in_use_is_not_the_one_evicted() {
+        let state = Recompact::default();
+        state.commit(0, &[(1, ReadDecision::Stale)]);
+        for conversation in 1..REMEMBER as u64 {
+            state.commit(conversation, &[(1, ReadDecision::Stale)]);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(state.reads(0).len(), 1, "a warm turn replays it");
+        state.commit(u64::MAX, &[(1, ReadDecision::Stale)]);
+        assert_eq!(state.reads(0).len(), 1, "and it is still there");
     }
 
     #[test]

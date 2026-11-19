@@ -112,6 +112,10 @@ async fn reordered_tools_go_upstream_in_the_conversations_first_order() {
     let second = rows[1].prefix.clone().expect("observed");
     assert_eq!(second.drift_in, DRIFT_TOOL_ORDER);
     assert_eq!(second.drift_out, 0);
+    assert_eq!(
+        second.repaired, DRIFT_TOOL_ORDER,
+        "put back before it went upstream, so no loss is laid at its door"
+    );
 }
 
 #[tokio::test]
@@ -226,6 +230,33 @@ async fn a_beta_token_the_conversation_sent_before_is_sent_again() {
     );
 }
 
+/// The client did drop a token, and the provider never saw it dropped: the
+/// statistics record the first and do not blame it for anything.
+#[tokio::test]
+async fn a_token_put_back_is_recorded_as_repaired() {
+    let harness = Harness::with(sticky).await;
+    Mock::given(any())
+        .respond_with(anthropic_answered())
+        .mount(&harness.server)
+        .await;
+    let body = anthropic_body("short");
+    harness
+        .post_with(
+            MESSAGES,
+            &body,
+            &[("anthropic-beta", "tools-2024,context-1m")],
+        )
+        .await;
+    harness
+        .post_with(MESSAGES, &body, &[("anthropic-beta", "context-1m")])
+        .await;
+    let rows = proxy_rows(&harness.events);
+    let seen = rows[1].prefix.clone().expect("observed");
+    assert_eq!(seen.drift_in, kompressor_stats::context::DRIFT_BETA);
+    assert_eq!(seen.repaired, kompressor_stats::context::DRIFT_BETA);
+    assert_eq!(seen.drift_out, 0);
+}
+
 #[tokio::test]
 async fn by_default_the_beta_header_is_the_clients() {
     let harness = Harness::new().await;
@@ -282,6 +313,96 @@ async fn every_turn_of_a_conversation_names_the_same_cache_route() {
     let mut without = sent[1].clone();
     without.as_object_mut().unwrap().remove(KEY);
     assert_eq!(without, chat(3, &["read"]));
+}
+
+/// A conversation whose first request is a single message — no system
+/// prompt — names the same route on that request as on every later one. A key
+/// taken from "the first two messages" changed after the first turn.
+#[tokio::test]
+async fn a_conversation_that_opens_with_one_message_keeps_its_route() {
+    let harness = Harness::with(keyed).await;
+    answering(&harness).await;
+    let opening = json!({"role": "user", "content": "Where is the bug?"});
+    let turn = |messages: Vec<Value>| json!({"model": "gpt-5.5", "messages": messages});
+    harness.post(CHAT, &turn(vec![opening.clone()])).await;
+    harness
+        .post(
+            CHAT,
+            &turn(vec![
+                opening.clone(),
+                json!({"role": "assistant", "content": "In the parser."}),
+                json!({"role": "user", "content": "Show me."}),
+            ]),
+        )
+        .await;
+    let sent = harness.upstream_json().await;
+    assert!(sent[0][KEY].is_string());
+    assert_eq!(sent[0][KEY], sent[1][KEY]);
+}
+
+/// A request that continues a response stored at the provider carries only
+/// this turn's items. It has no opening to name a route by, and gets none.
+#[tokio::test]
+async fn a_request_continuing_a_stored_response_is_given_no_key() {
+    let harness = Harness::with(keyed).await;
+    answering(&harness).await;
+    let body = json!({
+        "model": "gpt-5.5",
+        "previous_response_id": "resp_123",
+        "input": [{"type": "message", "role": "user",
+                   "content": [{"type": "input_text", "text": "And the tests?"}]}]
+    });
+    harness.post("/v1/responses", &body).await;
+    assert_eq!(harness.upstream_bodies().await[0], body.to_string());
+}
+
+/// An upstream that reports one unknown parameter at a time refuses the
+/// second only once the first is gone. Neither was the client's; the request
+/// still succeeds, and both are remembered.
+#[tokio::test]
+async fn two_added_fields_refused_one_at_a_time_still_cost_no_request() {
+    use kompressor_core::config::PromptCacheRetention;
+    let harness = Harness::with(|config| {
+        keyed(config);
+        config
+            .proxy
+            .providers
+            .get_mut("openai")
+            .expect("set by keyed")
+            .prompt_cache_retention = Some(PromptCacheRetention::Extended);
+    })
+    .await;
+    for field in ["prompt_cache_retention", KEY] {
+        Mock::given(body_string_contains(field))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": format!("Unknown parameter: '{field}'."),
+                          "type": "invalid_request_error", "param": field}
+            })))
+            .mount(&harness.server)
+            .await;
+    }
+    answering(&harness).await;
+
+    let reply = harness.post(CHAT, &chat(0, &["read"])).await;
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    let reply = harness.post(CHAT, &chat(1, &["read"])).await;
+    assert_eq!(reply.status, 200);
+    let carried: Vec<(bool, bool)> = harness
+        .upstream_json()
+        .await
+        .iter()
+        .map(|body| {
+            (
+                body.get("prompt_cache_retention").is_some(),
+                body.get(KEY).is_some(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        carried,
+        [(true, true), (false, true), (false, false), (false, false)],
+        "each refusal takes out the field it named; the next request sends neither"
+    );
 }
 
 /// A second proxy, or this one restarted, names the same route: the key comes

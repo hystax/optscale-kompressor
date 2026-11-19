@@ -116,6 +116,15 @@ impl Stabilizer {
     /// conversation sent before and this request left out. Returns whether
     /// the header was rewritten.
     pub(crate) fn keep_betas(&self, conversation: u64, headers: &mut HeaderMap) -> bool {
+        // A line that is not text cannot be carried into a rewritten header,
+        // and dropping it would be a change the client never made.
+        if headers
+            .get_all(BETA)
+            .iter()
+            .any(|value| value.to_str().is_err())
+        {
+            return false;
+        }
         let sent = beta_tokens(headers);
         let union = self.with(conversation, |pinned| {
             for token in &sent {
@@ -367,6 +376,20 @@ mod tests {
         let mut other = betas(&["context-1m"]);
         assert!(!pins.keep_betas(2, &mut other));
         assert_eq!(sent(&other), ["context-1m"]);
+    }
+
+    #[test]
+    fn a_header_line_that_is_not_text_is_never_rewritten() {
+        let pins = Stabilizer::default();
+        pins.keep_betas(1, &mut betas(&["tools-2024,context-1m"]));
+        let mut odd = betas(&["context-1m"]);
+        odd.append(BETA, HeaderValue::from_bytes(b"caf\xe9").unwrap());
+        assert!(!pins.keep_betas(1, &mut odd));
+        assert_eq!(
+            odd.get_all(BETA).iter().count(),
+            2,
+            "both lines still there"
+        );
     }
 
     #[test]

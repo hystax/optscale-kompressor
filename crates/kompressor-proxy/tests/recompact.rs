@@ -366,6 +366,19 @@ async fn through_a_lapse(
     harness.upstream_json().await
 }
 
+/// The fourth turn of [`through_a_lapse`] was recompacted, and no other was.
+/// Without this a test of what a recompaction leaves alone passes just as
+/// well when nothing was recompacted at all.
+fn assert_recompacted(harness: &Harness) {
+    let kinds: Vec<Option<String>> = proxy_rows(&harness.events)
+        .into_iter()
+        .map(|row| row.prefix.and_then(|seen| seen.recompacted))
+        .collect();
+    let mut expected = vec![None; 7];
+    expected[3] = Some("observed".to_string());
+    assert_eq!(kinds, expected);
+}
+
 /// Every message the cold turn sent goes out unchanged on the turns after it.
 fn assert_held(sent: &[Value]) {
     let cold = sent_messages(&sent[3]);
@@ -428,6 +441,7 @@ async fn a_partial_read_does_not_supersede_the_whole_file() {
         ),
     ];
     let sent = through_a_lapse(&harness, 0, |turns| reading(&reads, turns)).await;
+    assert_recompacted(&harness);
     assert!(!the_read(&sent[3]).starts_with("[Read superseded"));
 }
 
@@ -492,9 +506,107 @@ async fn a_read_still_in_use_and_one_with_the_setting_off_are_left_whole() {
     let harness = Harness::with(maturing(true)).await;
     let reads = [(json!({"file_path": "src/handlers.rs"}), handlers())];
     let sent = through_a_lapse(&harness, 0, |turns| reading(&reads, turns)).await;
+    assert_recompacted(&harness);
     assert_eq!(the_read(&sent[3]), handlers());
 
     let harness = Harness::with(maturing(false)).await;
     let sent = through_a_lapse(&harness, 6, |turns| reading(&reads, turns)).await;
+    assert_recompacted(&harness);
     assert_eq!(the_read(&sent[3]), handlers());
+}
+
+// ---------------------------------------------------------------------------
+// what a response does and does not say about a recompaction
+// ---------------------------------------------------------------------------
+
+/// A lapsed conversation still reads its instructions from cache when other
+/// conversations keep them there. That read says nothing about whether this
+/// conversation's own entry was alive, and must not count against the
+/// prediction — three of them used to switch prediction off.
+#[tokio::test]
+async fn a_lapse_that_still_reads_the_shared_opening_is_not_a_wrong_prediction() {
+    let harness = Harness::with(first_seen(ColdRecompact::Predicted)).await;
+    // The opening is about 10,000 tokens; each lapsed turn reads 9,000.
+    answering(
+        &harness,
+        &[
+            (0, 40_000),
+            (40_000, 200),
+            (9_000, 31_000),
+            (9_000, 31_000),
+            (9_000, 31_000),
+        ],
+    )
+    .await;
+    let with_system = |turns| {
+        let mut body = conversation(turns);
+        body["system"] = json!("You are a careful engineer. ".repeat(1_100));
+        body
+    };
+    harness.post(MESSAGES, &with_system(0)).await;
+    harness.post(MESSAGES, &with_system(1)).await;
+    let conversation_id = conversation_of(&harness);
+    let prefixes = harness.state.prefixes();
+    for lapse in 0..3 {
+        prefixes.age_for_test(conversation_id, Duration::from_secs(420));
+        harness.post(MESSAGES, &with_system(2 + lapse)).await;
+        let row = proxy_rows(&harness.events)
+            .pop()
+            .and_then(|row| row.prefix)
+            .expect("observed");
+        assert_eq!(
+            row.recompacted.as_deref(),
+            Some("predicted"),
+            "lapse {lapse}"
+        );
+    }
+    let recompact = harness.state.recompact();
+    assert_eq!(recompact.wrong_predictions(), 0);
+    assert!(recompact.predicting());
+}
+
+/// A recompaction whose response carried no usage leaves the tracker holding
+/// what it held before: "read nothing, wrote nothing". The next turn must not
+/// be taken for a second lapse and decided afresh.
+#[tokio::test]
+async fn a_recompaction_nobody_answered_is_not_repeated_on_the_next_turn() {
+    let harness = Harness::with(first_seen(ColdRecompact::Observed)).await;
+    for (read, written) in [(0, 30_000), (30_000, 200), (0, 0)] {
+        Mock::given(any())
+            .respond_with(usage(read, written))
+            .up_to_n_times(1)
+            .mount(&harness.server)
+            .await;
+    }
+    // The cold turn's answer: a reply with no usage in it.
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "msg_1", "type": "message", "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn"
+        })))
+        .up_to_n_times(1)
+        .mount(&harness.server)
+        .await;
+    Mock::given(any())
+        .respond_with(usage(30_000, 200))
+        .mount(&harness.server)
+        .await;
+
+    for turns in 0..6 {
+        harness.post(MESSAGES, &conversation(turns)).await;
+    }
+    let kinds: Vec<Option<String>> = proxy_rows(&harness.events)
+        .into_iter()
+        .map(|row| row.prefix.and_then(|seen| seen.recompacted))
+        .collect();
+    assert_eq!(
+        kinds,
+        [None, None, None, Some("observed".to_string()), None, None],
+        "once, on the turn that found the lapse"
+    );
+    let sent = harness.upstream_json().await;
+    let cold = sent_messages(&sent[3]);
+    for later in &sent[4..] {
+        assert_eq!(sent_messages(later)[..cold.len()], cold[..]);
+    }
 }

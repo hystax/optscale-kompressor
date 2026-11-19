@@ -103,6 +103,8 @@ pub struct SegmentDrift {
     pub segment: String,
     /// Compared requests on which the client changed it.
     pub client_turns: u64,
+    /// Of `client_turns`, those the proxy put back before they went upstream.
+    pub repaired_turns: u64,
     /// Compared requests on which only the proxy changed it.
     pub proxy_turns: u64,
     pub client_losses: u64,
@@ -176,11 +178,12 @@ pub struct ColdScore {
     pub scored: u64,
     /// Predicted cold: idle longer than the lifetime plus the margin.
     pub predicted: u64,
-    /// Predicted cold, and the provider read nothing.
+    /// Predicted cold, and the request did lose the prefix the one before it
+    /// left, by the cache report's reckoning.
     pub confirmed: u64,
-    /// Predicted cold, and the provider read from cache after all.
+    /// Predicted cold, and the prefix was read back after all.
     pub wrong: u64,
-    /// Not predicted, and the provider read nothing.
+    /// Not predicted, and the prefix was lost.
     pub missed: u64,
     pub precision: f64,
     pub recall: f64,
@@ -217,7 +220,7 @@ pub struct PrefixReport {
     pub observed: u64,
     /// Of those, the ones compared with an earlier request.
     pub compared: u64,
-    /// Compared requests on which nothing moved, on either side.
+    /// Compared requests on which nothing reached the provider changed.
     pub stable: u64,
     /// More rows matched than were read; only the newest were.
     pub truncated: bool,
@@ -235,10 +238,13 @@ pub struct PrefixReport {
 /// the way in, which is what `drift_out` already says; for every other segment
 /// the two masks cannot both be set.
 fn blame(observation: &PrefixObservation) -> Option<(&'static str, bool)> {
+    // A change the proxy put back never reached the provider, and so cannot
+    // be what it failed to read.
+    let by_client = observation.drift_in & !observation.repaired;
     RENDER_ORDER.iter().find_map(|(bit, name)| {
         if observation.drift_out & bit != 0 {
             Some((*name, true))
-        } else if observation.drift_in & bit != 0 {
+        } else if by_client & bit != 0 {
             Some((*name, false))
         } else {
             None
@@ -315,6 +321,17 @@ impl StatsReader {
         report.truncated = truncated;
         report.observed = observed.len() as u64;
 
+        // What the cache walk makes of each request, taken first: whether a
+        // request lost its prefix is the truth a predicted lapse is scored
+        // against.
+        let (losses, losses_truncated) = self.cache_losses(tenant, from_ms, to_ms)?;
+        report.truncated |= losses_truncated;
+        let lost: HashSet<&str> = losses
+            .iter()
+            .filter(|loss| !loss.keep_warm)
+            .map(|loss| loss.request_id.as_str())
+            .collect();
+
         let mut composition: BTreeMap<(String, String), Composition> = BTreeMap::new();
         let mut tools_seen: HashMap<(String, String), u64> = HashMap::new();
         let mut volatile_conversations: HashSet<&str> = HashSet::new();
@@ -355,12 +372,15 @@ impl StatsReader {
 
             if seen.compared {
                 report.compared += 1;
-                if seen.drift_in | seen.drift_out == 0 {
+                if (seen.drift_in & !seen.repaired) | seen.drift_out == 0 {
                     report.stable += 1;
                 }
                 for (slot, (bit, _)) in report.drift.iter_mut().zip(RENDER_ORDER) {
                     if seen.drift_in & bit != 0 {
                         slot.client_turns += 1;
+                    }
+                    if seen.repaired & bit != 0 {
+                        slot.repaired_turns += 1;
                     }
                     if seen.drift_out & bit != 0 {
                         slot.proxy_turns += 1;
@@ -371,7 +391,13 @@ impl StatsReader {
             if let Some(kind) = seen.recompacted.as_deref() {
                 if kind == "predicted" {
                     report.recompactions.predicted += 1;
-                    if row.read.is_some_and(|read| read > 0) {
+                    // A recompacted turn rewrites the conversation, so the
+                    // provider can read back only what precedes the first
+                    // rewritten message. A read reaching past the opening is
+                    // the one sign left that the cache was alive.
+                    if row.read.is_some_and(|read| {
+                        seen.read_reaches_messages(u32::try_from(read).unwrap_or(u32::MAX))
+                    }) {
                         report.recompactions.predicted_wrong += 1;
                     }
                 } else {
@@ -395,8 +421,22 @@ impl StatsReader {
             }
 
             // A lapse can only be scored where there was a cache to lapse and
-            // the provider said what it read.
-            if let (true, Some(idle_ms), Some(read)) = (seen.was_warm, seen.idle_ms, row.read) {
+            // the provider said what it read — and not on a turn that was
+            // itself recompacted, whose read says what was rewritten rather
+            // than what had expired.
+            //
+            // The truth is the cache walk's: the request failed to read back
+            // what the one before it left. A bare zero read is not it. On
+            // Anthropic the instructions and tools are often cached by other
+            // conversations too, so a conversation whose own entries have
+            // lapsed still reads them.
+            if let (true, Some(idle_ms), Some(_), None) = (
+                seen.was_warm,
+                seen.idle_ms,
+                row.read,
+                seen.recompacted.as_ref(),
+            ) {
+                let lapsed = lost.contains(row.request_id.as_str());
                 let asked = seen.lifetime_s.map(|lifetime| vec![(lifetime, true)]);
                 let lifetimes = asked.unwrap_or_else(|| {
                     ASSUMED_LIFETIMES_S
@@ -409,10 +449,10 @@ impl StatsReader {
                         let slot = scores
                             .entry((row.api_family.clone(), lifetime_s, asked, margin_s))
                             .or_insert_with(|| score(&row.api_family, lifetime_s, asked, margin_s));
-                        let predicted =
-                            idle_ms > u64::from(lifetime_s + margin_s).saturating_mul(1_000);
+                        let predicted = idle_ms
+                            > u64::from(lifetime_s.saturating_add(margin_s)).saturating_mul(1_000);
                         slot.scored += 1;
-                        match (predicted, read == 0) {
+                        match (predicted, lapsed) {
                             (true, true) => {
                                 slot.predicted += 1;
                                 slot.confirmed += 1;
@@ -432,8 +472,6 @@ impl StatsReader {
         report.recompactions.conversations = ledgers.len() as u64;
         report.recompactions.stale_reads = ledgers.values().map(|held| u64::from(*held)).sum();
 
-        let (losses, losses_truncated) = self.cache_losses(tenant, from_ms, to_ms)?;
-        report.truncated |= losses_truncated;
         for loss in losses
             .iter()
             .filter(|loss| loss.cause == Cause::PrefixChange)
