@@ -737,15 +737,32 @@ async fn launch(
     }
     .map_err(|e| CliError::runtime("could not wait for the agent", e))?;
 
+    exit_of(status)
+}
+
+/// What the agent's exit status makes ours.
+///
+/// The agent's exit code is the user's answer, not ours, so it is passed on
+/// as it is: every non-zero status used to become 1, and an agent killed by a
+/// signal — which has no code at all — was reported as success.
+fn exit_of(status: std::process::ExitStatus) -> CliResult {
     match status.code() {
-        Some(0) | None => Ok(()),
-        // The agent's exit code is the user's answer, not ours. Reporting it as
-        // a kompressor failure would make a failing test run look like a
-        // compression problem.
-        Some(code) => Err(CliError::Runtime(format!(
-            "{binary} exited with status {code}"
-        ))),
+        Some(0) => Ok(()),
+        Some(code) => Err(CliError::AgentExit(code)),
+        None => Err(CliError::AgentExit(signal_exit(status))),
     }
+}
+
+/// `128 + signal`, the shell's convention for a process a signal ended.
+#[cfg(unix)]
+fn signal_exit(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    128 + status.signal().unwrap_or(0)
+}
+
+#[cfg(not(unix))]
+fn signal_exit(_status: std::process::ExitStatus) -> i32 {
+    1
 }
 
 /// npm installs Windows launchers with `.cmd` names. Resolve them only after
@@ -999,6 +1016,53 @@ pub fn unwrap_agent(args: UnwrapArgs) -> CliResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn status_of(script: &str) -> std::process::ExitStatus {
+        std::process::Command::new("sh")
+            .args(["-c", script])
+            .status()
+            .expect("sh runs")
+    }
+
+    /// `wrap` is transparent: the agent's status is the command's status. It
+    /// used to be 1 for every failure, and 0 for an agent a signal killed.
+    #[cfg(unix)]
+    #[test]
+    fn the_agents_exit_status_becomes_ours() {
+        assert!(exit_of(status_of("exit 0")).is_ok());
+        for code in [1, 2, 7, 42, 127, 255] {
+            let error = exit_of(status_of(&format!("exit {code}"))).unwrap_err();
+            assert!(
+                matches!(error, CliError::AgentExit(c) if c == code),
+                "{code}"
+            );
+            assert_eq!(error.code(), code);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_killed_by_a_signal_is_not_a_success() {
+        let killed = exit_of(status_of("kill -9 $$")).unwrap_err();
+        assert_eq!(killed.code(), 137, "128 + SIGKILL");
+        let terminated = exit_of(status_of("kill -15 $$")).unwrap_err();
+        assert_eq!(terminated.code(), 143, "128 + SIGTERM");
+    }
+
+    /// Whatever the agent returned, the code handed to the shell is never 0
+    /// for a failure and never outside one byte.
+    #[test]
+    fn an_agent_exit_code_stays_a_failure_the_shell_can_report() {
+        assert_eq!(CliError::AgentExit(3).code(), 3);
+        assert_eq!(
+            CliError::AgentExit(256).code(),
+            1,
+            "256 would wrap to success"
+        );
+        assert_eq!(CliError::AgentExit(-1).code(), 255);
+        assert_eq!(CliError::AgentExit(0x1_02).code(), 2);
+    }
 
     fn args() -> WrapArgs {
         WrapArgs {

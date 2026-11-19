@@ -45,8 +45,16 @@ static HASH_COMMENT: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\s*#").unwrap());
 /// deliberately looser than the spec's single 1-9: over-matching costs one
 /// uncompressed payload, while under-matching strips `#` lines that were text
 /// inside the scalar.
-static YAML_BLOCK_SCALAR: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?m):\s*[|>][+-]?\d*[+-]?\s*$").unwrap());
+///
+/// The indicator need not follow a key. A sequence entry opens a scalar with
+/// `- |`, which is how every CI file writes a multi-line script; a tag or an
+/// anchor may sit in front of it (`key: !!str |`, `key: &run |`); and a comment
+/// may follow it (`key: | # why`). Each of those used to slip through, and the
+/// `#` lines of a shell script inside the scalar were then elided as comments.
+static YAML_BLOCK_SCALAR: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?m)(?::|^\s*-)[ \t]*(?:[!&]\S+[ \t]+)*[|>][+-]?\d*[+-]?[ \t]*(?:#.*)?\r?$")
+        .unwrap()
+});
 
 /// Below this the marker costs about as much as the lines it replaces, and the
 /// payload is churned for nothing.

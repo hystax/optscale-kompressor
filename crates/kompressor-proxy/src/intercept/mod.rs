@@ -175,6 +175,9 @@ impl Intercept {
     }
 }
 
+/// How long a client has to send its `CONNECT` request line and headers.
+const CONNECT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// One connection, from its request line to whichever of the two ends it
 /// reaches.
 async fn handle(
@@ -183,12 +186,17 @@ async fn handle(
     authority: Arc<Authority>,
     router: Router,
 ) -> std::io::Result<()> {
-    let (target, mut reader) = match connect::read_connect(stream).await {
-        Ok(pair) => pair,
-        Err((refusal, mut reader)) => {
+    // A client that connects and says nothing must not hold a task and a
+    // socket for ever: nothing has been authenticated yet, so the wait is
+    // bounded. Dropping the future closes the connection.
+    let read = tokio::time::timeout(CONNECT_READ_TIMEOUT, connect::read_connect(stream)).await;
+    let (target, mut reader) = match read {
+        Ok(Ok(pair)) => pair,
+        Ok(Err((refusal, mut reader))) => {
             connect::refuse(reader.get_mut(), &refusal).await;
             return Ok(());
         }
+        Err(_) => return Ok(()),
     };
 
     if !allow.intercepts(&target.host) {

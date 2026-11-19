@@ -46,7 +46,14 @@ impl RefId {
 
     /// Parse `k_XXXXXXXXXXXX` or the bare 12-character body.
     pub fn parse(s: &str) -> Option<RefId> {
-        let body = s.strip_prefix(REF_PREFIX).unwrap_or(s);
+        // A bare body is tried first: `k` and `_` are both handle bytes, so
+        // about one body in 4096 itself begins with `k_`, and stripping the
+        // prefix unconditionally cut such a body to ten characters.
+        let body = if s.len() == HANDLE_WIDTH {
+            s
+        } else {
+            s.strip_prefix(REF_PREFIX)?
+        };
         if body.len() != HANDLE_WIDTH || !body.bytes().all(is_handle_byte) {
             return None;
         }
@@ -191,6 +198,14 @@ pub struct Mark {
     oversized: usize,
 }
 
+/// A candidate set aside by [`RefCollector::shelve`].
+#[derive(Clone, Debug, Default)]
+pub struct Shelved {
+    fragments: Vec<String>,
+    /// Stashes refused for size while the candidate ran.
+    oversized: usize,
+}
+
 impl RefCollector {
     /// A collector that retains fragments up to `max_ref_bytes` UTF-8 bytes.
     pub fn new(max_ref_bytes: usize) -> Self {
@@ -326,6 +341,37 @@ impl RefCollector {
         self.oversized_attempts = mark.oversized;
     }
 
+    /// Set a candidate aside: remember what it stashed and what it was refused
+    /// since `mark`, then roll the collector back so the next candidate starts
+    /// clean. [`RefCollector::reinstate`] brings it back if it wins after all.
+    ///
+    /// The refusal count has to travel with the fragments. `rollback` clears
+    /// it — rightly, for a candidate that is gone — but a candidate that is
+    /// rolled back and then *re-adopted* ships its text, elisions included. If
+    /// one of those elisions was refused for being over `max_ref_bytes`, its
+    /// marker has no handle, and with the count cleared nothing downstream
+    /// knows: the payload goes out with content removed and no way back to it.
+    pub fn shelve(&mut self, mark: Mark) -> Shelved {
+        let shelved = Shelved {
+            fragments: self.pairs[mark.pairs.min(self.pairs.len())..]
+                .iter()
+                .map(|(_, fragment)| fragment.clone())
+                .collect(),
+            oversized: self.oversized_attempts.saturating_sub(mark.oversized),
+        };
+        self.rollback(mark);
+        shelved
+    }
+
+    /// Roll back to `mark` and put a shelved candidate back: its fragments
+    /// (content addressing reproduces the handles its markers carry) and its
+    /// refusals, so the oversized veto still sees them.
+    pub fn reinstate(&mut self, mark: Mark, shelved: &Shelved) {
+        self.rollback(mark);
+        self.restash_all(&shelved.fragments);
+        self.oversized_attempts += shelved.oversized;
+    }
+
     /// An empty collector with the same capacity rules, for one candidate of an
     /// arbitration. The loser's fragments are dropped; the winner's are
     /// replayed with [`RefCollector::adopt`].
@@ -459,6 +505,81 @@ mod tests {
         let mut refs = RefCollector::disabled();
         assert_eq!(refs.stash("anything"), None);
         assert!(refs.is_empty());
+    }
+
+    /// `parse` takes "`k_XXXXXXXXXXXX` or the bare 12-character body". A body
+    /// that itself begins with `k_` is still a body: stripping the prefix
+    /// first cut it to ten characters and refused a legal handle.
+    #[test]
+    fn a_bare_body_that_begins_with_the_prefix_parses_as_a_body() {
+        let id = RefId::parse("k_k_b306r9LLlg").expect("rendered");
+        assert_eq!(id.body(), "k_b306r9LLlg");
+        assert_eq!(RefId::parse(id.body()), Some(id), "the bare body");
+        // Every handle round-trips through both spellings.
+        for fragment in ["a", "b", "some fragment", "k_"] {
+            let id = ref_for(fragment);
+            assert_eq!(RefId::parse(&id.to_string()), Some(id));
+            assert_eq!(RefId::parse(id.body()), Some(id));
+        }
+        // Still refused: wrong widths, and a prefix with nothing legal behind it.
+        assert_eq!(RefId::parse("k_short"), None);
+        assert_eq!(RefId::parse("k_k_k_b306r9LLlg"), None);
+        assert_eq!(RefId::parse("x_k_b306r9LLlg"), None);
+        assert_eq!(RefId::parse("k_b306r9LL!g"), None);
+        assert_eq!(RefId::parse(""), None);
+    }
+
+    /// A candidate that is set aside and then wins after all ships its text,
+    /// so the refusals it collected must come back with its fragments. With
+    /// only `rollback` + `restash_all`, the count stayed at zero and an
+    /// elision with no handle passed the oversized veto.
+    #[test]
+    fn a_reinstated_candidate_brings_its_refusals_back() {
+        let mut refs = RefCollector::new(16);
+        refs.stash("before");
+        let mark = refs.mark();
+        let kept = refs.stash("fits").expect("under the cap");
+        assert_eq!(
+            refs.stash("this one is well over the sixteen byte cap"),
+            None
+        );
+        assert_eq!(refs.oversized_attempts(), 1);
+
+        let shelved = refs.shelve(mark);
+        assert_eq!(
+            refs.oversized_attempts(),
+            0,
+            "a shelved candidate vetoes nothing"
+        );
+        assert_eq!(refs.pairs().len(), 1, "and holds nothing");
+
+        // The rival runs, is refused something of its own, and loses.
+        assert_eq!(refs.stash("the rival is also far beyond the cap"), None);
+        refs.stash("rival");
+
+        refs.reinstate(mark, &shelved);
+        assert_eq!(
+            refs.oversized_attempts(),
+            1,
+            "its own refusal, not the rival's"
+        );
+        let held: Vec<RefId> = refs.pairs().iter().map(|(id, _)| *id).collect();
+        assert_eq!(held, vec![ref_for("before"), kept]);
+    }
+
+    /// Shelving a candidate that was refused nothing changes nothing.
+    #[test]
+    fn shelving_and_reinstating_a_clean_candidate_is_exact() {
+        let mut refs = RefCollector::new(1024);
+        let mark = refs.mark();
+        let a = refs.stash("alpha").unwrap();
+        let b = refs.stash("beta").unwrap();
+        let shelved = refs.shelve(mark);
+        assert!(refs.is_empty());
+        refs.reinstate(mark, &shelved);
+        let held: Vec<RefId> = refs.pairs().iter().map(|(id, _)| *id).collect();
+        assert_eq!(held, vec![a, b]);
+        assert_eq!(refs.oversized_attempts(), 0);
     }
 
     #[test]

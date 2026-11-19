@@ -79,7 +79,8 @@ pub fn crush_tabular(
 /// test below and be claimed. Selection runs over lines, so a skipped blank
 /// would also make the marker's count disagree with what actually left.
 fn is_uniform_table(content: &str, delimiter: u8) -> bool {
-    if split_lines(content).iter().any(|line| line.is_empty()) {
+    let lines = split_lines(content);
+    if lines.iter().any(|line| line.is_empty()) {
         return false;
     }
     let mut reader = csv::ReaderBuilder::new()
@@ -100,7 +101,12 @@ fn is_uniform_table(content: &str, delimiter: u8) -> bool {
             Some(_) => {}
         }
     }
-    rows >= MIN_ROWS
+    // One record per line, or it is not a table selection can work on. A
+    // quoted cell may hold a newline, so a record can span several lines, and
+    // the reader does not break on the form feeds and Unicode separators that
+    // `split_lines` does. Selection drops *lines*: on such a payload it kept
+    // one half of a record and omitted the other, leaving a quote open.
+    rows >= MIN_ROWS && rows == lines.len()
 }
 
 /// Markdown tables carry no delimiter the header test can see, so they are

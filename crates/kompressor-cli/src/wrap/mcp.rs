@@ -106,7 +106,8 @@ pub fn register(
     let config_path = paths.mcp_config(pid);
     let text = toml::to_string_pretty(&anchored(base)?)
         .map_err(|e| CliError::runtime("could not serialise the tool-server configuration", e))?;
-    std::fs::write(&config_path, text)
+    // Owner-only: the anchored configuration carries the `auth` section.
+    super::paths::write_private(&config_path, &text)
         .map_err(|e| CliError::runtime(&format!("could not write {}", config_path.display()), e))?;
 
     let file = paths.mcp_registration(pid);
