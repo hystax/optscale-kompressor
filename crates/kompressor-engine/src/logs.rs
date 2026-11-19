@@ -311,11 +311,7 @@ fn crush_body(
     // collected before the rollback: handles are content-addressed, so
     // re-stashing these exact fragments later reproduces the very handles the
     // plain reading's markers already carry
-    let plain_fragments: Vec<String> = refs.pairs()[mark.pairs..]
-        .iter()
-        .map(|(_, fragment)| fragment.clone())
-        .collect();
-    refs.rollback(mark);
+    let plain_shelved = refs.shelve(mark);
 
     let (elided_lines, echoed) = elide_diagnostic_echo(&lines, refs);
     let view: Vec<&str> = elided_lines.iter().map(|l| l.as_ref()).collect();
@@ -330,8 +326,7 @@ fn crush_body(
     if chars_len(&elided) <= chars_len(plain_text) {
         return Some(elided);
     }
-    refs.rollback(mark);
-    refs.restash_all(&plain_fragments);
+    refs.reinstate(mark, &plain_shelved);
     plain
 }
 
@@ -638,9 +633,21 @@ fn fold_templates(
 /// `out of memory` and `oom-killed` catch the OOM case without claiming every
 /// line that mentions killing something.
 static ERROR: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(
+    Regex::new(concat!(
         r"(?i)\b(?:error|fail(?:ed|ure)?|fatal|panic(?:ked|king)?|exception|critical|segfault|segmentation\s+fault|core\s+dumped|sig(?:segv|abrt|bus|ill|fpe)|double\s+free|stack\s+smashing|out\s+of\s+memory|oom[-_]?kill(?:ed|er)?|terminate\s+called|aborted|permission\s+denied|access\s+denied|operation\s+not\s+permitted|connection\s+(?:refused|reset)|broken\s+pipe|timed\s+out|no\s+space\s+left|disk\s+full|read-only\s+file\s+system|too\s+many\s+open\s+files|address\s+already\s+in\s+use|deadlock)\b",
-    )
+        // A raised exception names its failure with the word glued on —
+        // `KeyError: 'id'`, `java.lang.NullPointerException: …` — where
+        // `\berror\b` cannot see it. Only in the shape a runtime prints one:
+        // the class opening the line (package-qualified, or after `Caused by:`
+        // or `Uncaught`) and ending at `:` or the line's end. Anywhere in a line
+        // it also matched source — `except NotAMemberError:`, `raise
+        // KeyError(k)` — and on the committed corpus routed 437 lines of
+        // gutter-numbered Python to the log scorer, which elided 410 of them.
+        // Case-sensitive, so `errorCount` and `MyErrorHandler` stay out.
+        r"|(?-i:^\s*(?:Caused by: |Uncaught (?:\(in promise\) )?)?(?:[A-Za-z_]\w*\.)*[A-Z]\w*(?:Error|Exception)(?::|\s*$))",
+        // Python opens every traceback with this header and no error word.
+        r"|^\s*Traceback \(most recent call last\)",
+    ))
     .unwrap()
 });
 
@@ -1340,6 +1347,46 @@ mod tests {
     }
 
     #[test]
+    fn an_exception_line_without_an_error_word_is_kept_and_counted() {
+        // `KeyError: 'user_id'` names its failure in the class name and nowhere
+        // else; `\berror\b` cannot see `Error` glued to `Key`. Scored as an
+        // ordinary line, it went behind the handle and the marker said
+        // `0 ERROR` over the one line that explains the run.
+        let mut lines: Vec<String> = (0..80)
+            .map(|index| format!("INFO scanning widget number {index} of the shelf inventory"))
+            .collect();
+        lines[5] = "WARNING: retry attempt 1 for job 77".to_string();
+        lines[40] = "Traceback (most recent call last):".to_string();
+        lines[41] = r#"  File "/srv/app/jobs.py", line 12, in run"#.to_string();
+        lines[42] = "    owner = row['user_id']".to_string();
+        lines[43] = "KeyError: 'user_id'".to_string();
+        lines[60] = "java.lang.NullPointerException: owner is null".to_string();
+        let content = join_lines(&lines);
+        let mut refs = recoverable();
+        let out = crush_scored(
+            &split_lines(&content),
+            &options(Mode::Recoverable, 5),
+            &mut refs,
+        )
+        .expect("the warning scores");
+
+        for line in [
+            "KeyError: 'user_id'",
+            "java.lang.NullPointerException: owner is null",
+            "Traceback (most recent call last):",
+        ] {
+            assert!(out.contains(line), "{line:?} must survive, got {out:?}");
+        }
+        let missing: Vec<&String> = lines.iter().filter(|line| !out.contains(*line)).collect();
+        let errors = missing.iter().filter(|line| ERROR.is_match(line)).count();
+        assert!(
+            out.contains(&format!("; {errors} ERROR, ")),
+            "marker must report {errors} ERROR, got {out:?}"
+        );
+        assert_no_orphan_refs(&out, &refs);
+    }
+
+    #[test]
     fn the_scored_path_never_drops_a_marker_an_earlier_stage_left() {
         let mut lines = scored_payload();
         // an uninteresting-looking line that is in fact a handle into the store
@@ -1729,6 +1776,12 @@ mod tests {
             "accept: too many open files",
             "bind: address already in use",
             "deadlock detected while waiting on lock 7",
+            "KeyError: 'user_id'",
+            "json.decoder.JSONDecodeError: Expecting value: line 1 column 1",
+            "java.lang.NullPointerException: owner is null",
+            "Caused by: org.postgresql.util.PSQLException: relation missing",
+            "Uncaught TypeError: x is undefined",
+            "Traceback (most recent call last):",
         ] {
             assert!(
                 ERROR.is_match(line),
@@ -1744,6 +1797,13 @@ mod tests {
             "config: timeout=30",
             "no such file or directory",
             "W&B: run limit reached, metrics will be dropped",
+            "registered MyErrorHandler for /api",
+            "metrics: errorCount=0 exceptionsSeen=0",
+            "mounted ErrorBoundary around <App>",
+            // an exception class named in source, not raised
+            "125:        except NotAMemberError:",
+            "    raise KeyError(name)",
+            "class QuotaError(ValueError):",
         ] {
             assert!(
                 !ERROR.is_match(line),

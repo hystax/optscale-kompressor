@@ -40,7 +40,7 @@ use kompressor_core::{AppCore, RequestInfo};
 use kompressor_stats::events::Surface;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
-    PaginatedRequestParams, ServerInfo,
+    PaginatedRequestParams, ServerConfig,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
@@ -172,7 +172,7 @@ impl ProxyTools {
 }
 
 impl ServerHandler for ProxyTools {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         self.local.get_info()
     }
 

@@ -410,6 +410,16 @@ mod imp {
         crush_python_at(source, opts, refs, 0)
     }
 
+    /// Whether every line break in `text` is one tree-sitter counts as a row.
+    fn rows_are_lines(text: &str) -> bool {
+        let bytes = text.as_bytes();
+        !text.char_indices().any(|(i, c)| match c {
+            '\r' => bytes.get(i + 1) != Some(&b'\n'),
+            '\x0b' | '\x0c' | '\x1c' | '\x1d' | '\x1e' | '\u{85}' | '\u{2028}' | '\u{2029}' => true,
+            _ => false,
+        })
+    }
+
     fn crush_python_at(
         source: &str,
         opts: &EngineOptions,
@@ -417,6 +427,15 @@ mod imp {
         depth: usize,
     ) -> Option<String> {
         let salvage = salvage_python(source)?;
+        // tree-sitter counts rows by `\n` alone; `split_lines` also breaks on
+        // form feed, vertical tab, a lone carriage return and the Unicode
+        // separators. Where the two disagree every span below is off by the
+        // number of such characters before it — the `def` line goes behind
+        // the marker and the body's last line stays out — so such a file is
+        // left to the other readings.
+        if !rows_are_lines(salvage.head) {
+            return None;
+        }
         let lines = split_lines(salvage.head);
         // The synthetic scope shifts every row down by its own line count and
         // nothing else; columns and bytes are untouched.
@@ -659,6 +678,16 @@ mod imp {
                 continue;
             };
             if close <= open {
+                continue;
+            }
+            // Only a body that *is* a block. An arrow function's body may be
+            // an expression that merely contains braces — a curried
+            // `async (dispatch) => {…}`, a call `f(a, {…}, c)`, C#'s
+            // `=> new Foo {…}`, a C++ function-try-block — and the whole node
+            // is what gets replaced while only the text between the braces is
+            // stored. Whatever sat outside them was deleted with no marker and
+            // no handle.
+            if open != 0 || close != block.len() - 1 {
                 continue;
             }
             let hidden = &block[open + 1..close];

@@ -620,7 +620,8 @@ seconds until Claude Code's next request arrives, at most 11 times; after an
 `end_turn` while a background task or `Monitor` watch Claude Code started is
 still running (its end neither reported nor caused by `TaskStop`; a `Monitor` watch runs until it expires, whatever events it sends, and a wait on watches alone stops at the longest one's stated expiry, three pings for the usual ten minutes), at most 4 times (`proxy.cache_keep_warm_background_pings`,
 0 to turn that off), or while a `ScheduleWakeup` wake is still to come, until
-it is due.
+it is due: a wake whose delay the tool stated bounds the wait even with a task
+still running, and is held to the 11-ping limit only, not the background one.
 Each ping costs the conversation at the cache-read price plus one output token,
 and is recorded as its own `proxy_requests` row with `keep_warm = 1`. Simulated
 over the request logs of seven 89-task runs, it would have saved $1.84–$3.00 a

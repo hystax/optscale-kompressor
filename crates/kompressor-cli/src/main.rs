@@ -387,7 +387,10 @@ struct CheckConfigCmd {
 fn main() {
     let cli = Cli::parse();
     if let Err(error) = run(cli) {
-        eprintln!("kompressor: {error}");
+        // The agent's own failure is not ours to announce.
+        if !matches!(error, CliError::AgentExit(_)) {
+            eprintln!("kompressor: {error}");
+        }
         std::process::exit(error.code());
     }
 }

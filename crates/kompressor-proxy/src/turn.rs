@@ -48,6 +48,43 @@ pub enum Turn {
     OtherTool,
 }
 
+/// Whether a Responses output item of this `type` is a call the *client* has
+/// to answer, other than a plain `function_call`.
+///
+/// The Responses API has more call shapes than `function_call`: Codex's
+/// `apply_patch` and `exec` arrive as `custom_tool_call`, and there are
+/// `local_shell_call`, `computer_call` and an MCP approval request besides.
+/// Each one is the client's turn to finish. The calls the provider runs itself
+/// (web and file search, the code interpreter, image generation, a remote MCP
+/// call) come back already answered and are nobody's turn.
+pub(crate) fn is_client_side_call(kind: &str) -> bool {
+    const PROVIDER_RUN: [&str; 5] = [
+        "web_search_call",
+        "file_search_call",
+        "code_interpreter_call",
+        "image_generation_call",
+        "mcp_call",
+    ];
+    kind == "mcp_approval_request"
+        || (kind.ends_with("_call") && kind != "function_call" && !PROVIDER_RUN.contains(&kind))
+}
+
+/// Whether a Responses turn carries a client-side call that is not a
+/// `function_call`.
+fn has_client_side_call(family: ApiFamily, response: &Value) -> bool {
+    family == ApiFamily::OpenAiResponses
+        && response
+            .get("output")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(is_client_side_call)
+                })
+            })
+}
+
 /// Classify a complete (non-streamed) provider response.
 pub fn classify(family: ApiFamily, response: &Value) -> Turn {
     let calls = tool_calls(family, response);
@@ -55,6 +92,12 @@ pub fn classify(family: ApiFamily, response: &Value) -> Turn {
         return Turn::Answered;
     }
     if calls.iter().any(|call| call.name != RETRIEVE_TOOL_NAME) {
+        return Turn::OtherTool;
+    }
+    // Ours next to a call only the client can answer is the client's turn. Seen
+    // as retrieve-only, the round was run and the `custom_tool_call` replayed
+    // upstream with no output to match it, while the client never saw its call.
+    if has_client_side_call(family, response) {
         return Turn::OtherTool;
     }
     // `n > 1` asked for several independent completions; a retrieve round can
@@ -411,6 +454,37 @@ fn number(value: f64) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Our call next to a client-side call that is not a `function_call` is
+    /// the client's turn, not a retrieve round.
+    #[test]
+    fn a_custom_tool_call_beside_ours_is_the_clients_turn() {
+        let ours = json!({"type":"function_call","call_id":"c1","name":RETRIEVE_TOOL_NAME,"arguments":"{}"});
+        for kind in [
+            "custom_tool_call",
+            "local_shell_call",
+            "computer_call",
+            "mcp_approval_request",
+        ] {
+            let response = json!({"output":[ours.clone(), {"type":kind,"call_id":"c2","name":"apply_patch","input":"*** Begin Patch"}]});
+            assert_eq!(
+                classify(ApiFamily::OpenAiResponses, &response),
+                Turn::OtherTool,
+                "{kind}"
+            );
+        }
+        // Beside something the provider already ran, ours is still ours.
+        for kind in ["web_search_call", "reasoning", "message", "mcp_call"] {
+            let response = json!({"output":[{"type":kind,"id":"x"}, ours.clone()]});
+            assert!(
+                matches!(classify(ApiFamily::OpenAiResponses, &response), Turn::Retrieve(calls) if calls.len() == 1),
+                "{kind}"
+            );
+        }
+        assert!(is_client_side_call("custom_tool_call"));
+        assert!(!is_client_side_call("function_call"));
+        assert!(!is_client_side_call("function_call_output"));
+    }
 
     fn chat_response(name: &str) -> Value {
         json!({

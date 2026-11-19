@@ -535,7 +535,7 @@ impl StatsReader {
         )?;
         let (messages_compressed, saved_gross): (i64, i64) = self.conn.query_row(
             "SELECT coalesce(sum(messages_compressed), 0),
-                    coalesce(sum(tokens_in - tokens_out), 0)
+                    coalesce(sum(tokens_in - (CASE WHEN coalesce(outcome,'') = 'discarded' THEN tokens_in ELSE tokens_out END)), 0)
              FROM optimization_events WHERE time_ms >= ?1",
             [from_ms],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -559,7 +559,7 @@ impl StatsReader {
     pub fn summary(&self, tenant: &str, from_ms: i64, to_ms: i64) -> Result<Summary, StatsError> {
         let (requests, tokens_in, tokens_out, messages_total, messages_compressed) =
             self.conn.query_row(
-                "SELECT COUNT(*), COALESCE(SUM(tokens_in),0), COALESCE(SUM(tokens_out),0),
+                "SELECT COUNT(*), COALESCE(SUM(tokens_in),0), COALESCE(SUM((CASE WHEN coalesce(outcome,'') = 'discarded' THEN tokens_in ELSE tokens_out END)),0),
                         COALESCE(SUM(messages_total),0), COALESCE(SUM(messages_compressed),0)
                  FROM optimization_events
                  WHERE tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3",
@@ -614,7 +614,7 @@ impl StatsReader {
         let mut by_mode = Vec::new();
         {
             let mut stmt = self.conn.prepare_cached(
-                "SELECT mode, COUNT(*), COALESCE(SUM(tokens_in),0), COALESCE(SUM(tokens_out),0)
+                "SELECT mode, COUNT(*), COALESCE(SUM(tokens_in),0), COALESCE(SUM((CASE WHEN coalesce(outcome,'') = 'discarded' THEN tokens_in ELSE tokens_out END)),0)
                  FROM optimization_events
                  WHERE tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3
                  GROUP BY mode ORDER BY mode",
@@ -642,7 +642,7 @@ impl StatsReader {
         let mut by_surface = Vec::new();
         {
             let mut stmt = self.conn.prepare_cached(
-                "SELECT surface, COUNT(*), COALESCE(SUM(tokens_in),0), COALESCE(SUM(tokens_out),0)
+                "SELECT surface, COUNT(*), COALESCE(SUM(tokens_in),0), COALESCE(SUM((CASE WHEN coalesce(outcome,'') = 'discarded' THEN tokens_in ELSE tokens_out END)),0)
                  FROM optimization_events
                  WHERE tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3
                  GROUP BY surface ORDER BY surface",
@@ -704,7 +704,7 @@ impl StatsReader {
                     SUM(requests), SUM(tokens_in), SUM(tokens_out), SUM(retrieved)
              FROM (
                SELECT {floor} AS bucket, 1 AS requests, tokens_in AS tokens_in,
-                      tokens_out AS tokens_out, 0 AS retrieved
+                      (CASE WHEN coalesce(outcome,'') = 'discarded' THEN tokens_in ELSE tokens_out END) AS tokens_out, 0 AS retrieved
                  FROM optimization_events
                 WHERE tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3
                UNION ALL
@@ -759,16 +759,29 @@ impl StatsReader {
         to_ms: i64,
     ) -> Result<Vec<ProviderCoverage>, StatsError> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT COALESCE(o.provider, '') AS provider,
-                    COUNT(*) AS requests,
-                    SUM(o.tokens_in) AS tokens_in,
-                    SUM(o.tokens_out) AS tokens_out,
-                    COALESCE(GROUP_CONCAT(DISTINCT p.upstream), '') AS hosts
-             FROM optimization_events o
-             LEFT JOIN proxy_requests p ON p.request_id = o.request_id
-             WHERE o.tenant = ?1 AND o.time_ms >= ?2 AND o.time_ms < ?3
-             GROUP BY provider
-             ORDER BY tokens_in DESC, provider",
+            // Two things a plain `LEFT JOIN proxy_requests ON request_id` got
+            // wrong. It fanned out: a request id shared by N proxy rows (a
+            // retried request, a client that reuses its `x-request-id`)
+            // counted the compression N times. And it did not name the tenant,
+            // so another tenant's row with the same id put its upstream host in
+            // this tenant's report. The sums are taken over the events alone,
+            // and the hosts looked up beside them, in this tenant only.
+            "SELECT a.provider, a.requests, a.tokens_in, a.tokens_out,
+                    COALESCE((SELECT GROUP_CONCAT(DISTINCT p.upstream)
+                                FROM proxy_requests p
+                               WHERE p.tenant = ?1
+                                 AND p.request_id IN (
+                                     SELECT o.request_id FROM optimization_events o
+                                      WHERE o.tenant = ?1 AND o.time_ms >= ?2 AND o.time_ms < ?3
+                                        AND COALESCE(o.provider, '') = a.provider)), '') AS hosts
+             FROM (SELECT COALESCE(provider, '') AS provider,
+                          COUNT(*) AS requests,
+                          SUM(tokens_in) AS tokens_in,
+                          SUM((CASE WHEN coalesce(outcome,'') = 'discarded' THEN tokens_in ELSE tokens_out END)) AS tokens_out
+                     FROM optimization_events
+                    WHERE tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3
+                    GROUP BY 1) a
+             ORDER BY a.tokens_in DESC, a.provider",
         )?;
         let rows = stmt.query_map((tenant, from_ms, to_ms), |row| {
             let tokens_in: i64 = row.get(2)?;
@@ -995,7 +1008,7 @@ impl StatsReader {
         request_id: &str,
     ) -> Result<Option<RequestEconomy>, StatsError> {
         let (compressions, tokens_in, tokens_out, first_opt_time) = self.conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(tokens_in),0), COALESCE(SUM(tokens_out),0), MIN(time_ms)
+            "SELECT COUNT(*), COALESCE(SUM(tokens_in),0), COALESCE(SUM((CASE WHEN coalesce(outcome,'') = 'discarded' THEN tokens_in ELSE tokens_out END)),0), MIN(time_ms)
              FROM optimization_events WHERE tenant = ?1 AND request_id = ?2",
             (tenant, request_id),
             |row| {

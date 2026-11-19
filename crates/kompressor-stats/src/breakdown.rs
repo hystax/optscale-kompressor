@@ -80,7 +80,7 @@ pub struct Billed {
 }
 
 impl Billed {
-    fn add(&mut self, other: &Billed) {
+    pub(crate) fn add(&mut self, other: &Billed) {
         self.requests += other.requests;
         self.uncached += other.uncached;
         self.read += other.read;
@@ -91,7 +91,7 @@ impl Billed {
         self.cost += other.cost;
     }
 
-    fn finish(&mut self) {
+    pub(crate) fn finish(&mut self) {
         self.read_share = share(self.read, self.input);
         self.baseline = self.input as f64;
         self.saved_share = if self.baseline > 0.0 {
@@ -460,26 +460,27 @@ impl StatsReader {
         // (which the tracker does not produce) would credit both.
         let served = self.served();
         let mut stmt = self.conn.prepare_cached(&format!(
-            "WITH pc AS (
+            // Each request's credit and debit is looked up through the
+            // request-id indexes, one probe per request. The first form of this
+            // joined `pc` to two grouped subqueries that each re-read `pc` to
+            // filter themselves; SQLite planned the joins as nested scans, and
+            // on a real database (28,000 client requests, 2,300 conversations)
+            // the statement took 20 s for twelve days and over a minute for
+            // ninety. This returns the same rows in 0.1 s.
+            "WITH pc AS MATERIALIZED (
                SELECT DISTINCT request_id, conversation FROM proxy_requests
                 WHERE tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3
-                  AND conversation IS NOT NULL AND keep_warm = 0),
-             o AS (
-               SELECT request_id,
-                      SUM(CASE WHEN coalesce(outcome, '') <> 'discarded'
-                               THEN tokens_in - tokens_out ELSE 0 END) AS gross
-                 FROM optimization_events
-                WHERE tenant = ?1 AND request_id IN (SELECT request_id FROM pc)
-                GROUP BY request_id),
-             r AS (
-               SELECT request_id,
-                      SUM(CASE WHEN {served} AND found = 1 THEN returned_tokens ELSE 0 END) AS debit
-                 FROM retrieval_events
-                WHERE tenant = ?1 AND request_id IN (SELECT request_id FROM pc)
-                GROUP BY request_id)
-             SELECT pc.conversation, coalesce(SUM(o.gross), 0), coalesce(SUM(r.debit), 0)
-               FROM pc LEFT JOIN o ON o.request_id = pc.request_id
-                       LEFT JOIN r ON r.request_id = pc.request_id
+                  AND conversation IS NOT NULL AND keep_warm = 0)
+             SELECT pc.conversation,
+                    coalesce(SUM((SELECT SUM(CASE WHEN coalesce(o.outcome, '') <> 'discarded'
+                                                  THEN o.tokens_in - o.tokens_out ELSE 0 END)
+                                    FROM optimization_events o
+                                   WHERE o.request_id = pc.request_id AND o.tenant = ?1)), 0),
+                    coalesce(SUM((SELECT SUM(CASE WHEN {served} AND found = 1
+                                                  THEN returned_tokens ELSE 0 END)
+                                    FROM retrieval_events
+                                   WHERE request_id = pc.request_id AND tenant = ?1)), 0)
+               FROM pc
               GROUP BY pc.conversation"
         ))?;
         let mut rows = stmt.query(params![tenant, from_ms, to_ms])?;

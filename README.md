@@ -725,6 +725,18 @@ other and from every page's **Dashboards** link:
   retention, the archive's last day, and tables too busy to read whole.
   Columns this build never writes (such as the uncompressed-prompt measurement)
   are shown as information, not as failures.
+- `/models`: one row per API family and model, putting side by side what is
+  otherwise on four pages — what the provider billed and how much of it was
+  cache reads, what the engine removed and how long it took, what retrieval put
+  back, and how often the upstream failed. Where compression pays, and where it
+  only costs latency.
+- `/activity`: the window folded onto one week, a cell per weekday and hour in
+  your browser's zone, shaded by model calls, billed input, cache writes, engine
+  savings or keep-warm pings; the busiest hour and the busiest eight hours.
+- `/cohorts`: conversations grouped by how many client turns they ran (1, 2–4,
+  5–19, 20–99, 100–499, 500+), with each cohort's share of the cost, its cache
+  economics and its net compression saving, and how few conversations carry
+  half the bill.
 
 ### Statistics JSON API for automation
 
@@ -751,6 +763,9 @@ statistics listener (`server.stats_listen`) as well.
 | `GET /v1/stats/quality?window=24h` | coverage checks (ok / warn / bad, or info for columns not written), rows per table in the window, the oldest raw row, retention and the last archived day |
 | `GET /v1/stats/upstream?window=24h` | status mix, latency and failures by upstream and model, incidents, latest failures |
 | `GET /v1/stats/engine?window=24h` | engine time by content type, prompt size, outcome and surface, slowest runs, process slots |
+| `GET /v1/stats/models?window=24h` | per API family and model: client requests and pings, billed input split by how it was billed, engine runs, reduction and latency percentiles, retrieval rounds and tokens put back, net saving, upstream failures |
+| `GET /v1/stats/activity?window=7d` | requests, pings, pass-through, billed input, cache writes and engine savings per weekday and hour (UTC), the busiest cell and the busiest eight consecutive hours |
+| `GET /v1/stats/cohorts?window=7d` | conversations bucketed by client turns, each with its billed input, cost share, net saving and median length, and the share of conversations that carries half the cost |
 | `GET /v1/stats/summary`, `histogram`, `by_type`, `retrievals`, `requests?request_id=`, `store` | the aggregate reports `kompressor stats` prints |
 
 `from`/`to` are epoch milliseconds (`to` exclusive, at most 90 days apart).
