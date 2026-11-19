@@ -88,6 +88,10 @@ pub struct Composition {
     pub undeferred_requests: u64,
     /// Tool-definition bytes those requests carried.
     pub undeferred_tools_bytes: u64,
+    /// Bytes `proxy.tools_compact` took out of tool definitions, and the
+    /// requests it took them from.
+    pub tools_compacted_bytes: u64,
+    pub tools_compacted_requests: u64,
 }
 
 /// One segment's drift, and the losses put down to it.
@@ -335,6 +339,8 @@ impl StatsReader {
             entry.messages_bytes += u64::from(seen.messages_bytes);
             entry.text_bytes += u64::from(seen.text_bytes);
             entry.reasoning_bytes += u64::from(seen.reasoning_bytes);
+            entry.tools_compacted_bytes += u64::from(seen.tools_compacted_bytes);
+            entry.tools_compacted_requests += u64::from(seen.tools_compacted_bytes > 0);
             *tools_seen.entry(key).or_default() += u64::from(seen.tools_count);
             if seen.tools_deferred > 0 {
                 entry.deferring_requests += 1;

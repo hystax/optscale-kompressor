@@ -213,6 +213,8 @@ pub(crate) struct Segments {
     reasoning_bytes: u64,
     /// Whether any marker the provider reads asks for a one-hour entry.
     pub(crate) one_hour: bool,
+    /// Conversation items the request carried, instructions left out.
+    pub(crate) messages: usize,
     volatile: Volatile,
 }
 
@@ -451,6 +453,7 @@ impl Segments {
                 strings.push(description);
             }
         }
+        segments.messages = segments.hashes.messages_count;
         segments.hashes.tool_defs = defs.0;
         segments.hashes.tool_order = order.0;
         names.sort_unstable();
@@ -798,6 +801,7 @@ pub(crate) fn observation(
         // Stamped by the caller, which knows what the turn did.
         recompacted: None,
         ledger_reads: 0,
+        tools_compacted_bytes: 0,
     }
 }
 

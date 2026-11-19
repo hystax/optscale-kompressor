@@ -115,6 +115,10 @@ pub struct PrefixObservation {
     /// Stale reads the conversation's ledger held after that recompaction.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub ledger_reads: u32,
+    /// Bytes `proxy.tools_compact` took out of this request's tool
+    /// definitions. Zero when the conversation is not compacted.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tools_compacted_bytes: u32,
 }
 
 fn is_zero(count: &u32) -> bool {

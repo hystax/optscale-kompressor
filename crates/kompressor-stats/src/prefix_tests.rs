@@ -178,7 +178,11 @@ fn composition_is_added_up_per_model() {
         reasoning_bytes: 50,
         ..PrefixObservation::default()
     };
-    for (time, observation) in [(0, seen(20, 0)), (SEC, seen(4, 16)), (2 * SEC, seen(4, 0))] {
+    let compacted = PrefixObservation {
+        tools_compacted_bytes: 40,
+        ..seen(4, 0)
+    };
+    for (time, observation) in [(0, seen(20, 0)), (SEC, seen(4, 16)), (2 * SEC, compacted)] {
         insert(
             &conn,
             Row {
@@ -203,6 +207,10 @@ fn composition_is_added_up_per_model() {
     assert_eq!(model.opaque_share, 0.6, "180 of 300 conversation bytes");
     assert_eq!(model.tools_per_request, 28.0 / 3.0);
     assert_eq!(model.deferring_requests, 1);
+    assert_eq!(
+        (model.tools_compacted_bytes, model.tools_compacted_requests),
+        (40, 1)
+    );
     assert_eq!(
         (model.undeferred_requests, model.undeferred_tools_bytes),
         (1, 500),

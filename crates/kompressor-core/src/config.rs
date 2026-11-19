@@ -565,6 +565,18 @@ pub struct ProxyConfig {
     pub prompt_cache_key: PromptCacheKey,
     /// The order tool definitions go upstream in. See [`ToolsOrder`].
     pub tools_order: ToolsOrder,
+    /// Take out of each tool's schema what says nothing to a model: the
+    /// dialect, comments, an unreferenced identifier, a `title` that only
+    /// restates a property's name. **Off by default.**
+    ///
+    /// Nothing a model might act on is touched — descriptions, examples,
+    /// defaults, enums and constraints stay as written. Decided per
+    /// conversation when it is first seen, and never for one that was already
+    /// under way: the tool block sits at the front of the cached prefix and
+    /// must not change part-way. On Claude Code's own tools it removes about
+    /// 2% of the tool block; it exists for clients whose tools come from a
+    /// schema generator.
+    pub tools_compact: bool,
     /// Keep sending the `anthropic-beta` tokens a conversation has already
     /// sent. **Off by default.**
     ///
@@ -946,6 +958,8 @@ pub struct ProviderOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sticky_beta: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools_compact: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cold_recompact: Option<ColdRecompact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub superseded_reads: Option<bool>,
@@ -985,6 +999,7 @@ impl ProviderOverrides {
             prompt_cache_key,
             tools_order,
             sticky_beta,
+            tools_compact,
             cold_recompact,
             superseded_reads,
             matured_reads,
@@ -1056,6 +1071,7 @@ impl Default for ProxyConfig {
             prompt_cache_key: PromptCacheKey::Client,
             tools_order: ToolsOrder::Client,
             sticky_beta: false,
+            tools_compact: false,
             cold_recompact: ColdRecompact::Off,
             cold_recompact_margin: Duration::from_secs(60),
             superseded_reads: false,
@@ -1662,6 +1678,10 @@ impl Config {
                     self.proxy.matured_min_bytes = bytes;
                 }
             }
+            "tools_compact" => {
+                self.proxy.tools_compact =
+                    parse_bool_setting("proxy.tools_compact", value, self.proxy.tools_compact);
+            }
             "sticky_beta" => {
                 self.proxy.sticky_beta =
                     parse_bool_setting("proxy.sticky_beta", value, self.proxy.sticky_beta);
@@ -2195,6 +2215,19 @@ mod tests {
         assert_eq!(config.proxy.prompt_cache_key, PromptCacheKey::Client);
         assert_eq!(config.proxy.tools_order, ToolsOrder::Client);
         assert!(!config.proxy.sticky_beta);
+        assert!(!config.proxy.tools_compact);
+        config.apply_env(&[("KOMPRESSOR__PROXY__TOOLS_COMPACT".into(), "true".into())]);
+        assert!(config.proxy.tools_compact);
+        let per_provider: Config =
+            toml::from_str("[proxy.providers.openai]\ntools_compact = true\n").unwrap();
+        assert!(!per_provider.proxy.tools_compact);
+        assert!(
+            per_provider
+                .for_provider("openai")
+                .expect("openai has overrides")
+                .proxy
+                .tools_compact
+        );
 
         config.apply_env(&[
             (

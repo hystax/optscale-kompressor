@@ -595,6 +595,8 @@ struct Prepared {
     /// This turn found the provider's cache gone and was recompacted, with
     /// how many stale reads the conversation's ledger now holds.
     recompacted: Option<(crate::recompact::Cold, usize)>,
+    /// Bytes `proxy.tools_compact` took out of the tool definitions.
+    tools_compacted_bytes: usize,
 }
 
 impl Prepared {
@@ -607,6 +609,7 @@ impl Prepared {
             observation: None,
             opening: None,
             recompacted: None,
+            tools_compacted_bytes: 0,
             body,
             json: None,
             saved_tokens: 0,
@@ -715,6 +718,7 @@ fn passthrough_with_stable_tools(
         observation: None,
         opening: None,
         recompacted: None,
+        tools_compacted_bytes: 0,
     }
 }
 
@@ -799,6 +803,7 @@ struct Identified {
     /// The conversation's opening, which stays the same on every turn and
     /// across a restart: what `prompt_cache_key` is derived from.
     opening: u64,
+    family: ApiFamily,
 }
 
 fn prefix_identity(
@@ -882,7 +887,46 @@ fn prefix_identity(
         idle,
         tool_names,
         opening: opening_key,
+        family,
     })
+}
+
+/// Take the bookkeeping out of this request's tool schemas, under
+/// `proxy.tools_compact`, for a conversation whose policy says so. See
+/// [`crate::toolcompact`].
+///
+/// Every request of such a conversation is parsed and re-serialized here,
+/// compressed or not: the tool block has to carry the same bytes each turn.
+fn compact_tool_schemas(state: &ProxyState, identified: &Identified, prepared: &mut Prepared) {
+    let configured = state
+        .core
+        .config_for(Some(identified.family.provider()))
+        .proxy
+        .tools_compact;
+    if !state.tool_policies.compacting(
+        identified.fingerprint,
+        identified.incoming.messages,
+        configured,
+    ) {
+        return;
+    }
+    let mut parsed = None;
+    let value = match prepared.json.as_mut() {
+        Some(value) => value,
+        None => match serde_json::from_slice::<Value>(&prepared.body) {
+            Ok(value) => parsed.insert(value),
+            Err(_) => return,
+        },
+    };
+    let Some(Value::Array(tools)) = value.get_mut("tools") else {
+        return;
+    };
+    if crate::toolcompact::compact_tools(tools) > 0
+        && let Ok(out) = serde_json::to_vec(value)
+    {
+        prepared.tools_compacted_bytes = prepared.body.len().saturating_sub(out.len());
+        prepared.body = Bytes::from(out);
+    }
 }
 
 /// Send this request's tools in the order the conversation's first request
@@ -955,6 +999,8 @@ fn observe_prefix(
         identified.text_bytes,
         identified.idle,
     );
+    observation.tools_compacted_bytes =
+        u32::try_from(prepared.tools_compacted_bytes).unwrap_or(u32::MAX);
     if let Some((kind, held)) = prepared.recompacted {
         observation.recompacted = Some(kind.as_str().to_string());
         observation.ledger_reads = u32::try_from(held).unwrap_or(u32::MAX);
@@ -1091,6 +1137,9 @@ async fn prepare(
     }
     if let Some(identified) = identified.as_ref() {
         prepared.opening = Some(identified.opening);
+        // Asked of every conversation, on or off: the answer is fixed by the
+        // first request, and has to be on record before the setting changes.
+        compact_tool_schemas(state, identified, &mut prepared);
         if state
             .core
             .config_for(family.map(ApiFamily::provider))
@@ -1552,6 +1601,7 @@ async fn prepare_inner(
                 observation: None,
                 opening: None,
                 recompacted,
+                tools_compacted_bytes: 0,
             }
         }
         Err(error) => {

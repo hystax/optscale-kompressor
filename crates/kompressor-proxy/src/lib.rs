@@ -83,6 +83,7 @@ pub mod sse;
 pub mod stabilize;
 mod stream;
 pub mod tool;
+pub mod toolcompact;
 pub mod turn;
 mod upstream;
 pub mod websocket;
@@ -124,6 +125,9 @@ pub struct ProxyState {
     pub(crate) stabilizer: Arc<stabilize::Stabilizer>,
     /// What each conversation's cold turns decided, for `proxy.cold_recompact`.
     pub(crate) recompact: Arc<recompact::Recompact>,
+    /// Whether each conversation's tool schemas are compacted, decided when
+    /// it is first seen, for `proxy.tools_compact`.
+    pub(crate) tool_policies: Arc<toolcompact::ToolPolicies>,
 }
 
 impl ProxyState {
@@ -148,6 +152,7 @@ impl ProxyState {
             drift: Arc::new(drift::DriftTracker::default()),
             stabilizer: Arc::new(stabilize::Stabilizer::default()),
             recompact: Arc::new(recompact::Recompact::default()),
+            tool_policies: Arc::new(toolcompact::ToolPolicies::default()),
         }
     }
 

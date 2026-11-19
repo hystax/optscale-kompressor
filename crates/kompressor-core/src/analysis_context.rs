@@ -22,6 +22,7 @@ pub(crate) fn context(config: &Config) -> RunContext {
             "prompt_cache_key":p.prompt_cache_key,
             "tools_order":p.tools_order,
             "sticky_beta":p.sticky_beta,
+            "tools_compact":p.tools_compact,
             "cold_recompact":p.cold_recompact,
             "superseded_reads":p.superseded_reads,
             "matured_reads":p.matured_reads,

@@ -669,6 +669,7 @@ RENDER.prefix = d => {
       ["Tools per request", r => r.tools_per_request.toFixed(1)],
       ["Deferring", r => pct(share(r.deferring_requests, r.requests))],
       ["12+ tools, none deferred", r => pct(share(r.undeferred_requests, r.requests))],
+      ["Schema bytes compacted", r => r.tools_compacted_requests ? bytes(Math.round(r.tools_compacted_bytes / r.tools_compacted_requests)) + " a request" : "–"],
     ], d.composition, { empty: "No observed request in this window." }),
       note("Shares are of request bytes, not tokens: they rank the segments and do not price them. Opaque conversation is the part of the messages the engine holds no text for — tool-call arguments, images, structured results, signatures.")),
     section("Volatile values in instructions and tool descriptions", tiles([
