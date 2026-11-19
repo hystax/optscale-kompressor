@@ -1,0 +1,1200 @@
+//! Which part of a request's cacheable prefix moved, and who moved it.
+//!
+//! The statistics can already say that a turn failed to read back the prefix
+//! the turn before left, and put the loss down to expiry or to a
+//! `prefix_change`. What they could not say is *which* part changed, or
+//! whether the client or this proxy changed it — the question DESIGN §20 item 8
+//! needed captured bodies and a byte diff to answer once.
+//!
+//! So each request is reduced to a handful of hashes, one per segment the
+//! provider renders into the prompt ahead of the new turn, taken twice: over
+//! the body as the client sent it and over the body as it goes upstream. The
+//! next request of the same conversation is compared with both. A segment that
+//! differs on the way in is the client's doing; one that differs only on the
+//! way out is ours.
+//!
+//! Nothing here changes a byte of any request, and nothing here can fail one:
+//! every function returns a value for any JSON at all.
+//!
+//! # What is hashed, and what is deliberately not
+//!
+//! Key order is kept, because the provider caches the rendered prompt and a
+//! reordered schema renders differently. Three things are left out because the
+//! provider leaves them out too:
+//!
+//! - `cache_control` markers. They say where to cache, and are not part of
+//!   what is cached; Claude Code moves its marker to the newest message every
+//!   turn, which would otherwise read as a rewrite of the message before it.
+//! - The difference between a message whose content is a string and one whose
+//!   content is a single text block. Claude Code sends a notification as a
+//!   block the turn it arrives and as a string on every turn after.
+//! - Tools marked `defer_loading`, which are not rendered until searched for.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::Instant;
+
+use http::HeaderMap;
+use serde_json::Value;
+
+use kompressor_stats::context::{
+    DRIFT_BETA, DRIFT_HISTORY, DRIFT_SYSTEM, DRIFT_TOOL_DEFS, DRIFT_TOOL_ORDER, DRIFT_TOOL_SET,
+    PrefixObservation, Volatile,
+};
+use kompressor_wire::ApiFamily;
+
+/// Conversations remembered, the same bound the prefix tracker keeps.
+const REMEMBER: usize = 4096;
+
+/// Per-message hashes kept for one conversation. Messages past it are folded
+/// into one chain, so a change there is still seen and only its position is
+/// lost.
+const MESSAGES_KEPT: usize = 256;
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// FNV-1a, for the reason the prefix tracker uses it: no per-process seed, so
+/// a value means the same thing after a restart.
+#[derive(Clone, Copy)]
+struct Fnv(u64);
+
+impl Fnv {
+    fn new() -> Fnv {
+        Fnv(FNV_OFFSET)
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(FNV_PRIME);
+        }
+    }
+
+    /// One structural byte, so `["ab"]` and `["a","b"]` hash apart.
+    fn mark(&mut self, tag: u8) {
+        self.bytes(&[0xff, tag]);
+    }
+
+    fn word(&mut self, word: u64) {
+        self.bytes(&word.to_le_bytes());
+    }
+}
+
+/// Hash `value` in document order, skipping `cache_control` markers.
+///
+/// `opaque` is set below a tool call's `input` or `arguments`: what is in
+/// there is the agent's data, and a key it happens to call `cache_control` is
+/// content like any other.
+fn hash_value(hash: &mut Fnv, value: &Value, opaque: bool) {
+    match value {
+        Value::Null => hash.mark(b'n'),
+        Value::Bool(flag) => hash.mark(if *flag { b't' } else { b'f' }),
+        Value::Number(number) => {
+            hash.mark(b'#');
+            hash.bytes(number.to_string().as_bytes());
+        }
+        Value::String(text) => {
+            hash.mark(b's');
+            hash.bytes(text.as_bytes());
+        }
+        Value::Array(items) => {
+            hash.mark(b'[');
+            for item in items {
+                hash_value(hash, item, opaque);
+            }
+            hash.mark(b']');
+        }
+        Value::Object(object) => {
+            hash.mark(b'{');
+            for (key, item) in object {
+                if !opaque && key == "cache_control" {
+                    continue;
+                }
+                hash.mark(b'k');
+                hash.bytes(key.as_bytes());
+                hash_value(hash, item, opaque || key == "input" || key == "arguments");
+            }
+            hash.mark(b'}');
+        }
+    }
+}
+
+fn hash_of(value: &Value) -> u64 {
+    let mut hash = Fnv::new();
+    hash_value(&mut hash, value, false);
+    hash.0
+}
+
+/// One message, with a lone text block read as the string it stands for.
+fn hash_message(message: &Value) -> u64 {
+    let lone_text = message
+        .get("content")
+        .and_then(Value::as_array)
+        .filter(|blocks| blocks.len() == 1)
+        .and_then(|blocks| blocks[0].as_object())
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .and_then(|block| block.get("text"))
+        .filter(|text| text.is_string());
+    let Some(text) = lone_text else {
+        return hash_of(message);
+    };
+    let mut hash = Fnv::new();
+    hash.mark(b'{');
+    if let Some(object) = message.as_object() {
+        for (key, item) in object {
+            hash.mark(b'k');
+            hash.bytes(key.as_bytes());
+            hash_value(&mut hash, if key == "content" { text } else { item }, false);
+        }
+    }
+    hash.mark(b'}');
+    hash.0
+}
+
+/// Counts what `serde_json` would write, without writing it.
+struct Counter(u64);
+
+impl std::io::Write for Counter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 += bytes.len() as u64;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn size_of(value: &Value) -> u64 {
+    let mut counter = Counter(0);
+    // The counter cannot fail, and a `Value` always serializes.
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.0
+}
+
+fn clamp(size: u64) -> u32 {
+    u32::try_from(size).unwrap_or(u32::MAX)
+}
+
+/// The hashes two requests are compared by.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Hashes {
+    system: u64,
+    /// Every rendered tool definition, in order.
+    tool_defs: u64,
+    /// The rendered tools' names, in order.
+    tool_order: u64,
+    /// The same names, order removed.
+    tool_set: u64,
+    beta: u64,
+    /// The first [`MESSAGES_KEPT`] messages, one hash each.
+    messages: Vec<u64>,
+    /// A chain over every message past those, in order.
+    rest: u64,
+    /// The same chain as it stood after the message the previous request ended
+    /// on, which is what that request's `rest` is compared with. `None` when
+    /// this request does not reach that far, or no previous one is known.
+    rest_at_mark: Option<u64>,
+    messages_count: usize,
+}
+
+/// What one body holds: its hashes, its sizes, and what a later request needs
+/// to know about it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Segments {
+    pub(crate) hashes: Hashes,
+    body_bytes: u64,
+    system_bytes: u64,
+    tools_bytes: u64,
+    tools_count: u32,
+    tools_deferred: u32,
+    messages_bytes: u64,
+    reasoning_bytes: u64,
+    /// Whether any marker the provider reads asks for a one-hour entry.
+    pub(crate) one_hour: bool,
+    volatile: Volatile,
+}
+
+fn role_of(item: &Value) -> Option<&str> {
+    item.get("role").and_then(Value::as_str)
+}
+
+fn is_instruction(item: &Value) -> bool {
+    matches!(role_of(item), Some("system" | "developer"))
+}
+
+/// A tool's name, wherever its family keeps it.
+fn tool_name(tool: &Value) -> &str {
+    tool.get("name")
+        .and_then(Value::as_str)
+        .or_else(|| tool.pointer("/function/name").and_then(Value::as_str))
+        .or_else(|| tool.get("type").and_then(Value::as_str))
+        .unwrap_or("")
+}
+
+fn tool_description(tool: &Value) -> Option<&str> {
+    tool.get("description").and_then(Value::as_str).or_else(|| {
+        tool.pointer("/function/description")
+            .and_then(Value::as_str)
+    })
+}
+
+fn asks_one_hour(object: &Value) -> bool {
+    object.pointer("/cache_control/ttl").and_then(Value::as_str) == Some("1h")
+}
+
+/// Whether any marker the Messages API reads asks for an hour: the places
+/// `cachettl` writes, and no others.
+fn any_one_hour(body: &Value) -> bool {
+    if asks_one_hour(body) {
+        return true;
+    }
+    let blocks = |key: &str| {
+        body.get(key)
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    };
+    if blocks("system").iter().any(asks_one_hour) || blocks("tools").iter().any(asks_one_hour) {
+        return true;
+    }
+    blocks("messages").iter().any(|message| {
+        message
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|content| {
+                content.iter().any(|block| {
+                    asks_one_hour(block)
+                        || block
+                            .get("content")
+                            .and_then(Value::as_array)
+                            .is_some_and(|inner| inner.iter().any(asks_one_hour))
+                })
+            })
+    })
+}
+
+/// Bytes of plain-text reasoning inside `<think>` spans.
+fn think_spans(text: &str) -> u64 {
+    let mut total = 0;
+    let mut rest = text;
+    while let Some(open) = rest.find("<think>") {
+        let after = &rest[open + "<think>".len()..];
+        match after.find("</think>") {
+            Some(close) => {
+                total += close as u64;
+                rest = &after[close + "</think>".len()..];
+            }
+            None => {
+                total += after.len() as u64;
+                break;
+            }
+        }
+    }
+    total
+}
+
+/// Reasoning one conversation item re-sends: Chat's `reasoning_content` and
+/// inline `<think>` spans, Anthropic's `thinking` blocks, a Responses
+/// `reasoning` item.
+fn reasoning_in(item: &Value) -> u64 {
+    if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+        return size_of(item);
+    }
+    let mut total = item
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .map_or(0, |text| text.len() as u64);
+    match item.get("content") {
+        Some(Value::String(text)) if role_of(item) == Some("assistant") => {
+            total += think_spans(text);
+        }
+        Some(Value::Array(blocks)) => {
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) == Some("thinking") {
+                    total += block
+                        .get("thinking")
+                        .and_then(Value::as_str)
+                        .map_or(0, |text| text.len() as u64);
+                }
+            }
+        }
+        _ => {}
+    }
+    total
+}
+
+/// The sorted, de-duplicated beta tokens a request carries, as one hash.
+fn beta_hash(headers: &HeaderMap) -> u64 {
+    let mut tokens: Vec<String> = Vec::new();
+    for name in ["anthropic-beta", "openai-beta"] {
+        for value in headers.get_all(name) {
+            let Ok(text) = value.to_str() else { continue };
+            tokens.extend(
+                text.split(',')
+                    .map(|token| token.trim().to_ascii_lowercase())
+                    .filter(|token| !token.is_empty()),
+            );
+        }
+    }
+    tokens.sort();
+    tokens.dedup();
+    let mut hash = Fnv::new();
+    for token in &tokens {
+        hash.mark(b's');
+        hash.bytes(token.as_bytes());
+    }
+    hash.0
+}
+
+impl Segments {
+    /// Reduce one request body to what is compared and counted.
+    ///
+    /// `headers` are the client's: the proxy forwards the beta tokens it was
+    /// sent, so they are the same on both sides of it. `mark` is how many
+    /// messages the conversation's previous request carried
+    /// ([`DriftTracker::previous_messages`]).
+    pub(crate) fn of(
+        body: &Value,
+        family: ApiFamily,
+        headers: &HeaderMap,
+        mark: Option<usize>,
+    ) -> Segments {
+        let mut segments = Segments {
+            body_bytes: size_of(body),
+            one_hour: family == ApiFamily::AnthropicMessages && any_one_hour(body),
+            ..Segments::default()
+        };
+        segments.hashes.beta = beta_hash(headers);
+
+        // The conversation, and the instructions some families carry in it.
+        let conversation_key = match family {
+            ApiFamily::OpenAiResponses => "input",
+            _ => "messages",
+        };
+        let empty = Vec::new();
+        let items = body
+            .get(conversation_key)
+            .and_then(Value::as_array)
+            .unwrap_or(&empty);
+
+        let mut system = Fnv::new();
+        let mut strings: Vec<&str> = Vec::new();
+        for key in ["system", "instructions"] {
+            if let Some(value) = body.get(key) {
+                hash_value(&mut system, value, false);
+                segments.system_bytes += size_of(value);
+                collect_strings(value, &mut strings);
+            }
+        }
+        if family != ApiFamily::AnthropicMessages {
+            for item in items.iter().filter(|item| is_instruction(item)) {
+                hash_value(&mut system, item, false);
+                segments.system_bytes += size_of(item);
+                if let Some(content) = item.get("content") {
+                    collect_strings(content, &mut strings);
+                }
+            }
+        }
+        segments.hashes.system = system.0;
+
+        let mut rest = Fnv::new();
+        let turns = items
+            .iter()
+            .filter(|item| family == ApiFamily::AnthropicMessages || !is_instruction(item));
+        for item in turns {
+            let hash = hash_message(item);
+            if segments.hashes.messages.len() < MESSAGES_KEPT {
+                segments.hashes.messages.push(hash);
+            } else {
+                rest.word(hash);
+            }
+            segments.hashes.messages_count += 1;
+            if mark == Some(segments.hashes.messages_count) {
+                segments.hashes.rest_at_mark = Some(rest.0);
+            }
+            segments.messages_bytes += size_of(item);
+            segments.reasoning_bytes += reasoning_in(item);
+        }
+        segments.hashes.rest = rest.0;
+        // A Responses request may carry its whole input as one string.
+        if let Some(Value::String(text)) = body.get(conversation_key) {
+            let mut hash = Fnv::new();
+            hash.mark(b's');
+            hash.bytes(text.as_bytes());
+            segments.hashes.messages.push(hash.0);
+            segments.hashes.messages_count = 1;
+            segments.messages_bytes = text.len() as u64;
+        }
+
+        let mut defs = Fnv::new();
+        let mut order = Fnv::new();
+        let mut names: Vec<&str> = Vec::new();
+        for tool in body
+            .get("tools")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty)
+        {
+            if tool.get("defer_loading").and_then(Value::as_bool) == Some(true) {
+                segments.tools_deferred += 1;
+                continue;
+            }
+            segments.tools_count += 1;
+            segments.tools_bytes += size_of(tool);
+            hash_value(&mut defs, tool, false);
+            let name = tool_name(tool);
+            order.mark(b's');
+            order.bytes(name.as_bytes());
+            names.push(name);
+            if let Some(description) = tool_description(tool) {
+                strings.push(description);
+            }
+        }
+        segments.hashes.tool_defs = defs.0;
+        segments.hashes.tool_order = order.0;
+        names.sort_unstable();
+        let mut set = Fnv::new();
+        for name in &names {
+            set.mark(b's');
+            set.bytes(name.as_bytes());
+        }
+        segments.hashes.tool_set = set.0;
+
+        for text in strings {
+            scan_volatile(text.as_bytes(), &mut segments.volatile);
+        }
+        segments
+    }
+}
+
+/// Every string under `value`, for the volatile scan of the system prompt.
+fn collect_strings<'a>(value: &'a Value, into: &mut Vec<&'a str>) {
+    match value {
+        Value::String(text) => into.push(text),
+        Value::Array(items) => items.iter().for_each(|item| collect_strings(item, into)),
+        Value::Object(object) => {
+            for (key, item) in object {
+                if key != "cache_control" {
+                    collect_strings(item, into);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn digits(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && bytes.iter().all(u8::is_ascii_digit)
+}
+
+fn two(bytes: &[u8]) -> u32 {
+    u32::from(bytes[0] - b'0') * 10 + u32::from(bytes[1] - b'0')
+}
+
+/// `YYYY-MM-DD` at the start of `at`, with a month and a day that exist.
+fn is_date(at: &[u8]) -> bool {
+    at.len() >= 10
+        && digits(&at[0..4])
+        && at[4] == b'-'
+        && digits(&at[5..7])
+        && at[7] == b'-'
+        && digits(&at[8..10])
+        && (1..=12).contains(&two(&at[5..7]))
+        && (1..=31).contains(&two(&at[8..10]))
+}
+
+/// `[Tt ]HH:MM:SS` at the start of `at`.
+fn is_time(at: &[u8]) -> bool {
+    at.len() >= 9
+        && matches!(at[0], b'T' | b't' | b' ')
+        && digits(&at[1..3])
+        && at[3] == b':'
+        && digits(&at[4..6])
+        && at[6] == b':'
+        && digits(&at[7..9])
+}
+
+/// An 8-4-4-4-12 run of hex digits at the start of `at`.
+fn is_uuid(at: &[u8]) -> bool {
+    at.len() >= 36
+        && at[..36].iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+        && at.get(36).is_none_or(|next| !next.is_ascii_alphanumeric())
+}
+
+fn base64url(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
+}
+
+/// `eyJ…` followed by two more dot-separated base64url runs. Returns its
+/// length, so the scan can step over it.
+fn jwt_len(at: &[u8]) -> Option<usize> {
+    if !at.starts_with(b"eyJ") {
+        return None;
+    }
+    let mut position = 0;
+    for part in 0..3 {
+        let run = at[position..]
+            .iter()
+            .take_while(|byte| base64url(**byte))
+            .count();
+        if run < 10 {
+            return None;
+        }
+        position += run;
+        if part < 2 {
+            if at.get(position) != Some(&b'.') {
+                return None;
+            }
+            position += 1;
+        }
+    }
+    Some(position)
+}
+
+fn bump(count: &mut u8) {
+    *count = count.saturating_add(1);
+}
+
+/// Count the volatile-looking values in `text`. By byte shape rather than by
+/// pattern, so the cost is one pass and nothing is compiled.
+fn scan_volatile(text: &[u8], into: &mut Volatile) {
+    let mut index = 0;
+    while index < text.len() {
+        let at = &text[index..];
+        let boundary = index == 0 || !text[index - 1].is_ascii_alphanumeric();
+        if boundary && at[0].is_ascii_digit() && is_date(at) {
+            if is_time(&at[10..]) {
+                bump(&mut into.timestamps);
+                index += 19;
+                continue;
+            }
+            if at.get(10).is_none_or(|next| !next.is_ascii_digit()) {
+                bump(&mut into.dates);
+                index += 10;
+                continue;
+            }
+        }
+        if boundary && at[0].is_ascii_hexdigit() && is_uuid(at) {
+            bump(&mut into.uuids);
+            index += 36;
+            continue;
+        }
+        if boundary && let Some(length) = jwt_len(at) {
+            bump(&mut into.jwts);
+            index += length;
+            continue;
+        }
+        index += 1;
+    }
+}
+
+/// What the previous request of a conversation looked like, on both sides of
+/// this proxy.
+struct Entry {
+    at: Instant,
+    incoming: Hashes,
+    outgoing: Hashes,
+    one_hour: bool,
+}
+
+/// The previous request of each conversation, for the next one to be compared
+/// with.
+#[derive(Default)]
+pub struct DriftTracker {
+    entries: Mutex<HashMap<u64, Entry>>,
+}
+
+/// What the tracker knows about the request before this one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Compared {
+    pub(crate) compared: bool,
+    pub(crate) drift_in: u8,
+    pub(crate) drift_out: u8,
+    pub(crate) history_in_at: Option<u32>,
+    pub(crate) history_out_at: Option<u32>,
+    /// Whether the previous request asked for one-hour entries.
+    pub(crate) previous_one_hour: Option<bool>,
+}
+
+/// The first message of `before` that `now` no longer carries unchanged.
+///
+/// Only what `before` held is compared: everything past it is the new turn.
+fn first_changed(before: &Hashes, now: &Hashes) -> Option<u32> {
+    let shared = before.messages.len().min(now.messages.len());
+    if let Some(index) = (0..shared).find(|index| before.messages[*index] != now.messages[*index]) {
+        return Some(index as u32);
+    }
+    if now.messages.len() < before.messages.len() {
+        return Some(now.messages.len() as u32);
+    }
+    // Past the kept hashes only the chain is left: this request's, as it stood
+    // where the previous one ended.
+    (before.messages_count > MESSAGES_KEPT
+        && now.rest_at_mark.is_some_and(|rest| rest != before.rest))
+    .then_some(MESSAGES_KEPT as u32)
+}
+
+/// The segments of `now` that differ from `before`, and where history changed.
+fn changed(before: &Hashes, now: &Hashes) -> (u8, Option<u32>) {
+    let mut mask = 0;
+    if before.system != now.system {
+        mask |= DRIFT_SYSTEM;
+    }
+    if before.tool_set != now.tool_set {
+        mask |= DRIFT_TOOL_SET;
+    } else if before.tool_order != now.tool_order {
+        mask |= DRIFT_TOOL_ORDER;
+    } else if before.tool_defs != now.tool_defs {
+        mask |= DRIFT_TOOL_DEFS;
+    }
+    if before.beta != now.beta {
+        mask |= DRIFT_BETA;
+    }
+    let at = first_changed(before, now);
+    if at.is_some() {
+        mask |= DRIFT_HISTORY;
+    }
+    (mask, at)
+}
+
+impl DriftTracker {
+    /// Compare this request with the conversation's previous one, then
+    /// remember it in that one's place.
+    ///
+    /// A request carrying fewer messages than the one remembered is a branch —
+    /// a subagent summary or a side query re-sending an earlier history. It is
+    /// not compared, and it does not replace what is remembered: the main line
+    /// is still the one its next request should be measured against.
+    pub(crate) fn observe(
+        &self,
+        conversation: u64,
+        incoming: &Segments,
+        outgoing: &Segments,
+    ) -> Compared {
+        let Ok(mut entries) = self.entries.lock() else {
+            return Compared::default();
+        };
+        let mut result = Compared::default();
+        if let Some(previous) = entries.get(&conversation) {
+            if incoming.hashes.messages_count < previous.incoming.messages_count {
+                return result;
+            }
+            let (drift_in, history_in_at) = changed(&previous.incoming, &incoming.hashes);
+            let (out, history_out_at) = changed(&previous.outgoing, &outgoing.hashes);
+            // History is ours when it moved earlier on the way out than it did
+            // on the way in; every other segment, when it moved only there.
+            let history_is_ours = match (history_out_at, history_in_at) {
+                (Some(out_at), Some(in_at)) => out_at < in_at,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            let mut drift_out = out & !drift_in & !DRIFT_HISTORY;
+            if history_is_ours {
+                drift_out |= DRIFT_HISTORY;
+            }
+            result = Compared {
+                compared: true,
+                drift_in,
+                drift_out,
+                history_in_at,
+                history_out_at: history_is_ours.then_some(history_out_at).flatten(),
+                previous_one_hour: Some(previous.one_hour),
+            };
+        } else if entries.len() >= REMEMBER
+            && let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.at)
+                .map(|(key, _)| *key)
+        {
+            entries.remove(&oldest);
+        }
+        entries.insert(
+            conversation,
+            Entry {
+                at: Instant::now(),
+                incoming: incoming.hashes.clone(),
+                outgoing: outgoing.hashes.clone(),
+                one_hour: outgoing.one_hour,
+            },
+        );
+        result
+    }
+
+    /// How many messages the conversation's previous request carried, for
+    /// [`Segments::of`] to mark its chain at.
+    pub(crate) fn previous_messages(&self, conversation: u64) -> Option<usize> {
+        self.entries
+            .lock()
+            .ok()?
+            .get(&conversation)
+            .map(|entry| entry.incoming.messages_count)
+    }
+
+    /// Conversations remembered. For tests and for `/metrics`.
+    pub fn tracked(&self) -> usize {
+        self.entries.lock().map_or(0, |entries| entries.len())
+    }
+}
+
+/// What the prefix tracker knew of the conversation as this request arrived.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Idle {
+    pub(crate) idle_ms: u64,
+    pub(crate) was_warm: bool,
+}
+
+/// Put one request's observation together.
+pub(crate) fn observation(
+    family: ApiFamily,
+    incoming: &Segments,
+    compared: Compared,
+    text_bytes: u64,
+    idle: Option<Idle>,
+) -> PrefixObservation {
+    // Scanned on every request and reported only where it is news: the first
+    // request of a conversation, and one whose instructions or tools changed.
+    let fresh = !compared.compared
+        || compared.drift_in & (DRIFT_SYSTEM | DRIFT_TOOL_DEFS | DRIFT_TOOL_ORDER | DRIFT_TOOL_SET)
+            != 0;
+    PrefixObservation {
+        compared: compared.compared,
+        drift_in: compared.drift_in,
+        drift_out: compared.drift_out,
+        history_in_at: compared.history_in_at,
+        history_out_at: compared.history_out_at,
+        body_bytes: clamp(incoming.body_bytes),
+        system_bytes: clamp(incoming.system_bytes),
+        tools_bytes: clamp(incoming.tools_bytes),
+        tools_count: incoming.tools_count,
+        tools_deferred: incoming.tools_deferred,
+        messages_bytes: clamp(incoming.messages_bytes),
+        messages_count: clamp(incoming.hashes.messages_count as u64),
+        text_bytes: clamp(text_bytes),
+        reasoning_bytes: clamp(incoming.reasoning_bytes),
+        volatile: (fresh && incoming.volatile.any()).then_some(incoming.volatile),
+        idle_ms: idle.map(|idle| idle.idle_ms),
+        was_warm: idle.is_some_and(|idle| idle.was_warm),
+        lifetime_s: (family == ApiFamily::AnthropicMessages)
+            .then_some(compared.previous_one_hour)
+            .flatten()
+            .map(|one_hour| if one_hour { 3_600 } else { 300 }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn anthropic(body: &Value) -> Segments {
+        Segments::of(body, ApiFamily::AnthropicMessages, &HeaderMap::new(), None)
+    }
+
+    fn turn(messages: Value) -> Value {
+        json!({
+            "model": "claude-opus-5-5",
+            "system": [{"type": "text", "text": "You are an agent."}],
+            "tools": [
+                {"name": "Read", "description": "Read a file", "input_schema": {"type": "object"}},
+                {"name": "Bash", "description": "Run a command", "input_schema": {"type": "object"}}
+            ],
+            "messages": messages
+        })
+    }
+
+    fn observe(tracker: &DriftTracker, incoming: &Value, outgoing: &Value) -> Compared {
+        tracker.observe(7, &anthropic(incoming), &anthropic(outgoing))
+    }
+
+    #[test]
+    fn the_first_request_of_a_conversation_is_compared_with_nothing() {
+        let tracker = DriftTracker::default();
+        let body = turn(json!([{"role": "user", "content": "hello"}]));
+        let seen = observe(&tracker, &body, &body);
+        assert!(!seen.compared);
+        assert_eq!((seen.drift_in, seen.drift_out), (0, 0));
+        assert_eq!(tracker.tracked(), 1);
+    }
+
+    #[test]
+    fn an_appended_turn_is_not_drift() {
+        let tracker = DriftTracker::default();
+        let one = turn(json!([{"role": "user", "content": "hello"}]));
+        let two = turn(json!([
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "go on"}
+        ]));
+        observe(&tracker, &one, &one);
+        let seen = observe(&tracker, &two, &two);
+        assert!(seen.compared);
+        assert_eq!((seen.drift_in, seen.drift_out), (0, 0));
+        assert_eq!(seen.previous_one_hour, Some(false));
+    }
+
+    /// The client changing a tool is the client's drift; the same change made
+    /// between the two sides of the proxy is ours. Both directions, so neither
+    /// can pass by reporting everything or nothing.
+    #[test]
+    fn a_changed_tool_is_put_down_to_whoever_changed_it() {
+        let one = turn(json!([{"role": "user", "content": "hello"}]));
+        let mut two = one.clone();
+        two["tools"][0]["description"] = json!("Read a file from disk");
+
+        let tracker = DriftTracker::default();
+        observe(&tracker, &one, &one);
+        let by_client = observe(&tracker, &two, &two);
+        assert_eq!(by_client.drift_in, DRIFT_TOOL_DEFS);
+        assert_eq!(by_client.drift_out, 0);
+
+        let tracker = DriftTracker::default();
+        observe(&tracker, &one, &one);
+        let by_proxy = observe(&tracker, &one, &two);
+        assert_eq!(by_proxy.drift_in, 0);
+        assert_eq!(by_proxy.drift_out, DRIFT_TOOL_DEFS);
+    }
+
+    #[test]
+    fn a_reorder_an_addition_and_a_redefinition_are_told_apart() {
+        let one = anthropic(&turn(json!([])));
+        let mut reordered = turn(json!([]));
+        reordered["tools"].as_array_mut().unwrap().reverse();
+        let mut grown = turn(json!([]));
+        grown["tools"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name": "Grep", "description": "Search", "input_schema": {}}));
+        let mut schema_keys = turn(json!([]));
+        schema_keys["tools"][0]["input_schema"] = json!({"properties": {}, "type": "object"});
+
+        assert_eq!(
+            changed(&one.hashes, &anthropic(&reordered).hashes).0,
+            DRIFT_TOOL_ORDER
+        );
+        assert_eq!(
+            changed(&one.hashes, &anthropic(&grown).hashes).0,
+            DRIFT_TOOL_SET
+        );
+        assert_eq!(
+            changed(&one.hashes, &anthropic(&schema_keys).hashes).0,
+            DRIFT_TOOL_DEFS
+        );
+    }
+
+    /// The injected retrieve tool appearing mid-conversation is the break
+    /// DESIGN §20 item 8 took a byte diff to find.
+    #[test]
+    fn a_tool_the_proxy_adds_mid_conversation_is_its_own_drift() {
+        let tracker = DriftTracker::default();
+        let one = turn(json!([{"role": "user", "content": "hello"}]));
+        let mut with_tool = one.clone();
+        with_tool["tools"].as_array_mut().unwrap().push(
+            json!({"name": "optscale_kompressor_retrieve", "description": "Fetch", "input_schema": {}}),
+        );
+        observe(&tracker, &one, &one);
+        let seen = observe(&tracker, &one, &with_tool);
+        assert_eq!(seen.drift_in, 0);
+        assert_eq!(seen.drift_out, DRIFT_TOOL_SET);
+    }
+
+    #[test]
+    fn a_moved_cache_marker_is_not_a_rewritten_message() {
+        let tracker = DriftTracker::default();
+        let one = turn(json!([
+            {"role": "user", "content": [
+                {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}
+            ]}
+        ]));
+        // The marker has moved on and the lone block has become a string.
+        let two = turn(json!([
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "next", "cache_control": {"type": "ephemeral"}}
+            ]}
+        ]));
+        observe(&tracker, &one, &one);
+        let seen = observe(&tracker, &two, &two);
+        assert!(seen.compared);
+        assert_eq!(seen.drift_in, 0, "nothing the provider renders has changed");
+    }
+
+    #[test]
+    fn a_marker_inside_a_tool_call_is_the_agents_own_data() {
+        let call = |ttl: &str| {
+            turn(json!([
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Write",
+                     "input": {"cache_control": {"ttl": ttl}}}
+                ]}
+            ]))
+        };
+        let tracker = DriftTracker::default();
+        observe(&tracker, &call("5m"), &call("5m"));
+        let seen = observe(&tracker, &call("1h"), &call("1h"));
+        assert_eq!(seen.drift_in, DRIFT_HISTORY);
+        assert_eq!(seen.history_in_at, Some(0));
+        // And it is not read as a request for one-hour entries.
+        assert!(!anthropic(&call("1h")).one_hour);
+    }
+
+    #[test]
+    fn rewritten_history_is_located_and_attributed() {
+        let one = turn(json!([
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"},
+            {"role": "user", "content": "c"}
+        ]));
+        let mut grown = one.clone();
+        grown["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role": "assistant", "content": "d"}));
+        let mut client_rewrote = grown.clone();
+        client_rewrote["messages"][2]["content"] = json!("C");
+        let mut proxy_rewrote = grown.clone();
+        proxy_rewrote["messages"][1]["content"] = json!("[elided]");
+
+        let tracker = DriftTracker::default();
+        observe(&tracker, &one, &one);
+        let seen = observe(&tracker, &client_rewrote, &client_rewrote);
+        assert_eq!((seen.drift_in, seen.drift_out), (DRIFT_HISTORY, 0));
+        assert_eq!(seen.history_in_at, Some(2));
+
+        let tracker = DriftTracker::default();
+        observe(&tracker, &one, &one);
+        let seen = observe(&tracker, &grown, &proxy_rewrote);
+        assert_eq!((seen.drift_in, seen.drift_out), (0, DRIFT_HISTORY));
+        assert_eq!(seen.history_out_at, Some(1));
+
+        // Both changed it: ours only where we changed it earlier.
+        let tracker = DriftTracker::default();
+        observe(&tracker, &one, &one);
+        let mut both = client_rewrote.clone();
+        both["messages"][1]["content"] = json!("[elided]");
+        let seen = observe(&tracker, &client_rewrote, &both);
+        assert_eq!(seen.drift_in, DRIFT_HISTORY);
+        assert_eq!(seen.drift_out, DRIFT_HISTORY);
+        assert_eq!(
+            (seen.history_in_at, seen.history_out_at),
+            (Some(2), Some(1))
+        );
+    }
+
+    #[test]
+    fn a_branch_is_neither_compared_nor_remembered() {
+        let tracker = DriftTracker::default();
+        let long = turn(json!([
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"},
+            {"role": "user", "content": "c"}
+        ]));
+        let side = turn(json!([{"role": "user", "content": "summarise"}]));
+        let mut longer = long.clone();
+        longer["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role": "assistant", "content": "d"}));
+
+        observe(&tracker, &long, &long);
+        assert!(!observe(&tracker, &side, &side).compared);
+        let seen = observe(&tracker, &longer, &longer);
+        assert!(seen.compared);
+        assert_eq!(seen.drift_in, 0, "the main line is compared with itself");
+    }
+
+    #[test]
+    fn deferred_tools_are_counted_and_not_compared() {
+        let one = turn(json!([]));
+        let mut loaded = one.clone();
+        loaded["tools"].as_array_mut().unwrap().push(
+            json!({"name": "mcp__x__y", "description": "Later", "input_schema": {}, "defer_loading": true}),
+        );
+        let (before, after) = (anthropic(&one), anthropic(&loaded));
+        assert_eq!(changed(&before.hashes, &after.hashes).0, 0);
+        assert_eq!((after.tools_count, after.tools_deferred), (2, 1));
+        assert_eq!(after.tools_bytes, before.tools_bytes);
+    }
+
+    #[test]
+    fn beta_tokens_are_compared_as_a_set() {
+        let headers = |value: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("anthropic-beta", http::HeaderValue::from_static(value));
+            headers
+        };
+        let body = turn(json!([]));
+        let of = |value| Segments::of(&body, ApiFamily::AnthropicMessages, &headers(value), None);
+        assert_eq!(
+            changed(&of("a-1, b-2").hashes, &of("B-2,a-1").hashes).0,
+            0,
+            "order and case are not a change"
+        );
+        assert_eq!(
+            changed(&of("a-1, b-2").hashes, &of("a-1").hashes).0,
+            DRIFT_BETA
+        );
+    }
+
+    #[test]
+    fn chat_instructions_are_the_system_segment_and_not_history() {
+        let chat = |system: &str| {
+            json!({"model": "gpt-5.5", "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "<think>plan it</think>done",
+                 "reasoning_content": "abcd"}
+            ]})
+        };
+        let of = |body: &Value| Segments::of(body, ApiFamily::OpenAiChat, &HeaderMap::new(), None);
+        let (one, two) = (of(&chat("be brief")), of(&chat("be thorough")));
+        assert_eq!(changed(&one.hashes, &two.hashes).0, DRIFT_SYSTEM);
+        assert_eq!(one.hashes.messages_count, 2);
+        assert_eq!(one.reasoning_bytes, 4 + "plan it".len() as u64);
+        assert!(one.system_bytes > 0 && one.messages_bytes > 0);
+    }
+
+    #[test]
+    fn responses_input_and_instructions_are_read() {
+        let body = json!({"model": "gpt-5.5", "instructions": "be brief", "input": [
+            {"role": "developer", "content": "house rules"},
+            {"type": "reasoning", "id": "rs_1", "summary": []},
+            {"role": "user", "content": "hello"}
+        ], "tools": [{"type": "function", "name": "shell", "description": "run"}]});
+        let seen = Segments::of(&body, ApiFamily::OpenAiResponses, &HeaderMap::new(), None);
+        assert_eq!(seen.hashes.messages_count, 2);
+        assert_eq!(seen.tools_count, 1);
+        assert!(seen.reasoning_bytes > 0);
+        let text = json!({"model": "gpt-5.5", "input": "hello"});
+        let seen = Segments::of(&text, ApiFamily::OpenAiResponses, &HeaderMap::new(), None);
+        assert_eq!(seen.hashes.messages_count, 1);
+    }
+
+    #[test]
+    fn one_hour_markers_are_found_where_the_api_reads_them() {
+        let mut body = turn(json!([
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [
+                    {"type": "text", "text": "x", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+                ]}
+            ]}
+        ]));
+        assert!(anthropic(&body).one_hour);
+        body["messages"][0]["content"][0]["content"][0]["cache_control"]["ttl"] = json!("5m");
+        assert!(!anthropic(&body).one_hour);
+    }
+
+    #[test]
+    fn volatile_values_are_counted_by_shape() {
+        let mut seen = Volatile::default();
+        scan_volatile(
+            b"Today is 2026-11-20. Started 2026-11-20T10:15:00Z, session \
+              3f2b8c1e-9d4a-4b7c-8e21-0a1b2c3d4e5f, token \
+              eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlLWJ5dGVz",
+            &mut seen,
+        );
+        assert_eq!(
+            (seen.dates, seen.timestamps, seen.uuids, seen.jwts),
+            (1, 1, 1, 1)
+        );
+
+        // Shapes that only resemble them.
+        let mut none = Volatile::default();
+        scan_volatile(
+            b"build 1234-56-78, tool_search_tool_regex_20251119, v2026-13-01, \
+              claude-opus-4-5-20251101, range 10-20-30, eyJ.short.x, \
+              deadbeef-dead-beef-dead-beefdeadbeefX",
+            &mut none,
+        );
+        assert!(!none.any(), "{none:?}");
+    }
+
+    #[test]
+    fn volatile_values_are_reported_only_where_they_are_news() {
+        let mut body = turn(json!([{"role": "user", "content": "2026-11-20"}]));
+        body["system"][0]["text"] = json!("Today's date is 2026-11-20.");
+        let segments = anthropic(&body);
+        let first = observation(
+            ApiFamily::AnthropicMessages,
+            &segments,
+            Compared::default(),
+            10,
+            None,
+        );
+        assert_eq!(
+            first.volatile.map(|v| v.dates),
+            Some(1),
+            "the message is not scanned"
+        );
+        let settled = Compared {
+            compared: true,
+            previous_one_hour: Some(true),
+            ..Compared::default()
+        };
+        let later = observation(
+            ApiFamily::AnthropicMessages,
+            &segments,
+            settled,
+            10,
+            Some(Idle {
+                idle_ms: 42,
+                was_warm: true,
+            }),
+        );
+        assert_eq!(later.volatile, None);
+        assert_eq!(
+            (later.idle_ms, later.was_warm, later.lifetime_s),
+            (Some(42), true, Some(3_600))
+        );
+        assert_eq!(first.lifetime_s, None, "no earlier request to have asked");
+    }
+
+    #[test]
+    fn history_past_the_kept_hashes_is_still_compared() {
+        let messages = |changed: &str, extra: usize| {
+            let mut all: Vec<Value> = (0..MESSAGES_KEPT + 3)
+                .map(|index| json!({"role": "user", "content": format!("m{index}")}))
+                .collect();
+            all.push(json!({"role": "user", "content": changed}));
+            all.extend(
+                (0..extra).map(|index| json!({"role": "user", "content": format!("n{index}")})),
+            );
+            turn(Value::Array(all))
+        };
+        let count = MESSAGES_KEPT + 4;
+        let at = |body: &Value| {
+            Segments::of(
+                body,
+                ApiFamily::AnthropicMessages,
+                &HeaderMap::new(),
+                Some(count),
+            )
+        };
+        let one = at(&messages("x", 0));
+        assert_eq!(one.hashes.messages.len(), MESSAGES_KEPT);
+        // Grown by two turns, and unchanged up to where the last one ended.
+        assert_eq!(changed(&one.hashes, &at(&messages("x", 2)).hashes).0, 0);
+        // Grown, and changed past the kept hashes.
+        assert_eq!(
+            changed(&one.hashes, &at(&messages("y", 2)).hashes),
+            (DRIFT_HISTORY, Some(MESSAGES_KEPT as u32))
+        );
+    }
+
+    #[test]
+    fn the_table_stays_bounded() {
+        let tracker = DriftTracker::default();
+        let segments = anthropic(&turn(json!([])));
+        for conversation in 0..(REMEMBER as u64 + 16) {
+            tracker.observe(conversation, &segments, &segments);
+        }
+        assert_eq!(tracker.tracked(), REMEMBER);
+    }
+}

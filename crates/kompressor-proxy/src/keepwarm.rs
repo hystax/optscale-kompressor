@@ -678,6 +678,7 @@ async fn send(state: &ProxyState, ping: &Ping, sent: u32) -> Outcome {
     let waited = began.elapsed();
 
     let mut event = ProxyRequestEvent {
+        prefix: None,
         context: None,
         timing: None,
         time_ms,

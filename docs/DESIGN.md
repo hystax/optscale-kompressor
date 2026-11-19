@@ -1344,6 +1344,7 @@ prefix answers 404 rather than an empty report — an empty report would read as
 | `GET /v1/stats/models?window&from&to&tenant&format` | one card per `(api_family, model)`: billing from `stats cache`'s grouped query over `proxy_requests`, upstream failures and retrieval from a second grouped query (classified by the traffic report's rules), and the engine columns from the newest 200,000 `optimization_events` rows, read rather than grouped because a percentile needs the samples. Discarded rewrites are runs and latency samples but earn no credit. No table, column or view is added |
 | `GET /v1/stats/activity?window&from&to&tenant&format` | `proxy_requests` and `optimization_events` grouped by `strftime('%w')` and `strftime('%H')` in UTC — at most 168 cells — with billed input normalised per API family as everywhere else. The page shifts the cells to the browser's zone, to the hour |
 | `GET /v1/stats/cohorts?window&from&to&tenant&format` | `stats conversations` (costliest 50,000) bucketed by client turns in the window: 1, 2–4, 5–19, 20–99, 100–499, 500+. Every cohort is listed, empty or not, with the smallest share of conversations carrying half the input-equivalent cost |
+| `GET /v1/stats/prefix?window&from&to&tenant&format` | what the proxy observed of each request's cacheable prefix (`proxy_requests.prefix_json`, schema v15), newest 200,000 rows: compared requests and how many moved nothing; per segment — beta headers, tool set, tool order, tool definitions, system prompt, earlier messages, in the order a provider renders them — the turns the client changed it and the turns only the proxy did; every `prefix_change` loss of the cache walk joined to its request's observation and put down to the earliest changed segment and its side, or to `none_seen`, `not_compared` or `unobserved`; request composition per model in bytes (tools, system, reasoning, opaque conversation, deferral); volatile values in instructions and tool descriptions; and predicted-cold precision and recall per lifetime and margin. `available` is false on a database no build with v15 has written |
 | `GET /v1/refs?q&kind&request_id&expired&order&offset&limit&preview&tenant&format` | the ref browser (§8.3.1): one page of the tenant's fragments with a preview each, the match total, a count per kind and what the tenant holds live. JSON, or a page for `?format=html` or a browser's `Accept`. Off — 404 — unless `refs.browse = true` |
 | `GET /v1/refs/{handle}?history&tenant` | one fragment in full, read without touching it, with its retention and every recorded ask for it (`retrieval_events`) |
 | `DELETE /v1/refs/{handle}?tenant` | remove a fragment from the store and the recent-write cache; a later retrieval is a miss |
@@ -3715,6 +3716,11 @@ CREATE TABLE daily_analysis_conversations (
 -- as {"lines":1,"end":60} (`normalized`), or not narrowable at all
 -- (`unusable`, the whole fragment went back). NULL when no range was asked.
 ALTER TABLE retrieval_events ADD COLUMN range_status TEXT;
+
+-- v15: what the proxy observed about the request's cacheable prefix
+-- (`context::PrefixObservation`): segment drift, composition, volatile values
+-- and idle time. NULL on rows from before, which reports read as "unknown".
+ALTER TABLE proxy_requests ADD COLUMN prefix_json TEXT;
 ```
 
 ## C. Configuration reference — flat environment mapping

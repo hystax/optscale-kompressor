@@ -552,6 +552,9 @@ struct Prepared {
     /// The request asked for one-hour cache entries, which outlast any pause a
     /// keep-warm ping would bridge.
     one_hour: bool,
+    /// What was observed of the request's cacheable prefix, stamped by
+    /// `prepare` for the statistics row. Never read to decide anything.
+    observation: Option<kompressor_stats::context::PrefixObservation>,
 }
 
 impl Prepared {
@@ -561,6 +564,7 @@ impl Prepared {
             prefix: None,
             messages: None,
             one_hour: false,
+            observation: None,
             body,
             json: None,
             saved_tokens: 0,
@@ -666,6 +670,7 @@ fn passthrough_with_stable_tools(
         prefix: None,
         messages: None,
         one_hour: false,
+        observation: None,
     }
 }
 
@@ -734,13 +739,27 @@ fn conversation_opening(messages: &[Message]) -> Vec<String> {
         .collect()
 }
 
+/// What `prefix_identity` learned while it had the body open.
+struct Identified {
+    fingerprint: u64,
+    /// Messages the request carried.
+    messages: usize,
+    /// The request as the client sent it, reduced for the drift comparison.
+    incoming: crate::drift::Segments,
+    /// Conversation text the engine can see, in bytes.
+    text_bytes: u64,
+    /// How long the conversation had been idle as this request arrived.
+    idle: Option<crate::drift::Idle>,
+}
+
 fn prefix_identity(
     state: &ProxyState,
     identity: &Identity,
     family: Option<ApiFamily>,
     body: &Bytes,
     provider: &str,
-) -> Option<(u64, usize)> {
+    request_headers: &HeaderMap,
+) -> Option<Identified> {
     // Identified with compression off too. The control arm of a comparison has
     // to be observed the way the treated arm is: without a conversation its
     // rows filed no conversation, its cache-read drops went untracked — an
@@ -761,6 +780,21 @@ fn prefix_identity(
     let fingerprint = state
         .prefixes
         .identify(&prefixcache::identity_chain_in_scope(&refs, &scope))?;
+    // Read before anything below touches the conversation's entry.
+    let idle = state
+        .prefixes
+        .idle(fingerprint)
+        .map(|(idle, was_warm)| crate::drift::Idle {
+            idle_ms: u64::try_from(idle.as_millis()).unwrap_or(u64::MAX),
+            was_warm,
+        });
+    let incoming = crate::drift::Segments::of(
+        &value,
+        family,
+        request_headers,
+        state.drift.previous_messages(fingerprint),
+    );
+    let text_bytes = opening.iter().map(|text| text.len() as u64).sum();
     // The same history with the model left out, so that a conversation the
     // client moves to another model is recognised as one this proxy carried;
     // see `PrefixTracker::floor_for`.
@@ -779,7 +813,56 @@ fn prefix_identity(
         .get("messages")
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
-    Some((fingerprint, messages))
+    Some(Identified {
+        fingerprint,
+        messages,
+        incoming,
+        text_bytes,
+        idle,
+    })
+}
+
+/// Compare what goes upstream with the conversation's previous request, and
+/// put the observation on `prepared` for the statistics row.
+///
+/// Last in `prepare`, after every rewrite it makes, so the outgoing side is
+/// what the provider is sent. Parsing the outgoing body is the only cost that
+/// is not already paid, and a body forwarded as it arrived skips it.
+fn observe_prefix(
+    state: &ProxyState,
+    family: Option<ApiFamily>,
+    request_headers: &HeaderMap,
+    original: &Bytes,
+    identified: &Identified,
+    prepared: &mut Prepared,
+) {
+    let Some(family) = family else { return };
+    let mark = state.drift.previous_messages(identified.fingerprint);
+    let parsed;
+    let outgoing = if prepared.body == *original {
+        None
+    } else {
+        let value = match prepared.json.as_ref() {
+            Some(value) => Some(value),
+            None => {
+                parsed = serde_json::from_slice::<Value>(&prepared.body).ok();
+                parsed.as_ref()
+            }
+        };
+        value.map(|value| crate::drift::Segments::of(value, family, request_headers, mark))
+    };
+    let compared = state.drift.observe(
+        identified.fingerprint,
+        &identified.incoming,
+        outgoing.as_ref().unwrap_or(&identified.incoming),
+    );
+    prepared.observation = Some(crate::drift::observation(
+        family,
+        &identified.incoming,
+        compared,
+        identified.text_bytes,
+        identified.idle,
+    ));
 }
 
 /// Decide what to send, then stamp the conversation's cache identity on it.
@@ -803,8 +886,10 @@ async fn prepare(
     request_id: &str,
     provider: &str,
 ) -> Prepared {
-    let identified = prefix_identity(state, identity, family, &body, provider);
-    let fingerprint = identified.map(|(key, _)| key);
+    let identified = prefix_identity(state, identity, family, &body, provider, request_headers);
+    let fingerprint = identified.as_ref().map(|found| found.fingerprint);
+    // Refcounted: kept to tell a body forwarded as it arrived from a rewrite.
+    let original = body.clone();
     // Decided once, here: under `adaptive` the question itself moves the
     // conversation's state. Anthropic only; the TTL is its field.
     let long_ttl = family == Some(ApiFamily::AnthropicMessages)
@@ -816,9 +901,9 @@ async fn prepare(
         {
             CacheTtl::Default => false,
             CacheTtl::OneHour => true,
-            CacheTtl::Adaptive => {
-                identified.is_some_and(|(key, messages)| state.prefixes.long_ttl(key, messages))
-            }
+            CacheTtl::Adaptive => identified
+                .as_ref()
+                .is_some_and(|found| state.prefixes.long_ttl(found.fingerprint, found.messages)),
         };
     let mut prepared = prepare_inner(
         state,
@@ -837,7 +922,7 @@ async fn prepare(
     if prepared.prefix.is_none() {
         prepared.prefix = fingerprint;
     }
-    prepared.messages = identified.map(|(_, messages)| messages);
+    prepared.messages = identified.as_ref().map(|found| found.messages);
     // After every way `prepare_inner` can decline, for the reason the identity
     // is stamped here: under the default marker floor Claude Code freezes its
     // whole conversation, so nearly every request is a passthrough, and a TTL
@@ -845,6 +930,16 @@ async fn prepare(
     if long_ttl {
         extend_cache_ttl(&mut prepared);
         prepared.one_hour = true;
+    }
+    if let Some(identified) = identified.as_ref() {
+        observe_prefix(
+            state,
+            family,
+            request_headers,
+            &original,
+            identified,
+            &mut prepared,
+        );
     }
     prepared
 }
@@ -1234,6 +1329,7 @@ async fn prepare_inner(
                 prefix: fingerprint,
                 messages: None,
                 one_hour: false,
+                observation: None,
             }
         }
         Err(error) => {
@@ -2315,6 +2411,7 @@ impl Recorder {
         waited: Arc<AtomicU64>,
     ) -> Recorder {
         let event = ProxyRequestEvent {
+            prefix: prepared.observation.clone(),
             context: None,
             timing: None,
             time_ms: SystemTime::now()
@@ -2765,8 +2862,9 @@ mod tests {
                 Some(ApiFamily::OpenAiChat),
                 &body(model),
                 provider,
+                &HeaderMap::new(),
             )
-            .map(|(key, _)| key)
+            .map(|found| found.fingerprint)
         };
 
         let tenant_a = make_identity("tenant-a");

@@ -669,7 +669,7 @@ accept the same `from`/`to` pair. Analysis uses retained raw events; daily
 archives cannot reconstruct turn history. Token reduction remains an estimate
 per request, not a monetary saving or a count of unique content.
 
-Eleven more pages sit beside those on the statistics listener, linked from each
+Fifteen more pages sit beside those on the statistics listener, linked from each
 other and from every page's **Dashboards** link:
 
 - `/health`: one verdict for the last hour (or any window) — upstream incidents
@@ -734,6 +734,20 @@ other and from every page's **Dashboards** link:
   economics and its net compression saving, and how few conversations carry
   half the bill.
 
+- `/prefix`: which part of the cacheable prefix moved between two turns of a
+  conversation, and on which side of the proxy. Each request is reduced to a
+  hash per segment — beta headers, the tool set, tool order, tool definitions,
+  the system prompt, earlier messages — over the body as the client sent it
+  and as it went upstream, and compared with the turn before. Every
+  prefix-change loss on the Cache page is put down to the earliest segment
+  that changed and to the client or the proxy, or listed as unexplained. The
+  page also shows what a request is made of per model (tools, system,
+  reasoning and the conversation the engine cannot see, in bytes), volatile
+  values in instructions and tool descriptions (dates, date-times, UUIDs,
+  JWT-shaped tokens), and how well a cache lapse can be predicted on the
+  request that finds it, per lifetime and margin. Observation only: no byte of
+  any request changes.
+
 ### Statistics JSON API for automation
 
 Every dashboard is backed by a JSON route, and a client that sends no `Accept`
@@ -762,6 +776,7 @@ statistics listener (`server.stats_listen`) as well.
 | `GET /v1/stats/models?window=24h` | per API family and model: client requests and pings, billed input split by how it was billed, engine runs, reduction and latency percentiles, retrieval rounds and tokens put back, net saving, upstream failures |
 | `GET /v1/stats/activity?window=7d` | requests, pings, pass-through, billed input, cache writes and engine savings per weekday and hour (UTC), the busiest cell and the busiest eight consecutive hours |
 | `GET /v1/stats/cohorts?window=7d` | conversations bucketed by client turns, each with its billed input, cost share, net saving and median length, and the share of conversations that carries half the cost |
+| `GET /v1/stats/prefix?window=24h` | compared requests and how many moved nothing; per prompt segment the turns the client changed it and the turns only the proxy did, with the prefix-change losses, tokens and cost put down to each; losses the observations cannot explain; request composition per model; volatile values in instructions; predicted-cold precision and recall per lifetime and margin |
 | `GET /v1/stats/summary`, `histogram`, `by_type`, `retrievals`, `requests?request_id=`, `store` | the aggregate reports `kompressor stats` prints |
 
 `from`/`to` are epoch milliseconds (`to` exclusive, at most 90 days apart).

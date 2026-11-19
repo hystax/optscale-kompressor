@@ -1488,6 +1488,7 @@ fn proxied_turn(
     keep_warm: bool,
 ) -> kompressor_stats::Event {
     kompressor_stats::Event::ProxyRequest(kompressor_stats::ProxyRequestEvent {
+        prefix: None,
         context: None,
         timing: None,
         time_ms,
@@ -2057,6 +2058,91 @@ async fn a_json_lines_download_needs_the_same_key_as_the_json() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// The prefix view over HTTP: a loss the proxy caused is reported as its own,
+/// under both version prefixes, as JSON lines, and as a page.
+#[tokio::test]
+async fn the_prefix_dashboard_says_which_segment_moved_and_who_moved_it() {
+    use kompressor_stats::context::{DRIFT_TOOL_SET, PrefixObservation};
+
+    let harness = Harness::with_stats();
+    let (_, empty) = harness.get("/v1/stats/cache").await;
+    let tenant = text(&empty["tenant"]);
+    let t = now_ms() - 60_000;
+    let observed = |time_ms, read, write, seen: PrefixObservation| match proxied_turn(
+        time_ms, &tenant, read, write, false,
+    ) {
+        kompressor_stats::Event::ProxyRequest(mut event) => {
+            event.prefix = Some(seen);
+            kompressor_stats::Event::ProxyRequest(event)
+        }
+        other => other,
+    };
+    let sized = PrefixObservation {
+        body_bytes: 1_000,
+        tools_bytes: 600,
+        tools_count: 20,
+        ..PrefixObservation::default()
+    };
+    let stable = PrefixObservation {
+        compared: true,
+        ..sized.clone()
+    };
+    let moved = PrefixObservation {
+        drift_out: DRIFT_TOOL_SET,
+        ..stable.clone()
+    };
+    // Written, read back, then not read back two seconds later.
+    harness.sink.send(observed(t, 0, 40_000, sized));
+    harness.sink.send(observed(t + 1_000, 40_000, 0, stable));
+    harness.sink.send(observed(t + 2_000, 0, 40_000, moved));
+    harness.sink.flush().expect("the batch commits");
+
+    for version in ["v1", "v2"] {
+        let (status, report) = harness
+            .get(&format!("/{version}/stats/prefix?window=1h"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{report}");
+        assert_eq!(report["available"], true);
+        assert_eq!(
+            (&report["observed"], &report["compared"], &report["stable"]),
+            (&json!(3), &json!(2), &json!(1))
+        );
+        assert_eq!(report["losses"]["total"]["events"], 1, "{report}");
+        assert_eq!(report["losses"]["proxy"]["lost_tokens"], 40_000);
+        assert_eq!(report["losses"]["client"]["events"], 0);
+        let tool_set = report["drift"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["segment"] == "tool_set")
+            .unwrap_or_else(|| panic!("no tool_set row in {report}"));
+        assert_eq!(
+            (&tool_set["proxy_turns"], &tool_set["proxy_losses"]),
+            (&json!(1), &json!(1))
+        );
+        let model = &report["composition"][0];
+        assert_eq!(model["tools_share"], 0.6);
+        assert_eq!(model["undeferred_requests"], 3);
+    }
+
+    let path = "/v1/stats/prefix?format=jsonl&window=1h";
+    let (status, content_type, _, body) = get_raw(&harness, path, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(content_type, "application/x-ndjson");
+    let lines = jsonl_lines(&body);
+    assert_eq!(lines[0]["record"], "summary");
+    assert!(lines.iter().any(|line| line["record"] == "drift"), "{body}");
+
+    let (status, page) = harness.get("/v1/stats/prefix?format=html").await;
+    assert_eq!(status, StatusCode::OK);
+    let page = text(&page);
+    assert!(page.contains("\"view\":\"prefix\""));
+    assert!(page.contains("RENDER.prefix = ") && page.contains("api: \"stats/prefix\""));
+
+    let (status, _) = harness.get("/v1/stats/prefix?nonsense=1").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 /// The three scorecard views — models, activity, cohorts — over HTTP: the

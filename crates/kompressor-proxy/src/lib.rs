@@ -65,6 +65,7 @@ pub mod authmode;
 mod bodycapture;
 pub mod bodycodec;
 mod cachettl;
+pub mod drift;
 pub mod failopen;
 mod handler;
 pub mod headers;
@@ -112,6 +113,10 @@ pub struct ProxyState {
     /// The upstreams and models that refused `prompt_cache_retention`, so it
     /// is not sent there again.
     pub(crate) retention: Arc<retention::Rejections>,
+    /// The previous request of each conversation, reduced to hashes, so the
+    /// next can say which part of the prefix moved and on which side of this
+    /// proxy. Observation only: nothing reads it to decide what to send.
+    pub(crate) drift: Arc<drift::DriftTracker>,
 }
 
 impl ProxyState {
@@ -133,6 +138,7 @@ impl ProxyState {
             prefixes: Arc::new(prefixcache::PrefixTracker::new(ttl)),
             keepwarm: Arc::new(keepwarm::KeepWarm::default()),
             retention: Arc::new(retention::Rejections::default()),
+            drift: Arc::new(drift::DriftTracker::default()),
         }
     }
 

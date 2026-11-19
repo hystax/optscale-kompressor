@@ -1,19 +1,19 @@
 //! The second set of dashboards: a health overview, trends, compression
 //! yield, a conversation timeline, store health, keep-warm return, cache
 //! losses set against compression, upstream health, traffic composition, the
-//! engine, data quality, a per-model scorecard, activity by hour of the week
-//! and conversation cohorts.
+//! engine, data quality, a per-model scorecard, activity by hour of the week,
+//! conversation cohorts and what moved in the cacheable prefix.
 //!
 //! Each view has a JSON route under each version prefix —
-//! `/v1/stats/{health,trends,yield,store-health,keepwarm,cache-loss,upstream,traffic,engine,quality,models,activity,cohorts}`
+//! `/v1/stats/{health,trends,yield,store-health,keepwarm,cache-loss,upstream,traffic,engine,quality,models,activity,cohorts,prefix}`
 //! — and one
 //! shared page that draws whichever view it was opened on. The timeline has no
 //! route of its own: it draws a conversation's turns from
 //! `/v1/stats/analysis?conversation=`, which already carries them. On the
 //! statistics listener the pages are at `/health`, `/trends`, `/yield`,
 //! `/timeline`, `/cache-loss`, `/traffic`, `/quality`,
-//! `/store`, `/keepwarm`, `/upstream`, `/engine`, `/models`, `/activity` and
-//! `/cohorts`.
+//! `/store`, `/keepwarm`, `/upstream`, `/engine`, `/models`, `/activity`,
+//! `/cohorts` and `/prefix`.
 //!
 //! Credentials, tenant scoping, formats and the page-shell rule are the cache
 //! route's: the shell is served to anyone, the data only to a request that
@@ -38,6 +38,7 @@ use kompressor_stats::dashboards::{
     EngineReport, StoreHealth, StoredRef, TrendBucket, TrendsReport, UpstreamReport, YieldReport,
 };
 use kompressor_stats::health::{HealthReport, Runtime};
+use kompressor_stats::prefix::PrefixReport;
 use kompressor_stats::quality::{QualityReport, QualityRuntime};
 use kompressor_stats::traffic::TrafficReport;
 use kompressor_store::{RefCensus, Tenant};
@@ -82,10 +83,11 @@ pub(crate) enum View {
     Models,
     Activity,
     Cohorts,
+    Prefix,
 }
 
 impl View {
-    pub(crate) const ALL: [View; 14] = [
+    pub(crate) const ALL: [View; 15] = [
         View::Health,
         View::Trends,
         View::Yield,
@@ -100,6 +102,7 @@ impl View {
         View::Models,
         View::Activity,
         View::Cohorts,
+        View::Prefix,
     ];
 
     /// The page's path on the statistics listener.
@@ -119,6 +122,7 @@ impl View {
             View::Models => "/models",
             View::Activity => "/activity",
             View::Cohorts => "/cohorts",
+            View::Prefix => "/prefix",
         }
     }
 
@@ -139,6 +143,7 @@ impl View {
             View::Models => "/stats/models",
             View::Activity => "/stats/activity",
             View::Cohorts => "/stats/cohorts",
+            View::Prefix => "/stats/prefix",
         }
     }
 
@@ -158,6 +163,7 @@ impl View {
             View::Models => "models",
             View::Activity => "activity",
             View::Cohorts => "cohorts",
+            View::Prefix => "prefix",
         }
     }
 }
@@ -452,6 +458,12 @@ async fn respond(
         View::CacheLoss => {
             let report: CompressionCacheReport = state
                 .with_stats(move |r| r.compression_cache(&tenant, from_ms, to_ms, conversations))
+                .await?;
+            Ok(answer(format, view, now, window, report))
+        }
+        View::Prefix => {
+            let report: PrefixReport = state
+                .with_stats(move |r| r.prefix(&tenant, from_ms, to_ms))
                 .await?;
             Ok(answer(format, view, now, window, report))
         }

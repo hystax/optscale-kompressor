@@ -820,6 +820,19 @@ impl PrefixTracker {
         entry.idled_past_ttl
     }
 
+    /// How long the conversation has been idle — since its last response or
+    /// its last keep-warm read — and whether the provider has ever served it
+    /// from cache. `None` for a conversation not seen before.
+    ///
+    /// Read-only, and for the record only: what the next response reports is
+    /// scored against it to learn how well a lapse can be predicted on the
+    /// request that finds it. Nothing decides what to send from this.
+    pub fn idle(&self, fingerprint: u64) -> Option<(Duration, bool)> {
+        let seen = self.seen.lock().ok()?;
+        let entry = seen.get(&fingerprint)?;
+        Some((entry.at.elapsed(), entry.was_warm))
+    }
+
     /// A keep-warm ping just read this conversation's prefix from cache.
     ///
     /// The prefix was used, so the clock that decides whether the conversation

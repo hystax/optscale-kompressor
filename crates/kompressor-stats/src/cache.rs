@@ -576,6 +576,50 @@ impl StatsReader {
     }
 }
 
+/// One row that failed to read back the prefix the row before it left.
+#[derive(Clone, Debug)]
+pub(crate) struct LossRow {
+    pub(crate) request_id: String,
+    pub(crate) keep_warm: bool,
+    pub(crate) cause: Cause,
+    pub(crate) lost_tokens: i64,
+    /// What the loss cost, in input-equivalent tokens.
+    pub(crate) cost: f64,
+}
+
+impl StatsReader {
+    /// Every loss in the window, by the row it happened on: the same walk the
+    /// cache report makes, kept per request so another report can say what
+    /// else was true of that request.
+    pub(crate) fn cache_losses(
+        &self,
+        tenant: &str,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<(Vec<LossRow>, bool), StatsError> {
+        let (rows, truncated) = self.cache_rows(tenant, from_ms, to_ms)?;
+        let mut walks: HashMap<&str, Walk> = HashMap::new();
+        let mut losses = Vec::new();
+        for row in &rows {
+            let Some(conversation) = row.conversation.as_deref() else {
+                continue;
+            };
+            let walk = walks.entry(conversation).or_default();
+            let turn = step(walk, row, row.usage());
+            if turn.lost_tokens > 0 {
+                losses.push(LossRow {
+                    request_id: row.request_id.clone(),
+                    keep_warm: row.keep_warm,
+                    cause: turn.cause.unwrap_or(Cause::PrefixChange),
+                    lost_tokens: turn.lost_tokens,
+                    cost: loss_cost(row, turn.lost_tokens),
+                });
+            }
+        }
+        Ok((losses, truncated))
+    }
+}
+
 fn build(
     tenant: &str,
     from_ms: i64,
@@ -1259,6 +1303,7 @@ mod db_tests {
 
     fn event(time_ms: i64, tenant: &str, read: u32, write: u32, keep_warm: bool) -> Event {
         Event::ProxyRequest(ProxyRequestEvent {
+            prefix: None,
             context: None,
             timing: None,
             time_ms,

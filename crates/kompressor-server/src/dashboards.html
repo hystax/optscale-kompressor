@@ -143,6 +143,7 @@ const VIEWS = [
   { id: "models", title: "Models", api: "stats/models" },
   { id: "activity", title: "Activity", api: "stats/activity" },
   { id: "cohorts", title: "Conversation cohorts", api: "stats/cohorts" },
+  { id: "prefix", title: "Prefix drift", api: "stats/prefix" },
 ];
 const view = VIEWS.find(v => v.id === SETTINGS.view) || VIEWS[0];
 const $ = id => document.getElementById(id);
@@ -600,6 +601,90 @@ RENDER.traffic = d => {
     ], d.errors, { empty: "No error text in this window." }),
       note("Digits are folded to # so one message with different ids or sizes counts once.")),
   ];
+};
+
+const SEGMENT_TEXT = { beta: "Beta headers", tool_set: "Tools added or removed", tool_order: "Tool order", tool_defs: "Tool definitions", system: "System prompt", history: "Earlier messages" };
+RENDER.prefix = d => {
+  if (!d.available) {
+    return [note("This database was last written by a build that did not record prefix observations. They start with the first request a current build proxies.")];
+  }
+  const l = d.losses;
+  const explained = l.client.events + l.proxy.events;
+  const share = (a, b) => b ? a / b : null;
+  const lossRows = [
+    ["A segment the client changed", l.client], ["A segment only the proxy changed", l.proxy],
+    ["Compared, and nothing hashed had moved", l.none_seen], ["Nothing to compare with (first request seen, or a branch)", l.not_compared],
+    ["No observation on the row (ping, relayed frame, older row)", l.unobserved],
+  ].map(([label, b]) => ({ label, ...b }));
+  const asked = d.cold.filter(c => c.asked), assumed = d.cold.filter(c => !c.asked);
+  const coldTable = rows => table([
+    ["API family", r => r.api_family, { text: true }],
+    ["Lifetime", r => r.lifetime_s + " s"],
+    ["Margin", r => "+" + r.margin_s + " s"],
+    ["Scored", r => n(r.scored)],
+    ["Predicted cold", r => n(r.predicted)],
+    ["Read nothing", r => n(r.confirmed)],
+    ["Read from cache", r => r.wrong ? el("span", { class: "bad" }, n(r.wrong)) : "0"],
+    ["Missed", r => n(r.missed)],
+    ["Precision", r => r.predicted ? pct(r.precision, 2) : "–"],
+    ["Recall", r => r.confirmed + r.missed ? pct(r.recall) : "–"],
+  ], rows, { empty: "No request of a warm conversation reported usage in this window." });
+  return [
+    tiles([
+      ["Observed requests", n(d.observed), "of " + n(d.requests) + " client requests" + (d.truncated ? ", newest only" : "")],
+      ["Compared with the turn before", n(d.compared), pct(share(d.stable, d.compared)) + " with nothing moved"],
+      ["Prefix-change losses", n(l.total.events), tok(l.total.lost_tokens) + " tokens not read back", l.total.events ? "warn" : "good"],
+      ["Put down to the client", n(l.client.events), tok(l.client.lost_tokens) + " tokens"],
+      ["Put down to the proxy", n(l.proxy.events), tok(l.proxy.lost_tokens) + " tokens", l.proxy.events ? "bad" : "good"],
+      ["Explained", pct(share(explained, l.total.events)), n(l.none_seen.events) + " compared with nothing seen to move"],
+    ]),
+    section("What moved, and what it cost", table([
+      ["Segment", r => SEGMENT_TEXT[r.segment] || r.segment, { text: true }],
+      ["Client changed it", r => n(r.client_turns)],
+      ["Losses", r => n(r.client_losses)],
+      ["Tokens lost", r => tok(r.client_lost_tokens)],
+      ["Cost", r => tok(r.client_cost)],
+      ["Proxy changed it", r => r.proxy_turns ? el("span", { class: "bad" }, n(r.proxy_turns)) : "0"],
+      ["Losses", r => n(r.proxy_losses)],
+      ["Tokens lost", r => tok(r.proxy_lost_tokens)],
+      ["Cost", r => tok(r.proxy_cost)],
+    ], d.drift),
+      note("Segments are listed in the order a provider renders them. A loss is put down to the earliest one that changed, because everything after the first changed byte is lost whatever else changed with it. " +
+        "Cache markers, deferred tools and the string-or-single-block spelling of a message are left out of the comparison, as the provider leaves them out. Cost is in input-equivalent tokens.")),
+    section("Every prefix-change loss, by what explains it", table([
+      ["Explanation", r => r.label, { text: true }],
+      ["Losses", r => n(r.events)],
+      ["Tokens lost", r => tok(r.lost_tokens)],
+      ["Cost", r => tok(r.cost)],
+    ], lossRows)),
+    section("What a request is made of", table([
+      ["Model", r => r.model || "(none)", { text: true }],
+      ["API family", r => r.api_family, { text: true }],
+      ["Requests", r => n(r.requests)],
+      ["Request size", r => bytes(Math.round(r.body_bytes / r.requests))],
+      ["Tools", r => pct(r.tools_share)],
+      ["System", r => pct(r.system_share)],
+      ["Reasoning", r => pct(r.reasoning_share)],
+      ["Opaque conversation", r => pct(r.opaque_share)],
+      ["Tools per request", r => r.tools_per_request.toFixed(1)],
+      ["Deferring", r => pct(share(r.deferring_requests, r.requests))],
+      ["12+ tools, none deferred", r => pct(share(r.undeferred_requests, r.requests))],
+    ], d.composition, { empty: "No observed request in this window." }),
+      note("Shares are of request bytes, not tokens: they rank the segments and do not price them. Opaque conversation is the part of the messages the engine holds no text for — tool-call arguments, images, structured results, signatures.")),
+    section("Volatile values in instructions and tool descriptions", tiles([
+      ["Conversations", n(d.volatile.conversations), n(d.volatile.requests) + " requests reported any"],
+      ["Date-times", n(d.volatile.with_timestamps), "requests"],
+      ["Dates", n(d.volatile.with_dates), "requests"],
+      ["UUIDs", n(d.volatile.with_uuids), "requests"],
+      ["JWT-shaped tokens", n(d.volatile.with_jwts), "requests"],
+    ]),
+      note("Counted on a conversation's first request and whenever its instructions or tools changed. A value that changes by itself sits ahead of the whole conversation in the cached prefix.")),
+    section("Predicting a lapse on the request that finds it", coldTable(asked),
+      note("Each request of a conversation the provider had served from cache, scored as it arrived: predicted cold when it had been idle longer than the lifetime its previous request asked for, plus the margin. " +
+        "Read from cache is the expensive mistake — acting on that prediction would have rewritten a live prefix.")),
+    assumed.length ? section("The same, where the request names no lifetime", coldTable(assumed),
+      note("The lifetime is assumed, not asked for, so every row is one guess about the provider's retention.")) : null,
+  ].filter(Boolean);
 };
 
 const QUALITY_AREAS = [["requests", "Proxied requests"], ["engine", "Engine runs"], ["retrieval", "Retrievals"], ["limits", "What the database cannot hold"]];

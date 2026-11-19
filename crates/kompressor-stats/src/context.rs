@@ -53,6 +53,113 @@ impl ProxyTiming {
     }
 }
 
+/// What the proxy observed about one request's cacheable prefix. Sizes, hashes,
+/// verdicts and counts only: no prompt text, no header values.
+///
+/// Filed as `proxy_requests.prefix_json` (schema v15). A row without it was
+/// written before v15, or is one the proxy could not parse; either way it is
+/// "unknown", never "nothing drifted".
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrefixObservation {
+    /// Whether there was an earlier request of this conversation to compare
+    /// with. False on a conversation's first request and on a branch (a
+    /// request carrying fewer messages than the one before it).
+    pub compared: bool,
+    /// Segments the client sent differently from its previous request: a
+    /// bitmask of the `DRIFT_*` constants.
+    pub drift_in: u8,
+    /// Segments that went upstream differently from the previous request
+    /// although the client had not changed them: the proxy's own doing.
+    pub drift_out: u8,
+    /// The first earlier message the client changed, when it changed one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_in_at: Option<u32>,
+    /// The first earlier message that went upstream changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_out_at: Option<u32>,
+    /// Serialized size of the whole request the client sent.
+    pub body_bytes: u32,
+    pub system_bytes: u32,
+    /// Tool definitions the model is shown, deferred ones left out.
+    pub tools_bytes: u32,
+    pub tools_count: u32,
+    /// Tools marked `defer_loading`, which the provider does not render.
+    pub tools_deferred: u32,
+    pub messages_bytes: u32,
+    pub messages_count: u32,
+    /// Text in the conversation the engine can see. The rest of
+    /// `messages_bytes` is opaque to it: tool-call arguments, images,
+    /// structured results, signatures.
+    pub text_bytes: u32,
+    /// Plain-text reasoning the client re-sent.
+    pub reasoning_bytes: u32,
+    /// Volatile-looking values in the system prompt and tool descriptions,
+    /// counted when those segments were new or had changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volatile: Option<Volatile>,
+    /// Idle time since the conversation's last response or keep-warm read,
+    /// measured as this request arrived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_ms: Option<u64>,
+    /// Whether the provider had ever served this conversation from cache.
+    pub was_warm: bool,
+    /// The cache lifetime the previous request asked the provider for, in
+    /// seconds, where the request says: Anthropic's five minutes or an hour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifetime_s: Option<u32>,
+}
+
+/// The client changed its system prompt.
+pub const DRIFT_SYSTEM: u8 = 1;
+/// A tool's definition changed while the list of names did not.
+pub const DRIFT_TOOL_DEFS: u8 = 1 << 1;
+/// The same tools arrived in another order.
+pub const DRIFT_TOOL_ORDER: u8 = 1 << 2;
+/// Tools were added or removed.
+pub const DRIFT_TOOL_SET: u8 = 1 << 3;
+/// The `anthropic-beta` / `openai-beta` tokens changed.
+pub const DRIFT_BETA: u8 = 1 << 4;
+/// A message already sent on the previous request came back different.
+pub const DRIFT_HISTORY: u8 = 1 << 5;
+
+/// Every drift bit with the name reports use for it.
+pub const DRIFT_NAMES: [(u8, &str); 6] = [
+    (DRIFT_SYSTEM, "system"),
+    (DRIFT_TOOL_DEFS, "tool_defs"),
+    (DRIFT_TOOL_ORDER, "tool_order"),
+    (DRIFT_TOOL_SET, "tool_set"),
+    (DRIFT_BETA, "beta"),
+    (DRIFT_HISTORY, "history"),
+];
+
+/// The names of the bits set in `mask`, in [`DRIFT_NAMES`] order.
+pub fn drift_names(mask: u8) -> Vec<&'static str> {
+    DRIFT_NAMES
+        .iter()
+        .filter(|(bit, _)| mask & bit != 0)
+        .map(|(_, name)| *name)
+        .collect()
+}
+
+/// Counts of values that look as if they change from one request to the next.
+/// Each count stops at 255.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Volatile {
+    /// `2026-11-20T10:15:00`-shaped date-times.
+    pub timestamps: u8,
+    /// `2026-11-20`-shaped dates with no time after them.
+    pub dates: u8,
+    pub uuids: u8,
+    /// Three dot-separated base64url runs opening with `eyJ`.
+    pub jwts: u8,
+}
+
+impl Volatile {
+    pub fn any(self) -> bool {
+        self.timestamps > 0 || self.dates > 0 || self.uuids > 0 || self.jwts > 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
