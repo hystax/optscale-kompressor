@@ -142,6 +142,11 @@ impl RefStore for MemoryRefStore {
             let key = (tenant.0.clone(), *id);
             match entries.get_mut(&key) {
                 Some(existing) => {
+                    // A row past its window and not yet swept is no row: its
+                    // `created_at` must not make the new handle born expired.
+                    if is_expired(&existing.record, existing.max_lifetime_seconds, now) {
+                        existing.record.created_at = now;
+                    }
                     created.push(existing.record.created_at);
                     existing.record.fragment.clear();
                     existing.record.fragment.push_str(fragment);

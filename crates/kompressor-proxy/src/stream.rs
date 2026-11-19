@@ -988,6 +988,20 @@ impl StreamRelay {
         hidden: &Value,
         ours_seen: &mut Vec<String>,
     ) -> HandOver {
+        // No retriever, no call of ours. This request never offered the tool —
+        // execution is the client's, or the client declares it itself — so a
+        // call by that name in the held frames belongs to the client, exactly
+        // as the passthrough branch of `read_round` already treats it. Without
+        // this the frame opening the call was dropped, its arguments went out
+        // orphaned and the stop reason was rewritten to say no tool was called.
+        if self.retriever.is_none() {
+            for h in held {
+                if !self.emit(tx, &h.frame, rounds, hidden).await {
+                    return HandOver::ClientGone;
+                }
+            }
+            return HandOver::Sent { elided: false };
+        }
         // Chat first, and before the `ours` question is even asked. `Held.call`
         // attributes a whole frame to ONE call, which a coalesced Chat delta
         // carrying both sides cannot be: with foreign-call precedence such a
@@ -1542,7 +1556,10 @@ async fn next_chunk(
             // the departure costs something.
             // The caller logs this, with what was being held at the time.
             _ = tx.closed(), if silent => return Pull::ClientGone,
-            _ = tokio::time::sleep(keepalive), if silent => {
+            // Zero is "off", as for every other duration here. `sleep(ZERO)`
+            // is ready at once, so without the guard the loop spun, writing a
+            // keepalive comment to the client on every pass.
+            _ = tokio::time::sleep(keepalive), if silent && !keepalive.is_zero() => {
                 let beat = if intercepting { KEEPALIVE } else { KEEPALIVE_BUFFERING };
                 if !send(tx, Bytes::from_static(beat)).await {
                     return Pull::ClientGone;
@@ -1562,7 +1579,7 @@ async fn send_with_keepalive(
     loop {
         tokio::select! {
             result = &mut sending => return Some(result),
-            _ = tokio::time::sleep(keepalive) => {
+            _ = tokio::time::sleep(keepalive), if !keepalive.is_zero() => {
                 if !send(tx, Bytes::from_static(KEEPALIVE)).await {
                     return None;
                 }
@@ -1637,6 +1654,11 @@ struct StreamTurn {
     /// Completed Responses output items, kept verbatim so a reasoning item is
     /// carried into the next round rather than made the model redo it.
     items: Vec<Value>,
+    /// Anthropic content blocks by index, assembled from their deltas, for the
+    /// same reason: a turn that opens with a signed `thinking` block has to be
+    /// sent back with it, in place, or the next round is refused or the model
+    /// starts over without what it had just worked out.
+    blocks: BTreeMap<u64, Value>,
     /// The call slot the frame currently being observed belongs to.
     ///
     /// Set by `entry`, read once by `observe`. A frame has to be attributable
@@ -1654,7 +1676,63 @@ impl StreamTurn {
             calls: Vec::new(),
             index: BTreeMap::new(),
             items: Vec::new(),
+            blocks: BTreeMap::new(),
             touched: None,
+        }
+    }
+
+    /// Fold an Anthropic content-block frame into [`StreamTurn::blocks`].
+    fn assemble_anthropic(&mut self, kind: &str, value: &Value) {
+        let Some(index) = value.get("index").and_then(Value::as_u64) else {
+            return;
+        };
+        match kind {
+            "content_block_start" => {
+                if let Some(block) = value.get("content_block").filter(|b| b.is_object()) {
+                    self.blocks.insert(index, block.clone());
+                }
+            }
+            "content_block_delta" => {
+                let (Some(block), Some(delta)) = (self.blocks.get_mut(&index), value.get("delta"))
+                else {
+                    return;
+                };
+                // Each delta type extends one string field of its block.
+                let field = match delta.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => "text",
+                    Some("thinking_delta") => "thinking",
+                    Some("signature_delta") => "signature",
+                    Some("citations_delta") => {
+                        if let (Some(citation), Some(block)) =
+                            (delta.get("citation"), block.as_object_mut())
+                        {
+                            let list = block.entry("citations").or_insert_with(|| json!([]));
+                            if !list.is_array() {
+                                *list = json!([]);
+                            }
+                            if let Some(list) = list.as_array_mut() {
+                                list.push(citation.clone());
+                            }
+                        }
+                        return;
+                    }
+                    // `input_json_delta` is assembled per call, in `calls`.
+                    _ => return,
+                };
+                let Some(piece) = delta.get(field).and_then(Value::as_str) else {
+                    return;
+                };
+                if let Some(block) = block.as_object_mut() {
+                    let mut text = block
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    text.push_str(piece);
+                    block.insert(field.to_string(), Value::String(text));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1791,7 +1869,14 @@ impl StreamTurn {
                 entry.id = id.to_string();
             }
             let function = call.get("function");
-            if let Some(name) = function.and_then(|f| f.get("name")).and_then(Value::as_str) {
+            // Some dialects repeat `"name": ""` on every continuation delta. An
+            // empty name names nothing: letting it overwrite the recorded one
+            // made the call anonymous — no longer ours, no longer foreign.
+            if let Some(name) = function
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+            {
                 entry.name = name.to_string();
                 signal = match (signal, named(name)) {
                     (Signal::OtherCall, _) | (_, Signal::OtherCall) => Signal::OtherCall,
@@ -1827,7 +1912,32 @@ impl StreamTurn {
                 if kind == "response.output_item.done" {
                     self.items.push(item.clone());
                 }
-                if item.get("type").and_then(Value::as_str) != Some("function_call") {
+                let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+                if crate::turn::is_client_side_call(item_type) {
+                    // A call the client must answer that is not a
+                    // `function_call` — Codex's `apply_patch` is a
+                    // `custom_tool_call`. Recorded under its own name (or its
+                    // type, when it has none) so the turn knows a foreign call
+                    // is in it and hands over.
+                    let key = item_key(value, item);
+                    let name = item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.is_empty() && *name != RETRIEVE_TOOL_NAME)
+                        .unwrap_or(item_type)
+                        .to_string();
+                    let entry = self.entry(key);
+                    if let Some(id) = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(Value::as_str)
+                    {
+                        entry.id = id.to_string();
+                    }
+                    entry.name = name;
+                    return Signal::OtherCall;
+                }
+                if item_type != "function_call" {
                     return Signal::None;
                 }
                 let key = item_key(value, item);
@@ -1888,6 +1998,7 @@ impl StreamTurn {
             .get("index")
             .map(|index| index.to_string())
             .unwrap_or_else(|| "0".to_string());
+        self.assemble_anthropic(kind, value);
         match kind {
             "content_block_start" => {
                 let block = value.get("content_block").unwrap_or(&Value::Null);
@@ -2018,19 +2129,50 @@ impl StreamTurn {
                 json!({"output": items})
             }
             ApiFamily::AnthropicMessages => {
-                let blocks: Vec<Value> = self
-                    .calls
-                    .iter()
-                    .map(|call| {
-                        json!({
-                            "type": "tool_use",
-                            "id": call.id,
-                            "name": call.name,
-                            "input": serde_json::from_str::<Value>(&call.arguments)
-                                .unwrap_or_else(|_| json!({})),
-                        })
+                let tool_use = |call: &PartialCall| {
+                    json!({
+                        "type": "tool_use",
+                        "id": call.id,
+                        "name": call.name,
+                        "input": serde_json::from_str::<Value>(&call.arguments)
+                            .unwrap_or_else(|_| json!({})),
                     })
-                    .collect();
+                };
+                // The whole turn, in the order it was streamed: thinking with
+                // its signature, any text, and the calls. The buffered path
+                // replays `content` verbatim and this has to say the same
+                // thing. Replaying the calls alone dropped the thinking block
+                // an extended-thinking turn must begin with.
+                let mut used = vec![false; self.calls.len()];
+                let mut blocks: Vec<Value> = Vec::new();
+                for block in self.blocks.values() {
+                    match block.get("type").and_then(Value::as_str) {
+                        Some("tool_use") => {
+                            let id = block.get("id").and_then(Value::as_str);
+                            let at = self
+                                .calls
+                                .iter()
+                                .position(|call| Some(call.id.as_str()) == id);
+                            if let Some(at) = at.filter(|&at| !used[at]) {
+                                used[at] = true;
+                                blocks.push(tool_use(&self.calls[at]));
+                            }
+                        }
+                        // An empty text block is refused upstream.
+                        Some("text")
+                            if block
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .is_none_or(str::is_empty) => {}
+                        _ => blocks.push(block.clone()),
+                    }
+                }
+                // A call whose opening frame carried no index still goes back.
+                for (call, used) in self.calls.iter().zip(used) {
+                    if !used {
+                        blocks.push(tool_use(call));
+                    }
+                }
                 json!({"content": blocks})
             }
         }
@@ -2205,6 +2347,143 @@ mod tests {
         // The same shape on another family is not read: keep-warm is
         // Anthropic's alone.
         assert_eq!(frame_stop_reason(ApiFamily::OpenAiChat, &delta), None);
+    }
+
+    /// The assistant turn replayed into a retrieve round is the turn the model
+    /// produced: its signed thinking block first, then the call. The streamed
+    /// path used to rebuild it from the calls alone.
+    #[test]
+    fn a_streamed_anthropic_turn_is_replayed_with_its_thinking_block() {
+        let (turn, _) = observe(
+            ApiFamily::AnthropicMessages,
+            &[
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"let me "}}"#,
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"look"}}"#,
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"SIG"}}"#,
+                r#"{"type":"content_block_stop","index":0}"#,
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"OPAQUE"}}"#,
+                r#"{"type":"content_block_stop","index":1}"#,
+                r#"{"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}"#,
+                r#"{"type":"content_block_stop","index":2}"#,
+                r#"{"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"toolu_1","name":"optscale_kompressor_retrieve","input":{}}}"#,
+                r#"{"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"ref\":"}}"#,
+                r#"{"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"\"k_AbC123dEf456\"}"}}"#,
+                r#"{"type":"content_block_stop","index":3}"#,
+            ],
+        );
+        assert_eq!(
+            turn.as_response(),
+            json!({"content": [
+                {"type": "thinking", "thinking": "let me look", "signature": "SIG"},
+                {"type": "redacted_thinking", "data": "OPAQUE"},
+                // the empty text block is left out: upstream refuses one
+                {"type": "tool_use", "id": "toolu_1", "name": "optscale_kompressor_retrieve",
+                 "input": {"ref": "k_AbC123dEf456"}},
+            ]})
+        );
+    }
+
+    /// Text the model wrote before the call is part of the turn too, and a
+    /// turn of calls alone is replayed as it always was.
+    #[test]
+    fn a_streamed_anthropic_turn_keeps_its_text_and_its_block_order() {
+        let (turn, _) = observe(
+            ApiFamily::AnthropicMessages,
+            &[
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Checking "}}"#,
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"the log."}}"#,
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"a","name":"optscale_kompressor_retrieve","input":{}}}"#,
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"ref\":\"k_AbC123dEf456\"}"}}"#,
+                r#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"b","name":"optscale_kompressor_retrieve","input":{}}}"#,
+                r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"ref\":\"k_ZyX987wVu654\"}"}}"#,
+            ],
+        );
+        let response = turn.as_response();
+        let content = response["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(
+            content[0],
+            json!({"type": "text", "text": "Checking the log."})
+        );
+        assert_eq!(
+            (&content[1]["id"], &content[2]["id"]),
+            (&json!("a"), &json!("b"))
+        );
+        assert_eq!(content[2]["input"], json!({"ref": "k_ZyX987wVu654"}));
+    }
+
+    #[test]
+    fn an_empty_name_on_a_continuation_delta_does_not_unname_the_call() {
+        let (turn, _) = observe(
+            ApiFamily::OpenAiChat,
+            &[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"optscale_kompressor_retrieve","arguments":""}}]}}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"","arguments":"{\"ref\":\"k_AbC123dEf456\"}"}}]}}]}"#,
+            ],
+        );
+        let calls = turn.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, RETRIEVE_TOOL_NAME);
+        assert!(turn.is_ours(0));
+
+        // And a client's call stays a foreign call.
+        let (turn, _) = observe(
+            ApiFamily::OpenAiChat,
+            &[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"Bash","arguments":""}}]}}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"","arguments":"{}"}}]}}]}"#,
+            ],
+        );
+        assert!(turn.has_foreign_call());
+    }
+
+    /// Codex's `apply_patch` is a `custom_tool_call`, not a `function_call`.
+    /// Unseen, a turn pairing it with our call looked retrieve-only.
+    #[test]
+    fn a_responses_call_that_is_not_a_function_call_is_still_the_clients() {
+        for kind in [
+            "custom_tool_call",
+            "local_shell_call",
+            "computer_call",
+            "mcp_approval_request",
+        ] {
+            let added = format!(
+                r#"{{"type":"response.output_item.added","output_index":1,"item":{{"type":"{kind}","id":"x_1","call_id":"c2","name":"apply_patch"}}}}"#
+            );
+            let (turn, signals) = observe(
+                ApiFamily::OpenAiResponses,
+                &[
+                    r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"c1","name":"optscale_kompressor_retrieve","arguments":""}}"#,
+                    &added,
+                ],
+            );
+            assert_eq!(
+                signals,
+                vec![Signal::RetrieveCall, Signal::OtherCall],
+                "{kind}"
+            );
+            assert!(turn.has_foreign_call(), "{kind}");
+            assert!(turn.is_ours(0) && !turn.is_ours(1), "{kind}");
+        }
+        // What the provider runs itself is nobody's turn.
+        for kind in [
+            "web_search_call",
+            "file_search_call",
+            "code_interpreter_call",
+            "image_generation_call",
+            "mcp_call",
+            "reasoning",
+            "message",
+        ] {
+            let added = format!(
+                r#"{{"type":"response.output_item.added","output_index":0,"item":{{"type":"{kind}","id":"x_1"}}}}"#
+            );
+            let (turn, signals) = observe(ApiFamily::OpenAiResponses, &[&added]);
+            assert_eq!(signals, vec![Signal::None], "{kind}");
+            assert!(!turn.has_foreign_call(), "{kind}");
+        }
     }
 
     #[test]
@@ -3019,6 +3298,126 @@ mod completion_tests {
         body.split_inclusive("\n\n")
             .map(|frame| Ok(Bytes::from(frame.to_string())))
             .collect()
+    }
+
+    async fn relayed(family: ApiFamily, body: &str) -> String {
+        let relay = relay(family);
+        let mut stream: BoxStream<'static, reqwest::Result<Bytes>> =
+            Box::pin(futures_util::stream::iter(per_frame(body)));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
+        let _ = relay
+            .read_round(&mut stream, &tx, 0, &json!({}), false)
+            .await;
+        drop(tx);
+        let mut out = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            out.extend_from_slice(&chunk.expect("no relay error"));
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    /// With no retriever this request never offered the tool: execution is the
+    /// client's (`retrieve_execution = "client"`), or the client declares the
+    /// tool itself. A call to `optscale_kompressor_retrieve` in the stream is
+    /// then the client's own, and the relay must pass it through untouched.
+    ///
+    /// The passthrough branch already knew this. The hand-over did not: it
+    /// dropped the frame that opens the call, let the argument frames through
+    /// orphaned, and rewrote the stop reason to say no tool had been called —
+    /// so the client never ran the retrieval the model was waiting on.
+    #[tokio::test]
+    async fn a_retrieve_call_the_client_owns_is_relayed_untouched_on_anthropic() {
+        let body = concat!(
+            "event: message_start\n",
+            r#"data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":1}}}"#,
+            "\n\n",
+            "event: content_block_start\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"optscale_kompressor_retrieve","input":{}}}"#,
+            "\n\n",
+            "event: content_block_delta\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"ref\":\"k_AbC123dEf456\"}"}}"#,
+            "\n\n",
+            "event: content_block_stop\n",
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "\n\n",
+            "event: message_delta\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}"#,
+            "\n\n",
+            "event: message_stop\n",
+            r#"data: {"type":"message_stop"}"#,
+            "\n\n",
+        );
+        assert_eq!(relayed(ApiFamily::AnthropicMessages, body).await, body);
+    }
+
+    #[tokio::test]
+    async fn a_retrieve_call_the_client_owns_is_relayed_untouched_on_chat() {
+        let body = concat!(
+            r#"data: {"choices":[{"index":0,"finish_reason":null,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"optscale_kompressor_retrieve","arguments":""}}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"index":0,"finish_reason":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"ref\":\"k_AbC123dEf456\"}"}}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"index":0,"finish_reason":"tool_calls","delta":{}}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        assert_eq!(relayed(ApiFamily::OpenAiChat, body).await, body);
+    }
+
+    #[tokio::test]
+    async fn a_retrieve_call_the_client_owns_is_relayed_untouched_on_responses() {
+        let body = concat!(
+            "event: response.output_item.added\n",
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"c1","name":"optscale_kompressor_retrieve","arguments":""}}"#,
+            "\n\n",
+            "event: response.function_call_arguments.delta\n",
+            r#"data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":"{\"ref\":\"k_AbC123dEf456\"}"}"#,
+            "\n\n",
+            "event: response.output_item.done\n",
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"c1","name":"optscale_kompressor_retrieve","arguments":"{\"ref\":\"k_AbC123dEf456\"}"}}"#,
+            "\n\n",
+            "event: response.completed\n",
+            r#"data: {"type":"response.completed","response":{"id":"r","status":"completed","output":[{"type":"function_call","id":"fc_1","call_id":"c1","name":"optscale_kompressor_retrieve","arguments":"{\"ref\":\"k_AbC123dEf456\"}"}]}}"#,
+            "\n\n",
+        );
+        assert_eq!(relayed(ApiFamily::OpenAiResponses, body).await, body);
+    }
+
+    /// `proxy.stream_keepalive = 0` means no keepalive. It used to mean a
+    /// keepalive comment on every pass of a loop that never slept.
+    #[tokio::test]
+    async fn a_zero_keepalive_sends_no_keepalive() {
+        let mut idle: BoxStream<'static, reqwest::Result<Bytes>> =
+            Box::pin(futures_util::stream::pending());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+        let pulled = tokio::time::timeout(
+            Duration::from_millis(60),
+            next_chunk(&mut idle, &tx, Duration::ZERO, true, false, None),
+        )
+        .await;
+        assert!(pulled.is_err(), "an idle upstream is waited on, not polled");
+        let mut beats = 0;
+        while rx.try_recv().is_ok() {
+            beats += 1;
+        }
+        assert_eq!(beats, 0, "{beats} keepalive comments were written");
+    }
+
+    /// With an interval, the beat still arrives.
+    #[tokio::test]
+    async fn a_positive_keepalive_still_beats() {
+        let mut idle: BoxStream<'static, reqwest::Result<Bytes>> =
+            Box::pin(futures_util::stream::pending());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+        let _ = tokio::time::timeout(
+            Duration::from_millis(80),
+            next_chunk(&mut idle, &tx, Duration::from_millis(10), true, false, None),
+        )
+        .await;
+        assert!(
+            rx.try_recv().is_ok(),
+            "no keepalive in 80 ms at a 10 ms interval"
+        );
     }
 
     /// The live failure: mimo-v2.6-flash through OpenCode Go reasoned for

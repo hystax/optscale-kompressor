@@ -162,11 +162,7 @@ fn compress_framed<'a>(
     let mut plain_types = Vec::new();
     let (plain, plain_kind) = route(content, role, opts, forced, refs, ctx, &mut plain_types);
     let plain = plain.into_owned();
-    let plain_fragments: Vec<String> = refs.pairs()[mark.pairs..]
-        .iter()
-        .map(|(_, fragment)| fragment.clone())
-        .collect();
-    refs.rollback(mark);
+    let plain_shelved = refs.shelve(mark);
 
     let mut folded_types = Vec::new();
     let (folded, folded_kind) = route(&collapsed, role, opts, forced, refs, ctx, &mut folded_types);
@@ -187,8 +183,7 @@ fn compress_framed<'a>(
         return (Cow::Owned(folded), Some(kind));
     }
 
-    refs.rollback(mark);
-    refs.restash_all(&plain_fragments);
+    refs.reinstate(mark, &plain_shelved);
     applied.extend(plain_types);
     match plain_kind {
         Some(kind) => (Cow::Owned(plain), Some(kind)),
@@ -438,10 +433,11 @@ fn route<'a>(
     // on rollback, and it exists for the same reason: a candidate that cannot
     // ship must not veto the one that can.
     let whole = whole.filter(|_| whole_scratch.oversized_attempts() == 0);
-    // The disqualified reading is dropped, so carry across the refusal that
-    // disqualified it; it is the only account of why this payload compressed
-    // less than it could have.
-    refs.absorb_oversized_refusals(&whole_scratch);
+    // A reading that is dropped — disqualified here, or beaten below — takes
+    // its refusals with it unless they are carried across; they are the only
+    // account of why this payload compressed less than it could have. A reading
+    // that is *adopted* brings its own count, so absorbing it up front as well
+    // reported every refusal twice.
 
     match (mixed_candidate, whole) {
         (Some((mixed_out, mixed_kind, mixed_types, mixed_refs)), whole) => {
@@ -454,6 +450,7 @@ fn route<'a>(
                 applied.extend(whole_types);
                 (Cow::Owned(out), Some(kind))
             } else {
+                refs.absorb_oversized_refusals(&whole_scratch);
                 refs.adopt(mixed_refs);
                 applied.extend(mixed_types);
                 (Cow::Owned(mixed_out), Some(mixed_kind))
@@ -469,10 +466,13 @@ fn route<'a>(
         // inside a single enormous line, which a line-oriented compressor can
         // neither fold nor select from. See `crate::longline` for why this runs
         // here and nowhere earlier.
-        (None, None) => match clip_overlong(content, opts, refs, applied) {
-            Some((out, kind)) => (Cow::Owned(out), Some(kind)),
-            None => (Cow::Borrowed(content), None),
-        },
+        (None, None) => {
+            refs.absorb_oversized_refusals(&whole_scratch);
+            match clip_overlong(content, opts, refs, applied) {
+                Some((out, kind)) => (Cow::Owned(out), Some(kind)),
+                None => (Cow::Borrowed(content), None),
+            }
+        }
     }
 }
 
@@ -736,22 +736,17 @@ pub(crate) fn arbitrate_text(
         Identity::Exact
     };
     let exact = guarded(|| crush_log(content, opts, ctx, refs, exact_identity));
-    let exact_fragments: Vec<String> = refs.pairs()[mark.pairs..]
-        .iter()
-        .map(|(_, fragment)| fragment.clone())
-        .collect();
     let exact_len = exact.as_deref().map(chars_len);
-    refs.rollback(mark);
+    let exact_shelved = refs.shelve(mark);
 
     if !opts.enable_normalised_text_fold {
-        refs.restash_all(&exact_fragments);
+        refs.reinstate(mark, &exact_shelved);
         return exact;
     }
     match guarded(|| crush_log(content, opts, ctx, refs, normalised)) {
         Some(values) if exact_len.is_none_or(|e| chars_len(&values) < e) => Some(values),
         _ => {
-            refs.rollback(mark);
-            refs.restash_all(&exact_fragments);
+            refs.reinstate(mark, &exact_shelved);
             exact
         }
     }
@@ -781,17 +776,12 @@ pub(crate) fn arbitrate_config(
     {
         return Some(claimed);
     }
-    let claimed_fragments: Vec<String> = refs.pairs()[mark.pairs..]
-        .iter()
-        .map(|(_, fragment)| fragment.clone())
-        .collect();
-    refs.rollback(mark);
+    let claimed_shelved = refs.shelve(mark);
     let folded = guarded(|| crush_log(content, opts, ctx, refs, Identity::Values));
     match folded {
         Some(folded) if chars_len(&folded) < chars_len(&claimed) => Some(folded),
         _ => {
-            refs.rollback(mark);
-            refs.restash_all(&claimed_fragments);
+            refs.reinstate(mark, &claimed_shelved);
             Some(claimed)
         }
     }
@@ -1278,6 +1268,97 @@ mod tests {
     /// so a payload whose other groups folded perfectly came back whole.
     /// Measured with three groups and one over the cap: 0.00% against the
     /// 13.18% the two retainable groups are worth.
+    /// Recoverable means every elision has a handle behind it, or the payload
+    /// is returned whole. An arbitration that sets a candidate aside, tries a
+    /// rival, and then takes the first one back used to forget that the first
+    /// had been refused a fragment — so its clip shipped with no handle.
+    ///
+    /// Here the plain route clips a 300-character line it cannot store (the
+    /// cap is 100 bytes), the redraw fold then loses to it on size, and the
+    /// plain reading is reinstated.
+    #[test]
+    fn a_reinstated_reading_that_could_not_store_its_elision_ships_whole() {
+        let opts = EngineOptions {
+            max_ref_bytes: 100,
+            max_line_chars: 64,
+            ..EngineOptions::default()
+        };
+        let content = format!(
+            "{}\n{}\r{}\n",
+            "a".repeat(300),
+            "X".repeat(130),
+            "Y".repeat(130)
+        );
+        let mut refs = opts.collector();
+        let mut applied = Vec::new();
+        let ctx = Context::for_role("tool");
+        let (out, kind) =
+            compress_content(&content, "tool", &opts, None, &mut refs, &ctx, &mut applied);
+        assert_eq!(
+            (out.as_ref(), kind),
+            (content.as_str(), None),
+            "an elision with nothing behind it must not ship in recoverable mode"
+        );
+        assert!(refs.is_empty(), "and nothing is left in the collector");
+    }
+
+    /// The same payload with room to store the clipped line does compress, and
+    /// what it removed is behind a handle: the test above is the cap biting,
+    /// not the payload being incompressible.
+    #[test]
+    fn the_same_reading_ships_when_its_elision_fits() {
+        let opts = EngineOptions {
+            max_line_chars: 64,
+            ..EngineOptions::default()
+        };
+        let content = format!(
+            "{}\n{}\r{}\n",
+            "a".repeat(300),
+            "X".repeat(130),
+            "Y".repeat(130)
+        );
+        let mut refs = opts.collector();
+        let mut applied = Vec::new();
+        let ctx = Context::for_role("tool");
+        let (out, kind) =
+            compress_content(&content, "tool", &opts, None, &mut refs, &ctx, &mut applied);
+        assert!(kind.is_some());
+        assert!(chars_len(&out) < chars_len(&content));
+        assert!(!refs.is_empty());
+        for (id, _) in refs.pairs() {
+            assert!(
+                out.contains(&id.to_string()),
+                "{id} is stored but not referenced"
+            );
+        }
+    }
+
+    /// A refusal is reported once. The whole-payload reading's count used to
+    /// be absorbed before the arbitration *and* added again when that reading
+    /// was adopted.
+    #[test]
+    fn a_refused_fragment_is_counted_once() {
+        let opts = EngineOptions {
+            max_ref_bytes: 20_000,
+            ..EngineOptions::default()
+        };
+        let content = three_fold_groups();
+        let mut refs = opts.collector();
+        let mut applied = Vec::new();
+        let ctx = Context::for_role("tool");
+        let (_, kind) = compress_content(
+            &content,
+            "tool",
+            &opts,
+            Some(ForcedType::Log),
+            &mut refs,
+            &ctx,
+            &mut applied,
+        );
+        assert!(kind.is_some());
+        assert_eq!(refs.oversized_refusals(), 1, "one group was over the cap");
+    }
+
     #[test]
     fn a_fold_group_over_the_cap_does_not_discard_the_groups_under_it() {
         let opts = EngineOptions {

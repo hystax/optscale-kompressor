@@ -324,7 +324,7 @@ impl StatsReader {
         let mut columns = String::from(
             "COALESCE(SUM(time_ms >= ?2), 0),
              COALESCE(SUM(CASE WHEN time_ms >= ?2 THEN tokens_in END), 0),
-             COALESCE(SUM(CASE WHEN time_ms >= ?2 THEN tokens_out END), 0),
+             COALESCE(SUM(CASE WHEN time_ms >= ?2 THEN (CASE WHEN coalesce(outcome,'') = 'discarded' THEN tokens_in ELSE tokens_out END) END), 0),
              COALESCE(SUM(CASE WHEN time_ms >= ?2 THEN messages_total END), 0),
              COALESCE(SUM(CASE WHEN time_ms >= ?2 THEN messages_compressed END), 0),
              COALESCE(SUM(CASE WHEN time_ms >= ?2 THEN refs_emitted END), 0),
@@ -342,7 +342,7 @@ impl StatsReader {
             columns.push_str(&format!(
                 ", COALESCE(SUM(time_ms >= ?{n}), 0),
                    COALESCE(SUM(CASE WHEN time_ms >= ?{n} THEN tokens_in END), 0),
-                   COALESCE(SUM(CASE WHEN time_ms >= ?{n} THEN tokens_in - tokens_out END), 0)"
+                   COALESCE(SUM(CASE WHEN time_ms >= ?{n} THEN tokens_in - (CASE WHEN coalesce(outcome,'') = 'discarded' THEN tokens_in ELSE tokens_out END) END), 0)"
             ));
         }
         let sql = format!(
@@ -419,7 +419,7 @@ impl StatsReader {
             std::collections::BTreeMap::new();
         let mut stmt = self.conn.prepare_cached(
             "SELECT ?2 + ((time_ms - ?2) / ?4) * ?4 AS bucket,
-                    COUNT(*), SUM(tokens_in), SUM(tokens_out)
+                    COUNT(*), SUM(tokens_in), SUM((CASE WHEN coalesce(outcome,'') = 'discarded' THEN tokens_in ELSE tokens_out END))
              FROM optimization_events
              WHERE tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3
              GROUP BY bucket",
@@ -468,7 +468,7 @@ impl StatsReader {
         from_ms: i64,
         to_ms: i64,
     ) -> Result<UpstreamStats, StatsError> {
-        let mut stats = self.conn.query_row(
+        let (mut stats, billed_input) = self.conn.query_row(
             "SELECT COUNT(*),
                     COALESCE(SUM(status BETWEEN 200 AND 299), 0),
                     COALESCE(SUM(status BETWEEN 300 AND 399), 0),
@@ -483,37 +483,48 @@ impl StatsReader {
                     COALESCE(SUM(cache_read_tokens), 0),
                     COALESCE(SUM(cache_write_tokens), 0),
                     COALESCE(SUM(retrieve_rounds), 0),
-                    COALESCE(SUM(retrieve_tokens_injected), 0)
+                    COALESCE(SUM(retrieve_tokens_injected), 0),
+                    COALESCE(SUM(CASE WHEN api_family = 'anthropic_messages'
+                                      THEN max(coalesce(prompt_tokens, 0), 0)
+                                           + max(coalesce(cache_read_tokens, 0), 0)
+                                           + max(coalesce(cache_write_tokens, 0), 0)
+                                      ELSE max(coalesce(prompt_tokens, 0),
+                                               coalesce(cache_read_tokens, 0), 0) END), 0)
              FROM proxy_requests WHERE tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3",
             (tenant, from_ms, to_ms),
             |row| {
                 let count = |i: usize| row.get::<_, i64>(i).map(|v| v.max(0) as u64);
-                Ok(UpstreamStats {
-                    requests: count(0)?,
-                    status_2xx: count(1)?,
-                    status_3xx: count(2)?,
-                    status_4xx: count(3)?,
-                    status_5xx: count(4)?,
-                    no_status: count(5)?,
-                    errors: count(6)?,
-                    streamed: count(7)?,
-                    with_usage: count(8)?,
-                    prompt_tokens: row.get(9)?,
-                    completion_tokens: row.get(10)?,
-                    cache_read_tokens: row.get(11)?,
-                    cache_write_tokens: row.get(12)?,
-                    retrieve_rounds: row.get(13)?,
-                    retrieve_tokens_injected: row.get(14)?,
-                    ..Default::default()
-                })
+                let billed_input: i64 = row.get(15)?;
+                Ok((
+                    UpstreamStats {
+                        requests: count(0)?,
+                        status_2xx: count(1)?,
+                        status_3xx: count(2)?,
+                        status_4xx: count(3)?,
+                        status_5xx: count(4)?,
+                        no_status: count(5)?,
+                        errors: count(6)?,
+                        streamed: count(7)?,
+                        with_usage: count(8)?,
+                        prompt_tokens: row.get(9)?,
+                        completion_tokens: row.get(10)?,
+                        cache_read_tokens: row.get(11)?,
+                        cache_write_tokens: row.get(12)?,
+                        retrieve_rounds: row.get(13)?,
+                        retrieve_tokens_injected: row.get(14)?,
+                        ..Default::default()
+                    },
+                    billed_input,
+                ))
             },
         )?;
-        // Anthropic reports fresh input, cache reads and cache writes as three
-        // disjoint counts; their sum is what was billed as input.
-        stats.cache_read_share = ratio(
-            stats.cache_read_tokens,
-            stats.prompt_tokens + stats.cache_read_tokens + stats.cache_write_tokens,
-        );
+        // Billed input, per row and per family. Anthropic reports fresh input,
+        // cache reads and cache writes as three disjoint counts, and their sum
+        // is the input; OpenAI's prompt count already contains its cached
+        // part. Adding the three for every family put OpenAI's reads in the
+        // denominator twice and understated the share — 44% for a prompt that
+        // was 80% cached.
+        stats.cache_read_share = ratio(stats.cache_read_tokens, billed_input);
         (stats.upstream_ms, stats.total_ms) = self.latencies(tenant, from_ms, to_ms)?;
         Ok(stats)
     }
@@ -556,7 +567,7 @@ impl StatsReader {
         to_ms: i64,
     ) -> Result<Vec<ModelCoverage>, StatsError> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT COALESCE(model, ''), COUNT(*), SUM(tokens_in), SUM(tokens_out)
+            "SELECT COALESCE(model, ''), COUNT(*), SUM(tokens_in), SUM((CASE WHEN coalesce(outcome,'') = 'discarded' THEN tokens_in ELSE tokens_out END))
              FROM optimization_events
              WHERE tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3
              GROUP BY 1 ORDER BY 3 DESC, 1",
@@ -626,7 +637,7 @@ impl StatsReader {
              FROM proxy_requests p
              LEFT JOIN (
                  SELECT request_id, MAX(provider) AS provider, SUM(tokens_in) AS tokens_in,
-                        SUM(tokens_out) AS tokens_out,
+                        SUM((CASE WHEN coalesce(outcome,'') = 'discarded' THEN tokens_in ELSE tokens_out END)) AS tokens_out,
                         SUM(messages_compressed) AS messages_compressed,
                         SUM(refs_emitted) AS refs_emitted
                  FROM optimization_events
@@ -775,7 +786,9 @@ mod tests {
             time_ms,
             tenant: tenant.into(),
             request_id: id.into(),
-            api_family: "openai_chat".into(),
+            // Anthropic's shape: the cache read is reported beside the fresh
+            // input, not inside it.
+            api_family: "anthropic_messages".into(),
             model: Some("glm-5.3".into()),
             upstream: "https://opencode.ai".into(),
             status,
@@ -795,6 +808,67 @@ mod tests {
             error: status.is_none().then(|| "connect refused".to_string()),
             keep_warm: false,
         })
+    }
+
+    /// OpenAI's prompt count already contains its cached part, so a prompt of
+    /// 1,000 with 800 read from cache is 80% cached — not 800 / 1,800, which
+    /// is what adding the two (right for Anthropic) reported.
+    #[test]
+    fn the_cache_read_share_is_taken_per_api_family() {
+        let db = Db::new();
+        let openai = |id: &str, prompt: u32, read: u32| match proxied(T0, "", id, Some(200), 10.0) {
+            Event::ProxyRequest(mut event) => {
+                event.api_family = "openai_chat".into();
+                event.prompt_tokens = Some(prompt);
+                event.cache_read_tokens = Some(read);
+                Event::ProxyRequest(event)
+            }
+            other => other,
+        };
+        db.write(vec![openai("o1", 1_000, 800)]);
+        let share = |db: &Db| {
+            db.reader()
+                .live("", T0, T0 + 60 * MIN, 10)
+                .unwrap()
+                .upstream
+                .cache_read_share
+        };
+        assert!((share(&db) - 0.8).abs() < 1e-9, "{}", share(&db));
+
+        // Mixed with an Anthropic row (100 fresh + 300 read): 1,100 of 1,400.
+        db.write(vec![proxied(T0 + 1, "", "a1", Some(200), 10.0)]);
+        assert!(
+            (share(&db) - 1_100.0 / 1_400.0).abs() < 1e-9,
+            "{}",
+            share(&db)
+        );
+    }
+
+    /// A rewrite the proxy threw away never reached the provider. It is still
+    /// a run — it counts, and so does what it was shown — but it saved
+    /// nothing, on the live page as in the views.
+    #[test]
+    fn a_discarded_rewrite_saves_nothing_on_the_live_page() {
+        let db = Db::new();
+        db.write(vec![
+            compression(T0, "", "kept", 1_000, 400),
+            compression(T0 + 1, "", "thrown", 1_000, 100),
+            Event::Discarded {
+                tenant: "".into(),
+                request_id: "thrown".into(),
+            },
+        ]);
+        let live = db.reader().live("", T0, T0 + 60 * MIN, 10).unwrap();
+        assert_eq!(live.totals.compressions, 2);
+        assert_eq!(
+            (live.totals.tokens_in, live.totals.saved_gross),
+            (2_000, 600)
+        );
+        assert_eq!(
+            live.timeline.iter().map(|p| p.saved_gross).sum::<i64>(),
+            600
+        );
+        assert_eq!(live.by_model.iter().map(|m| m.saved).sum::<i64>(), 600);
     }
 
     fn fetched(time_ms: i64, tenant: &str, id: &str, tokens: u32) -> Event {

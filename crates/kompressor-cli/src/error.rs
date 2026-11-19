@@ -17,6 +17,11 @@ pub enum CliError {
     Usage(String),
     /// A benchmark comparison found a regression. The run itself succeeded.
     Regressed,
+    /// The wrapped agent ended with this status, which becomes ours: `wrap` is
+    /// transparent, so `kompressor wrap -- make test` in CI has to fail the way
+    /// `make test` failed. Nothing is printed for it — the agent already said
+    /// whatever it had to say.
+    AgentExit(i32),
 }
 
 impl CliError {
@@ -26,6 +31,12 @@ impl CliError {
             CliError::Runtime(_) => 1,
             CliError::Usage(_) => 2,
             CliError::Regressed => 3,
+            // Kept inside what a shell can report; 0 would turn a failure into
+            // success.
+            CliError::AgentExit(code) => match code & 0xff {
+                0 => 1,
+                code => code,
+            },
         }
     }
 
@@ -42,6 +53,7 @@ impl fmt::Display for CliError {
             // The detail is in the comparison table already printed; repeating
             // it on stderr would bury the table it refers to.
             CliError::Regressed => f.write_str("benchmark comparison regressed"),
+            CliError::AgentExit(code) => write!(f, "the agent exited with status {code}"),
         }
     }
 }

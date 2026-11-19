@@ -65,6 +65,7 @@ pub mod quality;
 pub mod reader;
 pub mod retention;
 pub mod schema;
+pub mod scorecards;
 pub mod traffic;
 pub mod writer;
 
@@ -831,6 +832,91 @@ mod tests {
             "a database that could not record a refusal reports none, which is true"
         );
         assert_eq!(report.top_refs.len(), 2);
+    }
+
+    /// `by_provider` used to join `proxy_requests` on the request id alone.
+    /// Two proxy rows under one id (a retry, a client that reuses its
+    /// `x-request-id`) then counted the compression twice, and a row of the
+    /// same id under another tenant put that tenant's upstream in this one's
+    /// report.
+    #[test]
+    fn provider_coverage_counts_each_compression_once_and_names_only_its_own_hosts() {
+        let harness = Harness::new();
+        let other_host = match proxy(T0, "globex", "req-1") {
+            Event::ProxyRequest(mut event) => {
+                event.upstream = "https://globex.invalid".to_string();
+                Event::ProxyRequest(event)
+            }
+            other => other,
+        };
+        harness.write(vec![
+            optimization(T0, "acme", "req-1", 1_000, 400),
+            proxy(T0, "acme", "req-1"),
+            proxy(T0 + 1, "acme", "req-1"),
+            other_host,
+        ]);
+        let rows = harness.reader().by_provider("acme", 0, i64::MAX).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].requests, 1,
+            "one compression, however many proxy rows"
+        );
+        assert_eq!(
+            (rows[0].tokens_in, rows[0].tokens_out, rows[0].saved),
+            (1_000, 400, 600)
+        );
+        assert_eq!(rows[0].hosts, vec!["https://upstream.invalid".to_string()]);
+
+        // A compression with no proxy row at all still has its line.
+        harness.write(vec![optimization(T0, "solo", "s-1", 50, 40)]);
+        let solo = harness.reader().by_provider("solo", 0, i64::MAX).unwrap();
+        assert_eq!((solo[0].requests, solo[0].saved), (1, 10));
+        assert!(solo[0].hosts.is_empty());
+    }
+
+    /// Design §9.4: a discarded row "still claimed the shrink" until
+    /// `Event::Discarded` amends it, and the savings views leave it out. The
+    /// reader behind `/v1/stats/summary`, the histogram, the MCP stats tool
+    /// and the line `kompressor wrap` prints on exit summed it regardless.
+    #[test]
+    fn a_discarded_rewrite_is_a_request_that_saved_nothing() {
+        let mut harness = Harness::new();
+        harness.write(vec![
+            optimization(T0, "acme", "kept", 1_000, 400),
+            optimization(T0, "acme", "thrown", 1_000, 100),
+            proxy(T0, "acme", "kept"),
+            proxy(T0, "acme", "thrown"),
+            Event::Discarded {
+                tenant: "acme".into(),
+                request_id: "thrown".into(),
+            },
+        ]);
+        let reader = harness.reader();
+        let summary = reader.summary("acme", 0, i64::MAX).unwrap();
+        assert_eq!(summary.requests, 2, "it is still a run");
+        assert_eq!(summary.saved_gross, 600);
+        assert_eq!(summary.saved_net, 600);
+        assert_eq!(
+            summary.by_mode.iter().map(|m| m.saved_gross).sum::<i64>(),
+            600
+        );
+
+        let histogram = reader.histogram("acme", 0, i64::MAX, Bucket::Day).unwrap();
+        assert_eq!(histogram.iter().map(|r| r.requests).sum::<u64>(), 2);
+        assert_eq!(histogram.iter().map(|r| r.saved_gross).sum::<i64>(), 600);
+
+        assert_eq!(reader.session_since(0).unwrap().saved_gross, 600);
+        assert_eq!(
+            reader.by_provider("acme", 0, i64::MAX).unwrap()[0].saved,
+            600
+        );
+        let one = reader
+            .request("acme", "thrown")
+            .unwrap()
+            .expect("the request");
+        assert_eq!(one.saved_gross, 0);
+        drop(reader);
+        harness.shutdown();
     }
 
     #[test]

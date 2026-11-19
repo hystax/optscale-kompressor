@@ -140,6 +140,9 @@ const VIEWS = [
   { id: "traffic", title: "Traffic", api: "stats/traffic" },
   { id: "engine", title: "Engine", api: "stats/engine" },
   { id: "quality", title: "Data quality", api: "stats/quality" },
+  { id: "models", title: "Models", api: "stats/models" },
+  { id: "activity", title: "Activity", api: "stats/activity" },
+  { id: "cohorts", title: "Conversation cohorts", api: "stats/cohorts" },
 ];
 const view = VIEWS.find(v => v.id === SETTINGS.view) || VIEWS[0];
 const $ = id => document.getElementById(id);
@@ -619,6 +622,167 @@ RENDER.quality = d => {
       ["Within one report's limit", r => r.over_limit ? el("span", { class: "warn" }, "no — truncated") : "yes", { text: true }],
     ], d.tables)),
     note("Coverage checks turn warn and bad below their limits; columns this build never writes are shown as Info, not as failures."),
+  ];
+};
+
+RENDER.models = d => {
+  const rows = d.models;
+  const sum = f => rows.reduce((a, r) => a + (f(r) || 0), 0);
+  const tokensIn = sum(r => r.tokens_in), saved = sum(r => r.saved_gross), back = sum(r => r.retrieved_tokens);
+  const idle = sum(r => r.idle_engine_ms);
+  const costliest = rows[0];
+  const best = rows.filter(r => r.tokens_in > 0).sort((a, b) => (b.reduction || 0) - (a.reduction || 0))[0];
+  const points = rows.filter(r => r.billed.input > 0).slice(0, 12).map(r => ({
+    x: r.model || "(none)", fresh: r.billed.uncached, read: r.billed.read,
+    write: r.billed.write_5m + r.billed.write_1h, saved: r.reduction,
+  }));
+  return [
+    tiles([
+      ["Models", n(rows.length), costliest ? "costliest: " + (costliest.model || "(none)") : "no model calls in this window"],
+      ["Engine reduction", pct(ratio(saved, tokensIn)), tok(saved) + " of " + tok(tokensIn) + " shown to the engine", "good"],
+      ["Net of retrieval", tok(saved - back), tok(back) + " put back by " + n(sum(r => r.retrieve_rounds)) + " retrieve rounds"],
+      ["Best reduction", best ? pct(best.reduction) : "–", best ? (best.model || "(none)") : ""],
+      ["Engine time that changed nothing", ms(idle), "runs that rewrote no message", idle > 600000 ? "warn" : ""],
+      ["Upstream failures", n(sum(r => r.upstream_failures)), "429, 5xx, no answer, broken streams", sum(r => r.upstream_failures) ? "warn" : "good"],
+    ]),
+    section("Billed input by model, with the engine's reduction",
+      chart(points, [
+        { key: "read", label: "Cache read", color: css("--read") },
+        { key: "write", label: "Cache write", color: css("--write") },
+        { key: "fresh", label: "Fresh input", color: css("--fresh") },
+      ], { line: { key: "saved", label: "Engine reduction", color: css("--ping"), fmt: pct, min: 0 } }),
+      note("Bars are what the provider billed as input, clients and keep-warm pings together. The line is how much of what the engine was shown it removed — a different base: the engine sees the whole prompt on every turn, the bill counts most of it as cache reads.")),
+    section("Scorecard", table([
+      ["Model", r => r.model || "(none)", { text: true }],
+      ["API family", r => r.api_family, { text: true }],
+      ["Requests", r => n(r.client_requests)],
+      ["Pings", r => n(r.pings)],
+      ["Billed input", r => tok(r.billed.input)],
+      ["Cache read", r => pct(r.billed.read_share)],
+      ["Cache saving", r => r.billed.input ? el("span", { class: r.billed.saved_share < 0 ? "bad" : "" }, pct(r.billed.saved_share)) : "–"],
+      ["Output", r => tok(r.billed.output)],
+      ["Engine runs", r => n(r.engine_runs)],
+      ["Rewrote", r => pct(ratio(r.compressed_runs, r.engine_runs), 0)],
+      ["Reduction", r => r.tokens_in ? meter(r.reduction) : "–"],
+      ["Saved", r => tok(r.saved_gross)],
+      ["Asked back", r => tok(r.retrieved_tokens)],
+      ["Net", r => el("span", { class: r.saved_net < 0 ? "bad" : "" }, tok(r.saved_net))],
+      ["Engine p50", r => ms(r.engine_ms.p50)],
+      ["Engine p95", r => ms(r.engine_ms.p95)],
+      ["Upstream failures", r => r.upstream_failures ? el("span", { class: "warn" }, n(r.upstream_failures) + " (" + pct(r.upstream_failure_share) + ")") : "0"],
+    ], rows, { empty: "No model calls and no engine runs in this window." }),
+      note("Cache saving is the bill against the same input at the fresh price; negative means cache writes cost more than reads saved. Rewrote is the share of engine runs that changed at least one message. Costliest model first."),
+      d.truncated ? note("Only the newest 200,000 engine runs were read; the engine columns cover those.") : null),
+  ];
+};
+
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const ACTIVITY_METRICS = [
+  ["requests", "Model calls", n],
+  ["input_tokens", "Billed input", tok],
+  ["cache_write_tokens", "Cache writes", tok],
+  ["saved_gross", "Engine savings", tok],
+  ["pings", "Keep-warm pings", n],
+];
+let activityMetric = "requests";
+RENDER.activity = d => {
+  // The report is in UTC; the grid is drawn in the viewer's zone, to the hour.
+  const shift = Math.round(-new Date().getTimezoneOffset() / 60);
+  const local = c => {
+    const h = c.weekday * 24 + c.hour + shift;
+    const w = ((h % 168) + 168) % 168;
+    return [Math.floor(w / 24), w % 24];
+  };
+  const [, label, fmt] = ACTIVITY_METRICS.find(m => m[0] === activityMetric) || ACTIVITY_METRICS[0];
+  const grid = Array.from({ length: 7 }, () => new Array(24).fill(0));
+  const byHour = Array.from({ length: 24 }, (_, hour) => ({ x: String(hour).padStart(2, "0"), requests: 0, pings: 0, passthrough: 0, write: 0 }));
+  for (const c of d.cells) {
+    const [w, h] = local(c);
+    grid[w][h] += c[activityMetric] || 0;
+    byHour[h].requests += c.requests; byHour[h].pings += c.pings; byHour[h].passthrough += c.passthrough;
+    byHour[h].write += c.cache_write_tokens;
+  }
+  const max = Math.max(1, ...grid.flat());
+  const picker = el("select", { "aria-label": "Metric", onchange: e => { activityMetric = e.target.value; if (last) $("content").replaceChildren(...RENDER.activity(last).filter(Boolean)); } },
+    ACTIVITY_METRICS.map(([id, text]) => el("option", { value: id, selected: id === activityMetric }, text)));
+  const heat = el("div", { class: "scroll" }, el("table", {},
+    el("thead", {}, el("tr", {}, el("th", { class: "text" }, ""), Array.from({ length: 24 }, (_, h) => el("th", {}, String(h).padStart(2, "0"))))),
+    el("tbody", {}, WEEKDAYS.map((day, w) => el("tr", {},
+      el("th", { class: "text" }, day),
+      grid[w].map((v, h) => el("td", {
+        style: "padding:0;min-width:26px;height:22px;background:color-mix(in srgb, var(--accent) " + (v ? 8 + 82 * v / max : 0).toFixed(0) + "%, transparent)",
+        title: day + " " + String(h).padStart(2, "0") + ":00 — " + label + ": " + fmt(v),
+      }, "")))))));
+  const b = d.busiest && local(d.busiest);
+  const peakStart = d.peak_window_start_hour == null ? null : ((d.peak_window_start_hour + shift) % 24 + 24) % 24;
+  const cells = d.cells.map(c => ({ ...c, at: local(c) })).sort((a, z) => z.requests - a.requests).slice(0, 12);
+  return [
+    tiles([
+      ["Model calls", n(d.requests), "in " + n(d.cells.length) + " of 168 weekly hours"],
+      ["Busiest hour", b ? WEEKDAYS[b[0]] + " " + String(b[1]).padStart(2, "0") + ":00" : "–", d.busiest ? n(d.busiest.requests) + " calls over " + n(d.busiest.days) + " day(s)" : ""],
+      ["Busiest 8 hours", peakStart == null ? "–" : String(peakStart).padStart(2, "0") + ":00–" + String((peakStart + 8) % 24).padStart(2, "0") + ":00", pct(d.peak_window_share) + " of model calls"],
+      ["Billed input", tok(d.input_tokens), tok(d.cache_write_tokens) + " of it written to cache"],
+      ["Cache-write share", pct(ratio(d.cache_write_tokens, d.input_tokens)), "the part of the input paid at the write price", ratio(d.cache_write_tokens, d.input_tokens) > 0.05 ? "warn" : "good"],
+    ]),
+    section("Hour of the week", el("p", { class: "note" }, "Shade: ", picker, " — darker is more. Times are in your browser's zone."), heat),
+    section("By hour of the day",
+      chart(byHour, [
+        { key: "requests", label: "Model calls", color: css("--accent") },
+        { key: "pings", label: "Keep-warm pings", color: css("--ping") },
+        { key: "passthrough", label: "Pass-through", color: css("--fresh") },
+      ], { fmt: n, line: { key: "write", label: "Cache writes", color: css("--write"), fmt: tok, min: 0 } }),
+      note("Hours where cache writes rise without model calls rising are where prefixes were rebuilt: the first turn after a pause, or a cache that lapsed.")),
+    section("Busiest hours", table([
+      ["When", r => WEEKDAYS[r.at[0]] + " " + String(r.at[1]).padStart(2, "0") + ":00", { text: true }],
+      ["Model calls", r => n(r.requests)],
+      ["Days seen", r => n(r.days)],
+      ["Calls per day", r => r.days ? (r.requests / r.days).toFixed(1) : "–"],
+      ["Pings", r => n(r.pings)],
+      ["Billed input", r => tok(r.input_tokens)],
+      ["Cache writes", r => tok(r.cache_write_tokens)],
+      ["Engine savings", r => tok(r.saved_gross)],
+    ], cells)),
+  ];
+};
+
+RENDER.cohorts = d => {
+  const rows = d.cohorts;
+  const total = rows.reduce((a, r) => a + r.billed.cost, 0);
+  const top = [...rows].sort((a, b) => b.billed.cost - a.billed.cost)[0];
+  const single = rows[0] || { conversations: 0 };
+  const points = rows.map(r => ({ x: r.turns, read: r.billed.read, write: r.billed.write_5m + r.billed.write_1h, fresh: r.billed.uncached, share: r.net_saving_share }));
+  return [
+    tiles([
+      ["Conversations", n(d.conversations), n(rows.reduce((a, r) => a + r.client_turns, 0)) + " client turns"],
+      ["Half the cost is in", pct(d.half_cost_conversation_share), "of conversations, costliest first", d.half_cost_conversation_share != null && d.half_cost_conversation_share < 0.1 ? "warn" : ""],
+      ["Costliest cohort", top && total ? top.turns + " turns" : "–", top && total ? pct(top.cost_share) + " of the cost, " + n(top.conversations) + " conversations" : ""],
+      ["One-turn conversations", pct(ratio(single.conversations, d.conversations)), n(single.conversations) + " — mostly side calls and one-shot requests"],
+    ]),
+    section("Billed input by conversation length",
+      chart(points, [
+        { key: "read", label: "Cache read", color: css("--read") },
+        { key: "write", label: "Cache write", color: css("--write") },
+        { key: "fresh", label: "Fresh input", color: css("--fresh") },
+      ], { line: { key: "share", label: "Net compression saving", color: css("--ping"), fmt: pct } }),
+      note("The line is net tokens removed (engine savings less what retrieval put back) over the input the provider was billed for, per cohort.")),
+    section("Cohorts by client turns", table([
+      ["Turns", r => r.turns, { text: true }],
+      ["Conversations", r => n(r.conversations)],
+      ["Client turns", r => n(r.client_turns)],
+      ["Pings", r => n(r.pings)],
+      ["Billed input", r => tok(r.billed.input)],
+      ["Cost share", r => r.cost_share == null ? "–" : meter(r.cost_share)],
+      ["Cache read", r => r.billed.input ? pct(r.billed.read_share) : "–"],
+      ["Cache saving", r => r.billed.input ? el("span", { class: r.billed.saved_share < 0 ? "bad" : "" }, pct(r.billed.saved_share)) : "–"],
+      ["Saved", r => tok(r.saved_gross)],
+      ["Asked back", r => tok(r.retrieved_tokens)],
+      ["Net saving", r => r.net_saving_share == null ? "–" : el("span", { class: r.net_saving_share < 0 ? "bad" : "" }, pct(r.net_saving_share, 2))],
+      ["Retrieve rounds", r => n(r.retrieve_rounds)],
+      ["Errors", r => n(r.errors)],
+      ["Median length", r => ms(r.median_duration_ms)],
+    ], rows),
+      note("A conversation is counted in the window it has rows in, by the client turns it ran there. Cost is input-equivalent tokens: reads and writes at their prices relative to fresh input."),
+      d.truncated ? note("Only the 50,000 costliest conversations were read.") : null),
   ];
 };
 

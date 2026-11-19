@@ -2059,6 +2059,159 @@ async fn a_json_lines_download_needs_the_same_key_as_the_json() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+/// The three scorecard views — models, activity, cohorts — over HTTP: the
+/// JSON under both version prefixes, the JSON-lines download, the page shell,
+/// and the pages on the statistics listener.
+#[tokio::test]
+async fn the_scorecard_dashboards_answer_with_what_was_recorded() {
+    let harness = Harness::with_stats();
+    let (status, _) = harness
+        .post(
+            "/v1/compress/raw",
+            json!({"content": log_payload(400), "request_id": "score-1"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, empty) = harness.get("/v1/stats/cache").await;
+    let tenant = text(&empty["tenant"]);
+    let t = now_ms() - 60_000;
+    harness
+        .sink
+        .send(proxied_turn(t, &tenant, 0, 40_000, false));
+    harness
+        .sink
+        .send(proxied_turn(t + 1_000, &tenant, 40_000, 0, false));
+    harness
+        .sink
+        .send(proxied_turn(t + 2_000, &tenant, 40_000, 0, true));
+    harness.sink.flush().expect("the batch commits");
+
+    let (status, models) = harness.get("/v1/stats/models?window=1h").await;
+    assert_eq!(status, StatusCode::OK, "{models}");
+    assert_eq!(models["window"], "1h");
+    let opus = models["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["model"] == "claude-opus-5-5")
+        .unwrap_or_else(|| panic!("no opus card in {models}"));
+    assert_eq!(
+        (&opus["client_requests"], &opus["pings"]),
+        (&json!(2), &json!(1))
+    );
+    assert_eq!(opus["billed"]["read"], 80_000);
+    assert_eq!(opus["billed"]["write_5m"], 40_000);
+    // The compression made through the API has no model: a card of its own.
+    assert!(
+        models["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["engine_runs"].as_u64() == Some(1) && m["saved_gross"].as_i64() > Some(0)),
+        "{models}"
+    );
+
+    let (status, activity) = harness.get("/v2/stats/activity?window=1h").await;
+    assert_eq!(status, StatusCode::OK, "{activity}");
+    assert_eq!(activity["requests"], 2);
+    let cells = activity["cells"].as_array().unwrap();
+    assert!(!cells.is_empty() && cells.len() <= 2, "{activity}");
+    assert_eq!(
+        cells
+            .iter()
+            .map(|c| c["pings"].as_u64().unwrap())
+            .sum::<u64>(),
+        1
+    );
+    assert!(activity["busiest"]["weekday"].as_u64().unwrap() < 7);
+    assert!(activity["peak_window_share"].as_f64().unwrap() > 0.99);
+
+    let (status, cohorts) = harness.get("/v1/stats/cohorts?window=1h").await;
+    assert_eq!(status, StatusCode::OK, "{cohorts}");
+    assert_eq!(cohorts["conversations"], 1);
+    let rows = cohorts["cohorts"].as_array().unwrap();
+    assert_eq!(rows.len(), 6, "every cohort is listed, empty or not");
+    let two_to_four = rows.iter().find(|r| r["turns"] == "2–4").unwrap();
+    assert_eq!(
+        (
+            &two_to_four["conversations"],
+            &two_to_four["client_turns"],
+            &two_to_four["pings"]
+        ),
+        (&json!(1), &json!(2), &json!(1))
+    );
+    assert_eq!(two_to_four["cost_share"], 1.0);
+
+    for name in ["models", "activity", "cohorts"] {
+        let path = format!("/v1/stats/{name}?format=jsonl&window=1h");
+        let (status, content_type, disposition, body) = get_raw(&harness, &path, &[]).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert_eq!(content_type, "application/x-ndjson", "{path}");
+        assert!(
+            disposition.starts_with(&format!("attachment; filename=\"kompressor-{name}-")),
+            "{path}: {disposition}"
+        );
+        assert_eq!(jsonl_lines(&body)[0]["record"], "summary", "{path}");
+
+        let (status, page) = harness.get(&format!("/v1/stats/{name}?format=html")).await;
+        assert_eq!(status, StatusCode::OK, "{name}");
+        let page = text(&page);
+        assert!(
+            page.contains(&format!("\"view\":\"{name}\"")),
+            "{name}: the shell names its view"
+        );
+        assert!(
+            page.contains(&format!("RENDER.{name} = ")),
+            "{name}: the page can draw the view it was opened on"
+        );
+        assert!(
+            page.contains(&format!("api: \"stats/{name}\"")),
+            "{name}: and links to it"
+        );
+
+        // A parameter no view knows is refused, as on every other dashboard.
+        let (status, _) = harness.get(&format!("/v1/stats/{name}?nonsense=1")).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{name}");
+    }
+
+    let listener = Harness::with_stats_and(|_| {}, kompressor_server::stats_listener_router);
+    for name in ["models", "activity", "cohorts"] {
+        let (status, page) = listener.get(&format!("/{name}")).await;
+        assert_eq!(status, StatusCode::OK, "/{name}");
+        assert!(
+            text(&page).contains(&format!("\"view\":\"{name}\"")),
+            "/{name}"
+        );
+        let (status, body) = listener.get(&format!("/v1/stats/{name}")).await;
+        assert_eq!(status, StatusCode::OK, "/v1/stats/{name}: {body}");
+    }
+}
+
+/// The scorecards carry what every statistics route carries: a key where keys
+/// are configured, and no way to name another tenant without being trusted.
+#[tokio::test]
+async fn the_scorecard_dashboards_need_a_key_and_keep_to_the_callers_tenant() {
+    let harness = Harness::with_stats_and(keyed_config, kompressor_server::stats_listener_router);
+    for name in ["models", "activity", "cohorts"] {
+        let path = format!("/v1/stats/{name}");
+        let (status, _, _, _) = get_raw(&harness, &path, &[]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+        let (status, _, _, body) =
+            get_raw(&harness, &path, &[("x-kompressor-key", "sk-alpha")]).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        let (status, _, _, _) = get_raw(
+            &harness,
+            &format!("{path}?tenant=team-b"),
+            &[("x-kompressor-key", "sk-alpha")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+        // The page shell itself is served to anyone; the data is not.
+        let (status, _, _, _) = get_raw(&harness, &format!("/{name}"), &[]).await;
+        assert_eq!(status, StatusCode::OK, "/{name}");
+    }
+}
+
 #[tokio::test]
 async fn every_dashboard_page_offers_the_download() {
     let harness = Harness::with_stats();

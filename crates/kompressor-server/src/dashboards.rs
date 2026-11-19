@@ -1,17 +1,19 @@
 //! The second set of dashboards: a health overview, trends, compression
 //! yield, a conversation timeline, store health, keep-warm return, cache
 //! losses set against compression, upstream health, traffic composition, the
-//! engine and data quality.
+//! engine, data quality, a per-model scorecard, activity by hour of the week
+//! and conversation cohorts.
 //!
 //! Each view has a JSON route under each version prefix —
-//! `/v1/stats/{health,trends,yield,store-health,keepwarm,cache-loss,upstream,traffic,engine,quality}`
+//! `/v1/stats/{health,trends,yield,store-health,keepwarm,cache-loss,upstream,traffic,engine,quality,models,activity,cohorts}`
 //! — and one
 //! shared page that draws whichever view it was opened on. The timeline has no
 //! route of its own: it draws a conversation's turns from
 //! `/v1/stats/analysis?conversation=`, which already carries them. On the
 //! statistics listener the pages are at `/health`, `/trends`, `/yield`,
 //! `/timeline`, `/cache-loss`, `/traffic`, `/quality`,
-//! `/store`, `/keepwarm`, `/upstream` and `/engine`.
+//! `/store`, `/keepwarm`, `/upstream`, `/engine`, `/models`, `/activity` and
+//! `/cohorts`.
 //!
 //! Credentials, tenant scoping, formats and the page-shell rule are the cache
 //! route's: the shell is served to anyone, the data only to a request that
@@ -77,10 +79,13 @@ pub(crate) enum View {
     Traffic,
     Engine,
     Quality,
+    Models,
+    Activity,
+    Cohorts,
 }
 
 impl View {
-    pub(crate) const ALL: [View; 11] = [
+    pub(crate) const ALL: [View; 14] = [
         View::Health,
         View::Trends,
         View::Yield,
@@ -92,6 +97,9 @@ impl View {
         View::Traffic,
         View::Engine,
         View::Quality,
+        View::Models,
+        View::Activity,
+        View::Cohorts,
     ];
 
     /// The page's path on the statistics listener.
@@ -108,6 +116,9 @@ impl View {
             View::Quality => "/quality",
             View::Upstream => "/upstream",
             View::Engine => "/engine",
+            View::Models => "/models",
+            View::Activity => "/activity",
+            View::Cohorts => "/cohorts",
         }
     }
 
@@ -125,6 +136,9 @@ impl View {
             View::Quality => "/stats/quality",
             View::Upstream => "/stats/upstream",
             View::Engine => "/stats/engine",
+            View::Models => "/stats/models",
+            View::Activity => "/stats/activity",
+            View::Cohorts => "/stats/cohorts",
         }
     }
 
@@ -141,6 +155,9 @@ impl View {
             View::Quality => "quality",
             View::Upstream => "upstream",
             View::Engine => "engine",
+            View::Models => "models",
+            View::Activity => "activity",
+            View::Cohorts => "cohorts",
         }
     }
 }
@@ -510,6 +527,24 @@ async fn respond(
                     .saturating_mul(u64::from(config.engine.ref_max_lifetime_multiplier)),
                 report,
             };
+            Ok(answer(format, view, now, window, report))
+        }
+        View::Models => {
+            let report = state
+                .with_stats(move |r| r.models(&tenant, from_ms, to_ms))
+                .await?;
+            Ok(answer(format, view, now, window, report))
+        }
+        View::Activity => {
+            let report = state
+                .with_stats(move |r| r.activity(&tenant, from_ms, to_ms))
+                .await?;
+            Ok(answer(format, view, now, window, report))
+        }
+        View::Cohorts => {
+            let report = state
+                .with_stats(move |r| r.cohorts(&tenant, from_ms, to_ms))
+                .await?;
             Ok(answer(format, view, now, window, report))
         }
         View::Timeline => unreachable!("answered above"),

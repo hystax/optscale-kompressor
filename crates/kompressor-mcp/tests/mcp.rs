@@ -857,6 +857,86 @@ async fn kompressor_stats_reports_only_the_calling_tenants_numbers() {
     handle.shutdown().unwrap();
 }
 
+/// Over stateless streamable HTTP a client's JSON-RPC id restarts with every
+/// POST, so it cannot be what tells two tool calls apart in the statistics.
+/// Recorded as `mcp-<id>`, every call a tenant made was one "request".
+#[tokio::test]
+async fn two_calls_sharing_a_json_rpc_id_are_recorded_as_two_requests() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = keyed_config();
+    config.stats.enabled = true;
+    config.stats.path = directory.path().join("stats.db");
+    let (sink, handle) = kompressor_stats::writer::spawn(&kompressor_stats::StatsConfig::at(
+        config.stats.path.clone(),
+    ))
+    .unwrap();
+    let core = Arc::new(AppCore::new(
+        config.clone(),
+        Arc::new(MemoryRefStore::new()),
+        sink.clone(),
+    ));
+    let router = mcp_router(core);
+
+    for lines in [400, 500] {
+        let (status, reply) = rpc(
+            &router,
+            Some(KEY_A),
+            HOST,
+            call(
+                1,
+                "optscale_kompressor_compress",
+                json!({"messages": [{"role": "user", "content": log_payload(lines)}]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+    }
+    sink.flush().unwrap();
+
+    let reader = kompressor_stats::reader::StatsReader::open(&config.stats.path).unwrap();
+    let summary = reader.summary("team-a", 0, i64::MAX).unwrap();
+    assert_eq!(summary.requests, 2);
+    let live = reader.live("team-a", 0, i64::MAX, 10).unwrap();
+    let ids: std::collections::HashSet<&str> = live
+        .recent
+        .iter()
+        .map(|row| row.request_id.as_str())
+        .collect();
+    assert_eq!(ids.len(), 2, "one request id for two calls: {ids:?}");
+    assert!(
+        ids.iter()
+            .all(|id| id.starts_with("mcp-") && id.ends_with("-1"))
+    );
+    drop(reader);
+    handle.shutdown().unwrap();
+}
+
+/// `to` is the caller's. With no `from`, the default window is subtracted from
+/// it — which must saturate, not overflow, at the bottom of the range.
+#[tokio::test]
+async fn a_stats_window_ending_at_the_minimum_timestamp_is_answered() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = keyed_config();
+    config.stats.enabled = true;
+    config.stats.path = directory.path().join("stats.db");
+    let (sink, handle) = kompressor_stats::writer::spawn(&kompressor_stats::StatsConfig::at(
+        config.stats.path.clone(),
+    ))
+    .unwrap();
+    let core = Arc::new(AppCore::new(config, Arc::new(MemoryRefStore::new()), sink));
+    let router = mcp_router(core);
+    let (status, reply) = rpc(
+        &router,
+        Some(KEY_A),
+        HOST,
+        call(7, "optscale_kompressor_stats", json!({"to": i64::MIN})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert!(reply.get("result").is_some(), "{reply}");
+    handle.shutdown().unwrap();
+}
+
 #[tokio::test]
 async fn kompressor_stats_says_so_rather_than_failing_when_statistics_are_off() {
     let router = mcp_router(keyed_core());

@@ -256,6 +256,17 @@ impl Rewrite {
         refs: &mut RefCollector,
         mark: Mark,
     ) {
+        // A span that ends its line must still end it once replaced. A fenced
+        // block's body runs up to and including the newline before the closing
+        // fence, and most compressors return text with no trailing newline:
+        // spliced in as it was, the fence landed on the end of the body's last
+        // line, where it closes nothing.
+        let compressed = compressed.map(|mut out| {
+            if body.ends_with('\n') && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out
+        });
         match compressed {
             Some(out) if chars_len(&out) < chars_len(body) => {
                 self.replacements.push((span.start, span.end, out));

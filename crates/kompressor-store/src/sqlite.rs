@@ -69,11 +69,20 @@ CREATE INDEX IF NOT EXISTS refs_expiry ON refs (last_accessed);
 /// the array cannot express that bug.
 const MIGRATIONS: &[(u32, &str)] = &[(1, SCHEMA_V1)];
 
+// `created_at` survives a re-store so the absolute lifetime cannot be reset
+// every turn — but only while the row is alive. A row already past its window
+// and not yet swept is the same thing as no row: keeping its `created_at` would
+// hand back a handle that is expired the moment it is minted, and whether that
+// happened would depend on when the sweep last ran. Every right-hand side reads
+// the row as it was before the update, so the test sees the old deadlines.
 const SQL_UPSERT: &str = "
 INSERT INTO refs (tenant, ref, fragment, bytes, kind, request_id,
                   created_at, last_accessed, ttl_seconds, max_lifetime)
 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
 ON CONFLICT(tenant, ref) DO UPDATE SET
+  created_at    = CASE WHEN min(refs.last_accessed + refs.ttl_seconds,
+                                refs.created_at + refs.max_lifetime) < excluded.created_at
+                       THEN excluded.created_at ELSE refs.created_at END,
   fragment      = excluded.fragment,
   bytes         = excluded.bytes,
   last_accessed = excluded.last_accessed,
