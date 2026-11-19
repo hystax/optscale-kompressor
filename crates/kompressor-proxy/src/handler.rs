@@ -25,8 +25,8 @@ use tracing::Instrument;
 
 use kompressor_core::auth::{Credentials, Identity};
 use kompressor_core::config::{
-    CacheTtl, FrozenPrefix, PromptCacheRetention, ProxyConfig, RetrieveExecution, RetrieveTool,
-    Upstream,
+    CacheTtl, FrozenPrefix, PromptCacheKey, PromptCacheRetention, ProxyConfig, RetrieveExecution,
+    RetrieveTool, ToolsOrder, Upstream,
 };
 use kompressor_core::{AppCore, RequestInfo};
 use kompressor_engine::estimate_tokens;
@@ -268,8 +268,22 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         bodycapture::record(&capturing, &request_id, "proxy->upstream", &prepared.body);
     }
 
-    let upstream_headers =
+    let mut upstream_headers =
         headers::upstream_headers(&parts.headers, upstream, &request_id, auth_mode);
+    // `proxy.sticky_beta`: before the keep-warm plan copies these headers, so
+    // a ping carries the tokens its request did.
+    if family == Some(ApiFamily::AnthropicMessages)
+        && state
+            .core
+            .config_for(family.map(ApiFamily::provider))
+            .proxy
+            .sticky_beta
+        && let Some(conversation) = prepared.prefix
+    {
+        state
+            .stabilizer
+            .keep_betas(conversation, &mut upstream_headers);
+    }
     let keep_warm = keep_warm_for(
         &state,
         family,
@@ -418,14 +432,22 @@ fn ask_for_retention(
         return None;
     }
     let config = state.core.config_for(family.map(ApiFamily::provider));
-    if config.proxy.prompt_cache_retention != PromptCacheRetention::Extended {
+    if !retention::upstream_is_openai(upstream, origin) {
         return None;
     }
     let model = prepared.model.clone()?;
-    if !retention::model_supported(&model)
-        || !retention::upstream_is_openai(upstream, origin)
-        || state.retention.refused(upstream, &model)
-    {
+    let retain = config.proxy.prompt_cache_retention == PromptCacheRetention::Extended
+        && retention::model_supported(&model)
+        && !state.retention.refused(upstream, &model);
+    // `proxy.prompt_cache_key = "conversation"`: named from the opening, which
+    // is the same on every turn, so every turn is routed alike.
+    let route = (config.proxy.prompt_cache_key == PromptCacheKey::Conversation
+        && !state
+            .retention
+            .refused_field(upstream, &model, retention::KEY_FIELD))
+    .then_some(prepared.opening)
+    .flatten();
+    if !retain && route.is_none() {
         return None;
     }
     let mut parsed = None;
@@ -433,19 +455,31 @@ fn ask_for_retention(
         Some(value) => value,
         None => parsed.insert(serde_json::from_slice::<Value>(&prepared.body).ok()?),
     };
-    if !retention::extend(value) {
+    let mut added = Vec::new();
+    if retain && retention::extend(value) {
+        added.push(retention::FIELD);
+    }
+    if let Some(opening) = route
+        && retention::name_cache_route(value, opening)
+    {
+        added.push(retention::KEY_FIELD);
+    }
+    if added.is_empty() {
         return None;
     }
     // As for the Anthropic TTL: re-serializing changes JSON bytes, never the
     // prompt the provider keys its cache on.
     prepared.body = Bytes::from(serde_json::to_vec(value).ok()?);
-    tracing::debug!(model = %model, "asked for 24h prompt-cache retention");
-    Some(retention::Guard::new(
-        state.retention.clone(),
-        upstream,
-        &model,
-        config.proxy.max_body_bytes,
-    ))
+    tracing::debug!(model = %model, fields = ?added, "added prompt-cache fields");
+    Some(
+        retention::Guard::new(
+            state.retention.clone(),
+            upstream,
+            &model,
+            config.proxy.max_body_bytes,
+        )
+        .for_fields(added),
+    )
 }
 
 /// The keep-warm ping this request would leave behind, if its conversation is
@@ -555,6 +589,8 @@ struct Prepared {
     /// What was observed of the request's cacheable prefix, stamped by
     /// `prepare` for the statistics row. Never read to decide anything.
     observation: Option<kompressor_stats::context::PrefixObservation>,
+    /// The conversation's opening, for `prompt_cache_key`.
+    opening: Option<u64>,
 }
 
 impl Prepared {
@@ -565,6 +601,7 @@ impl Prepared {
             messages: None,
             one_hour: false,
             observation: None,
+            opening: None,
             body,
             json: None,
             saved_tokens: 0,
@@ -671,6 +708,7 @@ fn passthrough_with_stable_tools(
         messages: None,
         one_hour: false,
         observation: None,
+        opening: None,
     }
 }
 
@@ -750,6 +788,11 @@ struct Identified {
     text_bytes: u64,
     /// How long the conversation had been idle as this request arrived.
     idle: Option<crate::drift::Idle>,
+    /// The names of the tools the client sent, in its order.
+    tool_names: Vec<String>,
+    /// The conversation's opening, which stays the same on every turn and
+    /// across a restart: what `prompt_cache_key` is derived from.
+    opening: u64,
 }
 
 fn prefix_identity(
@@ -777,9 +820,21 @@ fn prefix_identity(
         family.as_str(),
         walk.model.as_deref().unwrap_or(""),
     ];
-    let fingerprint = state
-        .prefixes
-        .identify(&prefixcache::identity_chain_in_scope(&refs, &scope))?;
+    let chain = prefixcache::identity_chain_in_scope(&refs, &scope);
+    // The first two messages: enough to tell conversations apart where their
+    // first user turn differs, and never changed by a later turn.
+    let opening_key = *chain.get(chain.len().min(2).checked_sub(1)?)?;
+    let fingerprint = state.prefixes.identify(&chain)?;
+    let tool_names = value
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .map(|tool| crate::drift::tool_name(tool).to_string())
+                .collect()
+        })
+        .unwrap_or_default();
     // Read before anything below touches the conversation's entry.
     let idle = state
         .prefixes
@@ -819,7 +874,38 @@ fn prefix_identity(
         incoming,
         text_bytes,
         idle,
+        tool_names,
+        opening: opening_key,
     })
+}
+
+/// Send this request's tools in the order the conversation's first request
+/// used, under `proxy.tools_order = "pinned"`. See [`crate::stabilize`].
+///
+/// The decision is made on the names the client sent, so a request that keeps
+/// its order — nearly all of them — is neither parsed nor re-serialized here.
+fn pin_tool_order(state: &ProxyState, identified: &Identified, prepared: &mut Prepared) {
+    let names: Vec<&str> = identified.tool_names.iter().map(String::as_str).collect();
+    let Some(pinned) = state.stabilizer.pin_tools(identified.fingerprint, &names) else {
+        return;
+    };
+    let mut parsed = None;
+    let value = match prepared.json.as_mut() {
+        Some(value) => value,
+        None => match serde_json::from_slice::<Value>(&prepared.body) {
+            Ok(value) => parsed.insert(value),
+            Err(_) => return,
+        },
+    };
+    let Some(Value::Array(tools)) = value.get_mut("tools") else {
+        return;
+    };
+    if crate::stabilize::reorder(tools, &pinned)
+        && let Ok(out) = serde_json::to_vec(value)
+    {
+        prepared.body = Bytes::from(out);
+        tracing::debug!("sent the tools in the conversation's first-seen order");
+    }
 }
 
 /// Compare what goes upstream with the conversation's previous request, and
@@ -932,6 +1018,16 @@ async fn prepare(
         prepared.one_hour = true;
     }
     if let Some(identified) = identified.as_ref() {
+        prepared.opening = Some(identified.opening);
+        if state
+            .core
+            .config_for(family.map(ApiFamily::provider))
+            .proxy
+            .tools_order
+            == ToolsOrder::Pinned
+        {
+            pin_tool_order(state, identified, &mut prepared);
+        }
         observe_prefix(
             state,
             family,
@@ -1330,6 +1426,7 @@ async fn prepare_inner(
                 messages: None,
                 one_hour: false,
                 observation: None,
+                opening: None,
             }
         }
         Err(error) => {

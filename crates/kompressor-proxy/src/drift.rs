@@ -225,7 +225,7 @@ fn is_instruction(item: &Value) -> bool {
 }
 
 /// A tool's name, wherever its family keeps it.
-fn tool_name(tool: &Value) -> &str {
+pub(crate) fn tool_name(tool: &Value) -> &str {
     tool.get("name")
         .and_then(Value::as_str)
         .or_else(|| tool.pointer("/function/name").and_then(Value::as_str))

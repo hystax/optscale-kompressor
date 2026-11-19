@@ -79,6 +79,7 @@ mod retention;
 pub mod retrieve;
 pub mod route;
 pub mod sse;
+pub mod stabilize;
 mod stream;
 pub mod tool;
 pub mod turn;
@@ -117,6 +118,9 @@ pub struct ProxyState {
     /// next can say which part of the prefix moved and on which side of this
     /// proxy. Observation only: nothing reads it to decide what to send.
     pub(crate) drift: Arc<drift::DriftTracker>,
+    /// The tool order and beta tokens each conversation's first request
+    /// established, for `proxy.tools_order` and `proxy.sticky_beta`.
+    pub(crate) stabilizer: Arc<stabilize::Stabilizer>,
 }
 
 impl ProxyState {
@@ -139,6 +143,7 @@ impl ProxyState {
             keepwarm: Arc::new(keepwarm::KeepWarm::default()),
             retention: Arc::new(retention::Rejections::default()),
             drift: Arc::new(drift::DriftTracker::default()),
+            stabilizer: Arc::new(stabilize::Stabilizer::default()),
         }
     }
 

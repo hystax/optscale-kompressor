@@ -45,8 +45,9 @@ pub(crate) struct Outbound {
     waited_us: Arc<AtomicU64>,
     timing: Arc<Mutex<ProxyTiming>>,
     started: Instant,
-    /// Set when the proxy added `prompt_cache_retention`, so a refusal of it
-    /// can be answered by sending without it. See [`crate::retention`].
+    /// Set when the proxy added `prompt_cache_retention` or `prompt_cache_key`,
+    /// so a refusal of either can be answered by sending without it. See
+    /// [`crate::retention`].
     retention: Option<retention::Guard>,
 }
 
@@ -178,10 +179,9 @@ impl Outbound {
         let version = response.version();
         let headers = response.headers().clone();
         let bytes = response.bytes().await?;
-        if retention::names_field(&bytes)
+        if guard.refuse_named(&bytes)
             && let Some(stripped) = guard.strip(&self.body, self.encoding)
         {
-            guard.refuse();
             return self.send_body(stripped).await;
         }
         let mut rebuilt = http::Response::new(bytes);

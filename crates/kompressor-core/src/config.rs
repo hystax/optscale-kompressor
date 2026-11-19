@@ -395,6 +395,45 @@ pub enum PromptCacheRetention {
     Extended,
 }
 
+/// The order tool definitions go upstream in.
+///
+/// A provider renders the tool list ahead of the conversation, so a client
+/// that sends the same tools in another order on a later turn loses the cache
+/// from the first tool that moved. `pinned` keeps each conversation's tools in
+/// the order its first request sent them; a tool that appears later is added
+/// after those. Nothing is sorted, so the first request of every conversation
+/// goes out exactly as written, and a client that never reorders is never
+/// touched. Built on the evidence of the `/prefix` dashboard's `tool_order`
+/// row, and off until that row says it is worth having.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolsOrder {
+    /// The client's order, as written. The shipped default.
+    #[default]
+    Client,
+    /// The order the conversation's first request used.
+    Pinned,
+}
+
+/// Whether OpenAI requests that name no `prompt_cache_key` are given one.
+///
+/// OpenAI routes a request to a cache by a hash of its opening, and combines
+/// that with `prompt_cache_key` when the request carries one. A client that
+/// sends none leaves two conversations with the same instructions and tools
+/// competing for one route. `conversation` names the conversation by its
+/// opening messages, so every turn of it is routed alike. Codex sets its own
+/// key and is never overridden.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheKey {
+    /// The client's request goes out as written. The shipped default.
+    #[default]
+    Client,
+    /// Add a key derived from the conversation's opening where the client
+    /// named none.
+    Conversation,
+}
+
 /// Where the frozen prefix ends: what the client says, or what the provider
 /// has actually cached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -487,6 +526,26 @@ pub struct ProxyConfig {
     /// that names the field is answered by sending the request again without
     /// it, and the field is not added again for that upstream and model.
     pub prompt_cache_retention: PromptCacheRetention,
+    /// Whether an OpenAI request that names no `prompt_cache_key` is given
+    /// one. See [`PromptCacheKey`]. Applied where
+    /// [`Self::prompt_cache_retention`] is: Chat Completions and Responses
+    /// through the `openai` upstream or one on `api.openai.com`, never on the
+    /// ChatGPT-subscription route, and a 400 naming the field is answered by
+    /// sending again without it.
+    pub prompt_cache_key: PromptCacheKey,
+    /// The order tool definitions go upstream in. See [`ToolsOrder`].
+    pub tools_order: ToolsOrder,
+    /// Keep sending the `anthropic-beta` tokens a conversation has already
+    /// sent. **Off by default.**
+    ///
+    /// A beta token can change how the provider renders the prompt, so a
+    /// client that sends one on some turns of a conversation and not on others
+    /// can lose its cache each time the set changes. With this on, a request
+    /// carrying fewer tokens than the conversation has sent before goes out
+    /// with all of them, in the order they were first seen. A token the client
+    /// never sent in this conversation is never added. Anthropic Messages
+    /// only.
+    pub sticky_beta: bool,
     /// Keep an Anthropic conversation's cached prefix alive while the client
     /// is busy running a tool. **On by default**; only Anthropic Messages
     /// traffic is ever pinged, so this is in effect Anthropic's default, and
@@ -812,6 +871,12 @@ pub struct ProviderOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_retention: Option<PromptCacheRetention>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<PromptCacheKey>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools_order: Option<ToolsOrder>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sticky_beta: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_keep_warm: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_read: Option<bool>,
@@ -842,6 +907,9 @@ impl ProviderOverrides {
             frozen_prefix,
             cache_ttl,
             prompt_cache_retention,
+            prompt_cache_key,
+            tools_order,
+            sticky_beta,
             cache_keep_warm,
             stale_read
         );
@@ -907,6 +975,9 @@ impl Default for ProxyConfig {
             frozen_prefix: FrozenPrefix::Marker,
             cache_ttl: CacheTtl::Default,
             prompt_cache_retention: PromptCacheRetention::Default,
+            prompt_cache_key: PromptCacheKey::Client,
+            tools_order: ToolsOrder::Client,
+            sticky_beta: false,
             cache_keep_warm: true,
             cache_keep_warm_interval: Duration::from_secs(270),
             cache_keep_warm_max_pings: 11,
@@ -1450,6 +1521,24 @@ impl Config {
                     _ => self.proxy.prompt_cache_retention,
                 };
             }
+            "prompt_cache_key" => {
+                self.proxy.prompt_cache_key = match value.to_ascii_lowercase().as_str() {
+                    "client" => PromptCacheKey::Client,
+                    "conversation" => PromptCacheKey::Conversation,
+                    _ => self.proxy.prompt_cache_key,
+                };
+            }
+            "tools_order" => {
+                self.proxy.tools_order = match value.to_ascii_lowercase().as_str() {
+                    "client" => ToolsOrder::Client,
+                    "pinned" => ToolsOrder::Pinned,
+                    _ => self.proxy.tools_order,
+                };
+            }
+            "sticky_beta" => {
+                self.proxy.sticky_beta =
+                    parse_bool_setting("proxy.sticky_beta", value, self.proxy.sticky_beta);
+            }
             "cache_keep_warm" => {
                 self.proxy.cache_keep_warm =
                     parse_bool_setting("proxy.cache_keep_warm", value, self.proxy.cache_keep_warm);
@@ -1971,6 +2060,50 @@ mod tests {
         assert_eq!(config.proxy.frozen_prefix, FrozenPrefix::FirstSeen);
         config.apply_env(&[("KOMPRESSOR__PROXY__FROZEN_PREFIX".into(), "marker".into())]);
         assert_eq!(config.proxy.frozen_prefix, FrozenPrefix::Marker);
+    }
+
+    #[test]
+    fn the_prefix_stabilisers_are_off_by_default_and_set_per_provider_or_from_the_environment() {
+        let mut config = Config::default();
+        assert_eq!(config.proxy.prompt_cache_key, PromptCacheKey::Client);
+        assert_eq!(config.proxy.tools_order, ToolsOrder::Client);
+        assert!(!config.proxy.sticky_beta);
+
+        config.apply_env(&[
+            (
+                "KOMPRESSOR__PROXY__PROMPT_CACHE_KEY".into(),
+                "conversation".into(),
+            ),
+            ("KOMPRESSOR__PROXY__TOOLS_ORDER".into(), "pinned".into()),
+            ("KOMPRESSOR__PROXY__STICKY_BETA".into(), "true".into()),
+        ]);
+        assert_eq!(config.proxy.prompt_cache_key, PromptCacheKey::Conversation);
+        assert_eq!(config.proxy.tools_order, ToolsOrder::Pinned);
+        assert!(config.proxy.sticky_beta);
+        // A typo leaves the setting alone.
+        config.apply_env(&[("KOMPRESSOR__PROXY__TOOLS_ORDER".into(), "sorted".into())]);
+        assert_eq!(config.proxy.tools_order, ToolsOrder::Pinned);
+
+        let parsed: Config = toml::from_str(
+            "[proxy.providers.anthropic]\nsticky_beta = true\ntools_order = \"pinned\"\n\
+             [proxy.providers.openai]\nprompt_cache_key = \"conversation\"\n",
+        )
+        .unwrap();
+        assert!(
+            !parsed.proxy.sticky_beta,
+            "the deployment default is untouched"
+        );
+        let anthropic = parsed
+            .for_provider("anthropic")
+            .expect("anthropic has overrides");
+        assert!(anthropic.proxy.sticky_beta);
+        assert_eq!(anthropic.proxy.tools_order, ToolsOrder::Pinned);
+        assert_eq!(anthropic.proxy.prompt_cache_key, PromptCacheKey::Client);
+        let openai = parsed.for_provider("openai").expect("openai has overrides");
+        assert_eq!(openai.proxy.prompt_cache_key, PromptCacheKey::Conversation);
+        assert!(!openai.proxy.sticky_beta);
+
+        assert!(toml::from_str::<Config>("[proxy]\ntools_order = \"sorted\"\n").is_err());
     }
 
     #[test]
