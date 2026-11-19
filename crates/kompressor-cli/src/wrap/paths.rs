@@ -94,6 +94,39 @@ impl Paths {
 /// Create a directory, reporting the path that failed rather than just the
 /// errno — a wrap that cannot write its state is usually a permissions problem
 /// on one specific directory and saying which one is the whole diagnosis.
+/// Write `text` to `path` readable by its owner alone.
+///
+/// For the files this command generates that can hold a credential: the proxy
+/// and tool-server configurations carry `auth.keys`, the cluster secret and
+/// any upstream headers, and the ownership record keeps a whole copy of the
+/// agent's own configuration file to restore later. Written with
+/// `std::fs::write` they were `0644` under the usual umask, whatever mode the
+/// file they were copied from had.
+///
+/// The mode is set when the file is created and again afterwards, so a file
+/// left behind by an earlier version is tightened too. A no-op beyond the
+/// write on platforms without Unix permissions.
+pub fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(text.as_bytes())?;
+        file.flush()
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, text)
+    }
+}
+
 pub fn ensure_dir(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)
 }

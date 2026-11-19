@@ -157,7 +157,10 @@ impl Authenticator {
 /// length of the configured key is observable from timing.
 fn constant_time_eq(left: &str, right: &str) -> bool {
     let (a, b) = (left.as_bytes(), right.as_bytes());
-    let mut diff = (a.len() ^ b.len()) as u8;
+    // Not `(a.len() ^ b.len()) as u8`: that keeps only the low byte, so two
+    // lengths 256 apart read as equal and the zero padding below then matches
+    // a key followed by NULs.
+    let mut diff = u8::from(a.len() != b.len());
     let len = a.len().max(b.len());
     for i in 0..len {
         let x = a.get(i).copied().unwrap_or(0);
@@ -370,5 +373,13 @@ mod tests {
         assert!(!constant_time_eq("abc", "abcd"));
         assert!(!constant_time_eq("", "a"));
         assert!(constant_time_eq("", ""));
+        // Lengths a multiple of 256 apart, the longer padded with NULs: the
+        // length difference used to be truncated to its low byte and vanish.
+        for extra in [256, 512, 65_536] {
+            let padded = format!("k{}", "\0".repeat(extra));
+            assert!(!constant_time_eq("k", &padded), "{extra} NULs");
+            assert!(!constant_time_eq(&padded, "k"), "{extra} NULs, reversed");
+        }
+        assert!(!constant_time_eq("", &"\0".repeat(256)));
     }
 }

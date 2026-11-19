@@ -15,7 +15,7 @@ use kompressor_stats::events::Surface;
 use kompressor_stats::reader::StatsReader;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 
@@ -145,10 +145,15 @@ impl KompressorTools {
 
     /// The request identifier recorded against everything this call does.
     ///
-    /// The JSON-RPC id is reused so a row in the statistics database can be
-    /// matched back to the exact tool call that produced it.
+    /// The JSON-RPC id ends it, so a row in the statistics database can still
+    /// be matched back to the tool call that produced it — but it cannot *be*
+    /// the id. It is chosen by the client, and over stateless streamable HTTP
+    /// it restarts at 1 with every POST, so every call a tenant made was
+    /// recorded as `mcp-1`: unrelated compressions summed as one request,
+    /// retrievals attributed to whichever of them came first, and each call's
+    /// run context overwriting the last.
     fn request_id(context: &RequestContext<RoleServer>) -> String {
-        format!("mcp-{}", context.id)
+        unique_request_id(&context.id.to_string())
     }
 }
 
@@ -423,7 +428,10 @@ impl KompressorTools {
         }
 
         let to = input.to.unwrap_or_else(now_ms);
-        let from = input.from.unwrap_or(to - DEFAULT_STATS_WINDOW_MS);
+        // `to` is the caller's: near `i64::MIN` a plain subtraction overflows.
+        let from = input
+            .from
+            .unwrap_or_else(|| to.saturating_sub(DEFAULT_STATS_WINDOW_MS));
         // Opened per call rather than held: the writer owns the connection that
         // matters, and a reader kept open across a retention sweep would serve
         // a stale page cache.
@@ -452,8 +460,8 @@ impl KompressorTools {
 // `tools/call`.
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for KompressorTools {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(SERVER_INSTRUCTIONS)
             // The default here is the transport library's own name and version,
             // which is what a user sees in an agent's server list. Naming the
@@ -465,6 +473,23 @@ impl ServerHandler for KompressorTools {
                 env!("CARGO_PKG_VERSION"),
             ))
     }
+}
+
+/// `mcp-<unique>-<json-rpc id>`: unique in this process by a counter, and
+/// across processes and restarts by the millisecond it was issued in.
+fn unique_request_id(rpc_id: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let ms = now_ms().max(0) as u64;
+    // Whatever the client put in its id is not carried into a log line or a
+    // stats key verbatim: only what could not forge either.
+    let tail: String = rpc_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .take(32)
+        .collect();
+    format!("mcp-{ms:x}{:04x}-{tail}", counter & 0xFFFF_FFFF)
 }
 
 fn now_ms() -> i64 {
@@ -480,4 +505,32 @@ fn internal(error: serde_json::Error) -> ErrorData {
 
 fn tool_failure(what: &str, error: impl std::fmt::Display) -> ErrorData {
     ErrorData::internal_error(format!("could not {what}: {error}"), None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A JSON-RPC id is the client's and repeats; the recorded id must not.
+    #[test]
+    fn two_calls_with_the_same_json_rpc_id_get_different_request_ids() {
+        let ids: Vec<String> = (0..500).map(|_| unique_request_id("1")).collect();
+        let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(distinct.len(), ids.len());
+        assert!(
+            ids.iter()
+                .all(|id| id.starts_with("mcp-") && id.ends_with("-1"))
+        );
+    }
+
+    /// The client's id is carried as a suffix, stripped of anything that could
+    /// break a log line or pass for a different key.
+    #[test]
+    fn the_json_rpc_id_is_carried_but_never_verbatim_when_it_is_hostile() {
+        let id = unique_request_id("\"abc\ninjected: 1\"");
+        assert!(id.ends_with("-abcinjected1"), "{id}");
+        assert!(!id.contains('\n') && !id.contains('"') && !id.contains(' '));
+        let long = unique_request_id(&"x".repeat(10_000));
+        assert!(long.len() < 80, "{}", long.len());
+    }
 }

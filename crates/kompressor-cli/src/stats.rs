@@ -880,8 +880,16 @@ fn parse_instant(value: Option<&str>, default: i64) -> Result<i64, CliError> {
 
 /// `30s`, `15m`, `24h`, `7d` as milliseconds.
 fn parse_relative(value: &str) -> Option<i64> {
-    let (digits, unit) = value.split_at(value.len().checked_sub(1)?);
+    // The unit is the last *character*. Cutting one byte off the end is not
+    // the same thing: `7д` ends in a two-byte character, the cut lands inside
+    // it, and `split_at` panics — on a command-line argument.
+    let (at, _) = value.char_indices().next_back()?;
+    let (digits, unit) = value.split_at(at);
     let amount: i64 = digits.parse().ok()?;
+    // A span is how long ago. `-5d` would otherwise be five days from now.
+    if amount < 0 {
+        return None;
+    }
     let scale = match unit {
         "s" => 1_000,
         "m" => 60_000,
@@ -1054,6 +1062,39 @@ mod tests {
         let day_ago = parse_instant(Some("1d"), 0).unwrap();
         let delta = now_ms() - day_ago;
         assert!((86_400_000..86_400_000 + 5_000).contains(&delta), "{delta}");
+    }
+
+    /// The bound comes straight from the command line, in whatever script the
+    /// user types. A unit that is not ASCII is not a unit — and must be refused
+    /// as bad usage, not by panicking on a byte offset inside the character.
+    #[test]
+    fn a_bound_ending_in_a_multi_byte_character_is_a_usage_error_not_a_panic() {
+        for bound in ["7д", "7日", "12час", "5\u{00e9}", "\u{1f600}", "д"] {
+            assert_eq!(
+                parse_instant(Some(bound), 0).unwrap_err().code(),
+                2,
+                "{bound}"
+            );
+        }
+        assert_eq!(parse_relative("7д"), None);
+        assert_eq!(parse_relative(""), None);
+        assert_eq!(parse_relative("d"), None);
+    }
+
+    #[test]
+    fn a_span_is_a_whole_non_negative_number_and_a_known_unit() {
+        assert_eq!(parse_relative("30s"), Some(30_000));
+        assert_eq!(parse_relative("15m"), Some(900_000));
+        assert_eq!(parse_relative("24h"), Some(86_400_000));
+        assert_eq!(parse_relative("7d"), Some(604_800_000));
+        assert_eq!(parse_relative("0d"), Some(0));
+        // A negative span would name a time in the future.
+        assert_eq!(parse_relative("-5d"), None);
+        assert_eq!(parse_instant(Some("-5d"), 0).unwrap_err().code(), 2);
+        assert_eq!(parse_relative("7w"), None);
+        assert_eq!(parse_relative("1.5h"), None);
+        // Overflow is refused rather than wrapped.
+        assert_eq!(parse_relative("9223372036854775807d"), None);
     }
 
     #[test]

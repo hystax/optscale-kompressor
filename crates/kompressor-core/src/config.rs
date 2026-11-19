@@ -35,6 +35,11 @@ pub struct Config {
     pub mcp: McpConfig,
     pub proxy: ProxyConfig,
     pub log: LogConfig,
+    /// Environment overrides that named a value this build does not know, for
+    /// the settings where carrying on regardless is not safe. Reported by
+    /// [`Config::validate`]; never read from or written to a file.
+    #[serde(skip)]
+    pub refused_env: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1212,19 +1217,35 @@ impl Config {
                 _ => {}
             },
             "auth" => match field {
-                "mode" => {
-                    if value.eq_ignore_ascii_case("api_keys") {
-                        self.auth.mode = AuthMode::ApiKeys;
-                    }
-                }
+                // Not "leave the setting standing", which is the rule for the
+                // tuning knobs. The setting left standing here is usually
+                // `none`: an operator who wrote `api-keys` or `apikeys` got a
+                // server that started, validated, and served every caller as
+                // the anonymous tenant. An unreadable auth mode stops the
+                // server instead (see `validate`).
+                "mode" => match value.to_ascii_lowercase().replace('-', "_").as_str() {
+                    "api_keys" | "apikeys" => self.auth.mode = AuthMode::ApiKeys,
+                    "none" => self.auth.mode = AuthMode::None,
+                    _ => self.refused_env.push(format!(
+                        "auth.mode cannot be {value:?}: expected none or api_keys"
+                    )),
+                },
                 "secret" => self.auth.secret = value.to_string(),
                 _ => {}
             },
             "refs" => match field {
                 "path" => self.refs.path = PathBuf::from(value),
-                "backend" if value.eq_ignore_ascii_case("memory") => {
-                    self.refs.backend = RefsBackend::Memory;
-                }
+                // Refused when unreadable, for the same reason as `auth.mode`:
+                // the backend left standing is SQLite, so asking for an
+                // in-memory store with a misspelt name wrote every fragment
+                // to disk.
+                "backend" => match value.to_ascii_lowercase().as_str() {
+                    "memory" => self.refs.backend = RefsBackend::Memory,
+                    "sqlite" => self.refs.backend = RefsBackend::Sqlite,
+                    _ => self.refused_env.push(format!(
+                        "refs.backend cannot be {value:?}: expected sqlite or memory"
+                    )),
+                },
                 "browse" => {
                     self.refs.browse = parse_bool_setting("refs.browse", value, self.refs.browse)
                 }
@@ -1510,6 +1531,11 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(refused) = self.refused_env.first() {
+            return Err(ConfigError::Invalid(format!(
+                "environment override refused: {refused}"
+            )));
+        }
         if self.refs.purge_interval.is_zero() {
             return Err(ConfigError::Invalid(
                 "refs.purge_interval must be greater than zero".into(),
@@ -2294,6 +2320,71 @@ mod tests {
         assert_eq!(
             parsed.proxy.retrieve_max_rounds,
             config.proxy.retrieve_max_rounds
+        );
+    }
+
+    /// `KOMPRESSOR__AUTH__MODE=api-keys` used to be ignored without a word,
+    /// leaving `none` in force: the server came up serving everyone as the
+    /// anonymous tenant. An auth mode that cannot be read is now an error at
+    /// validation, and the common spellings are understood.
+    #[test]
+    fn an_unreadable_auth_mode_in_the_environment_stops_the_server() {
+        let env = |value: &str| {
+            let mut config = Config::default();
+            config.apply_env(&[("KOMPRESSOR__AUTH__MODE".into(), value.into())]);
+            config
+        };
+        for spelling in ["api_keys", "API_KEYS", "api-keys", "ApiKeys"] {
+            assert_eq!(env(spelling).auth.mode, AuthMode::ApiKeys, "{spelling}");
+        }
+        assert_eq!(env("none").auth.mode, AuthMode::None);
+        assert!(env("none").validate().is_ok());
+
+        for typo in ["api_key", "keys", "on", "true", "nonee"] {
+            let config = env(typo);
+            let error = config.validate().expect_err(typo).to_string();
+            assert!(
+                error.contains("auth.mode") && error.contains(typo),
+                "{error}"
+            );
+        }
+
+        // The environment can also turn a file's `api_keys` off, explicitly.
+        let mut config = Config::default();
+        config.auth.mode = AuthMode::ApiKeys;
+        config.apply_env(&[("KOMPRESSOR__AUTH__MODE".into(), "none".into())]);
+        assert_eq!(config.auth.mode, AuthMode::None);
+    }
+
+    /// The same for the fragment store: a misspelt `memory` kept SQLite, and
+    /// fragments the operator wanted held in memory were written to disk.
+    #[test]
+    fn an_unreadable_refs_backend_in_the_environment_stops_the_server() {
+        let env = |value: &str| {
+            let mut config = Config::default();
+            config.apply_env(&[("KOMPRESSOR__REFS__BACKEND".into(), value.into())]);
+            config
+        };
+        assert_eq!(env("memory").refs.backend, RefsBackend::Memory);
+        assert_eq!(env("Memory").refs.backend, RefsBackend::Memory);
+        assert_eq!(env("sqlite").refs.backend, RefsBackend::Sqlite);
+        assert!(env("sqlite").validate().is_ok());
+        let error = env("ephemeral").validate().unwrap_err().to_string();
+        assert!(
+            error.contains("refs.backend") && error.contains("ephemeral"),
+            "{error}"
+        );
+    }
+
+    /// The refusals never reach a file or the fingerprint of a configuration.
+    #[test]
+    fn refused_overrides_are_not_part_of_the_serialised_configuration() {
+        let mut config = Config::default();
+        config.apply_env(&[("KOMPRESSOR__AUTH__MODE".into(), "bogus".into())]);
+        let text = toml::to_string(&config).unwrap();
+        assert!(
+            !text.contains("refused_env") && !text.contains("bogus"),
+            "{text}"
         );
     }
 

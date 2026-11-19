@@ -211,34 +211,98 @@ impl Gutter {
 
     /// Put the numbers back on the lines of `compressed` that came from the body.
     ///
-    /// Walks both sides forward only, so each input line is claimed at most once
-    /// and an output line can never take a number from above a line already
-    /// used. An output line with no match left ahead of it — a marker, or a
-    /// rewritten template — is emitted exactly as the compressor wrote it.
+    /// A line gets its own number or none — never another line's. That needs
+    /// more than "the first identical line ahead": once the compressor has
+    /// omitted something, an identical line (`}`, `return None`, a repeated log
+    /// line) may sit among what was omitted, and taking the first match gave a
+    /// kept line the number of one that is no longer there.
+    ///
+    /// So the output is read in three parts, split at the lines that match
+    /// nothing in the body — markers and rewritten templates, which are where
+    /// lines went missing:
+    ///
+    /// - before the first such line nothing has been omitted, and lines are
+    ///   matched forwards, each to the first identical line not yet claimed;
+    /// - after the last one, lines are matched backwards from the end of the
+    ///   body, since what follows the last omission is the body's tail;
+    /// - in between, a line is numbered only when it is the single candidate
+    ///   left, or directly continues the line numbered just before it.
+    ///
+    /// Anything else is emitted exactly as the compressor wrote it.
     pub fn reattach(&self, compressed: &str) -> String {
         let mut index: HashMap<&str, Vec<usize>> = HashMap::new();
         for (i, line) in self.lines.iter().enumerate() {
             index.entry(line.as_str()).or_default().push(i);
         }
+        let output = split_lines(compressed);
+        let unmatched = |line: &str| !line.is_empty() && !index.contains_key(line);
+        let first_gap = output.iter().position(|line| unmatched(line));
+        let last_gap = output.iter().rposition(|line| unmatched(line));
+        let mut origin: Vec<Option<usize>> = vec![None; output.len()];
 
-        let mut cursor = 0usize;
-        let mut out = Vec::new();
-        for line in split_lines(compressed) {
-            let origin = index.get(line).and_then(|hits| {
-                hits.iter()
-                    .copied()
-                    .find(|&i| i >= cursor)
-                    .filter(|_| !line.is_empty())
-            });
-            match origin {
-                Some(i) => {
-                    cursor = i + 1;
-                    match &self.prefixes[i] {
-                        Some(prefix) => out.push(format!("{prefix}{line}")),
-                        None => out.push(line.to_string()),
-                    }
+        // The tail, backwards. `limit` ends as the lowest body line it claimed,
+        // which nothing before it may reach.
+        let mut limit = self.lines.len();
+        if let Some(last) = last_gap {
+            for at in (last + 1..output.len()).rev() {
+                let line = output[at];
+                if line.is_empty() {
+                    continue;
                 }
-                None => out.push(line.to_string()),
+                if let Some(i) = index
+                    .get(line)
+                    .and_then(|hits| hits.iter().rev().copied().find(|&i| i < limit))
+                {
+                    origin[at] = Some(i);
+                    limit = i;
+                }
+            }
+        }
+
+        let head_end = first_gap.unwrap_or(output.len());
+        let middle_end = last_gap.unwrap_or(output.len());
+        let mut cursor = 0usize;
+        // The body line the previous output line was matched to, while the run
+        // is unbroken.
+        let mut previous: Option<usize> = None;
+        for at in 0..middle_end.max(head_end) {
+            let line = output[at];
+            if line.is_empty() {
+                // A blank line carries no number; it continues a run only when
+                // the body has a blank line in the same place.
+                previous = previous
+                    .map(|i| i + 1)
+                    .filter(|&i| i < limit && self.lines[i].is_empty());
+                if let Some(i) = previous {
+                    cursor = i + 1;
+                }
+                continue;
+            }
+            let hits = index.get(line).map(Vec::as_slice).unwrap_or(&[]);
+            let mut ahead = hits.iter().copied().filter(|&i| i >= cursor && i < limit);
+            let found = if at < head_end {
+                ahead.next()
+            } else {
+                let continues = previous
+                    .map(|i| i + 1)
+                    .filter(|&i| i < limit && self.lines[i] == line);
+                continues.or_else(|| match (ahead.next(), ahead.next()) {
+                    (Some(only), None) => Some(only),
+                    _ => None,
+                })
+            };
+            origin[at] = found;
+            previous = found;
+            if let Some(i) = found {
+                cursor = i + 1;
+            }
+        }
+
+        let mut out = Vec::with_capacity(output.len());
+        for (line, origin) in output.iter().zip(&origin) {
+            match origin.and_then(|i| self.prefixes[i].as_ref()) {
+                Some(prefix) => out.push(format!("{prefix}{line}")),
+                None => out.push((*line).to_string()),
             }
         }
         let mut joined = out.join("\n");

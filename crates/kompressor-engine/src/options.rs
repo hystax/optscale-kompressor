@@ -570,6 +570,8 @@ impl EngineOptionsPatch {
             enable_lossy_key_factoring,
             enable_stale_read,
             enable_preamble_aware_detection,
+            enable_line_gutter,
+            max_line_chars,
             enable_fold_fallback,
             strict_lossless,
             search_max_files,
@@ -598,6 +600,60 @@ mod tests {
     #[test]
     fn the_default_mode_is_recoverable() {
         assert_eq!(EngineOptions::default().mode, Mode::Recoverable);
+    }
+
+    /// Every field a request may override has to land. The patch accepts
+    /// unknown keys nowhere, so a field that is declared but not applied is
+    /// the one way an override can be silently dropped — which is what
+    /// happened to `enable_line_gutter` and `max_line_chars`.
+    ///
+    /// Driven from the serialised shapes so a field added to the patch later
+    /// is covered without anyone remembering to extend this test.
+    #[test]
+    fn every_field_of_a_patch_lands_in_the_merged_options() {
+        use serde_json::{Value, json};
+        let defaults = serde_json::to_value(EngineOptions::default()).unwrap();
+        let fields = serde_json::to_value(EngineOptionsPatch::default()).unwrap();
+        let fields = fields.as_object().unwrap();
+        assert!(
+            fields.len() > 30,
+            "the patch lost its fields: {}",
+            fields.len()
+        );
+        for name in fields.keys() {
+            let default = defaults
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} is in the patch but not in the options"));
+            let (sent, expected): (Value, Value) = match (name.as_str(), default) {
+                ("mode", _) => (json!("aggressive"), json!("aggressive")),
+                ("token_guard", _) => (json!("tokens"), json!("tokens")),
+                ("protected_roles", _) => (json!("critic"), json!(["critic"])),
+                (_, Value::Bool(b)) => (json!(!b), json!(!b)),
+                (_, Value::Number(n)) => {
+                    let v = n.as_u64().expect("an unsigned knob") + 7;
+                    (json!(v), json!(v))
+                }
+                (_, other) => panic!("{name}: no way to vary a {other:?}"),
+            };
+            assert_ne!(
+                &expected, default,
+                "{name}: the probe must differ from the default"
+            );
+            let patch: EngineOptionsPatch =
+                serde_json::from_value(json!({ name.as_str(): sent })).unwrap();
+            let merged = serde_json::to_value(EngineOptions::default().merged(&patch)).unwrap();
+            assert_eq!(
+                merged[name.as_str()],
+                expected,
+                "{name} was sent and ignored"
+            );
+            // And nothing else moved.
+            for (other, value) in defaults.as_object().unwrap() {
+                if other != name {
+                    assert_eq!(&merged[other.as_str()], value, "{name} changed {other}");
+                }
+            }
+        }
     }
 
     #[test]
