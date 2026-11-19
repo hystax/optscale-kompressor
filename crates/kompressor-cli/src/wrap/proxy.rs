@@ -135,7 +135,8 @@ pub fn write_config(
     let path = paths.proxy_config(port);
     let text = toml::to_string_pretty(&config)
         .map_err(|e| CliError::runtime("could not serialise the proxy configuration", e))?;
-    std::fs::write(&path, text)
+    // Owner-only: this is the user's configuration, `auth` section included.
+    super::paths::write_private(&path, &text)
         .map_err(|e| CliError::runtime(&format!("could not write {}", path.display()), e))?;
     Ok(path)
 }
@@ -413,6 +414,38 @@ pub async fn stop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// The generated proxy configuration is the user's own, credentials and
+    /// all. It must not be readable by other users of the machine.
+    #[cfg(unix)]
+    #[test]
+    fn the_generated_proxy_configuration_is_readable_by_its_owner_alone() {
+        let (paths, dir) = scratch("private-config");
+        let mut config = Config::default();
+        config.auth.secret = "cluster-secret-that-must-stay-private".into();
+        let path = write_config(&paths, &config, Vec::new(), 8817).unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("cluster-secret-that-must-stay-private"),
+            "the premise: the secret is in the file"
+        );
+        assert_eq!(mode_of(&path), 0o600);
+
+        // A file an earlier version left world-readable is tightened on rewrite.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let again = write_config(&paths, &config, Vec::new(), 8817).unwrap();
+        assert_eq!(again, path);
+        assert_eq!(mode_of(&path), 0o600);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// A scratch layout per test. No environment is touched, so these run in
     /// parallel with everything else in the binary.

@@ -1024,6 +1024,19 @@ impl PrefixTracker {
             entry.floor = Some(held);
             return held;
         }
+        // The cap is enforced here as well as in `record`. This runs at
+        // request time, before any response, so by the time `record` sees the
+        // fingerprint it is already in the table — its own "not yet held"
+        // test was never true again and nothing was ever evicted: one entry
+        // leaked per conversation, for the life of the process.
+        if seen.len() >= REMEMBER
+            && let Some(oldest) = seen
+                .iter()
+                .min_by_key(|(_, entry)| entry.at)
+                .map(|(key, _)| *key)
+        {
+            seen.remove(&oldest);
+        }
         seen.insert(
             fingerprint,
             Seen {
@@ -1974,6 +1987,34 @@ mod tests {
         assert_eq!(tracker.floor(1, 3), 3);
         assert_eq!(tracker.floor(2, 7), 7);
         assert_eq!(tracker.floor(1, 9), 3);
+    }
+
+    /// The order the proxy actually calls in: `floor` when the request
+    /// arrives, `record` when the response does. `floor` files the entry, so
+    /// the bound has to hold there — `record` alone never sees a new key.
+    #[test]
+    fn the_table_is_bounded_when_the_floor_is_asked_first() {
+        let tracker = PrefixTracker::new(Duration::ZERO);
+        for key in 0..(REMEMBER as u64 + 64) {
+            tracker.floor(key, 3);
+            tracker.record(key, Some(1), None, 0);
+        }
+        let held = tracker.seen.lock().unwrap().len();
+        assert!(held <= REMEMBER, "the table must stay bounded, held {held}");
+        // The newest conversation is still tracked, with its floor.
+        assert_eq!(tracker.floor(REMEMBER as u64 + 63, 9), 3);
+        assert_eq!(tracker.state(REMEMBER as u64 + 63), PrefixCache::Warm);
+    }
+
+    /// The same through `floor_for`, which is what the handler calls.
+    #[test]
+    fn the_table_is_bounded_through_floor_for() {
+        let tracker = PrefixTracker::new(Duration::ZERO);
+        for key in 0..(REMEMBER as u64 + 64) {
+            tracker.floor_for(key, 1, Some(key ^ 0xabcd), "m");
+        }
+        assert!(tracker.seen.lock().unwrap().len() <= REMEMBER);
+        assert!(tracker.lineages.lock().unwrap().len() <= REMEMBER);
     }
 
     #[test]

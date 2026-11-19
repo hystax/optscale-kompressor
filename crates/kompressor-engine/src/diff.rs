@@ -127,15 +127,79 @@ fn crush_body(
     accept.then_some(result)
 }
 
-/// Whether `line` is an added or removed line rather than a file header.
-fn is_change(line: &str) -> bool {
-    (line.starts_with('+') || line.starts_with('-'))
-        && !line.starts_with("+++")
-        && !line.starts_with("---")
+/// Which of `lines` are inside a hunk, by the lengths each `@@ -a,b +c,d @@`
+/// header declares.
+///
+/// Position is the only thing that tells a file header from a change. Inside a
+/// hunk `+++counter;` adds the line `++counter;` and `--- old` removes the
+/// line `-- old`; before the first hunk the same prefixes name the two files.
+/// Counting the hunk out is what `patch` does, and it is exact: a header the
+/// counts cannot be read from opens no hunk, and its lines fall back to the
+/// prefix rule in [`change_mask`].
+fn hunk_mask(lines: &[&str]) -> Vec<bool> {
+    let mut mask = vec![false; lines.len()];
+    let (mut old_left, mut new_left) = (0usize, 0usize);
+    for (index, line) in lines.iter().enumerate() {
+        if old_left == 0 && new_left == 0 {
+            if let Some((old, new)) = hunk_lengths(line) {
+                old_left = old;
+                new_left = new;
+            }
+            continue;
+        }
+        mask[index] = true;
+        match line.as_bytes().first() {
+            Some(b'+') => new_left = new_left.saturating_sub(1),
+            Some(b'-') => old_left = old_left.saturating_sub(1),
+            // "\ No newline at end of file" belongs to the line before it.
+            Some(b'\\') => {}
+            // Context, including a blank line whose leading space an editor or
+            // a paste has stripped.
+            _ => {
+                old_left = old_left.saturating_sub(1);
+                new_left = new_left.saturating_sub(1);
+            }
+        }
+    }
+    mask
+}
+
+/// `(old lines, new lines)` of `@@ -a,b +c,d @@`; a count left out is one.
+fn hunk_lengths(line: &str) -> Option<(usize, usize)> {
+    let rest = line.strip_prefix("@@ -")?;
+    let (old, rest) = rest.split_once(" +")?;
+    let (new, _) = rest.split_once(" @@")?;
+    let length = |range: &str| -> Option<usize> {
+        match range.split_once(',') {
+            Some((start, count)) => {
+                start.parse::<usize>().ok()?;
+                count.parse().ok()
+            }
+            None => range.parse::<usize>().ok().map(|_| 1),
+        }
+    };
+    Some((length(old)?, length(new)?))
+}
+
+/// Which of `lines` are added or removed lines rather than headers or context.
+fn change_mask(lines: &[&str]) -> Vec<bool> {
+    let in_hunk = hunk_mask(lines);
+    lines
+        .iter()
+        .zip(in_hunk)
+        .map(|(line, in_hunk)| {
+            let signed = line.starts_with('+') || line.starts_with('-');
+            // Outside a counted hunk the prefix is all there is to go on.
+            signed && (in_hunk || !(line.starts_with("+++") || line.starts_with("---")))
+        })
+        .collect()
 }
 
 fn changes(lines: &[&str]) -> usize {
-    lines.iter().filter(|line| is_change(line)).count()
+    change_mask(lines)
+        .into_iter()
+        .filter(|change| *change)
+        .count()
 }
 
 /// The path a chunk is about, for the marker that narrows its context.
@@ -160,6 +224,7 @@ fn path_of<'a>(chunk: &[&'a str]) -> &'a str {
 /// Blank lines are left out of `dropped`: they carry nothing to retrieve, and
 /// counting them would inflate every marker with whitespace.
 fn reduce_context<'a>(lines: &[&'a str], limit: usize) -> (Vec<&'a str>, Vec<&'a str>) {
+    let changed = change_mask(lines);
     let mut keep: HashSet<usize> = lines
         .iter()
         .enumerate()
@@ -171,7 +236,7 @@ fn reduce_context<'a>(lines: &[&'a str], limit: usize) -> (Vec<&'a str>, Vec<&'a
         })
         .map(|(index, _)| index)
         .collect();
-    for (index, _) in lines.iter().enumerate().filter(|(_, l)| is_change(l)) {
+    for (index, _) in changed.iter().enumerate().filter(|(_, change)| **change) {
         for around in index.saturating_sub(limit)..(index + limit + 1).min(lines.len()) {
             keep.insert(around);
         }

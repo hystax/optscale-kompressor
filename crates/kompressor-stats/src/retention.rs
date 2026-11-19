@@ -182,7 +182,7 @@ fn rollup_on(
                     SUM(retrievals), SUM(hits), SUM(retrieved)
              FROM (
                SELECT date(time_ms/1000,'unixepoch') AS day, tenant, mode, surface,
-                      1 AS requests, tokens_in AS tokens_in, tokens_out AS tokens_out,
+                      1 AS requests, tokens_in AS tokens_in, (CASE WHEN coalesce(outcome,'') = 'discarded' THEN tokens_in ELSE tokens_out END) AS tokens_out,
                       0 AS retrievals, 0 AS hits, 0 AS retrieved
                  FROM optimization_events
                 WHERE date(time_ms/1000,'unixepoch') = ?1 AND (?2 OR rolled_up = 0)

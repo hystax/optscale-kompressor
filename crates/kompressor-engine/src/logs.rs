@@ -311,11 +311,7 @@ fn crush_body(
     // collected before the rollback: handles are content-addressed, so
     // re-stashing these exact fragments later reproduces the very handles the
     // plain reading's markers already carry
-    let plain_fragments: Vec<String> = refs.pairs()[mark.pairs..]
-        .iter()
-        .map(|(_, fragment)| fragment.clone())
-        .collect();
-    refs.rollback(mark);
+    let plain_shelved = refs.shelve(mark);
 
     let (elided_lines, echoed) = elide_diagnostic_echo(&lines, refs);
     let view: Vec<&str> = elided_lines.iter().map(|l| l.as_ref()).collect();
@@ -330,8 +326,7 @@ fn crush_body(
     if chars_len(&elided) <= chars_len(plain_text) {
         return Some(elided);
     }
-    refs.rollback(mark);
-    refs.restash_all(&plain_fragments);
+    refs.reinstate(mark, &plain_shelved);
     plain
 }
 

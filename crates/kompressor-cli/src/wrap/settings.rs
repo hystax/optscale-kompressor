@@ -272,7 +272,9 @@ pub(super) fn write_owners(path: &Path, owners: &Owners) -> Result<(), CliError>
     }
     let text = serde_json::to_string_pretty(owners)
         .map_err(|e| CliError::runtime("could not render the ownership record", e))?;
-    std::fs::write(path, text + "\n")
+    // Owner-only: for codex and opencode the recorded original is the whole of
+    // the agent's configuration file, which may hold a token.
+    paths::write_private(path, &(text + "\n"))
         .map_err(|e| CliError::runtime(&format!("could not write {}", path.display()), e))
 }
 
@@ -315,13 +317,24 @@ pub fn claim(target: &Target, key: &str, value: &str) -> Result<bool, CliError> 
             target.section
         )));
     }
-    let current = section.get(key).and_then(Value::as_str).map(str::to_string);
+    let mut current = section.get(key).and_then(Value::as_str).map(str::to_string);
 
     let mut claim = owners.keys.remove(key).unwrap_or_default();
+    let had_holders = !claim.holders.is_empty();
     sweep(&mut claim, &owners_path);
     // The original is recorded once, by the first live claimant. A later session
     // observing a proxy URL must not adopt it as "the original" — restoring that
     // on exit would leave the file pointing at a proxy that is gone.
+    //
+    // That holds for a session that died, too. Its record is still here with
+    // every holder swept, and the file still says what it wrote: the proxy URL.
+    // Reading that as the original threw away the one copy of the user's real
+    // value, so the next clean exit "restored" the dead proxy and removed the
+    // record that `unwrap` would have needed. What the dead session owed is
+    // paid first — its recorded original is the value this key had.
+    if had_holders && claim.holders.is_empty() {
+        current = claim.original.clone();
+    }
     if claim.holders.is_empty() {
         claim.original = current.clone();
     }
@@ -546,6 +559,94 @@ mod tests {
             value_at(&target, "ANTHROPIC_BASE_URL").as_deref(),
             Some("https://real.example"),
             "the restored value is the pre-wrap one, not the first session's proxy"
+        );
+    }
+
+    /// `wrap --attach`, SIGKILL, `wrap --attach` again, Ctrl-C. The second
+    /// session finds the dead one's record and the dead one's proxy URL in the
+    /// file. It must leave by putting back what the user had, not the URL of
+    /// a proxy that is gone.
+    #[test]
+    fn a_claim_after_a_dead_session_keeps_the_real_original() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        for original in [Some("https://original.example"), None] {
+            let scratch = Scratch::new(if original.is_some() {
+                "reclaim"
+            } else {
+                "reclaim-none"
+            });
+            let target = scratch.target();
+            std::fs::create_dir_all(target.settings.parent().unwrap()).unwrap();
+            let owners_path = target.owners_path();
+            let mut owners = Owners::default();
+            owners.keys.insert(
+                "ANTHROPIC_BASE_URL".into(),
+                Claim {
+                    original: original.map(str::to_string),
+                    holders: vec![Holder {
+                        pid: 0,
+                        start_time: Some(1),
+                        lock: None,
+                    }],
+                },
+            );
+            write_owners(&owners_path, &owners).unwrap();
+            std::fs::write(
+                &target.settings,
+                r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8817"},"keep":1}"#,
+            )
+            .unwrap();
+
+            // Same port as the dead session: nothing in the file changes, and
+            // that must not be read as "the original is the proxy".
+            claim(&target, "ANTHROPIC_BASE_URL", "http://127.0.0.1:8817").unwrap();
+            assert_eq!(
+                read_owners(&owners_path).keys["ANTHROPIC_BASE_URL"]
+                    .original
+                    .as_deref(),
+                original,
+                "the record must still hold the user's value"
+            );
+            release(&target, "ANTHROPIC_BASE_URL", false).unwrap();
+            assert_eq!(
+                value_at(&target, "ANTHROPIC_BASE_URL").as_deref(),
+                original,
+                "the dead proxy's URL was restored as if it were the user's"
+            );
+            let text = std::fs::read_to_string(&target.settings).unwrap();
+            assert!(text.contains("\"keep\""), "unrelated keys survive: {text}");
+        }
+    }
+
+    /// The ownership record keeps the original value to restore — for codex
+    /// and opencode, the whole configuration file. It is owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn the_ownership_record_is_readable_by_its_owner_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("private-owners");
+        let target = scratch.target();
+        let owners_path = target.owners_path();
+        let mut owners = Owners::default();
+        owners.keys.insert(
+            "k".into(),
+            Claim {
+                original: Some("token = \"sk-not-for-everyone\"".into()),
+                holders: vec![Holder::me(&target.settings)],
+            },
+        );
+        write_owners(&owners_path, &owners).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&owners_path), 0o600);
+
+        std::fs::set_permissions(&owners_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_owners(&owners_path, &owners).unwrap();
+        assert_eq!(
+            mode(&owners_path),
+            0o600,
+            "an older, looser file is tightened"
         );
     }
 

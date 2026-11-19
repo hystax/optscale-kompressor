@@ -146,6 +146,8 @@ mod tests {
         an_entry_past_its_idle_window_reports_expired_rather_than_missing,
         an_expired_entry_is_dropped_by_the_read_that_reported_it,
         an_entry_that_keeps_being_read_still_dies_at_the_lifetime_cap,
+        re_storing_a_dead_unswept_handle_mints_a_live_one,
+        re_storing_a_live_handle_near_its_cap_does_not_extend_the_cap,
         touch_many_extends_several_at_once_and_reports_how_many_it_found,
         touching_does_not_resurrect_an_expired_entry,
         purge_expired_removes_exactly_the_dead_rows_and_returns_the_count,
@@ -359,6 +361,54 @@ mod tests {
             f.store().get(&a(), &id, true).unwrap(),
             Lookup::Expired { expired_at: 1_250 },
             "the absolute cap bounds the sliding window"
+        );
+    }
+
+    /// A row past its absolute lifetime that the sweep has not reached yet is
+    /// the same thing as no row. Before the fix the re-store kept the dead
+    /// `created_at`, so the handle just minted read back `Expired` — and the
+    /// request that stored it was reverted to its original bytes.
+    fn re_storing_a_dead_unswept_handle_mints_a_live_one(make: Make) {
+        let f = make(1_000, None);
+        let fragment = "crossed its cap between two turns";
+        let id = put(f.store(), &a(), fragment, &meta_with(100, 250));
+
+        // Past both deadlines (idle 1_100, absolute 1_250); no purge runs.
+        f.clock.advance(300);
+        let again = put(f.store(), &a(), fragment, &meta_with(100, 250));
+        assert_eq!(again, id);
+
+        match f.store().get(&a(), &id, false).unwrap() {
+            Lookup::Hit(record) => {
+                assert_eq!(record.created_at, 1_300, "a dead row is a fresh insert");
+                assert_eq!(record.fragment, fragment);
+            }
+            other => panic!("a handle stored a moment ago must resolve, got {other:?}"),
+        }
+        // And its new life is a full one, not the remainder of the old.
+        f.clock.advance(90);
+        assert!(f.store().get(&a(), &id, true).unwrap().is_hit());
+    }
+
+    /// The other side of the same rule: a row that is still alive keeps its
+    /// `created_at`, so re-storing it every turn cannot outrun the cap.
+    fn re_storing_a_live_handle_near_its_cap_does_not_extend_the_cap(make: Make) {
+        let f = make(1_000, None);
+        let fragment = "re-stored every turn";
+        let id = put(f.store(), &a(), fragment, &meta_with(100, 250));
+        for _ in 0..4 {
+            f.clock.advance(60);
+            put(f.store(), &a(), fragment, &meta_with(100, 250));
+        }
+        // 1_240: alive, with the original birth.
+        match f.store().get(&a(), &id, false).unwrap() {
+            Lookup::Hit(record) => assert_eq!(record.created_at, 1_000),
+            other => panic!("expected a hit, got {other:?}"),
+        }
+        f.clock.advance(11);
+        assert_eq!(
+            f.store().get(&a(), &id, false).unwrap(),
+            Lookup::Expired { expired_at: 1_250 }
         );
     }
 

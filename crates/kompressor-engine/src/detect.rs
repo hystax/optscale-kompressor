@@ -472,7 +472,12 @@ pub fn detect_content_with(content: &str, gutter_aware: bool, tabular_ratio: boo
     // and because `reattach` puts the numbers back on the lines that survived,
     // which is what makes lifting honest rather than a silent renumbering.
     if gutter_aware && let Some(gutter) = crate::gutter::split_line_gutter(content) {
-        return detect_content_with(&gutter.body, gutter_aware, tabular_ratio);
+        // One level, never more. The stripped body can itself open with
+        // increasing numbers — `1:1:1:…x` strips one prefix per call — and
+        // passing the flag through made the depth the line length: a frame and
+        // a copy of the body per level, ending in a stack overflow, which is
+        // an abort and not something the fail-open guard can catch.
+        return detect_content_with(&gutter.body, false, tabular_ratio);
     }
 
     if let Some(found) = try_json(content, sample, truncated) {
