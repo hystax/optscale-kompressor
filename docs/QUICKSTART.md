@@ -395,9 +395,13 @@ the archives off the host. The Maintenance page lists them and, with
 --keep 7` does one round of the same.
 
 The same page describes each database — size, write-ahead log, schema version,
-the space a vacuum would reclaim — with nothing turned on. Two actions need
-`actions = true`: *Check* runs a full integrity check and *Checkpoint* folds
-the write-ahead log into the file. From a shell:
+the space a vacuum would reclaim — with nothing turned on, along with when
+retention last ran and what it removed, how much disk is left, and (*Space*)
+which tables the bytes are in. Four actions need `actions = true`: *Check*
+runs a full integrity check, *Checkpoint* folds the write-ahead log into the
+file, *Vacuum* rewrites the file without its free pages (it needs about twice
+the file's size free, and holds writes while it runs) and *Optimize* gathers
+the statistics SQLite picks indexes by. The first two also run from a shell:
 
 ```bash
 kompressor db status --config /etc/kompressor/config.toml
@@ -406,6 +410,11 @@ kompressor db checkpoint --config /etc/kompressor/config.toml
 ```
 
 `db check` exits 1 if a database is damaged, so a scheduled job can alarm on it.
+
+The page ends with a danger zone: *Nuke all stats* deletes every statistic
+recorded, for every tenant, and leaves the fragments and the record of backups
+alone. It is off unless `erase = true`, asks twice, and can only be undone by
+restoring a backup — take one first.
 
 Every backup — scheduled, downloaded, or taken with `kompressor backup` — is
 recorded, and the Maintenance page shows when the last one was and the recent

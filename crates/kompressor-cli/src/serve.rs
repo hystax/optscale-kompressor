@@ -84,9 +84,17 @@ fn maintenance(
                     let result = tokio::task::spawn_blocking(move || {
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-                        if let Err(error) = core.refs().purge_expired(now.as_secs()) {
+                        let started = std::time::Instant::now();
+                        let purged = core.refs().purge_expired(now.as_secs());
+                        if let Err(error) = &purged {
                             tracing::warn!(%error, "fragment retention failed");
                         }
+                        core.note_refs_sweep(kompressor_core::RefsSweep {
+                            at_ms: now.as_millis() as i64,
+                            took_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            removed: purged.as_ref().ok().copied(),
+                            error: purged.err().map(|error| error.to_string()),
+                        });
                         match core.refs().stats() {
                             Ok(stats) => core.stats().send(kompressor_stats::events::Event::StoreSample {
                                 time_ms: now.as_millis() as i64,

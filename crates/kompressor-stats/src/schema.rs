@@ -569,6 +569,79 @@ pub fn time_span(path: &Path) -> Result<Option<(i64, i64)>, StatsError> {
     Ok(end("ASC")?.zip(end("DESC")?))
 }
 
+/// What [`erase`] removed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Erased {
+    /// Rows deleted, across `tables` tables.
+    pub rows: u64,
+    pub tables: usize,
+    /// The database's size on disk before and after, write-ahead log
+    /// included.
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+}
+
+/// The one table [`erase`] leaves: the record of backups taken is about the
+/// deployment, not about traffic, and "when was the last backup" matters
+/// most right after everything else has been deleted.
+const KEPT_BY_ERASE: &str = "backups";
+
+/// Delete every statistic in the database at `path` — every request, event
+/// and sample, and the daily rollups that outlive retention — and hand the
+/// space back to the filesystem. The schema stays, so the service carries on
+/// writing into the same file.
+///
+/// One transaction: a reader sees all of it or none of it. There is no
+/// undoing it short of restoring a backup. Whoever owns the file should hold
+/// its own writes meanwhile ([`crate::StatsSink::exclusive`]).
+pub fn erase(path: &Path) -> Result<Erased, StatsError> {
+    let size = || {
+        let len = |path: &Path| std::fs::metadata(path).map_or(0, |meta| meta.len());
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        len(path) + len(Path::new(&wal))
+    };
+    let bytes_before = size();
+    let mut conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+    let tables = {
+        let mut statement = conn.prepare(
+            "SELECT name FROM sqlite_schema
+             WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' AND name <> ?1
+             ORDER BY name",
+        )?;
+        statement
+            .query_map([KEPT_BY_ERASE], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<String>, _>>()?
+    };
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut rows = 0u64;
+    for table in &tables {
+        // Names from the schema itself, quoted as identifiers.
+        let quoted = table.replace('"', "\"\"");
+        rows += tx.execute(&format!("DELETE FROM \"{quoted}\""), [])? as u64;
+    }
+    tx.commit()?;
+    // The rows are gone whatever happens next; giving the pages back is the
+    // part that can wait for a quieter moment.
+    if let Err(error) = conn
+        .execute_batch("VACUUM;")
+        .and_then(|()| conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())))
+    {
+        tracing::warn!(%error, "statistics erased, but the file was not shrunk");
+    }
+    drop(conn);
+    Ok(Erased {
+        rows,
+        tables: tables.len(),
+        bytes_before,
+        bytes_after: size(),
+    })
+}
+
 /// How long a writer keeps trying to put a new file into WAL mode while
 /// another process is doing the same. The connection's busy timeout, in the
 /// one place that timeout is not consulted.

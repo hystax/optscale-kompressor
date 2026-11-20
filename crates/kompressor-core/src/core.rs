@@ -46,6 +46,9 @@ pub struct AppCore {
     /// without limit — and a proxy timeout does not cancel the task it gave up
     /// on, so abandoned work kept running and kept its copy of the messages.
     engine_slots: Arc<tokio::sync::Semaphore>,
+    /// What the last sweep of expired fragments did. In memory, as the
+    /// integrity checks are: it is about this process.
+    refs_sweep: std::sync::Mutex<Option<RefsSweep>>,
 }
 
 /// What one compression run produced, beyond the mutated messages.
@@ -105,6 +108,19 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// One sweep of expired fragments out of the ref store
+/// (`refs.purge_interval`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct RefsSweep {
+    /// When it ran, and for how long.
+    pub at_ms: i64,
+    pub took_ms: u64,
+    /// Fragments it removed. Absent when it failed.
+    pub removed: Option<u64>,
+    /// Why it failed, when it did.
+    pub error: Option<String>,
+}
+
 impl AppCore {
     pub fn new(config: Config, refs: Arc<dyn RefStore>, stats: StatsSink) -> AppCore {
         let stats = stats.with_context(crate::analysis_context::context(&config));
@@ -122,7 +138,25 @@ impl AppCore {
             refs,
             stats,
             config,
+            refs_sweep: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Put on record what a sweep of expired fragments did, for the
+    /// Maintenance page. Whoever runs the sweep calls this: `serve` does.
+    pub fn note_refs_sweep(&self, sweep: RefsSweep) {
+        *self
+            .refs_sweep
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sweep);
+    }
+
+    /// The last sweep of expired fragments in this process, if there was one.
+    pub fn refs_sweep(&self) -> Option<RefsSweep> {
+        self.refs_sweep
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// The permits every surface acquires before running the engine.

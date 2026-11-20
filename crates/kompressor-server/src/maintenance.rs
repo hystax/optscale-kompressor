@@ -18,7 +18,32 @@
 //! actions work on one: `POST /v1/maintenance/databases/{name}/check` runs a
 //! full integrity check, and `…/checkpoint` folds the write-ahead log into
 //! the file. Describing needs no setting; the actions need
-//! `maintenance.actions` and the caller a backup needs.
+//! `maintenance.actions` and the caller a backup needs. So do the two that
+//! write: `…/vacuum` rebuilds the file without its free pages, after checking
+//! the disk has room for the rebuild, and `…/optimize` gathers the statistics
+//! the query planner chooses indexes by. `GET …/space` says where a
+//! database's bytes are, table by table; it reads every page, so the page
+//! asks for it only when someone opens it.
+//!
+//! The status also says what keeps the databases from growing without bound
+//! — the retention pass over the statistics and the sweep of expired
+//! fragments: when each last ran in this process and what it removed — and
+//! how much room the disks under the databases and the backups have left.
+//!
+//! # The danger zone
+//!
+//! `POST /v1/maintenance/statistics/erase` deletes every statistic, for
+//! every tenant, daily rollups included, and keeps only the record of
+//! backups. It needs `maintenance.erase`, the caller a backup needs, and a
+//! body that spells the request out — `{"confirm": "nuke all stats"}` — so
+//! that no stray or replayed POST is one. The page asks twice before it
+//! sends that.
+//!
+//! A backup, a vacuum and an erase each read or rewrite a whole database:
+//! one of them runs at a time, and a second is refused with 409. The two
+//! that rewrite `stats.db` run while the statistics writer stands aside
+//! (`StatsSink::exclusive`), so what arrives meanwhile waits in its queue
+//! rather than failing against a locked file.
 //!
 //! # Who may take one
 //!
@@ -52,6 +77,7 @@ use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use kompressor_core::AppCore;
 use kompressor_core::backup;
 use kompressor_core::config::{AuthMode, Config, RefsBackend};
 use serde::{Deserialize, Serialize};
@@ -67,7 +93,8 @@ pub const CONTENT_TYPE: &str = "application/gzip";
 /// How much of the archive is read from disk at a time while it is sent.
 const CHUNK: usize = 256 * 1024;
 
-/// The one backup this server may be writing, released however it ends.
+/// The one heavy job this server may be running — a backup, a vacuum, an
+/// erase — released however it ends.
 struct Slot(Arc<ServerState>);
 
 impl Slot {
@@ -130,6 +157,76 @@ struct DatabaseStatus {
     checked: Option<Checked>,
     /// Why the file could not be described, when it could not.
     error: Option<String>,
+    /// Whether the query planner has statistics to choose indexes by: false
+    /// until an optimize has run on the file.
+    analyzed: Option<bool>,
+}
+
+/// A filesystem this deployment writes to.
+#[derive(Debug, Serialize)]
+struct Volume {
+    /// `data` for the one under the databases, `backups` for the one under
+    /// `maintenance.backup_dir`.
+    role: &'static str,
+    path: String,
+    /// Absent where the platform would not say.
+    free_bytes: Option<u64>,
+    total_bytes: Option<u64>,
+}
+
+/// How much room is left, and how fast it is going.
+#[derive(Debug, Default, Serialize)]
+struct Storage {
+    volumes: Vec<Volume>,
+    /// Whether the backups are kept on the filesystem they back up. Absent
+    /// with no backup directory, or where the platform would not say.
+    backups_share_disk: Option<bool>,
+    /// What `stats.db` has grown by per day over the span it records: an
+    /// estimate, absent until it holds a day of requests.
+    growth_bytes_per_day: Option<u64>,
+    /// Where that levels off: the size of a full retention window. Absent
+    /// with retention off, when nothing levels off.
+    projected_bytes: Option<u64>,
+    /// Days until the data filesystem is full at that rate. Absent when the
+    /// window is already full, or the estimate cannot be made.
+    days_left: Option<u64>,
+}
+
+/// The retention pass over the statistics.
+#[derive(Debug, Serialize)]
+struct StatsRetention {
+    /// `stats.retention_days`; zero keeps everything.
+    retention_days: u32,
+    /// Requests older than this are archived into daily rollups and removed.
+    cutoff_ms: Option<i64>,
+    /// Seconds between passes.
+    every_s: u64,
+    /// Whole days of requests older than the cutoff still in the file. A
+    /// pass archives a bounded number of days, so a long backlog takes
+    /// several.
+    backlog_days: Option<u64>,
+    /// The last pass since this process started.
+    last: Option<kompressor_stats::Upkeep>,
+}
+
+/// The sweep of expired fragments out of the ref store.
+#[derive(Debug, Serialize)]
+struct RefsRetention {
+    every_s: u64,
+    /// `refs.max_bytes`; zero is no cap.
+    max_bytes: u64,
+    live_refs: Option<u64>,
+    live_bytes: Option<u64>,
+    /// The last sweep since this process started.
+    last: Option<kompressor_core::RefsSweep>,
+}
+
+/// What keeps the databases from growing without bound.
+#[derive(Debug, Serialize)]
+struct Retention {
+    /// Absent with statistics off.
+    stats: Option<StatsRetention>,
+    refs: RefsRetention,
 }
 
 /// Whether something is on, and whether this caller may use it.
@@ -190,6 +287,11 @@ struct MaintenanceStatus {
     restore: RestoreHint,
     backup: Grant,
     actions: Grant,
+    erase: Grant,
+    /// Whether this caller may ask where a database's bytes are.
+    space: Grant,
+    retention: Retention,
+    storage: Storage,
     /// Absent when `maintenance.backup_dir` is not set.
     schedule: Option<ScheduleStatus>,
     databases: Vec<DatabaseStatus>,
@@ -204,6 +306,10 @@ pub(crate) fn maintenance_routes() -> Router<Arc<ServerState>> {
         .route("/maintenance/backups/{name}", get(stored_backup))
         .route("/maintenance/databases/{name}/check", post(check))
         .route("/maintenance/databases/{name}/checkpoint", post(checkpoint))
+        .route("/maintenance/databases/{name}/vacuum", post(vacuum))
+        .route("/maintenance/databases/{name}/optimize", post(optimize))
+        .route("/maintenance/databases/{name}/space", get(space))
+        .route("/maintenance/statistics/erase", post(erase))
 }
 
 /// The page at `/maintenance` on the statistics listener.
@@ -234,8 +340,14 @@ const PAGE: &str = include_str!("maintenance.html");
 enum Wanted {
     /// Take or fetch a backup: `maintenance.backup`.
     Backup,
-    /// Check or checkpoint a database: `maintenance.actions`.
+    /// Check, checkpoint, vacuum or optimize a database:
+    /// `maintenance.actions`.
     Action,
+    /// Delete every statistic: `maintenance.erase`.
+    Erase,
+    /// Read where a database's bytes are. No setting: it reads nothing out,
+    /// but it reads every page, so not for any tenant to ask.
+    Space,
 }
 
 impl Wanted {
@@ -243,6 +355,8 @@ impl Wanted {
         match self {
             Wanted::Backup => config.maintenance.backup,
             Wanted::Action => config.maintenance.actions,
+            Wanted::Erase => config.maintenance.erase,
+            Wanted::Space => true,
         }
     }
 }
@@ -259,8 +373,13 @@ fn refusal(wanted: Wanted, config: &Config, trusted: bool) -> Option<String> {
                 .to_string(),
             Wanted::Action => "maintenance actions over HTTP are off on this deployment; set \
                  maintenance.actions = true (or KOMPRESSOR__MAINTENANCE__ACTIONS=true) to turn \
-                 them on, or run `kompressor db check` and `kompressor db checkpoint` on the host"
+                 them on; `kompressor db check` and `kompressor db checkpoint` on the host need \
+                 no setting"
                 .to_string(),
+            Wanted::Erase => "erasing the statistics over HTTP is off on this deployment; set \
+                 maintenance.erase = true (or KOMPRESSOR__MAINTENANCE__ERASE=true) to turn it on"
+                .to_string(),
+            Wanted::Space => unreachable!("reading the space breakdown has no setting"),
         });
     }
     if config.auth.mode != AuthMode::None && !trusted {
@@ -268,7 +387,10 @@ fn refusal(wanted: Wanted, config: &Config, trusted: bool) -> Option<String> {
             Wanted::Backup => "a backup holds every tenant's data, so a tenant's key does not \
                  unlock it: present the shared secret (x-kompressor-secret)"
                 .to_string(),
-            Wanted::Action => "this works on every tenant's database, so a tenant's key does \
+            Wanted::Action | Wanted::Space => "this works on every tenant's database, so a \
+                 tenant's key does not unlock it: present the shared secret (x-kompressor-secret)"
+                .to_string(),
+            Wanted::Erase => "this deletes every tenant's statistics, so a tenant's key does \
                  not unlock it: present the shared secret (x-kompressor-secret)"
                 .to_string(),
         });
@@ -365,6 +487,7 @@ fn database(config: &Config, name: &'static str) -> DatabaseStatus {
         Ok(facts) => {
             status.schema_version = Some(facts.schema_version);
             status.reclaimable_bytes = Some(facts.reclaimable_bytes());
+            status.analyzed = Some(facts.analyzed);
         }
         Err(error) => status.error = Some(error.to_string()),
     }
@@ -429,6 +552,7 @@ async fn status(
     let mut status = tokio::task::spawn_blocking(move || {
         let config = core.config();
         let now_ms = now_ms();
+        let databases = databases(config);
         MaintenanceStatus {
             version: env!("CARGO_PKG_VERSION"),
             now_ms,
@@ -443,8 +567,12 @@ async fn status(
             },
             backup: grant(Wanted::Backup, config, identity.trusted),
             actions: grant(Wanted::Action, config, identity.trusted),
+            erase: grant(Wanted::Erase, config, identity.trusted),
+            space: grant(Wanted::Space, config, identity.trusted),
+            retention: retention(&core, &databases, now_ms),
+            storage: storage(config, &databases),
             schedule: schedule(config, now_ms),
-            databases: databases(config),
+            databases,
         }
     })
     .await
@@ -461,15 +589,138 @@ async fn status(
         status.schedule.as_ref(),
         status.now_ms,
     );
-    let checks = state
-        .integrity
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for database in &mut status.databases {
-        database.checked = checks.get(database.name).cloned();
+    {
+        let checks = state
+            .integrity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for database in &mut status.databases {
+            database.checked = checks.get(database.name).cloned();
+        }
     }
-    drop(checks);
+    if let Some(sample) = state.store_sample().await {
+        status.retention.refs.live_refs = Some(sample.live_refs);
+        status.retention.refs.live_bytes = Some(sample.live_bytes);
+    }
     Ok(json_response(&status))
+}
+
+const DAY_MS: i64 = 86_400_000;
+
+fn retention(core: &AppCore, databases: &[DatabaseStatus], now_ms: i64) -> Retention {
+    let config = core.config();
+    let stats = config.stats.enabled.then(|| {
+        let days = config.stats.retention_days;
+        // Whole UTC days, as the pass itself cuts.
+        let cutoff_ms =
+            (days > 0).then(|| (now_ms - i64::from(days) * DAY_MS).div_euclid(DAY_MS) * DAY_MS);
+        let oldest_ms = databases
+            .iter()
+            .find(|database| database.name == STATS_DB)
+            .and_then(|database| database.oldest_ms);
+        StatsRetention {
+            retention_days: days,
+            cutoff_ms,
+            every_s: kompressor_stats::writer::UPKEEP_INTERVAL_S,
+            // No request on record is no backlog.
+            backlog_days: cutoff_ms.map(|cutoff| {
+                oldest_ms.map_or(0, |oldest| {
+                    u64::try_from((cutoff - oldest + DAY_MS - 1).div_euclid(DAY_MS)).unwrap_or(0)
+                })
+            }),
+            last: core.stats().upkeep(),
+        }
+    });
+    Retention {
+        stats,
+        refs: RefsRetention {
+            every_s: config.refs.purge_interval.as_secs(),
+            max_bytes: config.refs.max_bytes,
+            live_refs: None,
+            live_bytes: None,
+            last: core.refs_sweep(),
+        },
+    }
+}
+
+/// The directory a file is in, as something a filesystem can be asked about.
+fn directory_of(path: &Path) -> PathBuf {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
+fn volume(role: &'static str, dir: &Path) -> Volume {
+    Volume {
+        role,
+        path: dir.display().to_string(),
+        free_bytes: fs4::available_space(dir).ok(),
+        total_bytes: fs4::total_space(dir).ok(),
+    }
+}
+
+/// Whether two directories are on one filesystem, where that can be told.
+fn same_filesystem(a: &Path, b: &Path) -> Option<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(std::fs::metadata(a).ok()?.dev() == std::fs::metadata(b).ok()?.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a, b);
+        None
+    }
+}
+
+/// The directory the databases are in: the statistics' when there are any,
+/// since that is the file that grows.
+fn data_dir(config: &Config) -> Option<PathBuf> {
+    if config.stats.enabled {
+        Some(directory_of(&config.stats.path))
+    } else if config.refs.backend == RefsBackend::Sqlite {
+        Some(directory_of(&config.refs.path))
+    } else {
+        None
+    }
+}
+
+fn storage(config: &Config, databases: &[DatabaseStatus]) -> Storage {
+    let mut storage = Storage::default();
+    let Some(data) = data_dir(config) else {
+        return storage;
+    };
+    storage.volumes.push(volume("data", &data));
+    let backups = &config.maintenance.backup_dir;
+    if !backups.as_os_str().is_empty() && backups.is_dir() {
+        storage.backups_share_disk = same_filesystem(&data, backups);
+        if storage.backups_share_disk != Some(true) {
+            storage.volumes.push(volume("backups", backups));
+        }
+    }
+    let stats = databases.iter().find(|database| database.name == STATS_DB);
+    let figures = stats.and_then(|stats| Some((stats.bytes?, stats.oldest_ms?, stats.newest_ms?)));
+    if let Some((bytes, oldest, newest)) = figures
+        && newest - oldest >= DAY_MS
+    {
+        let span_days = (newest - oldest) as f64 / DAY_MS as f64;
+        let per_day = (bytes as f64 / span_days) as u64;
+        storage.growth_bytes_per_day = Some(per_day);
+        let window = u64::from(config.stats.retention_days);
+        let projected = (window > 0).then(|| per_day.saturating_mul(window));
+        storage.projected_bytes = projected;
+        // Past the window the file stops growing; before it, the disk has
+        // to hold what is still to come.
+        let still_growing = projected.is_none_or(|projected| bytes < projected);
+        if let Some(free) = storage.volumes[0].free_bytes
+            && still_growing
+            && per_day > 0
+        {
+            storage.days_left = Some(free / per_day);
+        }
+    }
+    storage
 }
 
 fn last_backup(
@@ -597,6 +848,215 @@ async fn checkpoint(
     })))
 }
 
+/// The 409 a heavy job gets while another is running.
+fn busy() -> Response {
+    (
+        StatusCode::CONFLICT,
+        json_response(&serde_json::json!({"error": {
+            "code": "maintenance_running",
+            "message": "a backup, vacuum or erase is already running; wait for it to finish",
+        }})),
+    )
+        .into_response()
+}
+
+/// Run `job` on the database called `name` as its only writer: for the
+/// statistics, while the writer thread stands aside.
+fn alone<T, F>(core: &AppCore, name: &str, job: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    if name == STATS_DB {
+        core.stats()
+            .exclusive(job)
+            .map_err(|error| error.to_string())
+    } else {
+        Ok(job())
+    }
+}
+
+/// How much free space a vacuum is given before it is started: the rebuilt
+/// copy, and the same again while it waits in the write-ahead log.
+fn vacuum_needs(database_bytes: u64) -> u64 {
+    database_bytes.saturating_mul(2)
+}
+
+/// `POST /v1/maintenance/databases/{name}/vacuum`: rebuild the file without
+/// its free pages.
+async fn vacuum(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    UrlPath(name): UrlPath<String>,
+) -> Result<Response, ApiError> {
+    permit(&state, &headers, Wanted::Action)?;
+    let (name, path) = named(state.core.config(), &name)?;
+    let Some(slot) = Slot::take(&state) else {
+        return Ok(busy());
+    };
+    let size = sizes_on_disk(&path).map_or(0, |(main, _)| main);
+    let needs = vacuum_needs(size);
+    // Where the platform will not say how much is free, the vacuum is tried:
+    // SQLite fails it cleanly, and leaves the file as it was, if it runs out.
+    if let Ok(free) = fs4::available_space(directory_of(&path))
+        && free < needs
+    {
+        return Ok((
+            StatusCode::INSUFFICIENT_STORAGE,
+            json_response(&serde_json::json!({"error": {
+                "code": "disk_full",
+                "message": format!(
+                    "a vacuum of {name} needs about {needs} bytes free beside it and there are {free}"
+                ),
+            }})),
+        )
+            .into_response());
+    }
+    let core = state.core.clone();
+    let started = std::time::Instant::now();
+    let done = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        alone(&core, name, move || kompressor_store::sqlite::vacuum(&path))
+    })
+    .await
+    .map_err(|error| ApiError::Internal(format!("vacuum: {error}")))?
+    .map_err(|error| ApiError::Internal(format!("vacuum of {name}: {error}")))?
+    .map_err(|error| ApiError::Internal(format!("vacuum of {name}: {error}")))?;
+    let took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(
+        database = name,
+        bytes_before = done.bytes_before,
+        bytes_after = done.bytes_after,
+        folded = done.folded,
+        took_ms,
+        "vacuum"
+    );
+    Ok(json_response(&serde_json::json!({
+        "database": name,
+        "bytes_before": done.bytes_before,
+        "bytes_after": done.bytes_after,
+        "folded": done.folded,
+        "took_ms": took_ms,
+    })))
+}
+
+/// `POST /v1/maintenance/databases/{name}/optimize`: gather the statistics
+/// the query planner chooses indexes by.
+async fn optimize(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    UrlPath(name): UrlPath<String>,
+) -> Result<Response, ApiError> {
+    permit(&state, &headers, Wanted::Action)?;
+    let (name, path) = named(state.core.config(), &name)?;
+    let core = state.core.clone();
+    let started = std::time::Instant::now();
+    let described = tokio::task::spawn_blocking(move || {
+        alone(&core, name, move || {
+            kompressor_store::sqlite::optimize(&path)
+        })
+    })
+    .await
+    .map_err(|error| ApiError::Internal(format!("optimize: {error}")))?
+    .map_err(|error| ApiError::Internal(format!("optimize of {name}: {error}")))?
+    .map_err(|error| ApiError::Internal(format!("optimize of {name}: {error}")))?;
+    let took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(database = name, described, took_ms, "optimize");
+    Ok(json_response(&serde_json::json!({
+        "database": name,
+        "described": described,
+        "took_ms": took_ms,
+    })))
+}
+
+/// `GET /v1/maintenance/databases/{name}/space`: where the bytes are.
+async fn space(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    UrlPath(name): UrlPath<String>,
+) -> Result<Response, ApiError> {
+    permit(&state, &headers, Wanted::Space)?;
+    let (name, path) = named(state.core.config(), &name)?;
+    let started = std::time::Instant::now();
+    let found = tokio::task::spawn_blocking(move || kompressor_store::sqlite::space(&path))
+        .await
+        .map_err(|error| ApiError::Internal(format!("space: {error}")))?
+        .map_err(|error| ApiError::Internal(format!("space of {name}: {error}")))?;
+    let objects: Vec<serde_json::Value> = found
+        .iter()
+        .map(|object| {
+            serde_json::json!({
+                "name": object.name,
+                "kind": object.kind,
+                "table": object.table,
+                "bytes": object.bytes,
+                "unused_bytes": object.unused_bytes,
+                "rows": object.rows,
+            })
+        })
+        .collect();
+    Ok(json_response(&serde_json::json!({
+        "database": name,
+        "bytes": found.iter().map(|object| object.bytes).sum::<u64>(),
+        "took_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "objects": objects,
+    })))
+}
+
+/// What an erase must be asked for with, word for word.
+pub(crate) const ERASE_PHRASE: &str = "nuke all stats";
+
+#[derive(Debug, Deserialize)]
+struct EraseRequest {
+    confirm: String,
+}
+
+/// `POST /v1/maintenance/statistics/erase`: delete every statistic.
+async fn erase(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    permit(&state, &headers, Wanted::Erase)?;
+    let asked = serde_json::from_slice::<EraseRequest>(&body)
+        .ok()
+        .is_some_and(|request| request.confirm == ERASE_PHRASE);
+    if !asked {
+        return Err(ApiError::Invalid(format!(
+            "this deletes every statistic for every tenant and cannot be undone; to go ahead, \
+             send {{\"confirm\": \"{ERASE_PHRASE}\"}}"
+        )));
+    }
+    let (name, path) = named(state.core.config(), STATS_DB)?;
+    let Some(slot) = Slot::take(&state) else {
+        return Ok(busy());
+    };
+    let core = state.core.clone();
+    let started = std::time::Instant::now();
+    let erased = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        alone(&core, name, move || kompressor_stats::schema::erase(&path))
+    })
+    .await
+    .map_err(|error| ApiError::Internal(format!("erase: {error}")))?
+    .map_err(|error| ApiError::Internal(format!("erase: {error}")))?
+    .map_err(|error| ApiError::Internal(format!("erase: {error}")))?;
+    let took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    // Loud, and on record in the one place the erase cannot reach.
+    tracing::warn!(
+        rows = erased.rows,
+        tables = erased.tables,
+        bytes_before = erased.bytes_before,
+        bytes_after = erased.bytes_after,
+        took_ms,
+        "every statistic was erased on request"
+    );
+    Ok(json_response(&serde_json::json!({
+        "erased": erased,
+        "took_ms": took_ms,
+    })))
+}
+
 /// `GET /v1/maintenance/backups/{name}`: one of the scheduled archives.
 async fn stored_backup(
     State(state): State<Arc<ServerState>>,
@@ -668,14 +1128,7 @@ async fn take_backup(
 ) -> Result<Response, ApiError> {
     permit(&state, &headers, Wanted::Backup)?;
     let Some(slot) = Slot::take(&state) else {
-        return Ok((
-            StatusCode::CONFLICT,
-            json_response(&serde_json::json!({"error": {
-                "code": "backup_running",
-                "message": "a backup is already being written; wait for it to finish",
-            }})),
-        )
-            .into_response());
+        return Ok(busy());
     };
 
     let core = state.core.clone();

@@ -86,7 +86,7 @@ pub use reader::{
     TypeCoverage,
 };
 pub use retention::PruneCounts;
-pub use writer::{StatsHandle, StatsSink, StatsWriter, null_sink, spawn};
+pub use writer::{StatsHandle, StatsSink, StatsWriter, Upkeep, null_sink, spawn};
 
 #[cfg(test)]
 mod tests {

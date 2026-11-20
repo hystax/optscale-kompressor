@@ -72,6 +72,14 @@ h3 { font-size: 14px; margin: 18px 0 6px; color: var(--muted); font-weight: 600;
 #restore-steps li { margin: 6px 0; }
 #restore-steps code { display: inline-block; padding: 2px 6px; background: var(--soft); border-radius: 4px; }
 #last-backup { margin: 0 0 12px; }
+td.index { padding-left: 18px; color: var(--muted); }
+section.danger { border-color: var(--bad); }
+section.danger h2 { color: var(--bad); }
+button.danger { border-color: var(--bad); color: var(--bad); font-weight: 600; }
+#nuke-confirm { margin-top: 12px; padding: 12px; border: 1px solid var(--bad); border-radius: 5px; max-width: 80ch; }
+#nuke-confirm p { margin: 0 0 10px; line-height: 1.45; }
+#nuke-confirm button { margin-right: 6px; }
+#nuke-losing { font-weight: 600; }
 code { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
 .muted { color: var(--muted); }
 .note { color: var(--muted); margin: 8px 0 0; max-width: 80ch; line-height: 1.45; }
@@ -106,7 +114,7 @@ code { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap:
   <div class="scroll">
   <table id="databases" hidden>
     <thead><tr><th>Database</th><th>File</th><th>Size</th><th>Write-ahead log</th><th>Schema</th>
-      <th>Reclaimable</th><th>Records</th><th>Integrity</th><th></th></tr></thead>
+      <th>Reclaimable</th><th>Records</th><th>Planner</th><th>Integrity</th><th></th></tr></thead>
     <tbody></tbody>
   </table>
   </div>
@@ -115,10 +123,59 @@ code { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap:
   <p class="note">
     <b>Write-ahead log</b> is what has been written and not yet folded into the file; SQLite folds it in
     by itself, and <i>Checkpoint</i> does it now. <b>Schema</b> is the version the file holds against the
-    one this build expects. <b>Reclaimable</b> is space a vacuum would return to the disk.
+    one this build expects. <b>Reclaimable</b> is space a vacuum would return to the disk, and
+    <i>Vacuum</i> returns it: the file is rewritten, which needs about twice its size free and holds
+    writes to it until it is done. <b>Planner</b> says whether SQLite has statistics to choose indexes
+    by; <i>Optimize</i> gathers them, and again whenever the data has changed shape.
     <i>Check</i> reads every page and every index and can take a while on a large file; its result is
-    kept until the service restarts. From a shell: <code>kompressor db status</code>,
-    <code>kompressor db check</code>, <code>kompressor db checkpoint</code>.
+    kept until the service restarts. <i>Space</i> reads every page too. From a shell:
+    <code>kompressor db status</code>, <code>kompressor db check</code>,
+    <code>kompressor db checkpoint</code>.
+  </p>
+  <div id="space" hidden>
+    <h3 id="space-title">Where the space is</h3>
+    <div class="scroll">
+    <table id="space-table">
+      <thead><tr><th>Table or index</th><th>Rows</th><th>Size</th><th>Share</th><th>Unused inside</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    </div>
+    <p class="note">
+      <b>Unused inside</b> is slack within the pages a table holds, as distinct from
+      <b>Reclaimable</b> above, which is whole pages holding nothing. A vacuum returns all of the
+      second and only some of the first: rows that nearly fill a page leave the rest of it empty.
+    </p>
+  </div>
+</section>
+
+<section aria-labelledby="retention-title">
+  <h2 id="retention-title">Retention</h2>
+  <div class="scroll">
+  <table id="retention" hidden>
+    <thead><tr><th>What</th><th>Rule</th><th>Runs</th><th>Last run</th><th>It removed</th><th>Now</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  </div>
+  <p class="note">
+    What keeps the databases from growing without bound. Requests older than
+    <code>stats.retention_days</code> are archived into daily rollups, which are kept, and then
+    removed; expired fragments are swept out of the ref store every <code>refs.purge_interval</code>.
+    <b>Last run</b> is since the service started.
+  </p>
+</section>
+
+<section aria-labelledby="disk-title">
+  <h2 id="disk-title">Disk</h2>
+  <div class="scroll">
+  <table id="volumes" hidden>
+    <thead><tr><th>Holds</th><th>Directory</th><th>Free</th><th>Of</th><th>Used</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  </div>
+  <p id="growth" class="muted"></p>
+  <p id="shared-disk" class="warn" hidden>
+    The backups are kept on the disk they back up: they survive a bad upgrade, not a dead disk.
+    Copy the archives off this host.
   </p>
 </section>
 
@@ -159,6 +216,35 @@ code { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap:
     (<code>…before-restore-&lt;time&gt;</code>) instead of deleting them.
   </p>
   <ol id="restore-steps" class="note"></ol>
+</section>
+
+<section class="danger" aria-labelledby="danger-title">
+  <h2 id="danger-title">Danger zone</h2>
+  <button id="nuke" class="danger" type="button" disabled>Nuke all stats…</button>
+  <p class="note" id="nuke-why" hidden></p>
+  <p id="nuke-done" role="status" hidden></p>
+  <div id="nuke-confirm" hidden>
+    <div id="nuke-first">
+      <p>This deletes <b>every statistic</b> this deployment has recorded, for every tenant: every
+        request, compression and retrieval, and the daily rollups that outlive retention. Every
+        dashboard starts again from empty. It cannot be undone from here — only by restoring a backup.</p>
+      <p id="nuke-losing"></p>
+      <p id="nuke-backup"></p>
+      <button id="nuke-continue" class="danger" type="button">I understand, continue</button>
+      <button class="nuke-cancel" type="button">Cancel</button>
+    </div>
+    <div id="nuke-second" hidden>
+      <p><label for="nuke-phrase">To confirm, type <code>nuke all stats</code> below.</label></p>
+      <p><input id="nuke-phrase" type="text" size="24" autocomplete="off" spellcheck="false"/></p>
+      <button id="nuke-go" class="danger" type="button" disabled>Nuke all stats</button>
+      <button class="nuke-cancel" type="button">Cancel</button>
+    </div>
+  </div>
+  <p class="note">
+    Stored fragments (<code>refs.db</code>), the record of backups, the configuration and the backup
+    archives are left alone. The service keeps running and goes on recording into the emptied
+    database. Off unless <code>maintenance.erase = true</code>.
+  </p>
 </section>
 </main>
 <script>
@@ -229,13 +315,19 @@ const button = (label, title, run) => {
 };
 
 // POST one action and say what came of it.
-async function act(path, describe) {
+async function act(path, describe, body) {
   $("error").textContent = "";
   $("action-result").hidden = false;
   $("action-result").className = "muted";
   $("action-result").textContent = "Working…";
   try {
-    const response = await fetch(prefix + path, { method: "POST", headers: credentials(), cache: "no-store" });
+    const headers = credentials();
+    const request = { method: "POST", headers, cache: "no-store" };
+    if (body !== undefined) {
+      headers["content-type"] = "application/json";
+      request.body = JSON.stringify(body);
+    }
+    const response = await fetch(prefix + path, request);
     if (!response.ok) throw new Error(response.status + " " + await explain(response));
     const [text, className] = describe(await response.json());
     $("action-result").textContent = text;
@@ -303,15 +395,171 @@ function databaseRow(database, status) {
       () => act("maintenance/databases/" + database.name + "/checkpoint", result => result.complete
         ? [database.name + ": log folded in, " + size(result.wal_bytes_before) + " → " + size(result.wal_bytes_after) + ".", "good"]
         : [database.name + ": a reader was in the way; part of the log is still to fold in. Nothing is lost — try again.", "warn"]));
-    check.disabled = checkpoint.disabled = !status.actions.allowed;
-    actions.append(check, checkpoint);
+    const seconds = result => (result.took_ms / 1000).toFixed(1) + " s";
+    const vacuum = button("Vacuum", "Rewrite the file without its free pages", () => {
+      if (!confirm("Vacuum " + database.name + "?\n\nThe file (" + size(database.bytes) + ") is rewritten. That needs about "
+        + size(2 * database.bytes) + " free beside it, and writes to it wait until it is done.")) return;
+      act("maintenance/databases/" + database.name + "/vacuum", result =>
+        [database.name + ": vacuumed in " + seconds(result) + ", " + size(result.bytes_before) + " → " + size(result.bytes_after)
+          + (result.folded ? "." : ". A reader was in the way: the file itself shrinks at the next checkpoint."),
+          result.folded ? "good" : "warn"]);
+    });
+    const optimize = button("Optimize", "Gather the statistics the query planner chooses indexes by",
+      () => act("maintenance/databases/" + database.name + "/optimize", result =>
+        [database.name + ": planner statistics gathered for " + result.described + " tables and indexes in " + seconds(result) + ".", "good"]));
+    const where = button("Space", "Show where this database's bytes are", () => drawSpace(database.name));
+    check.disabled = checkpoint.disabled = vacuum.disabled = optimize.disabled = !status.actions.allowed;
+    where.disabled = !status.space.allowed;
+    actions.append(check, checkpoint, vacuum, optimize, where);
+  }
+
+  const planner = cell("");
+  if (database.analyzed != null) {
+    planner.append(tagged(database.analyzed ? "has statistics" : "no statistics", database.analyzed ? "" : "muted"));
+  } else {
+    planner.textContent = "–";
   }
 
   row.append(cell(database.name), path,
     cell(database.included ? size(database.bytes) : "– " + (database.reason || ""), "num"),
     cell(size(database.wal_bytes), "num"), schema, cell(size(database.reclaimable_bytes), "num"),
-    records, integrity, actions);
+    records, planner, integrity, actions);
   return row;
+}
+
+const count = number => number == null ? "–" : Number(number).toLocaleString();
+const ago = (ms, now) => span(ms, now) + " ago";
+
+// Where one database's bytes are. Asked for, not loaded with the page: it
+// reads the whole file.
+async function drawSpace(name) {
+  $("error").textContent = "";
+  $("space").hidden = false;
+  $("space-title").textContent = "Where the space is — " + name + " (reading…)";
+  $("space-table").tBodies[0].replaceChildren();
+  try {
+    const response = await fetch(prefix + "maintenance/databases/" + name + "/space", { headers: credentials(), cache: "no-store" });
+    if (!response.ok) throw new Error(response.status + " " + await explain(response));
+    const found = await response.json();
+    $("space-title").textContent = "Where the space is — " + name + ", " + size(found.bytes)
+      + " in " + found.objects.length + " tables and indexes";
+    $("space-table").tBodies[0].replaceChildren(...found.objects.map(object => {
+      const row = document.createElement("tr");
+      const index = object.kind === "index";
+      row.append(cell(index ? object.name + " (index on " + object.table + ")" : object.name, index ? "index" : ""),
+        cell(count(object.rows), "num"), cell(size(object.bytes), "num"),
+        cell(found.bytes ? (100 * object.bytes / found.bytes).toFixed(1) + " %" : "–", "num"),
+        cell(size(object.unused_bytes), "num"));
+      return row;
+    }));
+  } catch (error) {
+    $("space").hidden = true;
+    $("error").textContent = "Could not read the space breakdown: " + (error.message || error);
+  }
+}
+
+function drawRetention(status) {
+  const now = status.now_ms, rows = [];
+  const lastRun = last => {
+    const td = cell("");
+    if (!last) td.append(tagged("not since the service started", "muted"));
+    else if (last.error) td.append(tagged(ago(last.at_ms, now) + ", FAILED: " + last.error, "bad"));
+    else td.append(tagged(ago(last.at_ms, now) + ", took " + last.took_ms + " ms", "good"));
+    return td;
+  };
+  const stats = status.retention.stats;
+  if (stats) {
+    const row = document.createElement("tr");
+    const rule = cell("");
+    if (stats.retention_days) {
+      rule.textContent = "kept " + stats.retention_days + " d, then rolled up by day; now removing before "
+        + new Date(stats.cutoff_ms).toLocaleDateString();
+    } else {
+      rule.append(tagged("off (stats.retention_days = 0): nothing is ever removed", "warn"));
+    }
+    const removed = stats.last && stats.last.removed;
+    const total = removed ? Object.values(removed).reduce((sum, n) => sum + n, 0) : null;
+    const backlog = cell("");
+    if (stats.backlog_days) backlog.append(tagged(stats.backlog_days + " d of requests past the cutoff, still to remove", "warn"));
+    else backlog.textContent = stats.retention_days ? "nothing past the cutoff" : "–";
+    row.append(cell("Statistics (stats.db)"), rule, cell(stats.retention_days ? "every " + every(stats.every_s) : "–"),
+      stats.retention_days ? lastRun(stats.last) : cell("–"),
+      cell(total == null ? "–" : count(total) + " rows" + (total ? " (" + count(removed.proxy_requests) + " requests)" : "")),
+      backlog);
+    rows.push(row);
+  }
+  const refs = status.retention.refs;
+  const row = document.createElement("tr");
+  const held = refs.live_bytes == null ? "–"
+    : count(refs.live_refs) + " fragments, " + size(refs.live_bytes) + (refs.max_bytes ? " of a " + size(refs.max_bytes) + " cap" : "");
+  const full = refs.max_bytes && refs.live_bytes != null && refs.live_bytes > 0.9 * refs.max_bytes;
+  const holding = cell("");
+  holding.append(tagged(held, full ? "warn" : ""));
+  row.append(cell("Fragments (ref store)"), cell("each until its own time-to-live runs out"),
+    cell("every " + every(refs.every_s)), lastRun(refs.last),
+    cell(refs.last && refs.last.removed != null ? count(refs.last.removed) + " fragments" : "–"), holding);
+  rows.push(row);
+  $("retention").tBodies[0].replaceChildren(...rows);
+  $("retention").hidden = false;
+}
+
+function drawStorage(status) {
+  const storage = status.storage;
+  const holds = { data: "the databases", backups: "the scheduled backups" };
+  $("volumes").tBodies[0].replaceChildren(...storage.volumes.map(volume => {
+    const row = document.createElement("tr");
+    const path = cell("");
+    const code = document.createElement("code");
+    code.textContent = volume.path;
+    path.append(code);
+    const used = volume.total_bytes && volume.free_bytes != null ? 100 * (1 - volume.free_bytes / volume.total_bytes) : null;
+    const share = cell("", "num");
+    if (used == null) share.textContent = "–";
+    else share.append(tagged(used.toFixed(0) + " %", used >= 95 ? "bad" : used >= 85 ? "warn" : ""));
+    const what = holds[volume.role] + (volume.role === "data" && storage.backups_share_disk ? " and the scheduled backups" : "");
+    row.append(cell(what), path, cell(size(volume.free_bytes), "num"), cell(size(volume.total_bytes), "num"), share);
+    return row;
+  }));
+  $("volumes").hidden = !storage.volumes.length;
+  $("shared-disk").hidden = storage.backups_share_disk !== true;
+  const parts = [];
+  if (!storage.volumes.length) {
+    parts.push("No database is kept on disk.");
+  } else if (storage.growth_bytes_per_day == null) {
+    parts.push("No growth estimate yet: it needs a day of requests on record.");
+  } else {
+    parts.push("stats.db has grown about " + size(storage.growth_bytes_per_day) + " a day over what it records");
+    if (storage.projected_bytes != null) parts.push("a full retention window would be about " + size(storage.projected_bytes));
+    else parts.push("with retention off it does not level off");
+    if (storage.days_left != null) parts.push("at that rate the disk has room for about " + count(storage.days_left) + " d");
+  }
+  $("growth").textContent = parts.join(" · ") + (parts.length > 1 ? ". An estimate." : "");
+}
+
+// The danger zone: two steps before anything is sent, and the phrase the
+// server asks for typed by hand.
+const NUKE_PHRASE = "nuke all stats";
+function closeNuke() {
+  $("nuke-confirm").hidden = true;
+  $("nuke-first").hidden = false;
+  $("nuke-second").hidden = true;
+  $("nuke-phrase").value = "";
+  $("nuke-go").disabled = true;
+}
+function drawDanger(status) {
+  $("nuke").disabled = !status.erase.allowed;
+  $("nuke-why").textContent = status.erase.allowed ? "" : status.erase.reason;
+  $("nuke-why").hidden = status.erase.allowed;
+  if (!status.erase.allowed) closeNuke();
+  const stats = status.databases.find(database => database.name === "stats.db");
+  $("nuke-losing").textContent = !stats || stats.bytes == null ? ""
+    : "On the line: " + size(stats.bytes) + " in " + stats.path + (stats.oldest_ms == null ? "."
+      : ", requests from " + new Date(stats.oldest_ms).toLocaleDateString() + " to " + new Date(stats.newest_ms).toLocaleDateString() + ".");
+  const last = status.last_backup.ok_ms;
+  $("nuke-backup").replaceChildren(last == null
+    ? tagged("There is no backup on record. Take one first — the Backup section above.", "bad")
+    : tagged("The last backup was taken " + ago(last, status.now_ms) + "; anything recorded since is not in it.",
+      status.now_ms - last > 3600000 ? "warn" : ""));
 }
 
 function drawSchedule(status) {
@@ -423,6 +671,9 @@ async function load() {
     drawSchedule(status);
     drawLastBackup(status);
     drawRestore(status);
+    drawRetention(status);
+    drawStorage(status);
+    drawDanger(status);
     $("backup").disabled = !status.backup.allowed;
     $("why").textContent = status.backup.allowed ? "" : status.backup.reason;
     $("why").hidden = status.backup.allowed;
@@ -436,6 +687,46 @@ async function load() {
 }
 
 $("filters").addEventListener("submit", event => { event.preventDefault(); load(); });
+
+$("nuke").addEventListener("click", () => {
+  closeNuke();
+  $("nuke-done").hidden = true;
+  $("nuke-confirm").hidden = false;
+  $("nuke-continue").focus();
+});
+document.querySelectorAll(".nuke-cancel").forEach(element => element.addEventListener("click", closeNuke));
+$("nuke-continue").addEventListener("click", () => {
+  $("nuke-first").hidden = true;
+  $("nuke-second").hidden = false;
+  $("nuke-phrase").focus();
+});
+$("nuke-phrase").addEventListener("input", () => {
+  $("nuke-go").disabled = $("nuke-phrase").value.trim() !== NUKE_PHRASE;
+});
+$("nuke-go").addEventListener("click", async () => {
+  if ($("nuke-phrase").value.trim() !== NUKE_PHRASE) return;
+  closeNuke();
+  $("error").textContent = "";
+  $("nuke").disabled = true;
+  $("nuke-done").hidden = false;
+  $("nuke-done").className = "muted";
+  $("nuke-done").textContent = "Erasing…";
+  try {
+    const headers = credentials();
+    headers["content-type"] = "application/json";
+    const response = await fetch(prefix + "maintenance/statistics/erase",
+      { method: "POST", headers, cache: "no-store", body: JSON.stringify({ confirm: NUKE_PHRASE }) });
+    if (!response.ok) throw new Error(response.status + " " + await explain(response));
+    const erased = (await response.json()).erased;
+    $("nuke-done").className = "warn";
+    $("nuke-done").textContent = "Erased " + count(erased.rows) + " rows from " + erased.tables + " tables; stats.db went from "
+      + size(erased.bytes_before) + " to " + size(erased.bytes_after) + ".";
+  } catch (error) {
+    $("nuke-done").hidden = true;
+    $("error").textContent = "Erase failed: " + (error.message || error);
+  }
+  load();
+});
 
 $("backup").addEventListener("click", async () => {
   $("error").textContent = "";

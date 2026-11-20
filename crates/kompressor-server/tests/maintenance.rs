@@ -97,10 +97,25 @@ async fn send(
     } else {
         Body::empty()
     };
+    dispatch(deployment, request.body(body).expect("a request")).await
+}
+
+/// A POST carrying `body` as JSON.
+async fn post_json(deployment: &Deployment, path: &str, body: Value) -> Answer {
+    let request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("a request");
+    dispatch(deployment, request).await
+}
+
+async fn dispatch(deployment: &Deployment, request: Request<Body>) -> Answer {
     let response = deployment
         .router
         .clone()
-        .oneshot(request.body(body).expect("a request"))
+        .oneshot(request)
         .await
         .expect("an answer");
     Answer {
@@ -920,4 +935,331 @@ async fn the_page_gives_restore_instructions_and_no_restore_route() {
             answer.status
         );
     }
+}
+
+fn rows(deployment: &Deployment, table: &str) -> i64 {
+    rusqlite::Connection::open(deployment.dir.path().join("stats.db"))
+        .unwrap()
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+/// A vacuum hands free pages back and an optimize gives the planner its
+/// figures, on both databases, with the service writing before and after.
+#[tokio::test]
+async fn a_database_is_vacuumed_and_optimized_while_the_service_runs() {
+    let deployment = deployment(acting, kompressor_server::router);
+    for _ in 0..3 {
+        send(&deployment, "POST", "/v1/compress", &[]).await;
+    }
+    let _ = deployment.sink.flush();
+    // Free pages to reclaim: rows deleted behind the service's back.
+    {
+        let conn = rusqlite::Connection::open(deployment.dir.path().join("refs.db")).unwrap();
+        conn.execute("DELETE FROM refs", []).unwrap();
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .unwrap();
+    }
+    let before = send(&deployment, "GET", "/v1/maintenance?format=json", &[])
+        .await
+        .json();
+    assert!(
+        before["databases"][1]["reclaimable_bytes"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(before["databases"][0]["analyzed"], false);
+
+    for name in ["stats.db", "refs.db"] {
+        let answer = send(
+            &deployment,
+            "POST",
+            &format!("/v1/maintenance/databases/{name}/vacuum"),
+            &[],
+        )
+        .await;
+        assert_eq!(answer.status, StatusCode::OK, "{}", answer.json());
+        let done = answer.json();
+        assert_eq!(done["database"], name);
+        assert_eq!(done["folded"], true, "{done}");
+        assert!(done["bytes_after"].as_u64().unwrap() <= done["bytes_before"].as_u64().unwrap());
+
+        let answer = send(
+            &deployment,
+            "POST",
+            &format!("/v1/maintenance/databases/{name}/optimize"),
+            &[],
+        )
+        .await;
+        assert_eq!(answer.status, StatusCode::OK, "{}", answer.json());
+        // An emptied table has nothing to describe; the statistics do.
+        let described = answer.json()["described"].as_u64().unwrap();
+        assert!(described > 0 || name == "refs.db", "{name}: {described}");
+    }
+    let after = send(&deployment, "GET", "/v1/maintenance?format=json", &[])
+        .await
+        .json();
+    for database in after["databases"].as_array().unwrap() {
+        assert_eq!(database["reclaimable_bytes"], 0, "{database}");
+        assert_eq!(database["analyzed"], true, "{database}");
+    }
+    assert!(
+        after["databases"][1]["bytes"].as_u64().unwrap()
+            < before["databases"][1]["bytes"].as_u64().unwrap()
+    );
+    // The slot a vacuum held is free again, and the service carries on.
+    let recorded = rows(&deployment, "optimization_events");
+    assert_eq!(
+        send(&deployment, "POST", "/v1/compress", &[]).await.status,
+        StatusCode::OK
+    );
+    let _ = deployment.sink.flush();
+    assert!(rows(&deployment, "optimization_events") > recorded);
+    assert_eq!(
+        send(
+            &deployment,
+            "POST",
+            "/v1/maintenance/databases/stats.db/vacuum",
+            &[]
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+}
+
+/// The breakdown accounts for the file table by table, and the status says
+/// what keeps it bounded and how much room there is.
+#[tokio::test]
+async fn the_status_says_where_the_space_is_and_what_keeps_it_bounded() {
+    let deployment = deployment(
+        |config| config.maintenance.backup_dir = config.stats.path.with_file_name("backups"),
+        kompressor_server::router,
+    );
+    std::fs::create_dir_all(deployment.dir.path().join("backups")).unwrap();
+    send(&deployment, "POST", "/v1/compress", &[]).await;
+    let _ = deployment.sink.flush();
+
+    // With nothing turned on, as the rest of the description is.
+    let answer = send(
+        &deployment,
+        "GET",
+        "/v1/maintenance/databases/stats.db/space",
+        &[],
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.json());
+    let space = answer.json();
+    let objects = space["objects"].as_array().unwrap();
+    let table = objects
+        .iter()
+        .find(|object| object["name"] == "optimization_events")
+        .expect("the table is listed");
+    assert_eq!(table["kind"], "table");
+    assert!(table["rows"].as_u64().unwrap() >= 1);
+    assert!(
+        objects
+            .iter()
+            .any(|object| object["kind"] == "index" && object["table"] == "optimization_events")
+    );
+    assert_eq!(
+        space["bytes"].as_u64().unwrap(),
+        objects
+            .iter()
+            .map(|object| object["bytes"].as_u64().unwrap())
+            .sum::<u64>()
+    );
+    let sizes: Vec<u64> = objects
+        .iter()
+        .map(|object| object["bytes"].as_u64().unwrap())
+        .collect();
+    assert!(
+        sizes.windows(2).all(|pair| pair[0] >= pair[1]),
+        "largest first"
+    );
+
+    let status = send(&deployment, "GET", "/v1/maintenance?format=json", &[])
+        .await
+        .json();
+    assert_eq!(status["space"]["allowed"], true);
+    let retention = &status["retention"];
+    assert_eq!(retention["stats"]["retention_days"], 90);
+    assert!(retention["stats"]["cutoff_ms"].as_i64().unwrap() < status["now_ms"].as_i64().unwrap());
+    assert_eq!(retention["stats"]["every_s"], 3_600);
+    assert_eq!(retention["stats"]["backlog_days"], 0, "nothing is old yet");
+    // The writer's first pass runs as it starts.
+    assert_eq!(retention["stats"]["last"]["error"], Value::Null);
+    assert_eq!(retention["stats"]["last"]["removed"]["proxy_requests"], 0);
+    assert!(retention["refs"]["every_s"].as_u64().unwrap() > 0);
+    assert_eq!(retention["refs"]["live_refs"], 1);
+    assert_eq!(
+        retention["refs"]["last"],
+        Value::Null,
+        "the sweep is `serve`'s to run, and this is not `serve`"
+    );
+
+    let storage = &status["storage"];
+    assert_eq!(storage["volumes"][0]["role"], "data");
+    assert!(storage["volumes"][0]["free_bytes"].as_u64().unwrap() > 0);
+    #[cfg(unix)]
+    {
+        assert_eq!(storage["backups_share_disk"], true);
+        assert_eq!(storage["volumes"].as_array().unwrap().len(), 1);
+    }
+    assert_eq!(
+        storage["growth_bytes_per_day"],
+        Value::Null,
+        "not from a minute of requests"
+    );
+}
+
+fn erasing(config: &mut Config) {
+    config.maintenance.erase = true;
+}
+
+/// Erasing is its own setting, has to be asked for word for word, and
+/// leaves an empty database the service goes on writing to.
+#[tokio::test]
+async fn the_statistics_are_erased_only_when_asked_for_in_so_many_words() {
+    let path = "/v1/maintenance/statistics/erase";
+    let asked = json!({"confirm": "nuke all stats"});
+
+    // Off by default, and the housekeeping setting does not turn it on.
+    let guarded = deployment(acting, kompressor_server::router);
+    let refused = post_json(&guarded, path, asked.clone()).await;
+    assert_eq!(refused.status, StatusCode::NOT_FOUND);
+    assert!(
+        refused.json()["error"]["message"]
+            .to_string()
+            .contains("maintenance.erase = true")
+    );
+    let status = send(&guarded, "GET", "/v1/maintenance?format=json", &[])
+        .await
+        .json();
+    assert_eq!(status["erase"]["enabled"], false);
+    assert_eq!(status["erase"]["allowed"], false);
+
+    let deployment = deployment(erasing, kompressor_server::router);
+    for _ in 0..3 {
+        send(&deployment, "POST", "/v1/compress", &[]).await;
+    }
+    let _ = deployment.sink.flush();
+    let recorded = rows(&deployment, "optimization_events");
+    assert!(recorded >= 3);
+
+    // Not without the words: no body, another phrase, a near miss.
+    for body in [
+        Value::Null,
+        json!({}),
+        json!({"confirm": true}),
+        json!({"confirm": "yes"}),
+        json!({"confirm": "Nuke all stats"}),
+    ] {
+        let answer = post_json(&deployment, path, body.clone()).await;
+        assert_eq!(answer.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(
+            answer.json()["error"]["message"]
+                .to_string()
+                .contains("nuke all stats"),
+            "the refusal says what to send"
+        );
+    }
+    assert_eq!(
+        send(&deployment, "POST", path, &[]).await.status,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(rows(&deployment, "optimization_events"), recorded);
+
+    let answer = post_json(&deployment, path, asked.clone()).await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.json());
+    let erased = &answer.json()["erased"];
+    assert!(erased["rows"].as_i64().unwrap() >= recorded, "{erased}");
+    assert!(erased["bytes_after"].as_u64().unwrap() <= erased["bytes_before"].as_u64().unwrap());
+    assert_eq!(rows(&deployment, "optimization_events"), 0);
+
+    // The fragments are not statistics, and the schema is where it was.
+    let status = send(&deployment, "GET", "/v1/maintenance?format=json", &[])
+        .await
+        .json();
+    assert_eq!(status["erase"]["allowed"], true);
+    assert_eq!(status["retention"]["refs"]["live_refs"], 1);
+    let stats = &status["databases"][0];
+    assert_eq!(stats["schema_version"], stats["expected_schema_version"]);
+    assert_eq!(stats["oldest_ms"], Value::Null);
+    // The same writer carries on into the same file.
+    send(&deployment, "POST", "/v1/compress", &[]).await;
+    let _ = deployment.sink.flush();
+    assert!(rows(&deployment, "optimization_events") >= 1);
+    // Erasing does not turn the housekeeping on.
+    assert_eq!(
+        send(
+            &deployment,
+            "POST",
+            "/v1/maintenance/databases/stats.db/vacuum",
+            &[]
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// What works on every tenant's data is not a tenant's to ask for.
+#[tokio::test]
+async fn with_tenants_only_the_shared_secret_erases_or_reads_the_breakdown() {
+    let deployment = deployment(
+        |config| {
+            erasing(config);
+            config.auth.mode = AuthMode::ApiKeys;
+            config.auth.secret = "the-shared-secret".to_string();
+            config.auth.keys = vec![ApiKey {
+                key: "sk-alpha".to_string(),
+                tenant: "alpha".to_string(),
+                ..Default::default()
+            }];
+        },
+        kompressor_server::router,
+    );
+    let key = [("x-kompressor-key", "sk-alpha")];
+    let secret = [("x-kompressor-secret", "the-shared-secret")];
+    let space = "/v1/maintenance/databases/stats.db/space";
+    assert_eq!(
+        send(&deployment, "GET", space, &[]).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        send(&deployment, "GET", space, &key).await.status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send(&deployment, "GET", space, &secret).await.status,
+        StatusCode::OK
+    );
+    let status = send(&deployment, "GET", "/v1/maintenance?format=json", &key)
+        .await
+        .json();
+    assert_eq!(status["space"]["allowed"], false);
+    assert_eq!(status["erase"]["enabled"], true);
+    assert_eq!(status["erase"]["allowed"], false);
+
+    let erase = |headers: [(&'static str, &'static str); 1]| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/maintenance/statistics/erase")
+            .header("content-type", "application/json")
+            .header(headers[0].0, headers[0].1)
+            .body(Body::from(json!({"confirm": "nuke all stats"}).to_string()))
+            .unwrap()
+    };
+    assert_eq!(
+        dispatch(&deployment, erase(key)).await.status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        dispatch(&deployment, erase(secret)).await.status,
+        StatusCode::OK
+    );
 }

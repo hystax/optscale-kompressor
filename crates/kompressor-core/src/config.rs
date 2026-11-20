@@ -74,6 +74,15 @@ pub struct MaintenanceConfig {
     /// off by default and limited to the same callers. What the page *shows*
     /// about each database needs neither setting.
     pub actions: bool,
+    /// Serve `POST /v1/maintenance/statistics/erase`: delete every statistic
+    /// this deployment has recorded, for every tenant, rollups included. The
+    /// Maintenance page's danger zone.
+    ///
+    /// Apart from `actions` because nothing those do loses anything, and this
+    /// loses all of it: off by default, limited to the same callers, and the
+    /// request must spell out what it is asking for. There is no undoing it
+    /// short of `kompressor restore`.
+    pub erase: bool,
     /// Where `serve` writes a backup on a schedule. Empty, the default, takes
     /// none. The directory is created if it is missing, readable by its
     /// owner alone.
@@ -107,6 +116,7 @@ impl Default for MaintenanceConfig {
         MaintenanceConfig {
             backup: false,
             actions: false,
+            erase: false,
             backup_dir: PathBuf::new(),
             backup_every: Duration::from_secs(24 * 3_600),
             backup_keep: 7,
@@ -1582,6 +1592,10 @@ impl Config {
                 "actions" => {
                     self.maintenance.actions =
                         parse_bool_setting("maintenance.actions", value, self.maintenance.actions)
+                }
+                "erase" => {
+                    self.maintenance.erase =
+                        parse_bool_setting("maintenance.erase", value, self.maintenance.erase)
                 }
                 "backup_dir" => self.maintenance.backup_dir = PathBuf::from(value),
                 "backup_every" => {
@@ -3111,6 +3125,7 @@ mod tests {
             "no directory, no schedule"
         );
         assert!(!config.maintenance.actions);
+        assert!(!config.maintenance.erase, "nothing is erased by default");
         assert_eq!(config.maintenance.backup_keep, 7);
 
         let config: Config = toml::from_str(
@@ -3149,6 +3164,7 @@ mod tests {
             ("KOMPRESSOR__MAINTENANCE__BACKUP_EVERY".into(), "12h".into()),
             ("KOMPRESSOR__MAINTENANCE__BACKUP_KEEP".into(), "0".into()),
             ("KOMPRESSOR__MAINTENANCE__ACTIONS".into(), "true".into()),
+            ("KOMPRESSOR__MAINTENANCE__ERASE".into(), "true".into()),
         ]);
         assert_eq!(
             env.maintenance.schedule(),
@@ -3156,6 +3172,7 @@ mod tests {
         );
         assert_eq!(env.maintenance.backup_keep, 0);
         assert!(env.maintenance.actions);
+        assert!(env.maintenance.erase);
     }
 
     #[test]

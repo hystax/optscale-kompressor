@@ -1037,6 +1037,8 @@ pub struct DatabaseFacts {
     pub free_pages: u64,
     /// Whether the file is in write-ahead-log mode.
     pub wal: bool,
+    /// Whether it holds planner statistics: [`optimize`] has run on it.
+    pub analyzed: bool,
 }
 
 impl DatabaseFacts {
@@ -1070,6 +1072,7 @@ pub fn facts(path: &Path) -> Result<DatabaseFacts, StoreError> {
         page_count: number("page_count")?,
         free_pages: number("freelist_count")?,
         wal: mode.eq_ignore_ascii_case("wal"),
+        analyzed: number("table_info(sqlite_stat1)").is_ok(),
     })
 }
 
@@ -1160,6 +1163,118 @@ pub fn checkpoint(path: &Path) -> Result<Checkpointed, StoreError> {
         log_frames: log.max(0) as u64,
         moved_frames: moved.max(0) as u64,
     })
+}
+
+fn read_write(path: &Path) -> Result<Connection, StoreError> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+    Ok(conn)
+}
+
+/// The size on disk of the database at `path`: the file and its write-ahead
+/// log. Zero for one that is not there.
+pub fn on_disk(path: &Path) -> u64 {
+    let len = |path: &Path| std::fs::metadata(path).map_or(0, |meta| meta.len());
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    len(path) + len(Path::new(&wal))
+}
+
+/// What a vacuum did to the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Vacuumed {
+    /// The database's size on disk before and after, write-ahead log
+    /// included: rows not yet folded into the file are part of it.
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    /// False when a reader kept the rebuilt pages in the write-ahead log:
+    /// the file shrinks at the next checkpoint instead of now.
+    pub folded: bool,
+}
+
+/// Rebuild the database at `path` without its free pages (`VACUUM`), then
+/// fold the write-ahead log in so the file itself shrinks.
+///
+/// A vacuum writes the whole database again: it needs about the file's size
+/// free on its disk, twice that while the rebuilt pages wait in the log, and
+/// it is the one writer for as long as it takes. Readers carry on. Whoever
+/// else writes to the file waits out its busy timeout and then fails, so a
+/// service that owns the file holds its own writes for the duration rather
+/// than race this (`StatsSink::exclusive` in the statistics crate).
+pub fn vacuum(path: &Path) -> Result<Vacuumed, StoreError> {
+    let size = || on_disk(path);
+    let bytes_before = size();
+    let conn = read_write(path)?;
+    conn.execute_batch("VACUUM;")?;
+    drop(conn);
+    let folded = checkpoint(path)?.complete;
+    Ok(Vacuumed {
+        bytes_before,
+        bytes_after: size(),
+        folded,
+    })
+}
+
+/// Gather the statistics the query planner chooses indexes by (`ANALYZE`),
+/// and return how many tables and indexes it now has figures for.
+///
+/// Bounded (`analysis_limit`): it samples each index rather than reading all
+/// of it, so it is quick on a large file. The figures are kept in the file
+/// and go stale as the data's shape changes; running it again refreshes them.
+pub fn optimize(path: &Path) -> Result<u64, StoreError> {
+    let conn = read_write(path)?;
+    conn.execute_batch("PRAGMA analysis_limit=1000; ANALYZE;")?;
+    let described: i64 =
+        conn.query_row("SELECT count(*) FROM sqlite_stat1", [], |row| row.get(0))?;
+    Ok(described.max(0) as u64)
+}
+
+/// The space one table or index takes in the file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Space {
+    pub name: String,
+    /// `table` or `index`.
+    pub kind: String,
+    /// The table an index belongs to; a table's own name.
+    pub table: String,
+    /// Bytes of the file its pages take, and how many of those hold nothing.
+    pub bytes: u64,
+    pub unused_bytes: u64,
+    /// Rows of a table, entries of an index.
+    pub rows: u64,
+}
+
+/// Where the bytes of the database at `path` are: every table and index,
+/// largest first.
+///
+/// Reads every page (`dbstat`), so unlike [`facts`] it takes as long as the
+/// file is large.
+pub fn space(path: &Path) -> Result<Vec<Space>, StoreError> {
+    let conn = read_only(path)?;
+    let mut statement = conn.prepare(
+        "SELECT s.name, coalesce(m.type, 'table'), coalesce(m.tbl_name, s.name),
+                sum(s.pgsize), sum(s.unused),
+                sum(CASE WHEN s.pagetype = 'leaf' THEN s.ncell ELSE 0 END)
+         FROM dbstat s LEFT JOIN sqlite_schema m ON m.name = s.name
+         GROUP BY s.name ORDER BY 4 DESC, 1",
+    )?;
+    let number = |value: i64| value.max(0) as u64;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(Space {
+                name: row.get(0)?,
+                kind: row.get(1)?,
+                table: row.get(2)?,
+                bytes: number(row.get(3)?),
+                unused_bytes: number(row.get(4)?),
+                rows: number(row.get(5)?),
+            })
+        })?
+        .collect::<Result<Vec<Space>, _>>()?;
+    Ok(rows)
 }
 
 /// Connection pragmas, applied before the schema.
@@ -1489,6 +1604,33 @@ mod tests {
             after.reclaimable_bytes(),
             after.free_pages * after.page_size
         );
+
+        // The breakdown names the table and its index, and accounts for
+        // every page of the file.
+        let breakdown = space(&path).unwrap();
+        assert!(
+            breakdown
+                .iter()
+                .any(|s| s.name == "refs" && s.kind == "table")
+        );
+        assert!(
+            breakdown
+                .iter()
+                .any(|s| s.name == "refs_expiry" && s.kind == "index" && s.table == "refs")
+        );
+
+        // A vacuum hands the free pages back, with the store still open.
+        let vacuumed = vacuum(&path).unwrap();
+        assert!(vacuumed.folded);
+        assert!(vacuumed.bytes_after < vacuumed.bytes_before, "{vacuumed:?}");
+        assert_eq!(facts(&path).unwrap().free_pages, 0);
+        assert_eq!(integrity_check(&path).unwrap(), Vec::<String>::new());
+        let ids = filled(&store, "b");
+        assert!(
+            store.get(&Tenant::anonymous(), &ids[0], false).is_ok(),
+            "the store carries on after a vacuum"
+        );
+        assert!(optimize(&path).unwrap() > 0, "the planner has figures now");
         drop(store);
 
         // A file that is not a database is an error, not a clean bill.

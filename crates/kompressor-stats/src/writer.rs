@@ -24,9 +24,9 @@ use crate::events::{
 };
 use crate::schema;
 use rusqlite::{Connection, params};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -37,6 +37,9 @@ pub(crate) enum Msg {
     Event(Box<Event>),
     /// Commit everything queued before this, then acknowledge.
     Flush(mpsc::Sender<Result<(), String>>),
+    /// Commit everything queued before this, then run the job on the writer
+    /// thread: nothing is written to the database while it runs.
+    Exclusive(Box<dyn FnOnce() + Send>),
     /// Commit and stop. Anything queued behind this is discarded, so a caller
     /// with events it cares about flushes before shutting down.
     Shutdown,
@@ -46,6 +49,8 @@ struct SinkInner {
     tx: SyncSender<Msg>,
     // shared with the writer thread, which counts events lost to a failed commit
     dropped: Arc<AtomicU64>,
+    // what the writer thread's last retention pass did
+    upkeep: Arc<Mutex<Option<Upkeep>>>,
 }
 
 /// A cloneable handle for recording events. Cheap to clone, safe to share.
@@ -130,7 +135,62 @@ impl StatsSink {
             .map_err(|_| StatsError::WriterGone)?
             .map_err(StatsError::Batch)
     }
+
+    /// Run `job` while the writer writes nothing, and return what it returns.
+    ///
+    /// For work on `stats.db` that has to be the only writer for longer than
+    /// a busy timeout — a vacuum, erasing it — done on a connection of the
+    /// job's own. What was queued before the call is committed first; events
+    /// sent while the job runs wait in the queue and are written after it,
+    /// and are dropped and counted, as ever, only if the queue fills.
+    ///
+    /// Blocks until the job has run. With statistics off there is no writer
+    /// to hold, and the job runs where it is called.
+    pub fn exclusive<T, F>(&self, job: F) -> Result<T, StatsError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let Some(inner) = &self.inner else {
+            return Ok(job());
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+        inner
+            .tx
+            .send(Msg::Exclusive(Box::new(move || {
+                let _ = done_tx.send(job());
+            })))
+            .map_err(|_| StatsError::WriterGone)?;
+        done_rx.recv().map_err(|_| StatsError::WriterGone)
+    }
+
+    /// What the last retention pass did, or `None` when none has run: with
+    /// statistics off, with `retention_days = 0`, or in a process that only
+    /// records.
+    pub fn upkeep(&self) -> Option<Upkeep> {
+        let inner = self.inner.as_ref()?;
+        inner
+            .upkeep
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
 }
+
+/// One retention pass of the writer thread: [`StatsWriter::maintain`].
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Upkeep {
+    /// When it ran, and for how long.
+    pub at_ms: i64,
+    pub took_ms: u64,
+    /// The rows it archived and removed, by table. Absent when it failed.
+    pub removed: Option<crate::PruneCounts>,
+    /// Why it failed, when it did.
+    pub error: Option<String>,
+}
+
+/// Seconds between retention passes.
+pub const UPKEEP_INTERVAL_S: u64 = UPKEEP_INTERVAL.as_secs();
 
 /// A sink that discards everything, for `stats.enabled = false`.
 ///
@@ -159,6 +219,7 @@ pub fn capturing_sink(capacity: usize) -> (StatsSink, CapturedEvents) {
             inner: Some(Arc::new(SinkInner {
                 tx,
                 dropped: Arc::new(AtomicU64::new(0)),
+                upkeep: Arc::default(),
             })),
         },
         CapturedEvents { rx },
@@ -196,6 +257,7 @@ pub(crate) fn detached_sink(capacity: usize) -> (StatsSink, Receiver<Msg>) {
             inner: Some(Arc::new(SinkInner {
                 tx,
                 dropped: Arc::new(AtomicU64::new(0)),
+                upkeep: Arc::default(),
             })),
         },
         rx,
@@ -514,6 +576,8 @@ pub fn spawn(config: &StatsConfig) -> Result<(StatsSink, StatsHandle), StatsErro
     let retention = config.clone();
     let dropped = Arc::new(AtomicU64::new(0));
     let thread_dropped = Arc::clone(&dropped);
+    let upkeep = Arc::new(Mutex::new(None));
+    let thread_upkeep = Arc::clone(&upkeep);
     let thread = std::thread::Builder::new()
         .name("kompressor-stats".to_string())
         .spawn(move || {
@@ -524,6 +588,7 @@ pub fn spawn(config: &StatsConfig) -> Result<(StatsSink, StatsHandle), StatsErro
                 batch_max,
                 retention,
                 &thread_dropped,
+                &thread_upkeep,
             )
         })
         .map_err(StatsError::Thread)?;
@@ -533,6 +598,7 @@ pub fn spawn(config: &StatsConfig) -> Result<(StatsSink, StatsHandle), StatsErro
         inner: Some(Arc::new(SinkInner {
             tx: tx.clone(),
             dropped,
+            upkeep,
         })),
     };
     Ok((
@@ -557,6 +623,7 @@ fn run(
     batch_max: usize,
     retention: StatsConfig,
     dropped: &AtomicU64,
+    last_upkeep: &Mutex<Option<Upkeep>>,
 ) {
     let mut batch: Vec<Event> = Vec::with_capacity(batch_max);
     let mut deadline = Instant::now() + flush_interval;
@@ -573,10 +640,20 @@ fn run(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as i64;
-            if let Some(cutoff) = retention.retention_cutoff_ms(now_ms)
-                && let Err(error) = writer.maintain(cutoff)
-            {
-                tracing::warn!(%error, "statistics retention failed");
+            if let Some(cutoff) = retention.retention_cutoff_ms(now_ms) {
+                let started = Instant::now();
+                let result = writer.maintain(cutoff);
+                if let Err(error) = &result {
+                    tracing::warn!(%error, "statistics retention failed");
+                }
+                *last_upkeep
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Upkeep {
+                    at_ms: now_ms,
+                    took_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    removed: result.as_ref().ok().copied(),
+                    error: result.err().map(|error| error.to_string()),
+                });
             }
             upkeep = Instant::now() + UPKEEP_INTERVAL;
         }
@@ -599,6 +676,11 @@ fn run(
                 let report = result.as_ref().map(|_| ()).map_err(StatsError::to_string);
                 log_failure(result);
                 let _ = ack.send(report);
+                deadline = Instant::now() + flush_interval;
+            }
+            Ok(Msg::Exclusive(job)) => {
+                log_failure(commit(&mut writer, &mut batch, dropped));
+                job();
                 deadline = Instant::now() + flush_interval;
             }
             Ok(Msg::Shutdown) | Err(RecvTimeoutError::Disconnected) => {

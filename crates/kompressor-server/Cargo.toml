@@ -35,6 +35,9 @@ thiserror = { workspace = true }
 # `default-features = false` drops the exporter's own hyper listener and TLS
 # stack — /metrics is served by our router, so none of it would ever run.
 metrics = "0.24"
+# Free space on a filesystem, for the Maintenance page: the standard library
+# has no call for it, and this one is the same on every platform we ship for.
+fs4 = { version = "1", default-features = false, features = ["sync"] }
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 [dev-dependencies]
