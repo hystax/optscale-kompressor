@@ -1716,3 +1716,138 @@ fn serve_honours_no_color_in_its_log() {
         "the default is unchanged: {coloured:?}"
     );
 }
+
+/// `kompressor backup` writes one archive of every database the
+/// configuration names, into the directory it is pointed at, and refuses to
+/// write over one that is there.
+#[test]
+fn backup_writes_one_archive_of_every_database_and_never_replaces_one() {
+    let dir = scratch_dir();
+    let config = dir.join("backup.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[refs]\nbackend = \"sqlite\"\npath = {refs:?}\n\n[stats]\nenabled = true\npath = {stats:?}\n",
+            refs = dir.join("refs.db").to_str().unwrap(),
+            stats = dir.join("stats.db").to_str().unwrap(),
+        ),
+    )
+    .unwrap();
+    let kompressor = || {
+        let mut command = Command::cargo_bin("kompressor").unwrap();
+        command
+            .env_remove("KOMPRESSOR_CONFIG")
+            .env("XDG_CONFIG_HOME", no_config_dir())
+            .current_dir(&dir);
+        command
+    };
+    // Something to back up: a service that ran creates the statistics
+    // database, and a compression stores a fragment.
+    kompressor()
+        .args([
+            "serve",
+            "--api",
+            "--listen",
+            "127.0.0.1:0",
+            "--stop-on-stdin",
+            "--config",
+        ])
+        .arg(&config)
+        .write_stdin("stop\n")
+        .assert()
+        .success();
+    let payload = dir.join("log.txt");
+    std::fs::write(&payload, varying_log()).unwrap();
+    kompressor()
+        .args(["compress", "--config"])
+        .arg(&config)
+        .arg(&payload)
+        .assert()
+        .success();
+
+    let out = dir.join("backups");
+    std::fs::create_dir(&out).unwrap();
+    let assert = kompressor()
+        .args(["backup", "--json", "--config"])
+        .arg(&config)
+        .arg("--out")
+        .arg(&out)
+        .assert()
+        .success();
+    let report: serde_json::Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("one JSON object");
+    let archive = PathBuf::from(report["archive"].as_str().unwrap());
+    assert_eq!(archive.parent(), Some(out.as_path()));
+    let name = archive.file_name().unwrap().to_str().unwrap();
+    assert!(
+        name.starts_with("kompressor-backup-") && name.ends_with(".tar.gz"),
+        "{name}"
+    );
+    assert_eq!(
+        report["bytes"].as_u64(),
+        Some(std::fs::metadata(&archive).unwrap().len())
+    );
+    let names: Vec<&str> = report["manifest"]["databases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|database| database["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["stats.db", "refs.db"]);
+    // A gzip, and nothing else left beside it.
+    assert_eq!(std::fs::read(&archive).unwrap()[..2], [0x1f, 0x8b]);
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);
+
+    // Named outright, the summary is for a person; asked twice, it refuses.
+    let named = dir.join("mine.tar.gz");
+    let assert = kompressor()
+        .args(["backup", "--config"])
+        .arg(&config)
+        .arg("-o")
+        .arg(&named)
+        .assert()
+        .success();
+    let summary = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(summary.contains("mine.tar.gz"), "{summary}");
+    assert!(
+        summary.contains("stats.db") && summary.contains("schema v"),
+        "{summary}"
+    );
+    let before = std::fs::read(&named).unwrap();
+    let refused = kompressor()
+        .args(["backup", "--config"])
+        .arg(&config)
+        .arg("-o")
+        .arg(&named)
+        .assert()
+        .code(2);
+    let said = String::from_utf8(refused.get_output().stderr.clone()).unwrap();
+    assert!(said.contains("already exists"), "{said}");
+    assert_eq!(std::fs::read(&named).unwrap(), before);
+}
+
+/// With nothing on disk to copy, `backup` fails and says why rather than
+/// writing an archive that holds no database.
+#[test]
+fn backup_with_nothing_on_disk_fails_and_writes_nothing() {
+    let dir = scratch_dir();
+    let config = dir.join("memory.toml");
+    std::fs::write(&config, MCP_PLAIN).unwrap();
+    let assert = Command::cargo_bin("kompressor")
+        .unwrap()
+        .args(["backup", "--config"])
+        .arg(&config)
+        .env_remove("KOMPRESSOR_CONFIG")
+        .env("XDG_CONFIG_HOME", no_config_dir())
+        .current_dir(&dir)
+        .assert()
+        .code(1);
+    let said = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(said.contains("no database to back up"), "{said}");
+    let left: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name != "memory.toml")
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}

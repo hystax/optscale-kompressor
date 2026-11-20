@@ -260,6 +260,7 @@ $ curl -s localhost:8817/v1/retrieve -H 'content-type: application/json' \
 | `GET /v1/stats/cache` | prompt-cache analysis: reads, writes and lost prefixes per conversation, keep-warm, idle gaps — JSON or a page (`?format=html`) |
 | `GET /v1/stats/trends` `yield` `store-health` `keepwarm` `upstream` `engine` | the dashboards: long-horizon trends, yield by content type, ref-store health, keep-warm return, upstream incidents, engine time — JSON or a page (`?format=html`); on the statistics listener at `/trends`, `/yield`, `/store`, `/keepwarm`, `/upstream`, `/engine`, with a conversation timeline at `/timeline` |
 | `GET /v1/refs` | the ref browser: the fragments recoverable compression stored, searchable, as JSON or a page — off unless `refs.browse = true` |
+| `POST /v1/maintenance/backup` | every database as one `.tar.gz`, from the Maintenance page or `curl` — off unless `maintenance.backup = true`; `kompressor backup` does the same from a shell |
 | `GET /healthz` `/readyz` `/metrics` | liveness, readiness, Prometheus |
 
 `/v2` is served as an alias of `/v1` so a client pinned to either keeps working.
@@ -337,6 +338,48 @@ as a retrieval. A key sees only its own tenant's fragments. Fragments are tool
 output, so the browser is off by default — with it on and `auth.mode = "none"`,
 anyone who can reach the listener can read them. `KOMPRESSOR__REFS__BROWSE=true`
 sets it from the environment.
+
+### Backing up
+
+Two files hold what cannot be recomputed: `stats.db`, the history every
+dashboard is drawn from, and `refs.db`, the content behind every handle. A
+backup is a consistent snapshot of both in one `.tar.gz`, taken while the
+service runs.
+
+From a shell on the host — nothing to turn on, and the thing to schedule:
+
+```bash
+kompressor backup --config /etc/kompressor/config.toml --out /var/backups/kompressor
+```
+
+`--out` is a directory to put a timestamped archive in
+(`kompressor-backup-20261120-071530.tar.gz`) or a file to create; an existing
+file is never replaced. The archive is created readable by its owner alone.
+
+From a browser, turn it on:
+
+```toml
+[maintenance]
+backup = true
+```
+
+and open **Maintenance** — beside *Ref store* on every page, at
+`http://127.0.0.1:8818/maintenance` on the statistics listener — then
+*Download backup*. Or:
+
+```bash
+curl -s -X POST -OJ http://127.0.0.1:8080/v1/maintenance/backup
+```
+
+The archive holds every tenant's statistics and every stored fragment, so it is
+off by default, and with API keys configured a tenant's key does not unlock it:
+send the shared secret (`x-kompressor-secret`). The configuration and the
+interception CA are not included — they hold keys.
+
+To restore, stop the service, put `stats.db` and `refs.db` back where
+`stats.path` and `refs.path` point, remove any `-wal` and `-shm` files beside
+them, and start it. `manifest.json` in the archive says which version wrote it
+and the schema each database holds; an older database is migrated on start.
 
 ---
 

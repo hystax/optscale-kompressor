@@ -43,6 +43,7 @@ pub mod cache;
 pub mod dashboards;
 pub mod export;
 pub mod live;
+pub mod maintenance;
 mod ops;
 pub mod refs;
 mod stats_api;

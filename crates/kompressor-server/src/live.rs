@@ -242,10 +242,15 @@ pub(crate) fn live_routes() -> Router<Arc<ServerState>> {
 pub fn stats_listener_router(state: Arc<ServerState>) -> Router {
     let routes = live_routes()
         .merge(crate::refs::refs_routes())
+        .merge(crate::maintenance::maintenance_routes())
         .with_state(state.clone());
     let router = Router::new()
         .route("/", get(page_at_root))
         .route("/refs", get(crate::refs::page_on_stats_listener))
+        .route(
+            "/maintenance",
+            get(crate::maintenance::page_on_stats_listener),
+        )
         .route("/cache", get(crate::cache::page_on_stats_listener))
         .route("/analysis", get(crate::analysis::page_on_stats_listener));
     let router = crate::dashboards::listener_pages(router)

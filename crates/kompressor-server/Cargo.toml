@@ -23,6 +23,8 @@ tower-http = { workspace = true }
 tokio = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
+# The backup archive is streamed from disk; this is the stream.
+futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -39,3 +41,7 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 http-body-util = { workspace = true }
 tempfile = "3"
+# To open the backup archive the maintenance route answers with.
+tar = { workspace = true }
+flate2 = { workspace = true }
+rusqlite = { workspace = true }

@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod backup;
 pub mod config;
 pub mod core;
 pub mod error;

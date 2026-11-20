@@ -1349,6 +1349,8 @@ prefix answers 404 rather than an empty report — an empty report would read as
 | `GET /v1/refs?q&kind&request_id&expired&order&offset&limit&preview&tenant&format` | the ref browser (§8.3.1): one page of the tenant's fragments with a preview each, the match total, a count per kind and what the tenant holds live. JSON, or a page for `?format=html` or a browser's `Accept`. Off — 404 — unless `refs.browse = true` |
 | `GET /v1/refs/{handle}?history&tenant` | one fragment in full, read without touching it, with its retention and every recorded ask for it (`retrieval_events`) |
 | `DELETE /v1/refs/{handle}?tenant` | remove a fragment from the store and the recent-write cache; a later retrieval is a miss |
+| `GET /v1/maintenance?format` | the Maintenance page, or as JSON which databases there are (`stats.db`, `refs.db`: path, size on disk with its WAL, whether a backup would hold it) and whether this caller may back them up |
+| `POST /v1/maintenance/backup` | a backup (`kompressor_core::backup`): `application/gzip`, an attachment named `kompressor-backup-<UTC>.tar.gz` holding `manifest.json` and a snapshot of each database on disk. Each snapshot is taken with `VACUUM INTO` on a read-only connection — consistent while the writer runs, WAL folded in — and passes `PRAGMA quick_check` before it is packed; queued statistics are flushed first. Written to a file beside the databases (0600) and streamed from it, removed once sent; one at a time per process, a second is 409. 404 unless `maintenance.backup = true`; 403 under `auth.mode = "api_keys"` unless the caller presents `auth.secret`, because the archive is every tenant's data. The configuration and the interception CA are not in it. `kompressor backup [--out PATH]` writes the same archive from the host with no setting and no listener; restoring is stopping the service and putting the files back |
 | `GET /metrics` | Prometheus (§15) |
 
 Responses are JSON; `?format=csv` on the tabular ones. The same queries back `kompressor stats …` on the CLI (direct SQLite, no server needed).
@@ -2340,6 +2342,9 @@ allow_insecure_upstream = false
 level = "info"                      # RUST_LOG overrides
 format = "json"                     # json | text
 payloads = false                    # DEBUG: bodies and fragments (API), relay frames (proxy)
+
+[maintenance]
+backup = false                      # serve POST /v1/maintenance/backup (§10.1): every database, whole
 ```
 
 Durations are humantime strings (`2s`, `100ms`, `10m`); sizes are **plain byte

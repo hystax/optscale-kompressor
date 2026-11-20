@@ -54,6 +54,9 @@ pub struct ServerState {
     stats_slots: Arc<Semaphore>,
     stats_path: Option<PathBuf>,
     store_sample: Mutex<Option<(Instant, StoreStats)>>,
+    /// Set while a backup archive is being written
+    /// ([`crate::maintenance`]): one at a time.
+    pub(crate) backup_running: std::sync::atomic::AtomicBool,
 }
 
 impl ServerState {
@@ -72,6 +75,7 @@ impl ServerState {
             stats_slots: Arc::new(Semaphore::new(STATS_READERS)),
             stats_path,
             store_sample: Mutex::new(None),
+            backup_running: std::sync::atomic::AtomicBool::new(false),
             core,
         };
         Arc::new(state)

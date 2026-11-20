@@ -41,6 +41,7 @@ pub fn api_router(state: Arc<ServerState>) -> Router {
         .route("/detect", post(detect))
         .merge(crate::stats_api::stats_routes())
         .merge(crate::refs::refs_routes())
+        .merge(crate::maintenance::maintenance_routes())
         .with_state(state.clone());
 
     let versioned = Router::new()

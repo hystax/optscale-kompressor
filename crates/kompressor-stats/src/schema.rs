@@ -441,12 +441,23 @@ pub fn latest_version() -> u32 {
 /// Idempotent: a database already at the latest version is untouched, and each
 /// step runs inside its own transaction so a failure leaves the file at the
 /// last version that fully applied rather than half-way through one.
+///
+/// Safe for several processes at once. `serve`, `mcp serve` and every `wrap`
+/// session open the same file, and after an upgrade the first two to start
+/// both find it behind. Each step therefore takes the write lock *before*
+/// asking what version the file holds (`BEGIN IMMEDIATE`, which waits out the
+/// other process under the connection's busy timeout) and skips a step that
+/// was applied while it waited. Reading the version first and locking
+/// afterwards had the second process run a step the first had just committed:
+/// it failed on "table already exists" and did not start. Measured with two
+/// `serve` processes on one v12 file, 15 rounds of 15.
 pub fn apply(conn: &Connection) -> Result<u32, StatsError> {
-    let mut current: u32 = {
+    let version_of = |conn: &Connection| -> Result<u32, StatsError> {
         let raw: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         // a negative or absurd user_version is not ours; treat it as unversioned
-        u32::try_from(raw).unwrap_or(0)
+        Ok(u32::try_from(raw).unwrap_or(0))
     };
+    let mut current = version_of(conn)?;
 
     let mut ladder: Vec<&(u32, &str)> = MIGRATIONS.iter().collect();
     ladder.sort_by_key(|(version, _)| *version);
@@ -455,15 +466,28 @@ pub fn apply(conn: &Connection) -> Result<u32, StatsError> {
         if *version <= current {
             continue;
         }
-        conn.execute_batch("BEGIN")?;
-        match conn.execute_batch(sql) {
-            Ok(()) => {
-                // user_version takes no parameter binding, and the value is a
-                // crate constant rather than anything a caller supplies
-                conn.execute_batch(&format!("PRAGMA user_version = {version}"))?;
-                conn.execute_batch("COMMIT")?;
-                current = *version;
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        // Asked again now that nobody else can be writing: another process
+        // may have applied this step, and later ones, while this one waited.
+        current = match version_of(conn) {
+            Ok(held) => held,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
             }
+        };
+        if *version <= current {
+            conn.execute_batch("ROLLBACK")?;
+            continue;
+        }
+        // user_version takes no parameter binding, and the value is a crate
+        // constant rather than anything a caller supplies
+        let applied = conn
+            .execute_batch(sql)
+            .and_then(|()| conn.execute_batch(&format!("PRAGMA user_version = {version}")))
+            .and_then(|()| conn.execute_batch("COMMIT"));
+        match applied {
+            Ok(()) => current = *version,
             Err(e) => {
                 let _ = conn.execute_batch("ROLLBACK");
                 return Err(StatsError::Sqlite(e));
@@ -474,6 +498,46 @@ pub fn apply(conn: &Connection) -> Result<u32, StatsError> {
     Ok(current)
 }
 
+/// Write a consistent copy of the database at `source` to `destination`,
+/// which must not exist, and return the schema version the copy holds.
+///
+/// `VACUUM INTO` on a read-only connection: it reads one snapshot of the
+/// file, whatever the writer commits meanwhile, and writes a complete,
+/// defragmented database — the WAL folded in, so the copy is one file that
+/// needs nothing beside it. Copying `stats.db` with `cp` gets neither: the
+/// newest rows are still in `stats.db-wal`, and a page the writer changes
+/// mid-copy leaves a file SQLite refuses to open.
+///
+/// The copy is checked before it is returned (`PRAGMA quick_check`): a backup
+/// nobody can restore is worse than an error now.
+pub fn snapshot(source: &Path, destination: &Path) -> Result<u32, StatsError> {
+    let conn = Connection::open_with_flags(
+        source,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+    conn.execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])?;
+    drop(conn);
+    let copy = Connection::open_with_flags(
+        destination,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let verdict: String = copy.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if verdict != "ok" {
+        return Err(StatsError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            Some(format!("the copy failed its check: {verdict}")),
+        )));
+    }
+    let version: i64 = copy.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    Ok(u32::try_from(version).unwrap_or(0))
+}
+
+/// How long a writer keeps trying to put a new file into WAL mode while
+/// another process is doing the same. The connection's busy timeout, in the
+/// one place that timeout is not consulted.
+const WAL_SWITCH_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Pragmas every connection to `stats.db` sets, read-only ones included.
 ///
 /// `WAL` is what lets the reader and the CLI query the file while the writer
@@ -483,14 +547,40 @@ pub fn apply(conn: &Connection) -> Result<u32, StatsError> {
 /// stops a concurrent `prune` from turning into an immediate `SQLITE_BUSY` in
 /// the writer.
 fn set_pragmas(conn: &Connection, read_only: bool) -> Result<(), StatsError> {
+    // First, because the next statement needs it: switching a new file to WAL
+    // takes the file's lock, and a second process creating the same file at
+    // the same moment would otherwise be refused at once with "database is
+    // locked" instead of waiting its turn.
+    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
     if !read_only {
         // journal_mode returns a row, and it cannot be changed from a read-only
         // connection: the mode is a property of the file, already set by the
         // writer that created it.
-        let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        //
+        // Retried, because this is the one statement the busy timeout does
+        // not cover. Switching a new file to WAL needs it exclusively, and
+        // when two processes create the file together each holds a read lock
+        // the other is waiting on: SQLite sees the deadlock and refuses one at
+        // once rather than calling the busy handler. Letting go and asking
+        // again is what resolves it, and once the file is in WAL — which the
+        // other process is about to make it — the statement changes nothing.
+        let started = std::time::Instant::now();
+        loop {
+            match conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0)) {
+                Ok(_mode) => break,
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if matches!(
+                        error.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    ) && started.elapsed() < WAL_SWITCH_PATIENCE =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
         conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
     }
-    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
     if read_only {
         // Report queries sort and group whole windows (percentiles, per-request
         // joins): keep those temporary B-trees in memory, give the page cache

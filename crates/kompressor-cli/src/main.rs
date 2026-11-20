@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+mod backup;
 mod bench;
 mod compress;
 mod error;
@@ -58,6 +59,8 @@ enum Command {
     Bench(BenchCmd),
     /// Load a configuration, validate it, and print it with secrets removed.
     CheckConfig(CheckConfigCmd),
+    /// Write every database to one .tar.gz, without stopping the service.
+    Backup(BackupCmd),
     /// Run the HTTP API, the MCP tool server and the reverse proxy.
     Serve(ServeCmd),
     /// Serve the tools to an agent runtime that launches this process itself.
@@ -377,6 +380,21 @@ enum BenchAction {
 }
 
 #[derive(Args)]
+struct BackupCmd {
+    /// Where to write the archive: a file to create, or a directory to put a
+    /// timestamped one in. Defaults to the current directory. An existing
+    /// file is never replaced.
+    #[arg(long, short = 'o', value_name = "PATH")]
+    out: Option<PathBuf>,
+    /// The configuration naming the databases to back up.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// Print what was written as one JSON object instead of a summary.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
 struct CheckConfigCmd {
     /// Configuration file. Without one the built-in defaults are validated,
     /// which is a working single-tenant deployment.
@@ -506,6 +524,9 @@ fn run(cli: Cli) -> CliResult {
         }),
         Command::Unwrap(args) => wrap::unwrap_agent(wrap::UnwrapArgs { agent: args.agent }),
         Command::CheckConfig(args) => check_config(args.config.as_deref()),
+        Command::Backup(args) => {
+            backup::run(args.config.as_deref(), args.out.as_deref(), args.json)
+        }
         Command::Serve(args) => {
             let config =
                 Config::load(args.config.as_deref()).map_err(|e| CliError::Usage(e.to_string()))?;

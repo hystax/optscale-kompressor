@@ -991,14 +991,67 @@ fn into_stats((refs, bytes, oldest): (i64, i64, Option<i64>)) -> StoreStats {
     }
 }
 
+/// Write a consistent copy of the store at `source` to `destination`, which
+/// must not exist, and return the schema version the copy holds.
+///
+/// `VACUUM INTO` on a read-only connection, for the reasons
+/// `kompressor_stats::schema::snapshot` gives: one snapshot of the file
+/// whatever is being written meanwhile, the WAL folded in, and a result that
+/// is a single self-contained file. Checked (`PRAGMA quick_check`) before it
+/// is returned.
+///
+/// The copy holds every tenant's fragments, expired ones included: it is the
+/// file, not a view of it.
+pub fn snapshot(source: &Path, destination: &Path) -> Result<u32, StoreError> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(source, flags)?;
+    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+    conn.execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])?;
+    drop(conn);
+    let copy = Connection::open_with_flags(destination, flags)?;
+    let verdict: String = copy.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if verdict != "ok" {
+        return Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            Some(format!("the copy failed its check: {verdict}")),
+        )));
+    }
+    let version: i64 = copy.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    Ok(u32::try_from(version).unwrap_or(0))
+}
+
 /// Connection pragmas, applied before the schema.
 fn configure(conn: &Connection) -> Result<(), StoreError> {
+    // The timeout first: what follows takes the file's lock, and a process
+    // opening the same file at the same moment has to wait rather than fail.
+    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
     // `PRAGMA journal_mode` answers with the mode it settled on, so it is a
     // query: an in-memory database keeps "memory" and that is fine.
-    conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
+    //
+    // Retried, because the busy timeout does not cover it. Switching a new
+    // file to WAL needs it exclusively, and when two processes create the
+    // file together each holds a read lock the other waits on; SQLite refuses
+    // one at once instead of calling the busy handler. A `serve` and an
+    // `mcp serve` starting together on a fresh install lost one of the two
+    // to "database is locked". Asking again resolves it, and on a file
+    // already in WAL the statement changes nothing.
+    let started = std::time::Instant::now();
+    loop {
+        match conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(())) {
+            Ok(()) => break,
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if matches!(
+                    error.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) && started.elapsed() < std::time::Duration::from_secs(5) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
     conn.execute_batch(
         "PRAGMA synchronous=NORMAL;
-         PRAGMA busy_timeout=5000;
          PRAGMA temp_store=MEMORY;",
     )?;
     Ok(())
@@ -1015,7 +1068,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
         // Schema change and version bump commit together, so a crash mid-way
         // leaves a database that the next open migrates again rather than one
         // that claims a version it does not have.
-        let script = format!("BEGIN;\n{sql}\nPRAGMA user_version = {version};\nCOMMIT;");
+        // `IMMEDIATE`, so a second process opening the file waits here for
+        // the first instead of starting the same step beside it.
+        let script = format!("BEGIN IMMEDIATE;\n{sql}\nPRAGMA user_version = {version};\nCOMMIT;");
         conn.execute_batch(&script)
             .map_err(|source| StoreError::Migration {
                 version: *version,
@@ -1236,6 +1291,30 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version as u32, MIGRATIONS.last().unwrap().0);
+    }
+
+    /// Several processes creating one store at the same moment all get it.
+    #[test]
+    fn openers_racing_to_create_one_store_all_succeed() {
+        for _ in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("refs.db");
+            let start = std::sync::Barrier::new(4);
+            let opened: Vec<Result<(), String>> = std::thread::scope(|scope| {
+                let openers: Vec<_> = (0..4)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            start.wait();
+                            SqliteRefStore::open(&path)
+                                .map(|_| ())
+                                .map_err(|error| error.to_string())
+                        })
+                    })
+                    .collect();
+                openers.into_iter().map(|t| t.join().unwrap()).collect()
+            });
+            assert!(opened.iter().all(Result::is_ok), "{opened:?}");
+        }
     }
 
     #[test]

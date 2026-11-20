@@ -149,6 +149,7 @@ pre { background: var(--bg); border-color: var(--line); }
     <a id="health-link" href="#">Health</a>
     <a id="dashboards-link" href="#">Dashboards</a>
     <a id="refs-link" href="#" hidden>Ref store</a>
+    <a id="maintenance-link" href="#">Maintenance</a>
     <button id="download" type="button" title="Download this view as JSON Lines">Download JSONL</button>
     <button id="pause" aria-pressed="false">Pause</button>
   <button id="theme-toggle" type="button" aria-label="Switch to light theme">Light theme</button>
@@ -469,6 +470,7 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden && !s
 // listener, and as the sibling of /stats/live under a version prefix.
 // The cache analysis likewise: /cache there, /stats/cache under a prefix.
 $("cache-link").href = location.pathname === "/" ? "/cache" : location.pathname.replace(/stats\/live\/?$/, "stats/cache");
+$("maintenance-link").href = location.pathname === "/" ? "/maintenance" : location.pathname.replace(/stats\/live\/?$/, "maintenance");
 if (SETTINGS.refs) {
   $("refs-link").href = location.pathname === "/" ? "/refs" : location.pathname.replace(/stats\/live\/?$/, "refs");
   $("refs-link").hidden = false;

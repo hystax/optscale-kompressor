@@ -26,6 +26,9 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+# The backup archive: database snapshots, tarred and gzipped.
+tar = { workspace = true }
+flate2 = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

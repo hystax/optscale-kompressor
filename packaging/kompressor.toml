@@ -54,6 +54,13 @@ path = "/var/lib/kompressor/refs.db"
 # so it is off unless turned on here.
 # browse = true
 
+# The Maintenance page — /maintenance on server.stats_listen — can download a
+# backup: one .tar.gz with a snapshot of every database. It holds every
+# tenant's statistics and fragments, so it is off unless turned on here.
+# `kompressor backup --out DIR` on this host needs no setting.
+[maintenance]
+# backup = true
+
 [stats]
 # Optional labels recorded with requests for historical comparisons.
 # experiment_id = "compression-v2"

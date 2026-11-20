@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kompressor · Maintenance</title>
+<script>
+// Apply the shared preference before rendering to avoid a theme flash.
+(() => {
+  const key = "kompressor-theme";
+  let theme = "dark";
+  try { if (localStorage.getItem(key) === "light") theme = "light"; } catch (_) {}
+  const apply = (value) => {
+    theme = value === "light" ? "light" : "dark";
+    document.documentElement.dataset.theme = theme;
+    const button = document.getElementById("theme-toggle");
+    if (button) {
+      button.textContent = theme === "dark" ? "Light theme" : "Dark theme";
+      button.setAttribute("aria-label", "Switch to " + (theme === "dark" ? "light" : "dark") + " theme");
+    }
+  };
+  apply(theme);
+  document.addEventListener("DOMContentLoaded", () => {
+    apply(theme);
+    document.getElementById("theme-toggle").addEventListener("click", () => {
+      apply(theme === "dark" ? "light" : "dark");
+      try { localStorage.setItem(key, theme); } catch (_) {}
+    });
+  });
+  window.addEventListener("storage", (event) => {
+    if (event.key === key || event.key === null) apply(event.newValue);
+  });
+})();
+</script>
+<style>
+:root {
+  color-scheme: dark;
+  --ink: #e3eaf2; --bg: #101419; --panel: #191f27; --muted: #9caaba;
+  --line: #303a46; --accent: #70d8b6; --good: #70d8b6; --warn: #f2c66d; --bad: #ffa096; --soft: #262e39;
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+  --ink: #172033; --bg: #f7f8fa; --panel: #ffffff; --muted: #5b6475;
+  --line: #d5dce5; --accent: #13745b; --good: #13745b; --warn: #946000; --bad: #b83228; --soft: #eef1f5;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px system-ui, sans-serif; }
+main { max-width: 1100px; margin: auto; padding: 24px 16px; }
+header, .filters { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+h1 { font-size: 24px; margin: 0 auto 0 0; }
+h2 { font-size: 17px; margin: 0 0 10px; }
+a { color: var(--accent); }
+button, input {
+  font: inherit; color: inherit; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 5px; padding: 7px 9px;
+}
+button { cursor: pointer; }
+button:disabled { cursor: default; opacity: .55; }
+button.primary { border-color: var(--accent); background: var(--soft); font-weight: 600; }
+.filters { margin: 18px 0 6px; }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 16px; margin-top: 16px; }
+table { border-collapse: collapse; width: 100%; margin: 6px 0 14px; }
+th, td { text-align: left; padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; }
+td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+code { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+.muted { color: var(--muted); }
+.note { color: var(--muted); margin: 8px 0 0; max-width: 80ch; line-height: 1.45; }
+#error { color: var(--bad); }
+#status, #progress { color: var(--muted); margin: 8px 0 0; }
+#done { color: var(--good); margin: 8px 0 0; }
+[hidden] { display: none !important; }
+#theme-toggle:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+</style>
+</head>
+<body>
+<main>
+<header>
+  <h1>Kompressor maintenance</h1>
+  <a id="live-link" href="#">Live</a>
+  <a id="cache-link" href="#">Cache</a>
+  <a id="analysis-link" href="#">Analysis</a>
+  <a id="dashboards-link" href="#">Dashboards</a>
+  <a id="refs-link" href="#">Ref store</a>
+  <button id="theme-toggle" type="button" aria-label="Switch to light theme">Light theme</button>
+</header>
+<form class="filters" id="filters">
+  <label>Key <input id="key" type="password" size="16" autocomplete="off" placeholder="x-kompressor-key"/></label>
+  <label>Secret <input id="secret" type="password" size="16" autocomplete="off" placeholder="x-kompressor-secret"/></label>
+  <button type="submit">Load</button>
+</form>
+<p id="status" role="status">Loading…</p>
+<p id="error" role="alert"></p>
+
+<section aria-labelledby="backup-title">
+  <h2 id="backup-title">Backup</h2>
+  <table id="databases" hidden>
+    <thead><tr><th>Database</th><th>File</th><th>Size on disk</th><th>In the backup</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <button id="backup" class="primary" type="button" disabled>Download backup (.tar.gz)</button>
+  <p id="progress" role="status" hidden></p>
+  <p id="done" role="status" hidden></p>
+  <p class="note" id="why" hidden></p>
+  <p class="note">
+    One gzipped tar with a consistent snapshot of every database listed above and a
+    <code>manifest.json</code>. The snapshots are taken through SQLite while the service keeps running;
+    nothing is paused. The configuration and the interception CA are not included: they hold keys.
+    The same archive from a shell, for a scheduled job: <code>kompressor backup --out DIR</code>.
+  </p>
+  <p class="note">
+    To restore: stop the service, put <code>stats.db</code> and <code>refs.db</code> where the File
+    column says, remove any <code>-wal</code> and <code>-shm</code> files beside them, and start it.
+  </p>
+</section>
+</main>
+<script>
+"use strict";
+const SETTINGS = /*SETTINGS*/{};
+const $ = id => document.getElementById(id);
+
+// On the statistics listener the pages sit at /refs, /cache and so on and the
+// data under /v1; on the API this page is the data route itself.
+const prefix = SETTINGS.listener ? "/v1/" : location.pathname.replace(/maintenance\/?$/, "");
+$("live-link").href = SETTINGS.listener ? "/" : prefix + "stats/live";
+$("cache-link").href = SETTINGS.listener ? "/cache" : prefix + "stats/cache";
+$("analysis-link").href = SETTINGS.listener ? "/analysis" : prefix + "stats/analysis";
+$("dashboards-link").href = SETTINGS.listener ? "/health" : prefix + "stats/health";
+$("refs-link").href = SETTINGS.listener ? "/refs" : prefix + "refs";
+
+const credentials = () => {
+  const headers = {};
+  const key = $("key").value.trim(), secret = $("secret").value.trim();
+  if (key) headers["x-kompressor-key"] = key;
+  if (secret) headers["x-kompressor-secret"] = secret;
+  return headers;
+};
+const size = bytes => {
+  if (bytes == null) return "–";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes, unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
+  return (unit ? value.toFixed(value < 10 ? 1 : 0) : value) + " " + units[unit];
+};
+// Everything drawn from a response is inserted as text, never as markup.
+const cell = (text, className) => {
+  const td = document.createElement("td");
+  if (className) td.className = className;
+  td.textContent = text;
+  return td;
+};
+const explain = async response => {
+  try {
+    const body = await response.json();
+    return (body.error && body.error.message) || body.message || response.statusText;
+  } catch (_) { return response.statusText; }
+};
+
+async function load() {
+  $("error").textContent = "";
+  try {
+    const response = await fetch(prefix + "maintenance?format=json", { headers: credentials(), cache: "no-store" });
+    if (!response.ok) throw new Error(response.status + " " + await explain(response));
+    const status = await response.json();
+    const body = $("databases").tBodies[0];
+    body.replaceChildren(...status.databases.map(database => {
+      const row = document.createElement("tr");
+      const path = cell("");
+      const code = document.createElement("code");
+      code.textContent = database.path || "–";
+      path.append(code);
+      row.append(cell(database.name), path, cell(size(database.bytes), "num"),
+        cell(database.included ? "yes" : "no — " + database.reason));
+      return row;
+    }));
+    $("databases").hidden = false;
+    $("backup").disabled = !status.backup.allowed;
+    $("why").textContent = status.backup.allowed ? "" : status.backup.reason;
+    $("why").hidden = status.backup.allowed;
+    $("status").textContent = "kompressor " + status.version + " · " +
+      (status.backup.allowed ? "backup available" : "backup not available here");
+  } catch (error) {
+    $("status").textContent = "";
+    $("error").textContent = "Could not load: " + (error.message || error);
+  }
+}
+
+$("filters").addEventListener("submit", event => { event.preventDefault(); load(); });
+
+$("backup").addEventListener("click", async () => {
+  $("error").textContent = "";
+  $("done").hidden = true;
+  $("backup").disabled = true;
+  $("progress").hidden = false;
+  $("progress").textContent = "Taking snapshots and compressing — this can take a minute for a large database…";
+  try {
+    const response = await fetch(prefix + "maintenance/backup", { method: "POST", headers: credentials(), cache: "no-store" });
+    if (!response.ok) throw new Error(response.status + " " + await explain(response));
+    $("progress").textContent = "Downloading…";
+    const blob = await response.blob();
+    const match = /filename="?([^";]+)"?/.exec(response.headers.get("content-disposition") || "");
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = match ? match[1] : "kompressor-backup.tar.gz";
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+    $("done").textContent = "Saved " + link.download + " (" + size(blob.size) + ").";
+    $("done").hidden = false;
+  } catch (error) {
+    $("error").textContent = "Backup failed: " + (error.message || error);
+  } finally {
+    $("progress").hidden = true;
+    $("backup").disabled = false;
+  }
+});
+
+load();
+</script>
+</body>
+</html>

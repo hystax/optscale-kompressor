@@ -35,11 +35,31 @@ pub struct Config {
     pub mcp: McpConfig,
     pub proxy: ProxyConfig,
     pub log: LogConfig,
+    pub maintenance: MaintenanceConfig,
     /// Environment overrides that named a value this build does not know, for
     /// the settings where carrying on regardless is not safe. Reported by
     /// [`Config::validate`]; never read from or written to a file.
     #[serde(skip)]
     pub refused_env: Vec<String>,
+}
+
+/// What the Maintenance page may do over HTTP.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MaintenanceConfig {
+    /// Serve `POST /v1/maintenance/backup`: a gzipped tar of every database
+    /// this process keeps, whole.
+    ///
+    /// Off by default, for the reason `refs.browse` is and more: the archive
+    /// holds every tenant's statistics and every stored fragment — tool
+    /// output, which can be a `.env` read. Even when on, it is served only to
+    /// a caller that may act for every tenant: anyone under
+    /// `auth.mode = "none"`, where there is one tenant, and otherwise only a
+    /// caller presenting `auth.secret`.
+    ///
+    /// `kompressor backup` on the host needs none of this: it reads the files
+    /// directly, as whoever runs it.
+    pub backup: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1482,6 +1502,12 @@ impl Config {
                 "secret" => self.auth.secret = value.to_string(),
                 _ => {}
             },
+            "maintenance" => {
+                if field == "backup" {
+                    self.maintenance.backup =
+                        parse_bool_setting("maintenance.backup", value, self.maintenance.backup);
+                }
+            }
             "refs" => match field {
                 "path" => self.refs.path = PathBuf::from(value),
                 // Refused when unreadable, for the same reason as `auth.mode`:
@@ -2962,6 +2988,17 @@ mod tests {
             "0.0.0.0:9000".into(),
         )]);
         assert_eq!(config.server.stats_listen, "0.0.0.0:9000");
+    }
+
+    #[test]
+    fn backup_over_http_is_off_until_a_file_or_the_environment_turns_it_on() {
+        assert!(!Config::default().maintenance.backup);
+        let from_file: Config = toml::from_str("[maintenance]\nbackup = true\n").expect("parses");
+        assert!(from_file.maintenance.backup);
+        let mut config = Config::default();
+        config.apply_env(&[("KOMPRESSOR__MAINTENANCE__BACKUP".into(), "true".into())]);
+        assert!(config.maintenance.backup);
+        assert!(toml::from_str::<Config>("[maintenance]\nbackups = true\n").is_err());
     }
 
     #[test]

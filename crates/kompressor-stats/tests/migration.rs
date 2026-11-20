@@ -354,3 +354,84 @@ fn a_v13_database_gains_range_status_and_keeps_its_retrievals() {
         ]
     );
 }
+
+/// Several processes open one file, and after an upgrade the first to start
+/// all find it behind. Each must come up: the one that gets there first
+/// applies a step, the others wait for it and skip what it did.
+///
+/// Reading the version before taking the write lock had every one of them
+/// start the same step, and all but the first fail on "table already exists"
+/// — a `serve` and an `mcp serve` started together after an upgrade, and one
+/// of them did not start.
+#[test]
+fn openers_racing_to_upgrade_one_database_all_succeed() {
+    // v12 is what the last release before the v13–v15 steps left behind; v0
+    // is a first start with nothing on disk.
+    for from in [12, 0] {
+        for round in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("stats.db");
+            if from > 0 {
+                database_at(&path, from);
+                fill_v5(&path);
+            }
+            let before = (from > 0).then(|| {
+                let conn = Connection::open(&path).unwrap();
+                count(&conn, "SELECT COUNT(*) FROM optimization_events")
+            });
+            let start = std::sync::Barrier::new(4);
+            let versions: Vec<Result<u32, String>> = std::thread::scope(|scope| {
+                let openers: Vec<_> = (0..4)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            start.wait();
+                            schema::open_read_write(&path)
+                                .map(|conn| {
+                                    count(&conn, "SELECT * FROM pragma_user_version") as u32
+                                })
+                                .map_err(|e| e.to_string())
+                        })
+                    })
+                    .collect();
+                openers.into_iter().map(|t| t.join().unwrap()).collect()
+            });
+            for version in &versions {
+                assert_eq!(
+                    version.as_ref().ok(),
+                    Some(&schema::latest_version()),
+                    "from v{from}, round {round}: {versions:?}"
+                );
+            }
+            let conn = Connection::open(&path).unwrap();
+            let sound: String = conn
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(sound, "ok");
+            if let Some(before) = before {
+                assert_eq!(
+                    count(&conn, "SELECT COUNT(*) FROM optimization_events"),
+                    before,
+                    "no row lost or doubled"
+                );
+            }
+        }
+    }
+}
+
+/// Applying the ladder to a database that is already current changes nothing
+/// and leaves no transaction open.
+#[test]
+fn a_database_that_is_already_current_is_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stats.db");
+    let conn = schema::open_read_write(&path).unwrap();
+    let schema_before: i64 = count(&conn, "SELECT * FROM pragma_schema_version");
+    assert_eq!(schema::apply(&conn).unwrap(), schema::latest_version());
+    assert_eq!(schema::apply(&conn).unwrap(), schema::latest_version());
+    assert_eq!(
+        count(&conn, "SELECT * FROM pragma_schema_version"),
+        schema_before,
+        "nothing was altered"
+    );
+    assert!(conn.is_autocommit(), "no transaction left open");
+}
