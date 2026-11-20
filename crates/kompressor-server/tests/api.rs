@@ -2125,6 +2125,21 @@ async fn the_prefix_dashboard_says_which_segment_moved_and_who_moved_it() {
         let model = &report["composition"][0];
         assert_eq!(model["tools_share"], 0.6);
         assert_eq!(model["undeferred_requests"], 3);
+        // What the page's columns read: tool search beside deferral, and a
+        // predicted lapse broken out by what became of the prefix.
+        assert_eq!(model["tool_search_requests"], 0);
+        for score in report["cold"].as_array().unwrap() {
+            for outcome in [
+                "confirmed",
+                "wrong",
+                "partial",
+                "drift",
+                "unknown",
+                "missed",
+            ] {
+                assert!(score[outcome].is_u64(), "{outcome} in {score}");
+            }
+        }
     }
 
     let path = "/v1/stats/prefix?format=jsonl&window=1h";

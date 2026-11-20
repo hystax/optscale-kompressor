@@ -283,6 +283,10 @@ pub struct PrefixTracker {
     /// Extra idle time per conversation, set only by
     /// [`PrefixTracker::age_for_test`]. Empty outside tests.
     aged: Mutex<HashMap<u64, Duration>>,
+    /// How far this tracker's clock runs ahead of the machine's, in
+    /// milliseconds. Moved only by [`PrefixTracker::advance_clock_for_test`];
+    /// zero outside tests.
+    ahead_ms: std::sync::atomic::AtomicU64,
     /// Age past which a prefix is assumed lapsed. Zero disables the age rule
     /// and leaves only observed evidence, which is the shipped default: a TTL
     /// is a guess about someone else's eviction policy, and guessing `Cold` is
@@ -434,8 +438,37 @@ impl PrefixTracker {
             retrieved: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
             aged: Mutex::new(HashMap::new()),
+            ahead_ms: std::sync::atomic::AtomicU64::new(0),
             ttl,
         }
+    }
+
+    /// The time every idle measurement here is taken against: the machine's
+    /// clock, plus whatever a replay has moved this tracker's ahead by.
+    fn now(&self) -> Instant {
+        Instant::now()
+            + Duration::from_millis(self.ahead_ms.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// How long ago `at` — a time this tracker stamped — was, on its clock.
+    fn since(&self, at: Instant) -> Duration {
+        self.now().saturating_duration_since(at)
+    }
+
+    /// Move this tracker's clock forward by `by`, for every conversation.
+    ///
+    /// For a replay, which plays hours of captured traffic in seconds: the
+    /// provider it simulates expires entries on the capture's clock, and a
+    /// proxy left on the machine's would never see the pauses that expired
+    /// them — so the adaptive TTL would never switch and no lapse would ever
+    /// be predicted, whatever the settings under test. Nothing in the proxy
+    /// calls it.
+    #[doc(hidden)]
+    pub fn advance_clock_for_test(&self, by: Duration) {
+        self.ahead_ms.fetch_add(
+            u64::try_from(by.as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Is the prefix this request froze still being served from cache?
@@ -474,7 +507,7 @@ impl PrefixTracker {
         if entry.cache_read == Some(0) && !entry.rewritten {
             return PrefixCache::Cold;
         }
-        if !self.ttl.is_zero() && entry.at.elapsed() > self.ttl {
+        if !self.ttl.is_zero() && self.since(entry.at) > self.ttl {
             return PrefixCache::Cold;
         }
         PrefixCache::Warm
@@ -569,7 +602,7 @@ impl PrefixTracker {
                 was = before,
                 now,
                 lost = before - now,
-                since_previous_ms = prior.at.elapsed().as_millis() as u64,
+                since_previous_ms = self.since(prior.at).as_millis() as u64,
                 "the provider served less of this prefix from cache than last turn \
                          (observed, not attributed: expiry, eviction, a changed request \
                          and a rewrite all read the same here)"
@@ -578,7 +611,7 @@ impl PrefixTracker {
         seen.insert(
             fingerprint,
             Seen {
-                at: Instant::now(),
+                at: self.now(),
                 cache_read: known,
                 floor,
                 was_warm,
@@ -818,23 +851,31 @@ impl PrefixTracker {
         };
         let continues = messages > entry.most_messages;
         entry.most_messages = entry.most_messages.max(messages);
-        if continues && entry.at.elapsed() > PROVIDER_CACHE_TTL {
+        if continues && self.since(entry.at) > PROVIDER_CACHE_TTL {
             entry.idled_past_ttl = true;
         }
         entry.idled_past_ttl
     }
 
     /// How long the conversation has been idle — since its last response or
-    /// its last keep-warm read — and whether the provider has ever served it
-    /// from cache. `None` for a conversation not seen before.
+    /// its last keep-warm read — whether the provider has ever served it
+    /// from cache, and whether a request of `messages` messages continues it:
+    /// carries more than any before it. `None` for a conversation not seen
+    /// before.
     ///
-    /// Read-only, and for the record only: what the next response reports is
-    /// scored against it to learn how well a lapse can be predicted on the
-    /// request that finds it. Nothing decides what to send from this.
-    pub fn idle(&self, fingerprint: u64) -> Option<(Duration, bool)> {
+    /// These are the inputs of [`Self::predicted_cold`], read as it reads
+    /// them. Read-only, and for the record only: what the next response
+    /// reports is scored against them to learn how well a lapse can be
+    /// predicted on the request that finds it. Nothing decides what to send
+    /// from this.
+    pub fn idle(&self, fingerprint: u64, messages: usize) -> Option<(Duration, bool, bool)> {
         let seen = self.seen.lock().ok()?;
         let entry = seen.get(&fingerprint)?;
-        Some((entry.at.elapsed(), entry.was_warm))
+        Some((
+            self.since(entry.at),
+            entry.was_warm,
+            messages > entry.most_messages,
+        ))
     }
 
     /// Whether this request is arriving after the conversation's cache entry
@@ -863,7 +904,9 @@ impl PrefixTracker {
             .and_then(|aged| aged.get(&fingerprint).copied())
             .unwrap_or_default();
         seen.get(&fingerprint).is_some_and(|entry| {
-            entry.was_warm && messages > entry.most_messages && entry.at.elapsed() + aged > lifetime
+            entry.was_warm
+                && messages > entry.most_messages
+                && self.since(entry.at) + aged > lifetime
         })
     }
 
@@ -918,7 +961,7 @@ impl PrefixTracker {
         if let Ok(mut seen) = self.seen.lock()
             && let Some(entry) = seen.get_mut(&fingerprint)
         {
-            entry.at = Instant::now();
+            entry.at = self.now();
         }
     }
 
@@ -1194,7 +1237,7 @@ impl PrefixTracker {
         seen.insert(
             fingerprint,
             Seen {
-                at: Instant::now(),
+                at: self.now(),
                 cache_read: None,
                 floor: Some(observed),
                 was_warm: false,
@@ -1682,6 +1725,74 @@ mod tests {
             tracker.long_ttl(9, 6),
             "and the flag survives the response being recorded"
         );
+    }
+
+    /// A replay moves the tracker's clock, and everything that measures idle
+    /// time moves with it: what is recorded, the adaptive TTL, a predicted
+    /// lapse. A ping read during the pause starts the clock again.
+    #[test]
+    fn a_clock_moved_forward_is_idle_time_for_every_conversation() {
+        let tracker = PrefixTracker::new(Duration::from_secs(0));
+        for conversation in [9, 10] {
+            tracker.floor(conversation, 1);
+            tracker.record(conversation, Some(100), Some(1_000), 0);
+            tracker.note_messages(conversation, 2);
+        }
+        let idle_s = |conversation| tracker.idle(conversation, 4).unwrap().0.as_secs();
+        assert_eq!(idle_s(9), 0);
+        let lifetime = Duration::from_secs(300);
+        assert!(!tracker.predicted_cold(9, 4, lifetime));
+
+        tracker.advance_clock_for_test(Duration::from_secs(200));
+        assert_eq!((idle_s(9), idle_s(10)), (200, 200));
+        assert!(
+            !tracker.predicted_cold(9, 4, lifetime),
+            "inside the lifetime"
+        );
+
+        // A ping reads conversation 10 two hundred seconds in.
+        tracker.kept_warm(10);
+        tracker.advance_clock_for_test(Duration::from_secs(200));
+        assert_eq!((idle_s(9), idle_s(10)), (400, 200));
+        assert!(tracker.predicted_cold(9, 4, lifetime));
+        assert!(!tracker.predicted_cold(10, 4, lifetime), "kept warm");
+        assert!(
+            tracker.long_ttl(9, 4),
+            "the pause the adaptive TTL watches for"
+        );
+        assert!(!tracker.long_ttl(10, 4));
+
+        // The answer to the request that found the gap starts it again.
+        tracker.record(9, Some(100), Some(1_000), 0);
+        assert_eq!(idle_s(9), 0);
+        assert!(!tracker.predicted_cold(9, 6, lifetime));
+    }
+
+    /// What is recorded for scoring is what `predicted_cold` reads: whether
+    /// the request carries more messages than any before it.
+    #[test]
+    fn the_recorded_continuation_is_the_one_a_prediction_tests() {
+        let tracker = PrefixTracker::new(Duration::from_secs(0));
+        assert_eq!(tracker.idle(9, 1), None, "never seen");
+        tracker.floor(9, 1);
+        tracker.record(9, Some(100), Some(1_000), 0);
+        tracker.note_messages(9, 3);
+        tracker.advance_clock_for_test(Duration::from_secs(400));
+        let lifetime = Duration::from_secs(300);
+        for (messages, continues) in [(2, false), (3, false), (4, true)] {
+            let (_, was_warm, recorded) = tracker.idle(9, messages).unwrap();
+            assert!(was_warm);
+            assert_eq!(recorded, continues, "{messages} messages");
+            assert_eq!(tracker.predicted_cold(9, messages, lifetime), continues);
+        }
+        // Cold or not, never predicted of a conversation never served from cache.
+        tracker.floor(11, 1);
+        tracker.note_messages(11, 1);
+        assert_eq!(
+            tracker.idle(11, 5).map(|(_, warm, more)| (warm, more)),
+            Some((false, true))
+        );
+        assert!(!tracker.predicted_cold(11, 5, lifetime));
     }
 
     /// A pause a keep-warm ping bridged is not a pause: the cache was read

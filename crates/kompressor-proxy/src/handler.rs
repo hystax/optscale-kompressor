@@ -265,8 +265,21 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     // changed it. Off unless `KOMPRESSOR_BODY_CAPTURE` names a file.
     let capturing = bodycapture::path();
     if capturing.is_some() {
-        bodycapture::record(&capturing, &request_id, "client->proxy", &decoded);
-        bodycapture::record(&capturing, &request_id, "proxy->upstream", &prepared.body);
+        let beta = crate::drift::beta_fingerprint(&parts.headers);
+        bodycapture::record(
+            &capturing,
+            &request_id,
+            "client->proxy",
+            &decoded,
+            Some(beta),
+        );
+        bodycapture::record(
+            &capturing,
+            &request_id,
+            "proxy->upstream",
+            &prepared.body,
+            None,
+        );
     }
 
     let mut upstream_headers =
@@ -298,7 +311,12 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     } else if !encoding.is_encoded() {
         prepared.body.clone()
     } else {
-        match encoding.encode(&prepared.body) {
+        let encoded = if state.encode_fault.swap(false, Ordering::Relaxed) {
+            None
+        } else {
+            encoding.encode(&prepared.body)
+        };
+        match encoded {
             Some(encoded) => encoded,
             None => {
                 state
@@ -306,12 +324,21 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
                     .record(Stage::Parse, &"the rewritten body could not be re-encoded");
                 // The client's original goes out, so nothing was recompacted:
                 // the provider will cache these bytes, and the conversation
-                // keeps the freeze and the ledger that go with them.
+                // keeps the freeze and the ledger that go with them. Dropping
+                // the reservation frees it for the next turn that finds the
+                // cache gone.
                 prepared.pending_recompaction = None;
+                prepared.reservation = None;
                 prepared.recompacted = None;
                 if let Some(seen) = prepared.observation.as_mut() {
                     seen.recompacted = None;
                     seen.ledger_reads = 0;
+                }
+                // The drift tracker was told the rewritten body went out.
+                // It did not: the next request is to be compared with the
+                // client's own bytes on both sides.
+                if let Some(conversation) = prepared.prefix {
+                    state.drift.sent_as_received(conversation, prepared.ticket);
                 }
                 wire
             }
@@ -320,9 +347,11 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     // The commit point of a recompaction: this body is what the provider will
     // cache, so from here the conversation has no freeze and its ledger holds
     // what this turn decided.
-    if let Some((conversation, decided)) = prepared.pending_recompaction.take() {
+    if let Some((conversation, decided)) = prepared.pending_recompaction.take()
+        && let Some(reservation) = prepared.reservation.take()
+    {
         state.prefixes.lower_floor(conversation);
-        let held = state.recompact.commit(conversation, &decided);
+        let held = reservation.commit(&decided);
         tracing::info!(
             request_id = %request_id,
             how = prepared.recompacted.map(|(kind, _)| kind.as_str()),
@@ -621,6 +650,13 @@ struct Prepared {
     /// A recompaction to commit once this body is certain to go upstream as
     /// rewritten: the conversation, and what the turn decided about its reads.
     pending_recompaction: Option<(u64, Vec<(u64, ReadDecision)>)>,
+    /// The conversation's reservation for that recompaction, taken when the
+    /// turn was found cold. Committed with it, and released by being dropped
+    /// on every other way out of the request.
+    reservation: Option<crate::recompact::Reservation>,
+    /// This request's place among all requests, by arrival
+    /// ([`crate::recompact::Recompact::ticket`]).
+    ticket: u64,
     /// Bytes `proxy.tools_compact` took out of the tool definitions.
     tools_compacted_bytes: usize,
     /// Bytes it would take out, where it is not applied.
@@ -641,6 +677,8 @@ impl Prepared {
             recompacted: None,
             betas: None,
             pending_recompaction: None,
+            reservation: None,
+            ticket: 0,
             tools_compacted_bytes: 0,
             tools_compactable_bytes: 0,
             reasoning_elided_bytes: 0,
@@ -754,6 +792,8 @@ fn passthrough_with_stable_tools(
         recompacted: None,
         betas: None,
         pending_recompaction: None,
+        reservation: None,
+        ticket: 0,
         tools_compacted_bytes: 0,
         tools_compactable_bytes: 0,
         reasoning_elided_bytes: 0,
@@ -895,20 +935,32 @@ fn prefix_identity(
                 .collect()
         })
         .unwrap_or_default();
-    // Read before anything below touches the conversation's entry.
+    let messages = value
+        .get("messages")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    // Read before anything below touches the conversation's entry, and with
+    // the message count `cold_turn` will ask `predicted_cold` about.
     let idle = state
         .prefixes
-        .idle(fingerprint)
-        .map(|(idle, was_warm)| crate::drift::Idle {
+        .idle(fingerprint, messages)
+        .map(|(idle, was_warm, continues)| crate::drift::Idle {
             idle_ms: u64::try_from(idle.as_millis()).unwrap_or(u64::MAX),
             was_warm,
+            continues,
         });
-    let incoming = crate::drift::Segments::of(
+    let mut incoming = crate::drift::Segments::sized(
         &value,
+        body.len() as u64,
         family,
         request_headers,
         state.drift.previous_messages(fingerprint),
     );
+    // Only where it will be reported: the scan reads every byte of the
+    // instructions and tool descriptions.
+    if state.drift.opening_is_news(fingerprint, &incoming) {
+        incoming.scan_volatile(&value, family);
+    }
     let text_bytes = opening.iter().map(|text| text.len() as u64).sum();
     let proxy = &state.core.config_for(Some(family.provider())).proxy;
     let reads = kompressor_engine::messages::read_opportunity(
@@ -936,10 +988,6 @@ fn prefix_identity(
         lineage,
         walk.model.as_deref().unwrap_or(""),
     );
-    let messages = value
-        .get("messages")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
     Some(Identified {
         fingerprint,
         messages,
@@ -1156,7 +1204,10 @@ fn observe_prefix(
                 parsed.as_ref()
             }
         };
-        value.map(|value| crate::drift::Segments::of(value, family, request_headers, mark))
+        let sent_bytes = prepared.body.len() as u64;
+        value.map(|value| {
+            crate::drift::Segments::sized(value, sent_bytes, family, request_headers, mark)
+        })
     };
     // The body may be the client's own while the header is not.
     let outgoing = match sent_headers {
@@ -1172,6 +1223,7 @@ fn observe_prefix(
         identified.fingerprint,
         &identified.incoming,
         outgoing.as_ref().unwrap_or(&identified.incoming),
+        prepared.ticket,
     );
     let mut observation = crate::drift::observation(
         family,
@@ -1203,7 +1255,23 @@ fn observe_prefix(
 /// the freeze for good is what makes a recompaction hold on later turns — and
 /// for every request of a conversation whose cache is, as far as can be told,
 /// alive.
+///
+/// A turn found cold is reserved for this request before it is returned: the
+/// check that no recompaction is under way and the claim on the next one are
+/// made under one lock, so two requests arriving together cannot both decide.
 fn cold_turn(
+    state: &ProxyState,
+    family: Option<ApiFamily>,
+    found: &Identified,
+    ticket: u64,
+) -> Option<(crate::recompact::Cold, crate::recompact::Reservation)> {
+    let kind = cold_kind(state, family, found)?;
+    let reservation = state.recompact.reserve(found.fingerprint, ticket)?;
+    Some((kind, reservation))
+}
+
+/// How this request's conversation is known to be cold, if it is.
+fn cold_kind(
     state: &ProxyState,
     family: Option<ApiFamily>,
     found: &Identified,
@@ -1214,8 +1282,9 @@ fn cold_turn(
     {
         return None;
     }
-    // The last recompaction has not been answered yet: whatever the tracker
-    // holds describes the prefix before it. See `Recompact::unsettled`.
+    // A recompaction is being prepared, or the last one has not been answered
+    // yet: whatever the tracker holds describes the prefix before it. See
+    // `Recompact::unsettled`. Asked again, under the lock, by `reserve`.
     if state.recompact.unsettled(found.fingerprint) {
         return None;
     }
@@ -1270,10 +1339,16 @@ async fn prepare(
     let fingerprint = identified.as_ref().map(|found| found.fingerprint);
     // Refcounted: kept to tell a body forwarded as it arrived from a rewrite.
     let original = body.clone();
+    // Before anything is decided, so tickets order requests by what each
+    // could have known of the others.
+    let ticket = state.recompact.ticket();
     // Before `long_ttl` below, which moves the message count this reads.
-    let cold = identified
+    // The reservation lives in this frame until the body it is for is built:
+    // a request abandoned inside `prepare_inner` drops it with the future.
+    let (cold, reservation) = identified
         .as_ref()
-        .and_then(|found| cold_turn(state, family, found));
+        .and_then(|found| cold_turn(state, family, found, ticket))
+        .unzip();
     // Decided once, here: under `adaptive` the question itself moves the
     // conversation's state. Anthropic only; the TTL is its field.
     let long_ttl = family == Some(ApiFamily::AnthropicMessages)
@@ -1304,14 +1379,10 @@ async fn prepare(
         cold,
     )
     .await;
-    if let Some(found) = identified.as_ref()
-        && state
-            .core
-            .config_for(family.map(ApiFamily::provider))
-            .proxy
-            .cold_recompact
-            != ColdRecompact::Off
-    {
+    // Whatever the settings: `predicted_cold` reads it when the setting is
+    // on, and the observation records the same comparison when it is off, so
+    // that a prediction is scored on the requests it would have been made on.
+    if let Some(found) = identified.as_ref() {
         state
             .prefixes
             .note_messages(found.fingerprint, found.messages);
@@ -1319,6 +1390,11 @@ async fn prepare(
     if prepared.prefix.is_none() {
         prepared.prefix = fingerprint;
     }
+    prepared.ticket = ticket;
+    // Kept only for a recompaction that is waiting to be committed. Any other
+    // outcome — the engine declined, timed out, or the body did not shrink —
+    // releases the conversation here.
+    prepared.reservation = reservation.filter(|_| prepared.pending_recompaction.is_some());
     prepared.messages = identified.as_ref().map(|found| found.messages);
     // After every way `prepare_inner` can decline, for the reason the identity
     // is stamped here: under the default marker floor Claude Code freezes its
@@ -1818,6 +1894,8 @@ async fn prepare_inner(
                 recompacted,
                 betas: None,
                 pending_recompaction,
+                reservation: None,
+                ticket: 0,
                 tools_compacted_bytes: 0,
                 tools_compactable_bytes: 0,
                 reasoning_elided_bytes: 0,
@@ -2943,6 +3021,8 @@ pub(crate) struct Recorder {
     pub(crate) stop_reason: Option<String>,
     /// For the two things a response settles about a recompaction.
     recompact: Arc<crate::recompact::Recompact>,
+    /// This request's place among all requests, by arrival.
+    ticket: u64,
     /// This request was recompacted on a *predicted* lapse, so the provider's
     /// answer can be held against the prediction.
     predicted_cold: bool,
@@ -3013,6 +3093,7 @@ impl Recorder {
             keep_warm: None,
             stop_reason: None,
             recompact: state.recompact.clone(),
+            ticket: prepared.ticket,
             predicted_cold: prepared
                 .recompacted
                 .is_some_and(|(kind, _)| kind == crate::recompact::Cold::Predicted),
@@ -3096,9 +3177,14 @@ impl Recorder {
         }
         // The provider has answered with usage: the tracker is about to hold
         // what it says of the prefix as it now stands, so a recompaction this
-        // conversation was waiting on is settled.
+        // conversation was waiting on is settled — by this request if it was
+        // sent no earlier than the recompaction. One that was in flight when
+        // the recompaction went out is answering for the prefix before it.
+        let predates = self
+            .prefix
+            .is_some_and(|prefix| self.recompact.predates(prefix, self.ticket));
         if let (Some(prefix), Some(_)) = (self.prefix, usage) {
-            self.recompact.settled(prefix);
+            self.recompact.settled(prefix, self.ticket);
         }
         // A lapse was predicted and the whole conversation rewritten on it.
         // Was the cache alive after all? Having rewritten the conversation,
@@ -3111,18 +3197,18 @@ impl Recorder {
         // that was alive up to a first message that was itself rewritten
         // cannot be told from one that had lapsed, which is why the margin
         // has to be measured before this is relied on, not after.
+        // The classifier is `PrefixObservation::prediction_was_wrong`, which
+        // the prefix report counts by too.
         if std::mem::take(&mut self.predicted_cold)
-            && rounds == 0
-            && let Some(read) = self.event.cache_read_tokens
             && self
                 .event
                 .prefix
                 .as_ref()
-                .is_some_and(|seen| seen.read_reaches_messages(read))
+                .is_some_and(|seen| seen.prediction_was_wrong(self.event.cache_read_tokens, rounds))
         {
             tracing::warn!(
                 request_id = %self.event.request_id,
-                cache_read = read,
+                cache_read = self.event.cache_read_tokens,
                 "a predicted cache lapse was served from cache"
             );
             self.recompact.wrong_prediction();
@@ -3149,9 +3235,13 @@ impl Recorder {
             } else {
                 self.event.prompt_tokens
             };
-            self.prefixes
-                .record(prefix, self.event.cache_read_tokens, prompt, rounds);
-            if anthropic && written > 0 {
+            // What the provider read for a request sent before the
+            // conversation was recompacted is not evidence about the prefix
+            // it holds now: filed as no evidence, or a late "read nothing,
+            // wrote nothing" would have the next turn recompacted again.
+            let cache_read = self.event.cache_read_tokens.filter(|_| !predates);
+            self.prefixes.record(prefix, cache_read, prompt, rounds);
+            if anthropic && written > 0 && !predates {
                 self.prefixes.record_rewritten(prefix);
             }
             if anthropic

@@ -37,7 +37,7 @@ use crate::StatsError;
 use crate::cache::{Cause, MAX_ROWS};
 use crate::context::{
     DRIFT_BETA, DRIFT_HISTORY, DRIFT_SYSTEM, DRIFT_TOOL_DEFS, DRIFT_TOOL_ORDER, DRIFT_TOOL_SET,
-    PrefixObservation,
+    LapseOutcome, PrefixObservation,
 };
 use crate::reader::{StatsReader, ratio};
 
@@ -82,9 +82,14 @@ pub struct Composition {
     pub opaque_share: f64,
     /// Rendered tools per request, on average.
     pub tools_per_request: f64,
-    /// Requests carrying at least one deferred tool.
+    /// Requests that load tools on demand: at least one tool marked
+    /// `defer_loading`, or the provider's own tool-search tool in the list.
     pub deferring_requests: u64,
-    /// Requests rendering [`MANY_TOOLS`] or more with none deferred.
+    /// Of those, the ones carrying the tool-search tool.
+    #[serde(default)]
+    pub tool_search_requests: u64,
+    /// Requests rendering [`MANY_TOOLS`] or more that defer none and carry no
+    /// tool-search tool.
     pub undeferred_requests: u64,
     /// Tool-definition bytes those requests carried.
     pub undeferred_tools_bytes: u64,
@@ -174,17 +179,33 @@ pub struct ColdScore {
     /// one of [`ASSUMED_LIFETIMES_S`].
     pub asked: bool,
     pub margin_s: u32,
-    /// Warm conversations' requests that could be scored.
+    /// Requests the runtime could have predicted on, idle time aside — a
+    /// warm conversation, continued ([`PrefixObservation::could_predict`]) —
+    /// that reported usage and were not themselves recompacted.
     pub scored: u64,
     /// Predicted cold: idle longer than the lifetime plus the margin.
     pub predicted: u64,
-    /// Predicted cold, and the request did lose the prefix the one before it
-    /// left, by the cache report's reckoning.
+    /// Predicted cold, and the conversation's own messages were not read
+    /// back at all with nothing seen to change: an expiry.
     pub confirmed: u64,
     /// Predicted cold, and the prefix was read back after all.
     pub wrong: u64,
-    /// Not predicted, and the prefix was lost.
+    /// Predicted cold, and part of the conversation was read back. Not an
+    /// expiry, which takes all of it.
+    #[serde(default)]
+    pub partial: u64,
+    /// Predicted cold, and lost on a request whose prefix had changed: the
+    /// change explains the loss, the idle time need not.
+    #[serde(default)]
+    pub drift: u64,
+    /// Predicted cold, and lost with nothing to compare the request with.
+    #[serde(default)]
+    pub unknown: u64,
+    /// Not predicted, and the conversation's messages were lost whole with
+    /// nothing seen to change.
     pub missed: u64,
+    /// `confirmed` over `predicted`: a partial, drift-associated or unknown
+    /// loss counts against a prediction as a read-back does.
     pub precision: f64,
     pub recall: f64,
 }
@@ -261,6 +282,8 @@ pub(crate) struct Observed {
     pub(crate) read: Option<i64>,
     /// The prompt tokens the provider reported, as it reports them.
     pub(crate) prompt: i64,
+    /// Retrieve rounds the request spent.
+    pub(crate) rounds: i64,
     pub(crate) observation: PrefixObservation,
 }
 
@@ -365,7 +388,8 @@ impl StatsReader {
             entry.tools_compacted_bytes += u64::from(seen.tools_compacted_bytes);
             entry.tools_compacted_requests += u64::from(seen.tools_compacted_bytes > 0);
             *tools_seen.entry(key).or_default() += u64::from(seen.tools_count);
-            if seen.tools_deferred > 0 {
+            entry.tool_search_requests += u64::from(seen.tool_search);
+            if seen.tools_deferred > 0 || seen.tool_search {
                 entry.deferring_requests += 1;
             } else if seen.tools_count >= MANY_TOOLS {
                 entry.undeferred_requests += 1;
@@ -393,13 +417,11 @@ impl StatsReader {
             if let Some(kind) = seen.recompacted.as_deref() {
                 if kind == "predicted" {
                     report.recompactions.predicted += 1;
-                    // A recompacted turn rewrites the conversation, so the
-                    // provider can read back only what precedes the first
-                    // rewritten message. A read reaching past the opening is
-                    // the one sign left that the cache was alive.
-                    if row.read.is_some_and(|read| {
-                        seen.read_reaches_messages(u32::try_from(read).unwrap_or(u32::MAX))
-                    }) {
+                    // Counted as the proxy's breaker counted it when the
+                    // answer arrived: the same classifier, on the same row.
+                    let read = row.read.map(|read| u32::try_from(read).unwrap_or(u32::MAX));
+                    let rounds = u32::try_from(row.rounds).unwrap_or(u32::MAX);
+                    if seen.prediction_was_wrong(read, rounds) {
                         report.recompactions.predicted_wrong += 1;
                     }
                 } else {
@@ -422,23 +444,32 @@ impl StatsReader {
                 }
             }
 
-            // A lapse can only be scored where there was a cache to lapse and
-            // the provider said what it read — and not on a turn that was
+            // A lapse is scored on the requests the runtime could predict
+            // on — a warm conversation, continued by this request — where
+            // the provider said what it read, and not on a turn that was
             // itself recompacted, whose read says what was rewritten rather
             // than what had expired.
             //
-            // The truth is the cache walk's: the request failed to read back
-            // what the one before it left. A bare zero read is not it. On
-            // Anthropic the instructions and tools are often cached by other
-            // conversations too, so a conversation whose own entries have
-            // lapsed still reads them.
-            if let (true, Some(idle_ms), Some(_), None) = (
-                seen.was_warm,
+            // Whether the prefix was lost is the cache walk's to say: the
+            // request failed to read back what the one before it left. What
+            // kind of loss is this row's: only one that took the whole of
+            // the conversation's own messages, with no segment seen to
+            // change, is what an expiry does. A loss that left part of the
+            // conversation readable, or fell on a request whose prefix had
+            // changed, would have happened whatever the idle time, and
+            // counting it would credit the prediction with a rewrite.
+            // On Anthropic the instructions and tools are often cached by
+            // other conversations too, so a bare zero read is not the test.
+            if let (true, Some(idle_ms), Some(read), None) = (
+                seen.could_predict(),
                 seen.idle_ms,
                 row.read,
                 seen.recompacted.as_ref(),
             ) {
-                let lapsed = lost.contains(row.request_id.as_str());
+                let outcome = seen.lapse_outcome(
+                    lost.contains(row.request_id.as_str()),
+                    u32::try_from(read).unwrap_or(u32::MAX),
+                );
                 let asked = seen.lifetime_s.map(|lifetime| vec![(lifetime, true)]);
                 let lifetimes = asked.unwrap_or_else(|| {
                     ASSUMED_LIFETIMES_S
@@ -454,17 +485,15 @@ impl StatsReader {
                         let predicted = idle_ms
                             > u64::from(lifetime_s.saturating_add(margin_s)).saturating_mul(1_000);
                         slot.scored += 1;
-                        match (predicted, lapsed) {
-                            (true, true) => {
-                                slot.predicted += 1;
-                                slot.confirmed += 1;
-                            }
-                            (true, false) => {
-                                slot.predicted += 1;
-                                slot.wrong += 1;
-                            }
-                            (false, true) => slot.missed += 1,
-                            (false, false) => {}
+                        slot.predicted += u64::from(predicted);
+                        match (predicted, outcome) {
+                            (true, LapseOutcome::Full) => slot.confirmed += 1,
+                            (true, LapseOutcome::ReadBack) => slot.wrong += 1,
+                            (true, LapseOutcome::Partial) => slot.partial += 1,
+                            (true, LapseOutcome::Drift) => slot.drift += 1,
+                            (true, LapseOutcome::Unknown) => slot.unknown += 1,
+                            (false, LapseOutcome::Full) => slot.missed += 1,
+                            (false, _) => {}
                         }
                     }
                 }
@@ -556,7 +585,7 @@ impl StatsReader {
                     CASE WHEN prompt_tokens IS NULL AND cache_read_tokens IS NULL
                               AND cache_write_tokens IS NULL
                          THEN NULL ELSE COALESCE(cache_read_tokens, 0) END,
-                    prefix_json, COALESCE(prompt_tokens, 0)
+                    prefix_json, COALESCE(prompt_tokens, 0), retrieve_rounds
              FROM proxy_requests
              WHERE tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3
                AND keep_warm = 0 AND prefix_json IS NOT NULL
@@ -580,6 +609,7 @@ impl StatsReader {
                 conversation: row.get(3)?,
                 read: row.get(4)?,
                 prompt: row.get(6)?,
+                rounds: row.get(7)?,
                 observation,
             });
         }

@@ -189,3 +189,94 @@ async fn a_body_that_is_not_a_conversation_files_no_observation() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].prefix, None, "unknown, not `nothing drifted`");
 }
+
+/// The half of a lapse prediction that idle time does not show is on every
+/// row, whatever the settings: whether the request carried more messages
+/// than any before it under its conversation.
+#[tokio::test]
+async fn each_row_says_whether_its_request_continued_the_conversation() {
+    let harness = harness().await;
+    harness.post(CHAT, &conversation(0)).await;
+    assert_eq!(
+        observed(&harness).continues,
+        None,
+        "the first request has no conversation to continue"
+    );
+    harness.post(CHAT, &conversation(1)).await;
+    assert_eq!(observed(&harness).continues, Some(true));
+    // The same request again, as a retry or a second agent opening with the
+    // same bytes sends it: no further than the conversation has been.
+    harness.post(CHAT, &conversation(1)).await;
+    assert_eq!(observed(&harness).continues, Some(false));
+    harness.post(CHAT, &conversation(0)).await;
+    assert_eq!(observed(&harness).continues, Some(false), "a branch");
+    harness.post(CHAT, &conversation(2)).await;
+    assert_eq!(observed(&harness).continues, Some(true));
+}
+
+/// The volatile scan is reported — and so made — on the first request of a
+/// conversation and again when its tools change, and on no request between.
+#[tokio::test]
+async fn volatile_values_are_reported_when_the_opening_is_news_and_not_between() {
+    let harness = harness().await;
+    let dated = |turns, described: &str| {
+        let mut body = conversation(turns);
+        body["messages"][0]["content"] = json!("Today's date is 2026-11-20.");
+        body["tools"][0]["function"]["description"] = json!(described);
+        body
+    };
+    harness.post(CHAT, &dated(0, "Read a file")).await;
+    assert_eq!(
+        observed(&harness).volatile.map(|found| found.dates),
+        Some(1)
+    );
+    harness.post(CHAT, &dated(1, "Read a file")).await;
+    assert_eq!(observed(&harness).volatile, None);
+    harness
+        .post(CHAT, &dated(2, "Read a file, as of 2026-11-21"))
+        .await;
+    let changed = observed(&harness);
+    assert_eq!(changed.drift_in, DRIFT_TOOL_DEFS);
+    assert_eq!(
+        changed.volatile.map(|found| found.dates),
+        Some(2),
+        "the instructions' and the tool's"
+    );
+    harness
+        .post(CHAT, &dated(3, "Read a file, as of 2026-11-21"))
+        .await;
+    assert_eq!(observed(&harness).volatile, None);
+}
+
+/// The request's size is the bytes that arrived, not a re-serialization of
+/// what they parsed to; and the provider's tool-search tool in the list is on
+/// the row.
+#[tokio::test]
+async fn the_row_carries_the_size_that_arrived_and_the_tool_search_tool() {
+    let harness = harness().await;
+    let mut body = conversation(0);
+    let spaced = serde_json::to_string_pretty(&body).unwrap();
+    let reply = harness
+        .send(
+            http::Request::post(CHAT)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(spaced.clone()))
+                .unwrap(),
+        )
+        .await;
+    assert!(reply.status.is_success());
+    let seen = observed(&harness);
+    assert_eq!(seen.body_bytes as usize, spaced.len());
+    assert!(spaced.len() > body.to_string().len());
+    assert!(!seen.tool_search);
+
+    body["tools"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type": "tool_search"}));
+    body["messages"][1]["content"] = json!("Another conversation.");
+    harness.post(CHAT, &body).await;
+    let seen = observed(&harness);
+    assert!(seen.tool_search);
+    assert_eq!((seen.tools_count, seen.tools_deferred), (2, 0));
+}

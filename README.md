@@ -870,7 +870,7 @@ per setting, whether it clears the bar.
 | `tools_order = "pinned"` | sends a conversation's tools in the order its first request used, when a client reorders them between turns |
 | `sticky_beta = true` | re-sends the `anthropic-beta` tokens a conversation already sent when a later request leaves some out |
 | `prompt_cache_key = "conversation"` | names an OpenAI cache route from the conversation's opening where the client named none |
-| `tools_compact = true` | drops schema bookkeeping from tool definitions (`$schema`, `$comment`, a `title` that restates its property's name); about 2% of the tool block on Claude Code |
+| `tools_compact = true` | drops schema bookkeeping from tool definitions (`$comment`, a `title` that restates its property's name, a `$schema` no keyword in the schema depends on); about 2% of the tool block on Claude Code |
 | `cold_recompact = "observed"` or `"predicted"` | under `frozen_prefix = "first_seen"`, rewrites the whole conversation on the turn that finds the provider's cache gone, and replays what that turn decided on every turn after it |
 | `superseded_reads`, `matured_reads` | with `cold_recompact`: on that turn, also replace a file read a later read contains, and compress as source a read left alone for `matured_quiesce_turns` |
 | `reasoning_elide_models = ["…"]` | OpenAI Chat: for the models named, elides the plain-text reasoning of turns before the last user message. Rewrites the finished turn once per user turn |

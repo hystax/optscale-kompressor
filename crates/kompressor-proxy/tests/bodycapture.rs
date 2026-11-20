@@ -372,3 +372,101 @@ async fn the_relay_records_why_it_gave_up_on_a_streamed_turn() {
         "this fixture narrates past the grace, so that must be the reason given"
     );
 }
+
+/// What a replay of the file needs beside the bodies: the beta set each
+/// request travelled with, as a fingerprint, and every keep-warm ping the
+/// proxy sent — which request it followed and what the provider read.
+#[tokio::test]
+async fn the_capture_records_beta_sets_and_keep_warm_pings() {
+    use serde_json::json;
+    let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("bodies.jsonl");
+    // Safe for the reason given above: set before the code under test runs.
+    unsafe { std::env::set_var("KOMPRESSOR_BODY_CAPTURE", &file) };
+
+    let interval = std::time::Duration::from_millis(100);
+    let harness = Harness::with(|config| {
+        config.proxy.cache_keep_warm = true;
+        config.proxy.cache_keep_warm_interval = interval;
+        config.proxy.cache_keep_warm_max_pings = 1;
+    })
+    .await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "msg_1", "type": "message", "role": "assistant",
+            "content": [{"type": "tool_use", "id": "toolu_x", "name": "bash",
+                         "input": {"command": "make"}}],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 3, "cache_read_input_tokens": 4000,
+                      "cache_creation_input_tokens": 200, "output_tokens": 40}
+        })))
+        .mount(&harness.server)
+        .await;
+    let body = json!({
+        "model": "claude-opus-5-5", "max_tokens": 32000,
+        "system": [{"type": "text", "text": "You are an agent.",
+                    "cache_control": {"type": "ephemeral"}}],
+        "messages": [{"role": "user", "content": "Build the project."}]
+    });
+    for betas in [
+        "b-2025-01-01, a-2025-01-01",
+        "a-2025-01-01,b-2025-01-01",
+        "c-2025-01-01",
+    ] {
+        harness
+            .post_with("/v1/messages", &body, &[("anthropic-beta", betas)])
+            .await;
+    }
+    tokio::time::sleep(interval * 6).await;
+    unsafe { std::env::remove_var("KOMPRESSOR_BODY_CAPTURE") };
+
+    let written = std::fs::read_to_string(&file).expect("the capture file must exist");
+    let lines: Vec<serde_json::Value> = written
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each line is JSON"))
+        .collect();
+    let of = |dir: &str| -> Vec<&serde_json::Value> {
+        lines.iter().filter(|line| line["dir"] == dir).collect()
+    };
+    let incoming = of("client->proxy");
+    assert_eq!(incoming.len(), 3);
+    let beta = |line: &serde_json::Value| line["beta"].as_str().expect("a fingerprint").to_string();
+    assert_eq!(beta(incoming[0]).len(), 16);
+    assert_eq!(
+        beta(incoming[0]),
+        beta(incoming[1]),
+        "the same set, spelt differently"
+    );
+    assert_ne!(beta(incoming[0]), beta(incoming[2]));
+    assert!(
+        !written.contains("a-2025-01-01"),
+        "no header value is recorded"
+    );
+    assert!(
+        of("proxy->upstream")
+            .iter()
+            .all(|line| line.get("beta").is_none())
+    );
+
+    let pings = of("keep-warm");
+    assert_eq!(pings.len(), 1, "{written:.400}");
+    let ping = pings[0];
+    assert_eq!(
+        ping["request_id"],
+        json!(format!(
+            "{}.keepwarm1",
+            incoming[2]["request_id"].as_str().unwrap()
+        )),
+        "the latest request is the one kept warm"
+    );
+    assert_eq!(
+        (&ping["status"], &ping["read"]),
+        (&json!(200), &json!(4000))
+    );
+    assert!(ping.get("body").is_none());
+    assert!(
+        ping["at_ms"].as_u64() >= incoming[2]["at_ms"].as_u64(),
+        "in the file's own time order"
+    );
+}

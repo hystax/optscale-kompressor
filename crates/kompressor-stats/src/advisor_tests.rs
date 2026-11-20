@@ -242,6 +242,9 @@ fn lapsing(conn: &Connection, with_reads: bool) {
                     idle_ms: Some(900_000),
                     was_warm: true,
                     lifetime_s: Some(300),
+                    // The 13,000 tokens it read are the instructions and
+                    // tools other conversations keep cached: none of its own.
+                    system_bytes: 40_000,
                     text_bytes: 100_000,
                     stale_read_bytes: if with_reads { 5_000 } else { 0 },
                     superseded_read_bytes: if with_reads { 12_000 } else { 0 },

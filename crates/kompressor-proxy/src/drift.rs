@@ -214,6 +214,8 @@ pub(crate) struct Segments {
     tools_bytes: u64,
     tools_count: u32,
     tools_deferred: u32,
+    /// Whether the list carries the provider's own tool-search tool.
+    tool_search: bool,
     messages_bytes: u64,
     reasoning_bytes: u64,
     /// Whether any marker the provider reads asks for a one-hour entry.
@@ -241,6 +243,18 @@ pub(crate) fn tool_name(tool: &Value) -> &str {
         .or_else(|| tool.pointer("/function/name").and_then(Value::as_str))
         .or_else(|| tool.get("type").and_then(Value::as_str))
         .unwrap_or("")
+}
+
+/// Whether `tool` is a provider's native tool-search tool: Anthropic's
+/// `tool_search_tool_regex_…` and `tool_search_tool_bm25_…`, OpenAI's
+/// `tool_search`. A typed entry with no schema of its own, whose presence
+/// says the client loads tools on demand even where none in this list is
+/// marked `defer_loading` — an MCP toolset defers its tools by its own
+/// configuration, not by a flag on each.
+fn is_tool_search(tool: &Value) -> bool {
+    tool.get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.starts_with("tool_search"))
 }
 
 fn tool_description(tool: &Value) -> Option<&str> {
@@ -335,6 +349,12 @@ fn reasoning_in(item: &Value) -> u64 {
     total
 }
 
+/// [`beta_hash`], for the body capture: when two requests' beta sets differ,
+/// so do these, and nothing of the header can be read back from one.
+pub(crate) fn beta_fingerprint(headers: &HeaderMap) -> u64 {
+    beta_hash(headers)
+}
+
 /// The sorted, de-duplicated beta tokens a request carries, as one hash.
 fn beta_hash(headers: &HeaderMap) -> u64 {
     let mut tokens: Vec<String> = Vec::new();
@@ -359,20 +379,36 @@ fn beta_hash(headers: &HeaderMap) -> u64 {
 }
 
 impl Segments {
-    /// Reduce one request body to what is compared and counted.
-    ///
-    /// `headers` are the client's: the proxy forwards the beta tokens it was
-    /// sent, so they are the same on both sides of it. `mark` is how many
-    /// messages the conversation's previous request carried
-    /// ([`DriftTracker::previous_messages`]).
+    /// [`Self::sized`] for a body whose serialized length is not to hand.
+    #[cfg(test)]
     pub(crate) fn of(
         body: &Value,
         family: ApiFamily,
         headers: &HeaderMap,
         mark: Option<usize>,
     ) -> Segments {
+        Segments::sized(body, size_of(body), family, headers, mark)
+    }
+
+    /// Reduce one request body to what is compared and counted.
+    ///
+    /// `body_bytes` is the length of the bytes `body` was parsed from, which
+    /// the caller holds: serializing the whole request again only to count it
+    /// was a second pass over every request. `headers` are the client's: the
+    /// proxy forwards the beta tokens it was sent, so they are the same on
+    /// both sides of it. `mark` is how many messages the conversation's
+    /// previous request carried ([`DriftTracker::previous_messages`]).
+    ///
+    /// The volatile scan is not made here: see [`Self::scan_volatile`].
+    pub(crate) fn sized(
+        body: &Value,
+        body_bytes: u64,
+        family: ApiFamily,
+        headers: &HeaderMap,
+        mark: Option<usize>,
+    ) -> Segments {
         let mut segments = Segments {
-            body_bytes: size_of(body),
+            body_bytes,
             one_hour: family == ApiFamily::AnthropicMessages && any_one_hour(body),
             ..Segments::default()
         };
@@ -395,28 +431,19 @@ impl Segments {
             .unwrap_or(&empty);
 
         let mut system = Fnv::new();
-        let mut strings: Vec<&str> = Vec::new();
         for key in ["system", "instructions"] {
             if let Some(value) = body.get(key) {
                 hash_value(&mut system, value, false);
                 segments.system_bytes += size_of(value);
-                collect_strings(value, &mut strings);
             }
         }
         // On the OpenAI families the instructions are the conversation's
         // leading system and developer items. One that arrives later is a
         // turn like any other: appended, not a change to the opening.
-        let leading = if family == ApiFamily::AnthropicMessages {
-            0
-        } else {
-            items.iter().take_while(|item| is_instruction(item)).count()
-        };
+        let leading = leading_instructions(items, family);
         for item in &items[..leading] {
             hash_value(&mut system, item, false);
             segments.system_bytes += size_of(item);
-            if let Some(content) = item.get("content") {
-                collect_strings(content, &mut strings);
-            }
         }
         segments.hashes.system = system.0;
 
@@ -459,15 +486,13 @@ impl Segments {
                 continue;
             }
             segments.tools_count += 1;
+            segments.tool_search |= is_tool_search(tool);
             segments.tools_bytes += size_of(tool);
             hash_value(&mut defs, tool, false);
             let name = tool_name(tool);
             order.mark(b's');
             order.bytes(name.as_bytes());
             names.push(name);
-            if let Some(description) = tool_description(tool) {
-                strings.push(description);
-            }
         }
         segments.messages = segments.hashes.messages_count;
         segments.hashes.tool_defs = defs.0;
@@ -479,11 +504,59 @@ impl Segments {
             set.bytes(name.as_bytes());
         }
         segments.hashes.tool_set = set.0;
-
-        for text in strings {
-            scan_volatile(text.as_bytes(), &mut segments.volatile);
-        }
         segments
+    }
+
+    /// Count the volatile-looking values in the instructions and the rendered
+    /// tools' descriptions of `body`, the request these segments were made
+    /// from.
+    ///
+    /// Apart from [`Self::sized`] because it is wanted on few requests — the
+    /// first of a conversation, and one whose instructions or tools changed
+    /// ([`DriftTracker::opening_is_news`]) — and walks every byte of the
+    /// system prompt and tool descriptions when it runs. Made on every
+    /// request, it was most of what observing one cost.
+    pub(crate) fn scan_volatile(&mut self, body: &Value, family: ApiFamily) {
+        let mut strings: Vec<&str> = Vec::new();
+        for key in ["system", "instructions"] {
+            if let Some(value) = body.get(key) {
+                collect_strings(value, &mut strings);
+            }
+        }
+        let conversation_key = match family {
+            ApiFamily::OpenAiResponses => "input",
+            _ => "messages",
+        };
+        if let Some(items) = body.get(conversation_key).and_then(Value::as_array) {
+            for item in &items[..leading_instructions(items, family)] {
+                if let Some(content) = item.get("content") {
+                    collect_strings(content, &mut strings);
+                }
+            }
+        }
+        if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+            strings.extend(
+                tools
+                    .iter()
+                    .filter(|tool| tool.get("defer_loading").and_then(Value::as_bool) != Some(true))
+                    .filter_map(tool_description),
+            );
+        }
+        let mut found = Volatile::default();
+        for text in strings {
+            scan_volatile(text.as_bytes(), &mut found);
+        }
+        self.volatile = found;
+    }
+}
+
+/// How many of a conversation's leading items are its instructions: none on
+/// Anthropic, which carries them beside the conversation.
+fn leading_instructions(items: &[Value], family: ApiFamily) -> usize {
+    if family == ApiFamily::AnthropicMessages {
+        0
+    } else {
+        items.iter().take_while(|item| is_instruction(item)).count()
     }
 }
 
@@ -636,6 +709,11 @@ struct Entry {
     incoming: Hashes,
     outgoing: Hashes,
     one_hour: bool,
+    /// What `one_hour` would have been had the request gone out as received.
+    incoming_one_hour: bool,
+    /// The request's arrival ticket, so a correction is applied only to the
+    /// entry that request left.
+    ticket: u64,
 }
 
 /// The previous request of each conversation, for the next one to be compared
@@ -713,6 +791,7 @@ impl DriftTracker {
         conversation: u64,
         incoming: &Segments,
         outgoing: &Segments,
+        ticket: u64,
     ) -> Compared {
         let Ok(mut entries) = self.entries.lock() else {
             return Compared::default();
@@ -763,13 +842,48 @@ impl DriftTracker {
                 incoming: incoming.hashes.clone(),
                 outgoing: outgoing.hashes.clone(),
                 one_hour: outgoing.one_hour,
+                incoming_one_hour: incoming.one_hour,
+                ticket,
             },
         );
         result
     }
 
+    /// The request holding `ticket` went upstream as the client sent it after
+    /// all — its rewrite could not be re-encoded — so what is remembered as
+    /// sent is what was received. Nothing changes if a later request of the
+    /// conversation has been observed since.
+    pub(crate) fn sent_as_received(&self, conversation: u64, ticket: u64) {
+        if let Ok(mut entries) = self.entries.lock()
+            && let Some(entry) = entries.get_mut(&conversation)
+            && entry.ticket == ticket
+        {
+            entry.outgoing = entry.incoming.clone();
+            entry.one_hour = entry.incoming_one_hour;
+        }
+    }
+
+    /// Whether a volatile scan of `incoming` would be reported: there is no
+    /// earlier request to compare it with — the conversation's first, or a
+    /// branch — or its instructions or tools are not the ones that request
+    /// carried. The same test [`observation`] applies to what `observe`
+    /// returns, asked before the scan is paid for.
+    pub(crate) fn opening_is_news(&self, conversation: u64, incoming: &Segments) -> bool {
+        let Ok(entries) = self.entries.lock() else {
+            return false;
+        };
+        entries.get(&conversation).is_none_or(|previous| {
+            let (before, now) = (&previous.incoming, &incoming.hashes);
+            now.messages_count < before.messages_count
+                || before.system != now.system
+                || before.tool_set != now.tool_set
+                || before.tool_order != now.tool_order
+                || before.tool_defs != now.tool_defs
+        })
+    }
+
     /// How many messages the conversation's previous request carried, for
-    /// [`Segments::of`] to mark its chain at.
+    /// [`Segments::sized`] to mark its chain at.
     pub(crate) fn previous_messages(&self, conversation: u64) -> Option<usize> {
         self.entries
             .lock()
@@ -799,6 +913,8 @@ impl DriftTracker {
 pub(crate) struct Idle {
     pub(crate) idle_ms: u64,
     pub(crate) was_warm: bool,
+    /// Whether the request carries more messages than any before it.
+    pub(crate) continues: bool,
 }
 
 /// Put one request's observation together.
@@ -809,8 +925,10 @@ pub(crate) fn observation(
     text_bytes: u64,
     idle: Option<Idle>,
 ) -> PrefixObservation {
-    // Scanned on every request and reported only where it is news: the first
-    // request of a conversation, and one whose instructions or tools changed.
+    // Reported only where it is news: the first request of a conversation,
+    // and one whose instructions or tools changed. The caller scans only
+    // then (`DriftTracker::opening_is_news`); this is the same test, on what
+    // the comparison found.
     let fresh = !compared.compared
         || compared.drift_in & (DRIFT_SYSTEM | DRIFT_TOOL_DEFS | DRIFT_TOOL_ORDER | DRIFT_TOOL_SET)
             != 0;
@@ -826,6 +944,7 @@ pub(crate) fn observation(
         tools_bytes: clamp(incoming.tools_bytes),
         tools_count: incoming.tools_count,
         tools_deferred: incoming.tools_deferred,
+        tool_search: incoming.tool_search,
         messages_bytes: clamp(incoming.messages_bytes),
         messages_count: clamp(incoming.hashes.messages_count as u64),
         text_bytes: clamp(text_bytes),
@@ -833,6 +952,7 @@ pub(crate) fn observation(
         volatile: (fresh && incoming.volatile.any()).then_some(incoming.volatile),
         idle_ms: idle.map(|idle| idle.idle_ms),
         was_warm: idle.is_some_and(|idle| idle.was_warm),
+        continues: idle.map(|idle| idle.continues),
         lifetime_s: (family == ApiFamily::AnthropicMessages)
             .then_some(compared.previous_one_hour)
             .flatten()
@@ -873,7 +993,7 @@ mod tests {
     }
 
     fn observe(tracker: &DriftTracker, incoming: &Value, outgoing: &Value) -> Compared {
-        tracker.observe(7, &anthropic(incoming), &anthropic(outgoing))
+        tracker.observe(7, &anthropic(incoming), &anthropic(outgoing), 0)
     }
 
     #[test]
@@ -1239,7 +1359,9 @@ mod tests {
     fn volatile_values_are_reported_only_where_they_are_news() {
         let mut body = turn(json!([{"role": "user", "content": "2026-11-20"}]));
         body["system"][0]["text"] = json!("Today's date is 2026-11-20.");
-        let segments = anthropic(&body);
+        let mut segments = anthropic(&body);
+        assert!(!segments.volatile.any(), "reducing a body does not scan it");
+        segments.scan_volatile(&body, ApiFamily::AnthropicMessages);
         let first = observation(
             ApiFamily::AnthropicMessages,
             &segments,
@@ -1265,6 +1387,7 @@ mod tests {
             Some(Idle {
                 idle_ms: 42,
                 was_warm: true,
+                continues: true,
             }),
         );
         assert_eq!(later.volatile, None);
@@ -1272,7 +1395,226 @@ mod tests {
             (later.idle_ms, later.was_warm, later.lifetime_s),
             (Some(42), true, Some(3_600))
         );
+        assert_eq!((first.continues, later.continues), (None, Some(true)));
         assert_eq!(first.lifetime_s, None, "no earlier request to have asked");
+    }
+
+    /// The scan is paid for only on a request whose result would be
+    /// reported: one with nothing before it, a branch, or one whose
+    /// instructions or tools moved.
+    #[test]
+    fn the_volatile_scan_is_asked_for_only_where_it_is_news() {
+        let tracker = DriftTracker::default();
+        let one = turn(json!([{"role": "user", "content": "hello"}]));
+        let two = turn(json!([
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "again"}
+        ]));
+        assert!(tracker.opening_is_news(7, &anthropic(&one)), "never seen");
+        observe(&tracker, &one, &one);
+        assert!(
+            !tracker.opening_is_news(7, &anthropic(&two)),
+            "an appended turn"
+        );
+        observe(&tracker, &two, &two);
+        assert!(!tracker.opening_is_news(7, &anthropic(&two)));
+        assert!(tracker.opening_is_news(7, &anthropic(&one)), "a branch");
+        let mut retooled = two.clone();
+        retooled["tools"][0]["description"] = json!("Read a file at 2026-11-20T10:00:00Z");
+        assert!(tracker.opening_is_news(7, &anthropic(&retooled)));
+        let mut reworded = two.clone();
+        reworded["system"][0]["text"] = json!("You are another agent.");
+        assert!(tracker.opening_is_news(7, &anthropic(&reworded)));
+        // Whatever asks, the answer agrees with what the comparison reports.
+        for body in [&two, &retooled, &reworded] {
+            let tracker = DriftTracker::default();
+            observe(&tracker, &two, &two);
+            let news = tracker.opening_is_news(7, &anthropic(body));
+            let seen = observe(&tracker, body, body);
+            let reported = seen.drift_in
+                & (DRIFT_SYSTEM | DRIFT_TOOL_DEFS | DRIFT_TOOL_ORDER | DRIFT_TOOL_SET);
+            assert_eq!(news, reported != 0);
+        }
+    }
+
+    /// Instructions on every family, and descriptions of rendered tools only.
+    #[test]
+    fn the_volatile_scan_reads_instructions_and_rendered_tool_descriptions() {
+        let scanned = |body: &Value, family| {
+            let mut segments = Segments::of(body, family, &HeaderMap::new(), None);
+            segments.scan_volatile(body, family);
+            segments.volatile
+        };
+        let anthropic = json!({
+            "system": "Session 123e4567-e89b-12d3-a456-426614174000.",
+            "tools": [
+                {"name": "a", "description": "Built 2026-11-20.", "input_schema": {}},
+                {"name": "b", "description": "Built 2026-11-19.", "input_schema": {},
+                 "defer_loading": true}
+            ],
+            "messages": [{"role": "user", "content": "2026-11-18"}]
+        });
+        let found = scanned(&anthropic, ApiFamily::AnthropicMessages);
+        assert_eq!(
+            (found.uuids, found.dates),
+            (1, 1),
+            "not the deferred tool, not the message"
+        );
+        let chat = json!({"messages": [
+            {"role": "system", "content": "Today is 2026-11-20."},
+            {"role": "user", "content": "2026-11-18"},
+            {"role": "system", "content": "Later: 2026-11-17."}
+        ], "tools": [{"type": "function",
+                      "function": {"name": "f", "description": "Since 2026-11-16."}}]});
+        assert_eq!(scanned(&chat, ApiFamily::OpenAiChat).dates, 2);
+        let responses = json!({"instructions": "Today is 2026-11-20.", "input": "2026-11-18"});
+        assert_eq!(scanned(&responses, ApiFamily::OpenAiResponses).dates, 1);
+    }
+
+    /// A request that went out as it arrived after all is remembered so.
+    #[test]
+    fn a_body_sent_as_received_is_what_the_next_request_is_compared_with() {
+        let tracker = DriftTracker::default();
+        let one = turn(json!([{"role": "user", "content": "hello"}]));
+        let rewritten = turn(json!([{"role": "user", "content": "h…"}]));
+        let two = turn(json!([
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"}
+        ]));
+        let segments = |body| anthropic(body);
+        // Believed sent rewritten, the next request reads as the proxy
+        // putting a message back.
+        tracker.observe(7, &segments(&one), &segments(&rewritten), 1);
+        assert_eq!(observe(&tracker, &two, &two).drift_out, DRIFT_HISTORY);
+
+        let tracker = DriftTracker::default();
+        tracker.observe(7, &segments(&one), &segments(&rewritten), 1);
+        tracker.sent_as_received(7, 2);
+        tracker.sent_as_received(8, 1);
+        assert_eq!(
+            tracker.entries.lock().unwrap()[&7].outgoing,
+            segments(&rewritten).hashes,
+            "another request's correction, and another conversation's, change nothing"
+        );
+        tracker.sent_as_received(7, 1);
+        assert_eq!(observe(&tracker, &two, &two).drift_out, 0);
+    }
+
+    /// What observing a request costs, measured on the committed Claude Code
+    /// capture: reducing it to segments as every request is, against doing
+    /// that with the whole-body count and the volatile scan this used to make
+    /// on each one. Prints; asserts nothing. Run with
+    /// `cargo test --release -p kompressor-proxy --lib observing_a_request -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn observing_a_request_costs_this_much() {
+        use std::io::Read;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/claude-capture.jsonl.gz"
+        );
+        let mut text = String::new();
+        flate2::read::GzDecoder::new(std::fs::File::open(path).unwrap())
+            .read_to_string(&mut text)
+            .unwrap();
+        let bodies: Vec<(usize, Value)> = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|record| {
+                let raw = record["body"].as_str()?;
+                Some((raw.len(), serde_json::from_str(raw).ok()?))
+            })
+            .collect();
+        let family = ApiFamily::AnthropicMessages;
+        let headers = HeaderMap::new();
+        let rounds = 20;
+        let per_request =
+            |took: std::time::Duration| took.as_secs_f64() * 1e6 / (rounds * bodies.len()) as f64;
+        let began = Instant::now();
+        for _ in 0..rounds {
+            for (_, body) in &bodies {
+                let mut segments = Segments::of(body, family, &headers, None);
+                segments.scan_volatile(body, family);
+                std::hint::black_box(segments);
+            }
+        }
+        let before = per_request(began.elapsed());
+        let began = Instant::now();
+        for _ in 0..rounds {
+            for (len, body) in &bodies {
+                std::hint::black_box(Segments::sized(body, *len as u64, family, &headers, None));
+            }
+        }
+        let after = per_request(began.elapsed());
+        let bytes = bodies.iter().map(|(len, _)| len).sum::<usize>() / bodies.len();
+        eprintln!(
+            "{} requests averaging {bytes} bytes: {before:.0} µs each counted and scanned, \
+             {after:.0} µs each as observed now ({:.0}% less)",
+            bodies.len(),
+            (1.0 - after / before) * 100.0
+        );
+    }
+
+    /// A tracker that cannot be read asks for no scan and corrects nothing.
+    #[test]
+    fn a_poisoned_tracker_asks_for_no_scan() {
+        let tracker = std::sync::Arc::new(DriftTracker::default());
+        let one = turn(json!([{"role": "user", "content": "hello"}]));
+        observe(&tracker, &one, &one);
+        let poisoner = tracker.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.entries.lock().unwrap();
+            panic!("poison the tracker");
+        })
+        .join();
+        assert!(!tracker.opening_is_news(7, &anthropic(&one)));
+        assert!(!tracker.opening_is_news(8, &anthropic(&one)));
+        tracker.sent_as_received(7, 0);
+        assert_eq!(observe(&tracker, &one, &one), Compared::default());
+    }
+
+    /// The fingerprint the body capture records is the hash drift compares:
+    /// the same for the same set however it is spelt, different for another.
+    #[test]
+    fn the_beta_fingerprint_is_of_the_set() {
+        let with = |value: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("anthropic-beta", http::HeaderValue::from_static(value));
+            beta_fingerprint(&headers)
+        };
+        assert_eq!(with("a-2025, b-2025"), with("B-2025,a-2025,a-2025"));
+        assert_ne!(with("a-2025"), with("a-2025,b-2025"));
+        assert_eq!(
+            beta_fingerprint(&HeaderMap::new()),
+            anthropic(&turn(json!([]))).hashes.beta
+        );
+    }
+
+    #[test]
+    fn a_native_tool_search_entry_is_noticed() {
+        let mut body = turn(json!([]));
+        assert!(!anthropic(&body).tool_search);
+        body["tools"].as_array_mut().unwrap().push(
+            json!({"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"}),
+        );
+        let seen = anthropic(&body);
+        assert!(seen.tool_search);
+        assert_eq!(
+            (seen.tools_count, seen.tools_deferred),
+            (3, 0),
+            "and it is rendered"
+        );
+        let openai = json!({"input": "go", "tools": [
+            {"type": "function", "name": "shell", "parameters": {}},
+            {"type": "tool_search"}
+        ]});
+        assert!(
+            Segments::of(&openai, ApiFamily::OpenAiResponses, &HeaderMap::new(), None).tool_search
+        );
+        // A tool the client merely named that way is a function like any other.
+        let named = json!({"tools": [{"name": "tool_search", "input_schema": {}}], "messages": []});
+        assert!(!anthropic(&named).tool_search);
     }
 
     #[test]
@@ -1312,7 +1654,7 @@ mod tests {
         let tracker = DriftTracker::default();
         let segments = anthropic(&turn(json!([])));
         for conversation in 0..(REMEMBER as u64 + 16) {
-            tracker.observe(conversation, &segments, &segments);
+            tracker.observe(conversation, &segments, &segments, 0);
         }
         assert_eq!(tracker.tracked(), REMEMBER);
     }

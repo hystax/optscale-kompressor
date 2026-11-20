@@ -610,3 +610,232 @@ async fn a_recompaction_nobody_answered_is_not_repeated_on_the_next_turn() {
         assert_eq!(sent_messages(later)[..cold.len()], cold[..]);
     }
 }
+
+/// Every row filed since the last look, as how its turn was recompacted, and
+/// the conversation the last of them was filed under.
+fn recompacted_rows(harness: &Harness) -> (Vec<Option<String>>, u64) {
+    let rows = proxy_rows(&harness.events);
+    let conversation = rows
+        .last()
+        .and_then(|row| row.conversation.as_deref())
+        .map_or(0, |hex| {
+            u64::from_str_radix(hex, 16).expect("a hex fingerprint")
+        });
+    let kinds = rows
+        .into_iter()
+        .map(|row| row.prefix.and_then(|seen| seen.recompacted))
+        .collect();
+    (kinds, conversation)
+}
+
+fn recompactions(kinds: &[Option<String>]) -> usize {
+    kinds.iter().filter(|kind| kind.is_some()).count()
+}
+
+/// A request still in flight when the conversation is recompacted is answered
+/// afterwards, about the prefix as it was. Its answer must neither end the
+/// wait for the recompaction's own — which here never comes — nor stand as
+/// the provider's word that the recompacted prefix is gone: either would have
+/// the next turn recompacted a second time, deciding afresh over messages the
+/// provider has just cached.
+#[tokio::test]
+async fn an_older_request_answered_after_a_recompaction_does_not_cause_another() {
+    let harness = Harness::with(first_seen(ColdRecompact::Observed)).await;
+    for (read, written) in [(0, 30_000), (30_000, 200)] {
+        Mock::given(any())
+            .respond_with(usage(read, written))
+            .up_to_n_times(1)
+            .mount(&harness.server)
+            .await;
+    }
+    // The request that is held: read nothing, wrote nothing, a second late.
+    Mock::given(any())
+        .respond_with(usage(0, 0).set_delay(Duration::from_millis(1_000)))
+        .up_to_n_times(1)
+        .mount(&harness.server)
+        .await;
+    // Its twin, answered at once: the provider's word that the cache is gone.
+    Mock::given(any())
+        .respond_with(usage(0, 0))
+        .up_to_n_times(1)
+        .mount(&harness.server)
+        .await;
+    // The recompacted turn's answer carries no usage, so it settles nothing.
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "msg_1", "type": "message", "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn"
+        })))
+        .up_to_n_times(1)
+        .mount(&harness.server)
+        .await;
+    Mock::given(any())
+        .respond_with(usage(30_000, 200))
+        .mount(&harness.server)
+        .await;
+
+    for turns in 0..2 {
+        harness.post(MESSAGES, &conversation(turns)).await;
+    }
+    let third = conversation(2);
+    let held = harness.post(MESSAGES, &third);
+    let meanwhile = async {
+        while harness.server.received_requests().await.unwrap().len() < 3 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        harness.post(MESSAGES, &third).await;
+        harness.post(MESSAGES, &conversation(3)).await;
+        // The recompaction is out and unanswered; the held request is not back.
+        assert_eq!(recompactions(&recompacted_rows(&harness).0), 1);
+    };
+    let (held, ()) = tokio::join!(held, meanwhile);
+    assert_eq!(held.status, 200);
+
+    for turns in 4..6 {
+        harness.post(MESSAGES, &conversation(turns)).await;
+    }
+    let (kinds, conversation_id) = recompacted_rows(&harness);
+    assert_eq!(
+        recompactions(&kinds),
+        0,
+        "no turn after the held request came back was recompacted again"
+    );
+    let sent = harness.upstream_json().await;
+    let cold = sent_messages(&sent[4]);
+    assert!(the_read(&sent[4]).starts_with(STALE));
+    for later in &sent[5..] {
+        assert_eq!(sent_messages(later)[..cold.len()], cold[..]);
+    }
+    assert_eq!(harness.state.recompact().epoch(conversation_id), 1);
+}
+
+/// The rewrite of a cold turn could not be put back into the coding the
+/// client used, so the client's own bytes went out. Nothing was recompacted:
+/// the conversation is not left reserved, its ledger is not started, and the
+/// next request is compared with what was actually sent.
+#[tokio::test]
+async fn a_recompaction_that_cannot_be_encoded_is_not_recorded_as_sent() {
+    let harness = Harness::with(first_seen(ColdRecompact::Observed)).await;
+    answering(
+        &harness,
+        &[(0, 30_000), (30_000, 200), (0, 0), (30_000, 200), (0, 0)],
+    )
+    .await;
+    for turns in 0..3 {
+        harness.post_zstd(MESSAGES, &conversation(turns)).await;
+    }
+    harness.state.fail_next_encode_for_test();
+    let reply = harness.post_zstd(MESSAGES, &conversation(3)).await;
+    assert_eq!(reply.status, 200);
+    let (kinds, conversation_id) = recompacted_rows(&harness);
+    assert_eq!(kinds, [None, None, None, None]);
+    let raw = harness.upstream_raw_bodies().await;
+    let sent: Value =
+        serde_json::from_slice(&zstd::stream::decode_all(raw[3].as_slice()).unwrap()).unwrap();
+    assert_eq!(sent, conversation(3), "the client's own body went out");
+    assert_eq!(harness.state.recompact().epoch(conversation_id), 0);
+    assert_eq!(
+        harness.state.recompact().tracked(),
+        0,
+        "and nothing is held"
+    );
+
+    // A warm turn after it. The failed turn went out without the retrieve
+    // tool every other turn carries, so the tool coming back is the one
+    // thing that moved on the way out — and no message did. Compared with
+    // the rewrite that was never sent, this would read as the proxy putting
+    // the stale read back: history drift that did not happen.
+    harness.post_zstd(MESSAGES, &conversation(4)).await;
+    let row = proxy_rows(&harness.events)
+        .pop()
+        .and_then(|row| row.prefix)
+        .expect("observed");
+    assert_eq!(
+        (row.drift_out, row.history_out_at),
+        (kompressor_stats::context::DRIFT_TOOL_SET, None),
+        "compared with the bytes that were sent, not the rewrite that was not"
+    );
+    // That turn's answer says the cache is gone again, and this time the
+    // rewrite goes out: the failed one left the conversation free.
+    harness.post_zstd(MESSAGES, &conversation(5)).await;
+    assert_eq!(recompacted_rows(&harness).0, [Some("observed".to_string())]);
+    assert_eq!(harness.state.recompact().epoch(conversation_id), 1);
+}
+
+/// A turn found cold whose body the engine then leaves alone — here a
+/// conversation too small to be worth compressing — recompacted nothing. The
+/// conversation it reserved on the way in is let go on the way out, and no
+/// ledger is started for it.
+#[tokio::test]
+async fn a_cold_turn_the_engine_declines_holds_nothing() {
+    let harness = Harness::with(|config| {
+        first_seen(ColdRecompact::Observed)(config);
+        config.proxy.retrieve_tool = kompressor_core::config::RetrieveTool::Never;
+    })
+    .await;
+    answering(&harness, &[(0, 30_000), (30_000, 200), (0, 0), (0, 0)]).await;
+    let small = |turns: usize| {
+        let mut messages = vec![json!({"role": "user", "content": "Say hello."})];
+        for turn in 0..turns {
+            messages.push(json!({"role": "assistant", "content": format!("Hello {turn}.")}));
+            messages.push(json!({"role": "user", "content": "Again."}));
+        }
+        json!({"model": "claude-opus-5-5", "max_tokens": 64, "messages": messages})
+    };
+    for turns in 0..5 {
+        let body = small(turns);
+        harness.post(MESSAGES, &body).await;
+        assert_eq!(
+            harness.upstream_json().await[turns],
+            body,
+            "turn {turns} went out as it arrived"
+        );
+        assert_eq!(
+            harness.state.recompact().tracked(),
+            0,
+            "turn {turns}: nothing reserved once the request is over"
+        );
+    }
+    let (kinds, conversation_id) = recompacted_rows(&harness);
+    assert_eq!(kinds, [None, None, None, None, None]);
+    assert_eq!(harness.state.recompact().epoch(conversation_id), 0);
+}
+
+/// A predicted lapse is recorded with what made it predictable, so the report
+/// scores the request the runtime acted on: a warm conversation, continued.
+#[tokio::test]
+async fn the_row_of_a_predicted_lapse_says_the_request_was_one_to_predict_on() {
+    let harness = Harness::with(first_seen(ColdRecompact::Predicted)).await;
+    answering(&harness, &[(0, 30_000), (30_000, 200), (0, 31_000)]).await;
+    harness.post(MESSAGES, &conversation(0)).await;
+    harness.post(MESSAGES, &conversation(1)).await;
+    let conversation_id = conversation_of(&harness);
+    harness
+        .state
+        .prefixes()
+        .advance_clock_for_test(Duration::from_secs(420));
+    harness.post(MESSAGES, &conversation(2)).await;
+    let row = proxy_rows(&harness.events)
+        .pop()
+        .and_then(|row| row.prefix)
+        .expect("observed");
+    assert_eq!(row.recompacted.as_deref(), Some("predicted"));
+    assert!(row.could_predict());
+    assert_eq!((row.was_warm, row.continues), (true, Some(true)));
+    assert!(row.idle_ms.is_some_and(|idle| idle >= 420_000));
+    assert_eq!(row.lifetime_s, Some(300));
+    // The same request again does not continue the conversation, and however
+    // long it waits no lapse is predicted on it.
+    harness
+        .state
+        .prefixes()
+        .advance_clock_for_test(Duration::from_secs(4_000));
+    harness.post(MESSAGES, &conversation(2)).await;
+    let row = proxy_rows(&harness.events)
+        .pop()
+        .and_then(|row| row.prefix)
+        .expect("observed");
+    assert!(!row.could_predict());
+    assert_eq!((row.recompacted, row.continues), (None, Some(false)));
+    assert_eq!(harness.state.recompact().epoch(conversation_id), 1);
+}

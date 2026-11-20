@@ -91,6 +91,11 @@ pub struct PrefixObservation {
     pub tools_count: u32,
     /// Tools marked `defer_loading`, which the provider does not render.
     pub tools_deferred: u32,
+    /// Whether the rendered list carries the provider's own tool-search tool.
+    /// A client that sends one loads tools on demand, whether or not any tool
+    /// in this list is itself marked `defer_loading`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tool_search: bool,
     pub messages_bytes: u32,
     pub messages_count: u32,
     /// Text in the conversation the engine can see. The rest of
@@ -109,6 +114,13 @@ pub struct PrefixObservation {
     pub idle_ms: Option<u64>,
     /// Whether the provider had ever served this conversation from cache.
     pub was_warm: bool,
+    /// Whether this request carried more messages than any before it under
+    /// its conversation, as it arrived: the half of the runtime's test for a
+    /// predicted lapse that idle time does not show. One that does not is
+    /// another conversation opening with the same bytes, which finds no
+    /// lapse of this one's. `None` on a row written before this was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continues: Option<bool>,
     /// The cache lifetime the previous request asked the provider for, in
     /// seconds, where the request says: Anthropic's five minutes or an hour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -149,6 +161,10 @@ pub struct PrefixObservation {
     pub quiet_read_bytes: u32,
 }
 
+fn is_false(flag: &bool) -> bool {
+    !*flag
+}
+
 fn is_zero(count: &u32) -> bool {
     *count == 0
 }
@@ -157,7 +173,64 @@ fn is_zero_u8(mask: &u8) -> bool {
     *mask == 0
 }
 
+/// What a turn scored for a predicted lapse turned out to be, from what the
+/// provider reported reading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LapseOutcome {
+    /// The prefix the request before it left was read back.
+    ReadBack,
+    /// The conversation's own messages were not read at all: what an expired
+    /// entry looks like, and the only outcome that confirms a prediction.
+    Full,
+    /// Part of the conversation was read and the rest was not. An expiry
+    /// takes all of it, so something past the first messages changed.
+    Partial,
+    /// A hashed segment of the prefix changed on this request, which explains
+    /// the loss whatever the idle time was.
+    Drift,
+    /// Lost, with no earlier request to compare this one with.
+    Unknown,
+}
+
 impl PrefixObservation {
+    /// Whether a turn recompacted on a *predicted* lapse was served from
+    /// cache after all: the one classifier for a wrong prediction, used by
+    /// the proxy's breaker as the answer arrives and by the report afterwards.
+    ///
+    /// Having rewritten the conversation, the provider can read back only
+    /// what precedes the first rewritten message, so a read that reaches past
+    /// the instructions and tools is the one sign left. A turn with retrieve
+    /// rounds is left out: its usage sums a later round's read of what an
+    /// earlier one wrote.
+    pub fn prediction_was_wrong(&self, read: Option<u32>, rounds: u32) -> bool {
+        rounds == 0 && read.is_some_and(|read| self.read_reaches_messages(read))
+    }
+
+    /// Whether this request met the runtime's conditions for predicting a
+    /// lapse, idle time aside: a conversation the provider had served from
+    /// cache, continued by this request. On a row from before `continues`
+    /// was recorded, a request that was compared — one carrying no fewer
+    /// messages than the one before it — stands in for it.
+    pub fn could_predict(&self) -> bool {
+        self.was_warm && self.idle_ms.is_some() && self.continues.unwrap_or(self.compared)
+    }
+
+    /// What became of the prefix on a turn the cache walk says did
+    /// (`lost`) or did not lose it, given what the provider read.
+    pub fn lapse_outcome(&self, lost: bool, read: u32) -> LapseOutcome {
+        if !lost {
+            LapseOutcome::ReadBack
+        } else if !self.compared {
+            LapseOutcome::Unknown
+        } else if (self.drift_in & !self.repaired) | self.drift_out != 0 {
+            LapseOutcome::Drift
+        } else if self.read_reaches_messages(read) {
+            LapseOutcome::Partial
+        } else {
+            LapseOutcome::Full
+        }
+    }
+
     /// Whether a cache read of `read` tokens reached into the conversation,
     /// past the instructions and tool definitions in front of it.
     ///

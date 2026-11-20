@@ -129,6 +129,8 @@ pub struct ProxyState {
     /// Whether each conversation's tool schemas are compacted, decided when
     /// it is first seen, for `proxy.tools_compact`.
     pub(crate) tool_policies: Arc<toolcompact::ToolPolicies>,
+    /// Set by [`ProxyState::fail_next_encode_for_test`]. Never set otherwise.
+    pub(crate) encode_fault: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ProxyState {
@@ -154,6 +156,7 @@ impl ProxyState {
             stabilizer: Arc::new(stabilize::Stabilizer::default()),
             recompact: Arc::new(recompact::Recompact::default()),
             tool_policies: Arc::new(toolcompact::ToolPolicies::default()),
+            encode_fault: Arc::default(),
         }
     }
 
@@ -172,6 +175,18 @@ impl ProxyState {
     /// predictions have fared. Exposed on the same terms as `prefixes`.
     pub fn recompact(&self) -> Arc<recompact::Recompact> {
         self.recompact.clone()
+    }
+
+    /// Have the next rewritten body fail to re-encode in its client's coding,
+    /// as an encoder that errors would.
+    ///
+    /// For tests: no input makes zstd or gzip fail on demand, and what the
+    /// proxy does when one does is a path that has to hold. Nothing in the
+    /// proxy calls it.
+    #[doc(hidden)]
+    pub fn fail_next_encode_for_test(&self) {
+        self.encode_fault
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The keep-warm timers. Exposed on the same terms as `prefixes`.

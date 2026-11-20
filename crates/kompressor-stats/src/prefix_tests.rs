@@ -214,6 +214,7 @@ fn composition_is_added_up_per_model() {
     assert_eq!(model.opaque_share, 0.6, "180 of 300 conversation bytes");
     assert_eq!(model.tools_per_request, 28.0 / 3.0);
     assert_eq!(model.deferring_requests, 1);
+    assert_eq!(model.tool_search_requests, 0);
     assert_eq!(
         (model.tools_compacted_bytes, model.tools_compacted_requests),
         (40, 1)
@@ -300,7 +301,11 @@ fn a_predicted_lapse_is_scored_against_what_the_conversation_lost() {
         compared: true,
         idle_ms: Some(idle_s * 1_000),
         was_warm,
+        continues: Some(true),
         lifetime_s: Some(300),
+        // 40,000 bytes of opening: the 13,000 tokens every turn reads.
+        system_bytes: 16_000,
+        tools_bytes: 24_000,
         ..PrefixObservation::default()
     };
     // (idle seconds, cache read, cache write, was warm)
@@ -390,6 +395,184 @@ fn a_predicted_lapse_is_scored_against_what_the_conversation_lost() {
     assert_eq!((openai(3_600).predicted, openai(3_600).missed), (0, 1));
 }
 
+/// A loss is an expiry only if it took the whole of the conversation's own
+/// messages and nothing in the prefix was seen to change. Every other loss on
+/// a long-idle turn would have happened whatever the idle time, and is
+/// counted beside the prediction it does not confirm.
+#[test]
+fn a_loss_that_idle_time_does_not_explain_does_not_confirm_a_prediction() {
+    let (dir, conn) = database();
+    let waited = |idle_s: u64| PrefixObservation {
+        compared: true,
+        idle_ms: Some(idle_s * 1_000),
+        was_warm: true,
+        continues: Some(true),
+        lifetime_s: Some(300),
+        system_bytes: 16_000,
+        tools_bytes: 24_000,
+        ..PrefixObservation::default()
+    };
+    // (cache read, cache write, observation)
+    let turns = [
+        (13_000, 20_000, PrefixObservation::default()),
+        (33_000, 1_000, waited(10)),
+        // Idle 400 s; the proxy rewrote a message near the end. Most of the
+        // conversation was read back all the same.
+        (
+            28_000,
+            7_000,
+            PrefixObservation {
+                drift_out: DRIFT_HISTORY,
+                ..waited(400)
+            },
+        ),
+        // Idle 400 s, nothing seen to change, and the first two thirds of
+        // the conversation read back: not what an expiry leaves.
+        (25_000, 11_000, waited(400)),
+        // Idle 400 s and lost whole on a request with nothing before it to
+        // compare with.
+        (
+            13_000,
+            24_000,
+            PrefixObservation {
+                compared: false,
+                ..waited(400)
+            },
+        ),
+        // Idle 400 s and lost whole, nothing changed: an expiry.
+        (13_000, 25_000, waited(400)),
+        // The same, on a request that does not continue the conversation —
+        // another one opening with the same bytes. The runtime would not
+        // have predicted on it, and it is not scored.
+        (
+            13_000,
+            25_000,
+            PrefixObservation {
+                continues: Some(false),
+                ..waited(400)
+            },
+        ),
+        // Not idle, and part of the conversation lost: nothing was predicted
+        // and no expiry was missed.
+        (30_000, 9_000, waited(5)),
+    ];
+    for (index, (read, write, observation)) in turns.into_iter().enumerate() {
+        insert(
+            &conn,
+            Row {
+                time: index as i64 * SEC,
+                conversation: "a",
+                family: "anthropic_messages",
+                read,
+                write,
+                observation: Some(observation),
+            },
+        );
+    }
+    drop(conn);
+    let report = report(&dir);
+    let at = cold(&report, "anthropic_messages", 300, 0);
+    assert_eq!(
+        at.scored, 6,
+        "every warm, continued turn that was not the non-continuation"
+    );
+    assert_eq!(at.predicted, 4);
+    assert_eq!(
+        (at.confirmed, at.partial, at.drift, at.unknown, at.wrong),
+        (1, 1, 1, 1, 0)
+    );
+    assert_eq!(
+        at.missed, 0,
+        "a partial loss on a busy turn is not a missed expiry"
+    );
+    assert_eq!(at.precision, 0.25, "one expiry of four predictions");
+    assert_eq!(at.recall, 1.0);
+}
+
+/// Rows from before `continues` was recorded are scored where they were
+/// compared, which is what a request carrying no fewer messages than the one
+/// before it was.
+#[test]
+fn an_older_row_is_scored_where_it_was_compared() {
+    let old = PrefixObservation {
+        compared: true,
+        idle_ms: Some(1),
+        was_warm: true,
+        ..PrefixObservation::default()
+    };
+    assert!(old.could_predict());
+    let branch = PrefixObservation {
+        compared: false,
+        ..old.clone()
+    };
+    assert!(!branch.could_predict());
+    assert!(
+        !PrefixObservation {
+            was_warm: false,
+            ..old.clone()
+        }
+        .could_predict()
+    );
+    // The breaker's classifier and the report's are this one function: a
+    // read past the opening on a turn with no retrieve rounds.
+    assert!(old.prediction_was_wrong(Some(9_000), 0));
+    assert!(
+        !old.prediction_was_wrong(Some(9_000), 1),
+        "a later round read an earlier one's write"
+    );
+    assert!(
+        !old.prediction_was_wrong(Some(500), 0),
+        "the shared opening alone"
+    );
+    assert!(
+        !old.prediction_was_wrong(None, 0),
+        "no usage is no evidence"
+    );
+    assert!(
+        !serde_json::to_string(&old).unwrap().contains("continues"),
+        "and a row that does not know says nothing"
+    );
+}
+
+/// The provider's own tool-search tool in the list is a client loading tools
+/// on demand, whatever `defer_loading` flags the rest of the list carries.
+#[test]
+fn a_tool_search_client_is_not_counted_as_carrying_its_tools_whole() {
+    let (dir, conn) = database();
+    let seen = |tools_count, tool_search| PrefixObservation {
+        body_bytes: 1_000,
+        tools_bytes: 500,
+        tools_count,
+        tool_search,
+        ..PrefixObservation::default()
+    };
+    for (time, observation) in [(0, seen(20, true)), (SEC, seen(20, false))] {
+        insert(
+            &conn,
+            Row {
+                time,
+                conversation: "a",
+                family: "anthropic_messages",
+                read: 0,
+                write: 0,
+                observation: Some(observation),
+            },
+        );
+    }
+    drop(conn);
+    let report = report(&dir);
+    let model = &report.composition[0];
+    assert_eq!(
+        (
+            model.deferring_requests,
+            model.tool_search_requests,
+            model.undeferred_requests,
+            model.undeferred_tools_bytes
+        ),
+        (1, 1, 1, 500)
+    );
+}
+
 #[test]
 fn recompactions_are_counted_by_how_the_lapse_was_known() {
     let (dir, conn) = database();
@@ -443,6 +626,79 @@ fn recompactions_are_counted_by_how_the_lapse_was_known() {
         3 + 2 + 1,
         "each conversation's ledger once, at its largest"
     );
+}
+
+/// "Predicted wrongly" is counted as the proxy's breaker counted it: a turn
+/// that spent retrieve rounds sums a later round's read of what an earlier
+/// one wrote, and is not evidence the cache was alive.
+#[test]
+fn a_recompacted_turn_with_retrieve_rounds_is_not_a_wrong_prediction() {
+    let (dir, conn) = database();
+    let predicted = PrefixObservation {
+        compared: true,
+        recompacted: Some("predicted".to_string()),
+        ..PrefixObservation::default()
+    };
+    for (index, conversation) in ["a", "b"].into_iter().enumerate() {
+        insert(
+            &conn,
+            Row {
+                time: index as i64 * SEC,
+                conversation,
+                family: "anthropic_messages",
+                read: 9_000,
+                write: 100,
+                observation: Some(predicted.clone()),
+            },
+        );
+    }
+    conn.execute(
+        "UPDATE proxy_requests SET retrieve_rounds = 2 WHERE conversation = 'b'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let seen = report(&dir).recompactions;
+    assert_eq!((seen.predicted, seen.predicted_wrong), (2, 1));
+}
+
+/// What a lost prefix is put down to, case by case.
+#[test]
+fn a_loss_is_classified_by_what_else_was_true_of_the_request() {
+    use crate::context::{DRIFT_TOOL_ORDER, LapseOutcome};
+    let seen = PrefixObservation {
+        compared: true,
+        system_bytes: 16_000,
+        tools_bytes: 24_000,
+        ..PrefixObservation::default()
+    };
+    assert_eq!(seen.lapse_outcome(false, 0), LapseOutcome::ReadBack);
+    assert_eq!(seen.lapse_outcome(true, 0), LapseOutcome::Full);
+    assert_eq!(seen.lapse_outcome(true, 13_000), LapseOutcome::Full);
+    assert_eq!(seen.lapse_outcome(true, 20_000), LapseOutcome::Partial);
+    let client = PrefixObservation {
+        drift_in: DRIFT_TOOL_ORDER,
+        ..seen.clone()
+    };
+    assert_eq!(client.lapse_outcome(true, 0), LapseOutcome::Drift);
+    // A change the proxy put back never reached the provider, and so cannot
+    // be what it failed to read.
+    let repaired = PrefixObservation {
+        repaired: DRIFT_TOOL_ORDER,
+        ..client.clone()
+    };
+    assert_eq!(repaired.lapse_outcome(true, 0), LapseOutcome::Full);
+    let ours = PrefixObservation {
+        drift_out: DRIFT_HISTORY,
+        ..seen.clone()
+    };
+    assert_eq!(ours.lapse_outcome(true, 20_000), LapseOutcome::Drift);
+    let first = PrefixObservation {
+        compared: false,
+        ..ours
+    };
+    assert_eq!(first.lapse_outcome(true, 0), LapseOutcome::Unknown);
+    assert_eq!(first.lapse_outcome(false, 0), LapseOutcome::ReadBack);
 }
 
 /// The reader never migrates, so a database only an older build has written

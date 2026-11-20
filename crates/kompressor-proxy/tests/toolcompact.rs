@@ -171,3 +171,44 @@ async fn the_injected_retrieve_tool_is_left_as_written() {
     assert!(sent[0]["tools"][0]["input_schema"].get("$schema").is_none());
     assert_eq!(sent[0]["tools"], sent[1]["tools"]);
 }
+
+/// A schema whose meaning depends on its dialect goes upstream still saying
+/// which one, and a Markdown description that says more than the plain one
+/// goes with it; the tool beside it, which depends on neither, is compacted.
+#[tokio::test]
+async fn a_schema_that_depends_on_its_dialect_keeps_its_declaration_upstream() {
+    let harness = Harness::with(compacting).await;
+    answering(&harness).await;
+    let draft7 = "http://json-schema.org/draft-07/schema#";
+    let pair = json!({
+        "$schema": draft7, "type": "object",
+        "properties": {
+            "range": {"type": "array",
+                      "items": [{"type": "integer"}, {"type": "integer"}],
+                      "additionalItems": false,
+                      "description": "First and last line.",
+                      "markdownDescription": "First and last line. **Both 1-based.**"}
+        }
+    });
+    let plain = json!({
+        "$schema": draft7, "type": "object",
+        "properties": {"path": {"type": "string", "description": "The file.",
+                                "markdownDescription": "The `file`."}}
+    });
+    let mut body = conversation(0);
+    body["tools"] = json!([
+        {"name": "slice", "description": "Read a range.", "input_schema": pair},
+        {"name": "open", "description": "Open a file.", "input_schema": plain}
+    ]);
+    harness.post(MESSAGES, &body).await;
+    let sent = harness.upstream_json().await;
+    assert_eq!(
+        sent[0]["tools"][0], body["tools"][0],
+        "a tuple under draft-07 is nothing under 2020-12: untouched"
+    );
+    assert_eq!(
+        sent[0]["tools"][1]["input_schema"],
+        json!({"type": "object",
+               "properties": {"path": {"type": "string", "description": "The file."}}})
+    );
+}

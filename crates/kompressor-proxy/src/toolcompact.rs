@@ -8,12 +8,19 @@
 //!
 //! # What is removed
 //!
-//! - `$schema` and `$comment`. The first names a dialect for a validator; the
-//!   second is, by the specification, to be ignored.
-//! - A root `$id`, when nothing in the schema refers outside it. It names the
-//!   schema for other documents to point at.
-//! - `markdownDescription` beside a `description`: an editor's rendering of
-//!   the same text.
+//! - `$comment`, which is, by the specification, to be ignored.
+//! - A root `$schema`, when the schema uses only keywords that mean the same
+//!   in every published dialect (`same_in_every_dialect`). It names the
+//!   dialect a validator reads the schema in, so it can go only where every
+//!   dialect reads it alike: with it gone a draft-07 tuple `items`, a `$ref`
+//!   with siblings or a boolean `exclusiveMinimum` would be read in whatever
+//!   dialect the reader defaults to.
+//! - A root `$id`, when nothing in the schema refers outside it — by `$ref`,
+//!   `$dynamicRef` or `$recursiveRef`. It names the schema for other documents
+//!   to point at, and is what a relative reference resolves against.
+//! - `markdownDescription` beside a `description` that says the same thing:
+//!   the same text once emphasis and code marks are taken out. One that says
+//!   more is instructions the model would lose.
 //! - A `title` that only restates the name of the property it sits on
 //!   (`"file_path"` titled `"File Path"`), or, at the root, the name of the
 //!   tool. This is what a schema generated from a typed model is full of.
@@ -88,15 +95,98 @@ fn restates(title: &str, names: &[String]) -> bool {
 }
 
 /// Whether anything under `value` refers to a schema outside this document.
+/// A dynamic or recursive reference resolves against the base the root `$id`
+/// sets exactly as a plain one does.
 fn refers_outside(value: &Value) -> bool {
     match value {
         Value::Object(object) => object.iter().any(|(key, item)| {
-            (key == "$ref" && item.as_str().is_some_and(|target| !target.starts_with('#')))
+            (matches!(key.as_str(), "$ref" | "$dynamicRef" | "$recursiveRef")
+                && item.as_str().is_some_and(|target| !target.starts_with('#')))
                 || refers_outside(item)
         }),
         Value::Array(items) => items.iter().any(refers_outside),
         _ => false,
     }
+}
+
+/// Keywords that validate nothing in any dialect: a reader that does not know
+/// one ignores it, and one that does only records it.
+const ANNOTATIONS: [&str; 11] = [
+    "$schema",
+    "$id",
+    "$comment",
+    "title",
+    "description",
+    "markdownDescription",
+    "default",
+    "examples",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+];
+
+/// Whether `schema` validates the same instances under every published
+/// dialect, draft-04 to 2020-12, so that the `$schema` naming one of them can
+/// go without changing what the schema means.
+///
+/// An allowlist, because what differs between dialects is a keyword one of
+/// them reads and another reads differently or not at all: `items` as a list
+/// (a tuple until 2019-09, nothing after), `exclusiveMinimum` (a flag in
+/// draft-04, a bound since), `$ref` beside other keywords (which it silenced
+/// until 2019-09), `const`, `contains`, `if`, `dependencies`, `prefixItems`,
+/// `unevaluatedProperties`, `format` and the rest. A keyword not listed here —
+/// those, and any this does not know — keeps the declaration.
+///
+/// `at_root` allows the `$schema` and `$id` a root may carry; nested, they
+/// start a schema resource of their own. One difference is accepted: draft-04
+/// alone does not take `1.0` for an `integer`.
+fn same_in_every_dialect(schema: &Value, at_root: bool) -> bool {
+    let Some(object) = schema.as_object() else {
+        // A boolean schema is not one in draft-04.
+        return false;
+    };
+    let each = |item: &Value| same_in_every_dialect(item, false);
+    object.iter().all(|(key, item)| match key.as_str() {
+        "$schema" | "$id" => at_root,
+        key if ANNOTATIONS.contains(&key) => true,
+        "type" => item.is_string() || item.is_array(),
+        // Draft-03 spelt `required` as a flag on the property.
+        "enum" | "required" => item.is_array(),
+        "minimum" | "maximum" | "multipleOf" | "minLength" | "maxLength" | "pattern"
+        | "minItems" | "maxItems" | "uniqueItems" | "minProperties" | "maxProperties" => true,
+        "properties" | "patternProperties" | "definitions" | "$defs" => {
+            item.as_object().is_some_and(|map| map.values().all(each))
+        }
+        "items" | "not" => each(item),
+        "additionalProperties" => item.is_boolean() || each(item),
+        "allOf" | "anyOf" | "oneOf" => item.as_array().is_some_and(|list| list.iter().all(each)),
+        // A pointer into this document, with nothing beside it that one
+        // dialect would apply and another ignore.
+        "$ref" => {
+            item.as_str()
+                .is_some_and(|target| target == "#" || target.starts_with("#/"))
+                && object
+                    .keys()
+                    .all(|other| other == "$ref" || ANNOTATIONS.contains(&other.as_str()))
+        }
+        _ => false,
+    })
+}
+
+/// A description as plain text: Markdown's emphasis and code marks taken out
+/// and every run of whitespace made one space.
+fn plain(text: &str) -> String {
+    let unmarked: String = text.chars().filter(|c| !matches!(c, '*' | '`')).collect();
+    unmarked.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// What may be taken from the root of a schema, decided over the whole of it.
+#[derive(Clone, Copy)]
+struct Root {
+    /// Something refers outside the document, so its `$id` stays.
+    keep_id: bool,
+    /// Some keyword reads differently by dialect, so its `$schema` stays.
+    keep_dialect: bool,
 }
 
 fn removed(object: &mut Map<String, Value>, key: &str) -> bool {
@@ -108,18 +198,27 @@ fn removed(object: &mut Map<String, Value>, key: &str) -> bool {
 /// Compact one schema in place. `named` is what a `title` here would have to
 /// restate to be noise: the property's name, or at the root every title a
 /// generator derives from the tool's name.
-fn compact_schema(schema: &mut Value, named: &[String], root: Option<bool>) -> bool {
+fn compact_schema(schema: &mut Value, named: &[String], root: Option<Root>) -> bool {
     let Some(object) = schema.as_object_mut() else {
         return false;
     };
     let mut changed = removed(object, "$comment");
-    if let Some(keep_id) = root {
-        changed |= removed(object, "$schema");
-        if !keep_id {
+    if let Some(root) = root {
+        if !root.keep_dialect {
+            changed |= removed(object, "$schema");
+        }
+        if !root.keep_id {
             changed |= removed(object, "$id");
         }
     }
-    if object.get("description").is_some_and(Value::is_string) {
+    let says_the_same = match (
+        object.get("description").and_then(Value::as_str),
+        object.get("markdownDescription").and_then(Value::as_str),
+    ) {
+        (Some(description), Some(markdown)) => plain(description) == plain(markdown),
+        _ => false,
+    };
+    if says_the_same {
         changed |= removed(object, "markdownDescription");
     }
     if object
@@ -213,8 +312,11 @@ pub(crate) fn compact_tool(tool: &mut Value) -> bool {
     let Some(schema) = schema_of(tool) else {
         return false;
     };
-    let keep_id = refers_outside(schema);
-    compact_schema(schema, &named, Some(keep_id))
+    let root = Root {
+        keep_id: refers_outside(schema),
+        keep_dialect: !same_in_every_dialect(schema, true),
+    };
+    compact_schema(schema, &named, Some(root))
 }
 
 /// How many bytes [`compact_tools`] would take out of `tools`, without
@@ -487,12 +589,112 @@ mod tests {
             out["input_schema"].get("$id").is_some(),
             "the reference resolves against it"
         );
-        assert!(out["input_schema"].get("$schema").is_none());
+        assert!(
+            out["input_schema"].get("$schema").is_some(),
+            "and how it resolves is the dialect's to say"
+        );
 
         // A reference inside the document needs no identifier.
         let mut local = generated();
         local["input_schema"]["properties"]["limit"] = json!({"$ref": "#/$defs/limit"});
-        assert!(compacted(local)["input_schema"].get("$id").is_none());
+        let out = compacted(local);
+        assert!(out["input_schema"].get("$id").is_none());
+        assert!(out["input_schema"].get("$schema").is_none());
+
+        // A dynamic or recursive reference resolves against it all the same.
+        for keyword in ["$dynamicRef", "$recursiveRef"] {
+            let mut dynamic = generated();
+            dynamic["input_schema"]["properties"]["limit"] = json!({keyword: "tree.json#node"});
+            assert!(
+                compacted(dynamic)["input_schema"].get("$id").is_some(),
+                "{keyword}"
+            );
+        }
+    }
+
+    /// `$schema` goes only where every dialect reads the schema alike. Each
+    /// of these means one thing under the dialect it names and another, or
+    /// nothing, under some other.
+    #[test]
+    fn a_dialect_the_schema_depends_on_stays_declared() {
+        let draft7 = "http://json-schema.org/draft-07/schema#";
+        let sensitive = [
+            // A tuple until 2019-09; ignored by 2020-12, which wants
+            // `prefixItems`.
+            json!({"items": [{"type": "string"}, {"type": "integer"}], "additionalItems": false}),
+            json!({"prefixItems": [{"type": "string"}]}),
+            // Silenced by a sibling `$ref` until 2019-09, applied since.
+            json!({"properties": {"n": {"$ref": "#/definitions/n", "maximum": 3}},
+                   "definitions": {"n": {"type": "integer"}}}),
+            // A flag in draft-04, a bound in every later one.
+            json!({"properties": {"n": {"type": "number", "exclusiveMinimum": 0}}}),
+            json!({"dependencies": {"a": ["b"]}}),
+            json!({"if": {"required": ["a"]}, "then": {"required": ["b"]}}),
+            json!({"properties": {"kind": {"const": "x"}}}),
+            json!({"properties": {"when": {"type": "string", "format": "date-time"}}}),
+            json!({"unevaluatedProperties": false}),
+            // A boolean schema, and a keyword this has never heard of.
+            json!({"properties": {"anything": true}}),
+            json!({"properties": {"n": {"type": "integer", "x-range": [1, 9]}}}),
+            // A nested resource carries its own identity.
+            json!({"properties": {"n": {"$id": "n.json", "type": "integer"}}}),
+        ];
+        for mut schema in sensitive {
+            schema["$schema"] = json!(draft7);
+            schema["type"] = json!("object");
+            let tool = json!({"name": "t", "input_schema": schema});
+            assert_eq!(compacted(tool.clone()), tool, "{tool}");
+        }
+
+        // Everything a plain typed model generates reads the same everywhere.
+        let plain = json!({"name": "t", "input_schema": {
+            "$schema": draft7, "type": "object",
+            "properties": {
+                "path": {"type": "string", "minLength": 1, "pattern": "^/"},
+                "mode": {"enum": ["r", "w"], "default": "r"},
+                "lines": {"type": "array", "items": {"$ref": "#/definitions/line"},
+                          "maxItems": 9, "uniqueItems": true},
+                "either": {"anyOf": [{"type": "null"}, {"type": ["integer", "string"]}]}
+            },
+            "definitions": {"line": {"type": "integer", "minimum": 1, "description": "1-based"}},
+            "required": ["path"], "additionalProperties": false
+        }});
+        assert!(compacted(plain)["input_schema"].get("$schema").is_none());
+    }
+
+    /// A Markdown rendering goes only when the plain description already says
+    /// everything in it.
+    #[test]
+    fn a_markdown_description_that_says_more_is_kept() {
+        let tool = |description: &str, markdown: &str| {
+            json!({"name": "t", "input_schema": {"type": "object", "properties": {
+                "path": {"type": "string", "description": description,
+                         "markdownDescription": markdown}
+            }}})
+        };
+        let kept = |tool: Value| {
+            compacted(tool)["input_schema"]["properties"]["path"]
+                .get("markdownDescription")
+                .is_some()
+        };
+        assert!(!kept(tool("The file to read.", "The **file** to `read`.")));
+        assert!(!kept(tool("Two\nlines.", "Two  lines.")));
+        assert!(
+            kept(tool(
+                "The file to read.",
+                "The file to read. **Must be absolute**; never pass a directory."
+            )),
+            "instructions the description does not carry"
+        );
+        assert!(kept(tool(
+            "See the docs.",
+            "See [the docs](https://example.invalid/d)."
+        )));
+        // With no description beside it, it is the description.
+        let alone = json!({"name": "t", "input_schema": {"type": "object", "properties": {
+            "path": {"type": "string", "markdownDescription": "The **file**."}
+        }}});
+        assert_eq!(compacted(alone.clone()), alone);
     }
 
     #[test]
@@ -614,6 +816,12 @@ mod tests {
         }
         // The measurement the setting's documentation quotes.
         let saved = (before_bytes - after_bytes) as f64 / before_bytes as f64;
+        eprintln!(
+            "{} of {before_bytes} bytes, {:.2}%, from {} keys",
+            before_bytes - after_bytes,
+            saved * 100.0,
+            taken.len()
+        );
         assert!(
             (0.015..0.03).contains(&saved),
             "{saved:.4} of {before_bytes} bytes"

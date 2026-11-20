@@ -624,8 +624,11 @@ RENDER.prefix = d => {
     ["Margin", r => "+" + r.margin_s + " s"],
     ["Scored", r => n(r.scored)],
     ["Predicted cold", r => n(r.predicted)],
-    ["Lost its prefix", r => n(r.confirmed)],
+    ["Expired", r => n(r.confirmed)],
     ["Read it back", r => r.wrong ? el("span", { class: "bad" }, n(r.wrong)) : "0"],
+    ["Partly lost", r => n(r.partial || 0)],
+    ["Lost to a change", r => n(r.drift || 0)],
+    ["Lost, uncompared", r => n(r.unknown || 0)],
     ["Missed", r => n(r.missed)],
     ["Precision", r => r.predicted ? pct(r.precision, 2) : "–"],
     ["Recall", r => r.confirmed + r.missed ? pct(r.recall) : "–"],
@@ -671,7 +674,8 @@ RENDER.prefix = d => {
       ["Opaque conversation", r => pct(r.opaque_share)],
       ["Tools per request", r => r.tools_per_request.toFixed(1)],
       ["Deferring", r => pct(share(r.deferring_requests, r.requests))],
-      ["12+ tools, none deferred", r => pct(share(r.undeferred_requests, r.requests))],
+      ["With tool search", r => pct(share(r.tool_search_requests || 0, r.requests))],
+      ["12+ tools, none deferred, no tool search", r => pct(share(r.undeferred_requests, r.requests))],
       ["Schema bytes compacted", r => r.tools_compacted_requests ? bytes(Math.round(r.tools_compacted_bytes / r.tools_compacted_requests)) + " a request" : "–"],
     ], d.composition, { empty: "No observed request in this window." }),
       note("Shares are of request bytes, not tokens: they rank the segments and do not price them. Opaque conversation is the part of the messages the engine holds no text for — tool-call arguments, images, structured results, signatures.")),
@@ -684,13 +688,14 @@ RENDER.prefix = d => {
     ]),
       note("Counted on a conversation's first request and whenever its instructions or tools changed. A value that changes by itself sits ahead of the whole conversation in the cached prefix.")),
     section("Predicting a lapse on the request that finds it", coldTable(asked),
-      note("Each request of a conversation the provider had served from cache, scored as it arrived: predicted cold when it had been idle longer than the lifetime its previous request asked for, plus the margin. " +
-        "Whether it lapsed is the Cache page's reckoning: the request failed to read back what the one before it left. A read of the instructions and tools alone does not count as alive, since other conversations keep those cached. " +
+      note("Each request the proxy could have predicted on — one that continues a conversation the provider had served from cache — scored as it arrived: predicted cold when it had been idle longer than the lifetime its previous request asked for, plus the margin. " +
+        "Whether it lost its prefix is the Cache page's reckoning: the request failed to read back what the one before it left. Only a loss of the whole conversation with nothing seen to change is an expiry, and only that confirms a prediction. " +
+        "A read of the instructions and tools alone does not count as alive, since other conversations keep those cached. Partly lost, lost on a request whose prefix changed, and lost with nothing to compare are losses the idle time does not explain; they count against precision. " +
         "Read it back is the expensive mistake — acting on that prediction would have rewritten a live prefix. Turns that were themselves recompacted are left out: what they read says what was rewritten.")),
     section("Recompactions on a lapsed cache", tiles([
       ["On the provider's answer", n(d.recompactions.observed), "it had read nothing and written nothing"],
       ["On idle time", n(d.recompactions.predicted), "predicted on the turn that found it"],
-      ["Predicted wrongly", n(d.recompactions.predicted_wrong), "the read reached past the instructions and tools: a live prefix rewritten", d.recompactions.predicted_wrong ? "bad" : "good"],
+      ["Predicted wrongly", n(d.recompactions.predicted_wrong), "the read reached past the instructions and tools: a live prefix rewritten. Counted as the proxy's own breaker counts it, turns with retrieve rounds left out", d.recompactions.predicted_wrong ? "bad" : "good"],
       ["Conversations", n(d.recompactions.conversations), n(d.recompactions.stale_reads) + " reads rewritten (stale, superseded or matured)"],
     ]),
       note("With proxy.cold_recompact on, the turn that finds the provider's cache gone rewrites the whole conversation, and what it decided is replayed on every later turn. Three wrong predictions in an hour end prediction until restart.")),
