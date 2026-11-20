@@ -189,6 +189,12 @@ once compressed and once not, and which one a model reaches for is a coin toss.
 Then **fully quit and reopen Desktop**. A reopened window is not enough: the
 server is spawned per session with the environment it was given.
 
+A fronted server inherits that environment, with one exception: the credential
+`kompressor mcp serve` itself runs with (`KOMPRESSOR_API_KEY`,
+`KOMPRESSOR_SECRET`, `KOMPRESSOR_TENANT`) is not passed on. A server that needs
+one of those — a second kompressor, fronted on purpose — gets it from the `env`
+table of its own `[[mcp.servers]]` entry.
+
 ## 5. Verify from Chat
 
 Ask Chat to use a fronted tool on something bulky — reading a large file is the

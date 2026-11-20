@@ -221,7 +221,10 @@ pub struct McpServerConfig {
     /// Spawned, speaking JSON-RPC on its pipe. Exclusive with [`Self::url`].
     pub command: Option<String>,
     pub args: Vec<String>,
-    /// Extra environment for a spawned server. The parent's is inherited.
+    /// Extra environment for a spawned server. The parent's is inherited,
+    /// except `KOMPRESSOR_API_KEY`, `KOMPRESSOR_SECRET` and
+    /// `KOMPRESSOR_TENANT`: this process's own credential reaches a fronted
+    /// server only when named here.
     pub env: std::collections::BTreeMap<String, String>,
     /// Connected to over streamable HTTP. Exclusive with [`Self::command`].
     pub url: Option<String>,

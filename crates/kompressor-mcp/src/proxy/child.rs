@@ -12,7 +12,6 @@ use kompressor_core::config::McpServerConfig;
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, CallToolResult, Tool};
 use rmcp::service::{RoleClient, RunningService};
-use tokio::sync::Mutex;
 
 /// Set on every server this process spawns, and checked before fronting
 /// anything.
@@ -36,6 +35,36 @@ pub const FRONTED_MARKER: &str = "KOMPRESSOR_MCP_FRONTED";
 /// caller's topology.
 pub fn is_fronted() -> bool {
     std::env::var_os(FRONTED_MARKER).is_some()
+}
+
+/// What this process authenticates with, which a fronted server is not given.
+///
+/// A spawned server inherits the environment, and the runtime that launched
+/// us put our credential there: the key or secret that says which tenant's
+/// fragments this process may read. A fronted server is somebody else's code
+/// — often a package `npx -y` fetched a moment ago — and has no use for it.
+/// One that is meant to have one, a kompressor of its own, is given it by
+/// name in its entry's `env`.
+const WITHHELD: [&str; 3] = [
+    crate::stdio::ENV_API_KEY,
+    crate::stdio::ENV_SECRET,
+    crate::stdio::ENV_TENANT,
+];
+
+/// The command that starts the server `config` names with `command`.
+fn spawn_command(command: &str, config: &McpServerConfig) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(command);
+    cmd.args(&config.args);
+    // Before the configured `env`, so an entry can still pass one on purpose.
+    for name in WITHHELD {
+        cmd.env_remove(name);
+    }
+    for (key, value) in &config.env {
+        cmd.env(key, value);
+    }
+    // The recursion guard. Set last so a configured `env` cannot unset it.
+    cmd.env(FRONTED_MARKER, "1");
+    cmd
 }
 
 /// Why a fronted server could not be reached.
@@ -81,7 +110,11 @@ pub enum UpstreamError {
 pub struct Upstream {
     pub name: String,
     pub compress: bool,
-    service: Arc<Mutex<Option<RunningService<RoleClient, ()>>>>,
+    /// Not behind a lock. Requests are matched to answers by id, so calls to
+    /// one server run side by side; a lock held across a call made each wait
+    /// for the one before it, and made `tools/list` — which asks every server
+    /// — wait on any call that never returned.
+    service: Arc<RunningService<RoleClient, ()>>,
 }
 
 impl Upstream {
@@ -106,14 +139,7 @@ impl Upstream {
         }
 
         let service = if let Some(command) = &config.command {
-            let mut cmd = tokio::process::Command::new(command);
-            cmd.args(&config.args);
-            for (key, value) in &config.env {
-                cmd.env(key, value);
-            }
-            // The recursion guard. Set last so a configured `env` cannot
-            // unset it.
-            cmd.env(FRONTED_MARKER, "1");
+            let cmd = spawn_command(command, config);
             let transport = rmcp::transport::TokioChildProcess::new(cmd).map_err(|source| {
                 UpstreamError::Start {
                     name: name.clone(),
@@ -139,7 +165,7 @@ impl Upstream {
         Ok(Upstream {
             name,
             compress: config.compress,
-            service: Arc::new(Mutex::new(Some(service))),
+            service: Arc::new(service),
         })
     }
 
@@ -148,11 +174,7 @@ impl Upstream {
     /// A dead server contributes an empty list rather than failing the whole
     /// `tools/list`: the client keeps every other server's tools and ours.
     pub async fn tools(&self) -> Vec<Tool> {
-        let guard = self.service.lock().await;
-        let Some(service) = guard.as_ref() else {
-            return Vec::new();
-        };
-        match service.list_all_tools().await {
+        match self.service.list_all_tools().await {
             Ok(tools) => tools,
             Err(error) => {
                 tracing::warn!(server = %self.name, %error, "mcp server did not list its tools");
@@ -167,17 +189,16 @@ impl Upstream {
         tool: &str,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, String> {
-        let guard = self.service.lock().await;
-        let Some(service) = guard.as_ref() else {
-            return Err(format!("mcp server {:?} is not running", self.name));
-        };
         // `CallToolRequestParams` is `#[non_exhaustive]`, so it is built by
         // assignment rather than as a literal; new protocol fields then default
         // rather than failing this build.
         let mut params = CallToolRequestParams::default();
         params.name = tool.to_string().into();
         params.arguments = arguments;
-        service.call_tool(params).await.map_err(|e| e.to_string())
+        self.service
+            .call_tool(params)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -200,6 +221,68 @@ mod tests {
             Ok(upstream) => panic!("{:?} was fronted", upstream.name),
             Err(error) => error,
         }
+    }
+
+    /// What the child's environment is told, name by name: `Some` to set,
+    /// `None` to remove from what it would inherit.
+    fn told(config: &McpServerConfig) -> std::collections::BTreeMap<String, Option<String>> {
+        spawn_command("server", config)
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    /// Our credential is ours: a fronted server does not inherit it.
+    #[test]
+    fn a_spawned_server_is_not_handed_our_credentials() {
+        let env = told(&server("fs", Some("server"), None));
+        for name in [
+            "KOMPRESSOR_API_KEY",
+            "KOMPRESSOR_SECRET",
+            "KOMPRESSOR_TENANT",
+        ] {
+            assert_eq!(env.get(name), Some(&None), "{name} is removed");
+        }
+        assert_eq!(env.get(FRONTED_MARKER), Some(&Some("1".to_string())));
+        assert_eq!(
+            env.len(),
+            4,
+            "everything else is inherited as it is: {env:?}"
+        );
+    }
+
+    /// An entry that names one in its `env` means it: a kompressor fronted on
+    /// purpose is given the key it is configured with, and still cannot
+    /// clear the recursion marker.
+    #[test]
+    fn a_credential_an_entry_names_is_passed() {
+        let mut config = server("inner", Some("kompressor"), None);
+        config.args = vec!["mcp".to_string(), "serve".to_string()];
+        config.env = [
+            ("KOMPRESSOR_API_KEY", "its-own-key"),
+            ("FS_ROOT", "/srv"),
+            (FRONTED_MARKER, ""),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        let env = told(&config);
+        assert_eq!(
+            env.get("KOMPRESSOR_API_KEY"),
+            Some(&Some("its-own-key".to_string()))
+        );
+        assert_eq!(env.get("KOMPRESSOR_SECRET"), Some(&None));
+        assert_eq!(env.get("FS_ROOT"), Some(&Some("/srv".to_string())));
+        assert_eq!(env.get(FRONTED_MARKER), Some(&Some("1".to_string())));
+        let command = spawn_command("kompressor", &config);
+        let args: Vec<_> = command.as_std().get_args().collect();
+        assert_eq!(args, ["mcp", "serve"]);
     }
 
     #[tokio::test]

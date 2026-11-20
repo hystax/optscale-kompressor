@@ -1653,3 +1653,66 @@ fn a_supervised_proxy_outlives_its_supervisor() {
     let _ = child.wait();
     assert!(!exited, "end of input stopped the proxy");
 }
+
+/// What `serve` logs to stdout from start to a clean stop, with `NO_COLOR`
+/// set to `no_color` or absent.
+fn serve_stdout(no_color: Option<&str>) -> String {
+    use std::io::Read;
+    let dir = scratch_dir();
+    // The human-readable format: JSON lines carry no colour to begin with.
+    let config = dir.join("text-log.toml");
+    std::fs::write(&config, format!("{MCP_PLAIN}\n[log]\nformat = \"text\"\n")).unwrap();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_kompressor"));
+    command
+        .args([
+            "serve",
+            "--api",
+            "--listen",
+            "127.0.0.1:0",
+            "--stop-on-stdin",
+            "--config",
+        ])
+        .arg(&config)
+        .env_remove("KOMPRESSOR_CONFIG")
+        .env_remove("RUST_LOG")
+        .env_remove("NO_COLOR")
+        .env("XDG_CONFIG_HOME", no_config_dir())
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    if let Some(value) = no_color {
+        command.env("NO_COLOR", value);
+    }
+    let mut child = command.spawn().expect("serve starts");
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "stop").unwrap();
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+    stdout
+}
+
+/// `serve` logs in colour unless `NO_COLOR` says not to. Routing `mcp serve`'s
+/// log to stderr passed an explicit "colour on" for stdout, which overrides
+/// the variable: an operator's `NO_COLOR=1` stopped working for every command
+/// that logs.
+#[test]
+fn serve_honours_no_color_in_its_log() {
+    let plain = serve_stdout(Some("1"));
+    assert!(plain.contains("listening"), "it did log: {plain:?}");
+    assert!(
+        !plain.contains('\u{1b}'),
+        "NO_COLOR is set and the log is coloured: {plain:?}"
+    );
+    let coloured = serve_stdout(None);
+    assert!(
+        coloured.contains('\u{1b}'),
+        "the default is unchanged: {coloured:?}"
+    );
+}

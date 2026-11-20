@@ -22,11 +22,11 @@ use crate::handler::KompressorTools;
 use crate::limit::RetrievalLimiter;
 
 /// The API key a launching runtime may pass in the environment.
-const ENV_API_KEY: &str = "KOMPRESSOR_API_KEY";
+pub(crate) const ENV_API_KEY: &str = "KOMPRESSOR_API_KEY";
 /// The shared secret, for a trusted local component.
-const ENV_SECRET: &str = "KOMPRESSOR_SECRET";
+pub(crate) const ENV_SECRET: &str = "KOMPRESSOR_SECRET";
 /// The tenant to act for. Honoured only alongside a valid secret.
-const ENV_TENANT: &str = "KOMPRESSOR_TENANT";
+pub(crate) const ENV_TENANT: &str = "KOMPRESSOR_TENANT";
 
 /// Serve the tools over stdin and stdout until the peer disconnects.
 ///

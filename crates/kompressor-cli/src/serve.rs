@@ -171,14 +171,17 @@ fn upstream_client(config: &Config) -> Result<reqwest::Client, CliError> {
 ///
 /// `RUST_LOG` wins over the configured level, as the configuration says it does.
 fn init_logging(log: &kompressor_core::config::LogConfig) {
-    init_logging_to(log, std::io::stdout, true);
+    init_logging_to(log, std::io::stdout, None);
 }
 
 /// [`init_logging`], writing somewhere other than stdout.
 ///
-/// `ansi` is off for a destination that ends up in a file rather than a
-/// terminal, where colour codes are noise in every line.
-fn init_logging_to<W>(log: &kompressor_core::config::LogConfig, writer: W, ansi: bool)
+/// `ansi` is `Some(false)` for a destination that ends up in a file rather
+/// than a terminal, where colour codes are noise in every line, and `None` to
+/// leave the subscriber's own default alone. That default honours `NO_COLOR`;
+/// `with_ansi(true)` overrides it, so stdout logging must not pass a value —
+/// it did for one merge, and an operator's `NO_COLOR=1` stopped working.
+fn init_logging_to<W>(log: &kompressor_core::config::LogConfig, writer: W, ansi: Option<bool>)
 where
     W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
 {
@@ -191,17 +194,26 @@ where
 
     // `try_init` rather than `init`: a second call must not take the process
     // down, and a caller that already installed one keeps it.
-    let _ = match log.format.as_str() {
-        "json" => fmt::Subscriber::builder()
+    let _ = match (log.format.as_str(), ansi) {
+        ("json", Some(ansi)) => fmt::Subscriber::builder()
             .json()
             .with_env_filter(filter)
             .with_writer(writer)
             .with_ansi(ansi)
             .try_init(),
-        _ => fmt::Subscriber::builder()
+        ("json", None) => fmt::Subscriber::builder()
+            .json()
+            .with_env_filter(filter)
+            .with_writer(writer)
+            .try_init(),
+        (_, Some(ansi)) => fmt::Subscriber::builder()
             .with_env_filter(filter)
             .with_writer(writer)
             .with_ansi(ansi)
+            .try_init(),
+        (_, None) => fmt::Subscriber::builder()
+            .with_env_filter(filter)
+            .with_writer(writer)
             .try_init(),
     };
 }
@@ -237,7 +249,7 @@ pub async fn run_stdio(config: Config) -> CliResult {
         level: format!("{},rmcp=warn", config.log.level),
         ..config.log.clone()
     };
-    init_logging_to(&log, std::io::stderr, false);
+    init_logging_to(&log, std::io::stderr, Some(false));
     let (core, running) = build_core(config)?;
     let (stop, rx) = tokio::sync::watch::channel(false);
     let upkeep = maintenance(core.clone(), rx);

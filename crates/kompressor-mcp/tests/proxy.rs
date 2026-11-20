@@ -31,6 +31,7 @@ use kompressor_store::memory::MemoryRefStore;
 /// * `whoami` — its arguments and two environment variables, so a test can see
 ///   how it was spawned.
 /// * `die` — exits without answering, as a crashed server would.
+/// * `slow` — answers two seconds later, and goes on serving meanwhile.
 ///
 /// Spawned as `bash <script>` (see [`spawned`]), never as the script itself.
 fn fake_server(dir: &std::path::Path, lines: usize) -> std::path::PathBuf {
@@ -49,7 +50,7 @@ while IFS= read -r line; do
     *'"method":"notifications/initialized"'*) ;;
     *'"method":"tools/list"'*)
       tools=''
-      for name in big_result small_result with_image echo whoami die; do
+      for name in big_result small_result with_image echo whoami die slow; do
         tools="$tools"'{{"name":"'"$name"'","description":"fake '"$name"'","inputSchema":{{"type":"object"}}}},'
       done
       emit '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"tools":['"${{tools%,}}"']}}}}' ;;
@@ -65,6 +66,8 @@ while IFS= read -r line; do
       text "args=$* fronted=${{KOMPRESSOR_MCP_FRONTED-unset}} extra=${{FAKE_EXTRA-unset}}" ;;
     *'"method":"tools/call"'*'"name":"die"'*)
       exit 3 ;;
+    *'"method":"tools/call"'*'"name":"slow"'*)
+      ( sleep 2; text 'late' ) & ;;
     *'"method":"ping"'*)
       emit '{{"jsonrpc":"2.0","id":'"$id"',"result":{{}}}}' ;;
   esac
@@ -636,6 +639,55 @@ async fn a_server_that_dies_mid_call_is_a_tool_error_not_a_dead_session() {
 
     let _ = client.cancel().await;
     serving.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A call that takes its time holds up nothing else: the tool list, another
+/// call to the same server and our own tools are all answered while it runs,
+/// and it is answered when it is done. Calls to a server used to queue behind
+/// a lock held for the whole call, so one that never returned took the
+/// server's tools — and with them every `tools/list` — out of the session.
+#[tokio::test]
+async fn a_slow_call_holds_up_nothing_else() {
+    let dir = tempdir("slow");
+    let script = fake_server(&dir, 10);
+    let (client, serving) = session(vec![fake(&script, true)]).await;
+
+    let started = std::time::Instant::now();
+    let slow = client.call_tool(request("fake__slow", None));
+    let meanwhile = async {
+        // Let the slow call reach the server first.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let listed = client.list_all_tools().await.expect("tools/list");
+        assert!(
+            listed.iter().any(|tool| tool.name == "fake__slow"),
+            "the fronted server's tools are listed while it is busy"
+        );
+        let quick = client
+            .call_tool(request("fake__small_result", None))
+            .await
+            .expect("a second call to the same server");
+        assert_eq!(texts(&quick), ["all good"]);
+        let ours = client
+            .call_tool(request(
+                "optscale_kompressor_retrieve",
+                Some(serde_json::json!({"ref": "k_AbC123dEf456"})),
+            ))
+            .await
+            .expect("one of ours");
+        assert!(!texts(&ours).is_empty());
+        started.elapsed()
+    };
+    let (slow, answered) = tokio::join!(slow, meanwhile);
+    assert!(
+        answered < std::time::Duration::from_millis(1_500),
+        "everything else waited for the slow call: {answered:?}"
+    );
+    assert_eq!(texts(&slow.expect("the slow call itself")), ["late"]);
+    assert!(started.elapsed() >= std::time::Duration::from_secs(2));
+
+    client.cancel().await.ok();
+    let _ = serving.await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
