@@ -25,13 +25,14 @@ use tracing::Instrument;
 
 use kompressor_core::auth::{Credentials, Identity};
 use kompressor_core::config::{
-    CacheTtl, FrozenPrefix, PromptCacheRetention, ProxyConfig, RetrieveExecution, RetrieveTool,
-    Upstream,
+    CacheTtl, ColdRecompact, FrozenPrefix, PromptCacheKey, PromptCacheRetention, ProxyConfig,
+    RetrieveExecution, RetrieveTool, ToolsOrder, Upstream,
 };
 use kompressor_core::{AppCore, RequestInfo};
 use kompressor_engine::estimate_tokens;
 use kompressor_engine::messages::{Message, PrefixCache};
 use kompressor_engine::options::EngineOptionsPatch;
+use kompressor_engine::read_lifecycle::{Maturity, ReadDecision, ReadPolicy};
 use kompressor_engine::refs::{RefId, refs_in};
 use kompressor_stats::events::{Event, ProxyRequestEvent, Surface};
 use kompressor_wire::{ApiFamily, Walk, detect_family, walker_for};
@@ -264,12 +265,31 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     // changed it. Off unless `KOMPRESSOR_BODY_CAPTURE` names a file.
     let capturing = bodycapture::path();
     if capturing.is_some() {
-        bodycapture::record(&capturing, &request_id, "client->proxy", &decoded);
-        bodycapture::record(&capturing, &request_id, "proxy->upstream", &prepared.body);
+        let beta = crate::drift::beta_fingerprint(&parts.headers);
+        bodycapture::record(
+            &capturing,
+            &request_id,
+            "client->proxy",
+            &decoded,
+            Some(beta),
+        );
+        bodycapture::record(
+            &capturing,
+            &request_id,
+            "proxy->upstream",
+            &prepared.body,
+            None,
+        );
     }
 
-    let upstream_headers =
+    let mut upstream_headers =
         headers::upstream_headers(&parts.headers, upstream, &request_id, auth_mode);
+    // `proxy.sticky_beta`, decided in `prepare`: before the keep-warm plan
+    // copies these headers, so a ping carries the tokens its request did.
+    if let Some(betas) = prepared.betas.take() {
+        upstream_headers.remove("anthropic-beta");
+        upstream_headers.insert("anthropic-beta", betas);
+    }
     let keep_warm = keep_warm_for(
         &state,
         family,
@@ -291,16 +311,54 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     } else if !encoding.is_encoded() {
         prepared.body.clone()
     } else {
-        match encoding.encode(&prepared.body) {
+        let encoded = if state.encode_fault.swap(false, Ordering::Relaxed) {
+            None
+        } else {
+            encoding.encode(&prepared.body)
+        };
+        match encoded {
             Some(encoded) => encoded,
             None => {
                 state
                     .failopen
                     .record(Stage::Parse, &"the rewritten body could not be re-encoded");
+                // The client's original goes out, so nothing was recompacted:
+                // the provider will cache these bytes, and the conversation
+                // keeps the freeze and the ledger that go with them. Dropping
+                // the reservation frees it for the next turn that finds the
+                // cache gone.
+                prepared.pending_recompaction = None;
+                prepared.reservation = None;
+                prepared.recompacted = None;
+                if let Some(seen) = prepared.observation.as_mut() {
+                    seen.recompacted = None;
+                    seen.ledger_reads = 0;
+                }
+                // The drift tracker was told the rewritten body went out.
+                // It did not: the next request is to be compared with the
+                // client's own bytes on both sides.
+                if let Some(conversation) = prepared.prefix {
+                    state.drift.sent_as_received(conversation, prepared.ticket);
+                }
                 wire
             }
         }
     };
+    // The commit point of a recompaction: this body is what the provider will
+    // cache, so from here the conversation has no freeze and its ledger holds
+    // what this turn decided.
+    if let Some((conversation, decided)) = prepared.pending_recompaction.take()
+        && let Some(reservation) = prepared.reservation.take()
+    {
+        state.prefixes.lower_floor(conversation);
+        let held = reservation.commit(&decided);
+        tracing::info!(
+            request_id = %request_id,
+            how = prepared.recompacted.map(|(kind, _)| kind.as_str()),
+            reads_decided = held,
+            "the provider's cache was gone; recompacted the whole conversation"
+        );
+    }
     let outbound = {
         let mut outbound = Outbound::new(
             state.client.clone(),
@@ -418,14 +476,22 @@ fn ask_for_retention(
         return None;
     }
     let config = state.core.config_for(family.map(ApiFamily::provider));
-    if config.proxy.prompt_cache_retention != PromptCacheRetention::Extended {
+    if !retention::upstream_is_openai(upstream, origin) {
         return None;
     }
     let model = prepared.model.clone()?;
-    if !retention::model_supported(&model)
-        || !retention::upstream_is_openai(upstream, origin)
-        || state.retention.refused(upstream, &model)
-    {
+    let retain = config.proxy.prompt_cache_retention == PromptCacheRetention::Extended
+        && retention::model_supported(&model)
+        && !state.retention.refused(upstream, &model);
+    // `proxy.prompt_cache_key = "conversation"`: named from the opening, which
+    // is the same on every turn, so every turn is routed alike.
+    let route = (config.proxy.prompt_cache_key == PromptCacheKey::Conversation
+        && !state
+            .retention
+            .refused_field(upstream, &model, retention::KEY_FIELD))
+    .then_some(prepared.opening)
+    .flatten();
+    if !retain && route.is_none() {
         return None;
     }
     let mut parsed = None;
@@ -433,19 +499,37 @@ fn ask_for_retention(
         Some(value) => value,
         None => parsed.insert(serde_json::from_slice::<Value>(&prepared.body).ok()?),
     };
-    if !retention::extend(value) {
+    let mut added = Vec::new();
+    if retain && retention::extend(value) {
+        added.push(retention::FIELD);
+    }
+    // A request that continues a response stored at the provider carries
+    // only this turn's items: its opening is not the conversation's, and a
+    // key derived from it would name a different route every turn.
+    let continues_stored = value
+        .get("previous_response_id")
+        .is_some_and(|id| !id.is_null());
+    if let Some(opening) = route.filter(|_| !continues_stored)
+        && retention::name_cache_route(value, opening)
+    {
+        added.push(retention::KEY_FIELD);
+    }
+    if added.is_empty() {
         return None;
     }
     // As for the Anthropic TTL: re-serializing changes JSON bytes, never the
     // prompt the provider keys its cache on.
     prepared.body = Bytes::from(serde_json::to_vec(value).ok()?);
-    tracing::debug!(model = %model, "asked for 24h prompt-cache retention");
-    Some(retention::Guard::new(
-        state.retention.clone(),
-        upstream,
-        &model,
-        config.proxy.max_body_bytes,
-    ))
+    tracing::debug!(model = %model, fields = ?added, "added prompt-cache fields");
+    Some(
+        retention::Guard::new(
+            state.retention.clone(),
+            upstream,
+            &model,
+            config.proxy.max_body_bytes,
+        )
+        .for_fields(added),
+    )
 }
 
 /// The keep-warm ping this request would leave behind, if its conversation is
@@ -552,6 +636,33 @@ struct Prepared {
     /// The request asked for one-hour cache entries, which outlast any pause a
     /// keep-warm ping would bridge.
     one_hour: bool,
+    /// What was observed of the request's cacheable prefix, stamped by
+    /// `prepare` for the statistics row. Never read to decide anything.
+    observation: Option<kompressor_stats::context::PrefixObservation>,
+    /// The conversation's opening, for `prompt_cache_key`.
+    opening: Option<u64>,
+    /// This turn found the provider's cache gone and was recompacted, with
+    /// how many stale reads the conversation's ledger now holds.
+    recompacted: Option<(crate::recompact::Cold, usize)>,
+    /// The `anthropic-beta` header to send in place of the client's, when
+    /// `proxy.sticky_beta` put back tokens the request left out.
+    betas: Option<http::HeaderValue>,
+    /// A recompaction to commit once this body is certain to go upstream as
+    /// rewritten: the conversation, and what the turn decided about its reads.
+    pending_recompaction: Option<(u64, Vec<(u64, ReadDecision)>)>,
+    /// The conversation's reservation for that recompaction, taken when the
+    /// turn was found cold. Committed with it, and released by being dropped
+    /// on every other way out of the request.
+    reservation: Option<crate::recompact::Reservation>,
+    /// This request's place among all requests, by arrival
+    /// ([`crate::recompact::Recompact::ticket`]).
+    ticket: u64,
+    /// Bytes `proxy.tools_compact` took out of the tool definitions.
+    tools_compacted_bytes: usize,
+    /// Bytes it would take out, where it is not applied.
+    tools_compactable_bytes: usize,
+    /// Bytes of earlier-turn reasoning taken out of the conversation.
+    reasoning_elided_bytes: usize,
 }
 
 impl Prepared {
@@ -561,6 +672,16 @@ impl Prepared {
             prefix: None,
             messages: None,
             one_hour: false,
+            observation: None,
+            opening: None,
+            recompacted: None,
+            betas: None,
+            pending_recompaction: None,
+            reservation: None,
+            ticket: 0,
+            tools_compacted_bytes: 0,
+            tools_compactable_bytes: 0,
+            reasoning_elided_bytes: 0,
             body,
             json: None,
             saved_tokens: 0,
@@ -666,6 +787,16 @@ fn passthrough_with_stable_tools(
         prefix: None,
         messages: None,
         one_hour: false,
+        observation: None,
+        opening: None,
+        recompacted: None,
+        betas: None,
+        pending_recompaction: None,
+        reservation: None,
+        ticket: 0,
+        tools_compacted_bytes: 0,
+        tools_compactable_bytes: 0,
+        reasoning_elided_bytes: 0,
     }
 }
 
@@ -734,13 +865,36 @@ fn conversation_opening(messages: &[Message]) -> Vec<String> {
         .collect()
 }
 
+/// What `prefix_identity` learned while it had the body open.
+struct Identified {
+    fingerprint: u64,
+    /// Messages the request carried.
+    messages: usize,
+    /// The request as the client sent it, reduced for the drift comparison.
+    incoming: crate::drift::Segments,
+    /// Conversation text the engine can see, in bytes.
+    text_bytes: u64,
+    /// How long the conversation had been idle as this request arrived.
+    idle: Option<crate::drift::Idle>,
+    /// The names of the tools the client sent, in its order.
+    tool_names: Vec<String>,
+    /// The conversation's opening, which stays the same on every turn and
+    /// across a restart: what `prompt_cache_key` is derived from.
+    opening: u64,
+    family: ApiFamily,
+    /// What a recompaction would decide about this conversation's file reads
+    /// right now, in bytes. Measured for the statistics; acted on nowhere.
+    reads: kompressor_engine::messages::ReadOpportunity,
+}
+
 fn prefix_identity(
     state: &ProxyState,
     identity: &Identity,
     family: Option<ApiFamily>,
     body: &Bytes,
     provider: &str,
-) -> Option<(u64, usize)> {
+    request_headers: &HeaderMap,
+) -> Option<Identified> {
     // Identified with compression off too. The control arm of a comparison has
     // to be observed the way the treated arm is: without a conversation its
     // rows filed no conversation, its cache-read drops went untracked — an
@@ -758,9 +912,68 @@ fn prefix_identity(
         family.as_str(),
         walk.model.as_deref().unwrap_or(""),
     ];
-    let fingerprint = state
+    let chain = prefixcache::identity_chain_in_scope(&refs, &scope);
+    // Everything up to and including the first user message: enough to tell
+    // conversations apart where their first ask differs, and — because a
+    // conversation's first request already carries it — the same on that
+    // request as on every later one. A fixed count of messages is not: a
+    // request of one message has no second to hash until the next turn.
+    let first_ask = walk
+        .messages
+        .iter()
+        .position(|message| message.role.eq_ignore_ascii_case("user"))
+        .unwrap_or(0);
+    let opening_key = *chain.get(first_ask.min(chain.len().checked_sub(1)?))?;
+    let fingerprint = state.prefixes.identify(&chain)?;
+    let tool_names = value
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .map(|tool| crate::drift::tool_name(tool).to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let messages = value
+        .get("messages")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    // Read before anything below touches the conversation's entry, and with
+    // the message count `cold_turn` will ask `predicted_cold` about.
+    let idle = state
         .prefixes
-        .identify(&prefixcache::identity_chain_in_scope(&refs, &scope))?;
+        .idle(fingerprint, messages)
+        .map(|(idle, was_warm, continues)| crate::drift::Idle {
+            idle_ms: u64::try_from(idle.as_millis()).unwrap_or(u64::MAX),
+            was_warm,
+            continues,
+        });
+    let mut incoming = crate::drift::Segments::sized(
+        &value,
+        body.len() as u64,
+        family,
+        request_headers,
+        state.drift.previous_messages(fingerprint),
+    );
+    // Only where it will be reported: the scan reads every byte of the
+    // instructions and tool descriptions.
+    if state.drift.opening_is_news(fingerprint, &incoming) {
+        incoming.scan_volatile(&value, family);
+    }
+    let text_bytes = opening.iter().map(|text| text.len() as u64).sum();
+    let proxy = &state.core.config_for(Some(family.provider())).proxy;
+    let reads = kompressor_engine::messages::read_opportunity(
+        &walk.messages,
+        &ReadPolicy {
+            superseded: true,
+            matured: Some(Maturity {
+                quiesce_turns: proxy.matured_quiesce_turns,
+                max_hold_turns: proxy.matured_max_hold_turns,
+                min_bytes: proxy.matured_min_bytes,
+            }),
+        },
+    );
     // The same history with the model left out, so that a conversation the
     // client moves to another model is recognised as one this proxy carried;
     // see `PrefixTracker::floor_for`.
@@ -775,11 +988,330 @@ fn prefix_identity(
         lineage,
         walk.model.as_deref().unwrap_or(""),
     );
-    let messages = value
-        .get("messages")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
-    Some((fingerprint, messages))
+    Some(Identified {
+        fingerprint,
+        messages,
+        incoming,
+        text_bytes,
+        idle,
+        tool_names,
+        opening: opening_key,
+        family,
+        reads,
+    })
+}
+
+/// Leave out the reasoning of turns that are over, for a model the operator
+/// named in `proxy.reasoning_elide_models`. See [`crate::reasoning`].
+///
+/// Whatever is elided is retained before the body is changed, and a store
+/// that cannot retain it leaves the body as it was: a marker whose fragment
+/// is gone is worse than the reasoning it replaced.
+async fn elide_reasoning(
+    state: &ProxyState,
+    identity: &Identity,
+    mode: ProxyMode,
+    request_id: &str,
+    prepared: &mut Prepared,
+) {
+    let config = state
+        .core
+        .config_for(Some(ApiFamily::OpenAiChat.provider()));
+    let models = &config.proxy.reasoning_elide_models;
+    if models.is_empty() || mode.is_off() {
+        return;
+    }
+    let Some(model) = prepared.model.as_deref() else {
+        return;
+    };
+    if !crate::reasoning::listed(models, model) {
+        return;
+    }
+    let options = state.core.options_for_provider(
+        identity,
+        Some(ApiFamily::OpenAiChat.provider()),
+        Some(&EngineOptionsPatch {
+            mode: mode.engine_mode(),
+            ..Default::default()
+        }),
+    );
+    // Lossless promises to drop nothing, and this drops.
+    if options.is_lossless() {
+        return;
+    }
+    let mut value = match prepared.json.clone() {
+        Some(value) => value,
+        None => match serde_json::from_slice::<Value>(&prepared.body) {
+            Ok(value) => value,
+            Err(_) => return,
+        },
+    };
+    let mut refs = options.collector();
+    let elided = crate::reasoning::elide_past_turns(&mut value, &mut refs);
+    if elided.messages == 0 {
+        return;
+    }
+    let Ok(out) = serde_json::to_vec(&value) else {
+        return;
+    };
+    let (core, identity, request) = (state.core.clone(), identity.clone(), request_id.to_string());
+    let retained = tokio::task::spawn_blocking(move || {
+        core.retain_fragments(&identity, &refs, &request, &options)
+    })
+    .await
+    .unwrap_or(false);
+    if !retained {
+        state
+            .failopen
+            .record(Stage::Compress, &"elided reasoning could not be retained");
+        return;
+    }
+    tracing::debug!(
+        messages = elided.messages,
+        bytes = elided.bytes,
+        "left out the reasoning of earlier turns"
+    );
+    prepared.reasoning_elided_bytes = elided.bytes;
+    prepared.body = Bytes::from(out);
+    if prepared.json.is_some() {
+        prepared.json = Some(value);
+    }
+}
+
+/// Take the bookkeeping out of this request's tool schemas, under
+/// `proxy.tools_compact`, for a conversation whose policy says so. See
+/// [`crate::toolcompact`].
+///
+/// Every request of such a conversation is parsed and re-serialized here,
+/// compressed or not: the tool block has to carry the same bytes each turn.
+fn compact_tool_schemas(state: &ProxyState, identified: &Identified, prepared: &mut Prepared) {
+    let configured = state
+        .core
+        .config_for(Some(identified.family.provider()))
+        .proxy
+        .tools_compact;
+    if !state.tool_policies.compacting(
+        identified.fingerprint,
+        identified.incoming.messages,
+        configured,
+    ) {
+        // Not compacting: measure what it would take out, once for these
+        // tool definitions, so the statistics can say whether it would pay.
+        let defs = identified.incoming.tool_defs();
+        prepared.tools_compactable_bytes = state
+            .tool_policies
+            .measured(identified.fingerprint, defs)
+            .unwrap_or_else(|| {
+                let parsed;
+                let value = match prepared.json.as_ref() {
+                    Some(value) => Some(value),
+                    None => {
+                        parsed = serde_json::from_slice::<Value>(&prepared.body).ok();
+                        parsed.as_ref()
+                    }
+                };
+                let bytes = value
+                    .and_then(|value| value.get("tools"))
+                    .and_then(Value::as_array)
+                    .map_or(0, |tools| crate::toolcompact::compactable_bytes(tools));
+                state
+                    .tool_policies
+                    .measure(identified.fingerprint, defs, bytes);
+                bytes
+            });
+        return;
+    }
+    let mut parsed = None;
+    let value = match prepared.json.as_mut() {
+        Some(value) => value,
+        None => match serde_json::from_slice::<Value>(&prepared.body) {
+            Ok(value) => parsed.insert(value),
+            Err(_) => return,
+        },
+    };
+    let Some(Value::Array(tools)) = value.get_mut("tools") else {
+        return;
+    };
+    // Measured on the tool list alone: the whole body can also shrink from
+    // being re-serialized, and that is not schema this took out.
+    let size = |tools: &[Value]| serde_json::to_vec(tools).map_or(0, |bytes| bytes.len());
+    let before = size(tools);
+    if crate::toolcompact::compact_tools(tools) == 0 {
+        return;
+    }
+    let saved = before.saturating_sub(size(tools));
+    if let Ok(out) = serde_json::to_vec(value) {
+        prepared.tools_compacted_bytes = saved;
+        prepared.body = Bytes::from(out);
+    }
+}
+
+/// Send this request's tools in the order the conversation's first request
+/// used, under `proxy.tools_order = "pinned"`. See [`crate::stabilize`].
+///
+/// The decision is made on the names the client sent, so a request that keeps
+/// its order — nearly all of them — is neither parsed nor re-serialized here.
+fn pin_tool_order(state: &ProxyState, identified: &Identified, prepared: &mut Prepared) {
+    let names: Vec<&str> = identified.tool_names.iter().map(String::as_str).collect();
+    let Some(pinned) = state.stabilizer.pin_tools(identified.fingerprint, &names) else {
+        return;
+    };
+    let mut parsed = None;
+    let value = match prepared.json.as_mut() {
+        Some(value) => value,
+        None => match serde_json::from_slice::<Value>(&prepared.body) {
+            Ok(value) => parsed.insert(value),
+            Err(_) => return,
+        },
+    };
+    let Some(Value::Array(tools)) = value.get_mut("tools") else {
+        return;
+    };
+    if crate::stabilize::reorder(tools, &pinned)
+        && let Ok(out) = serde_json::to_vec(value)
+    {
+        prepared.body = Bytes::from(out);
+        tracing::debug!("sent the tools in the conversation's first-seen order");
+    }
+}
+
+/// Compare what goes upstream with the conversation's previous request, and
+/// put the observation on `prepared` for the statistics row.
+///
+/// Last in `prepare`, after every rewrite it makes, so the outgoing side is
+/// what the provider is sent. Parsing the outgoing body is the only cost that
+/// is not already paid, and a body forwarded as it arrived skips it.
+fn observe_prefix(
+    state: &ProxyState,
+    family: Option<ApiFamily>,
+    request_headers: &HeaderMap,
+    // The beta header as it goes upstream, when it is not the client's.
+    sent_headers: Option<&HeaderMap>,
+    original: &Bytes,
+    identified: &Identified,
+    prepared: &mut Prepared,
+) {
+    let Some(family) = family else { return };
+    let mark = state.drift.previous_messages(identified.fingerprint);
+    let parsed;
+    let outgoing = if prepared.body == *original {
+        None
+    } else {
+        let value = match prepared.json.as_ref() {
+            Some(value) => Some(value),
+            None => {
+                parsed = serde_json::from_slice::<Value>(&prepared.body).ok();
+                parsed.as_ref()
+            }
+        };
+        let sent_bytes = prepared.body.len() as u64;
+        value.map(|value| {
+            crate::drift::Segments::sized(value, sent_bytes, family, request_headers, mark)
+        })
+    };
+    // The body may be the client's own while the header is not.
+    let outgoing = match sent_headers {
+        Some(sent) => Some(
+            outgoing
+                .as_ref()
+                .unwrap_or(&identified.incoming)
+                .with_beta(sent),
+        ),
+        None => outgoing,
+    };
+    let compared = state.drift.observe(
+        identified.fingerprint,
+        &identified.incoming,
+        outgoing.as_ref().unwrap_or(&identified.incoming),
+        prepared.ticket,
+    );
+    let mut observation = crate::drift::observation(
+        family,
+        &identified.incoming,
+        compared,
+        identified.text_bytes,
+        identified.idle,
+    );
+    observation.reasoning_elided_bytes =
+        u32::try_from(prepared.reasoning_elided_bytes).unwrap_or(u32::MAX);
+    let clamp = |bytes: u64| u32::try_from(bytes).unwrap_or(u32::MAX);
+    observation.tools_compactable_bytes = clamp(prepared.tools_compactable_bytes as u64);
+    observation.stale_read_bytes = clamp(identified.reads.stale);
+    observation.superseded_read_bytes = clamp(identified.reads.superseded);
+    observation.quiet_read_bytes = clamp(identified.reads.matured);
+    observation.tools_compacted_bytes =
+        u32::try_from(prepared.tools_compacted_bytes).unwrap_or(u32::MAX);
+    if let Some((kind, held)) = prepared.recompacted {
+        observation.recompacted = Some(kind.as_str().to_string());
+        observation.ledger_reads = u32::try_from(held).unwrap_or(u32::MAX);
+    }
+    prepared.observation = Some(observation);
+}
+
+/// Whether this request finds its conversation's provider cache gone, and
+/// how that is known, under `proxy.cold_recompact`. See [`crate::recompact`].
+///
+/// `None` with the setting off, under any freeze but `first_seen` — lowering
+/// the freeze for good is what makes a recompaction hold on later turns — and
+/// for every request of a conversation whose cache is, as far as can be told,
+/// alive.
+///
+/// A turn found cold is reserved for this request before it is returned: the
+/// check that no recompaction is under way and the claim on the next one are
+/// made under one lock, so two requests arriving together cannot both decide.
+fn cold_turn(
+    state: &ProxyState,
+    family: Option<ApiFamily>,
+    found: &Identified,
+    ticket: u64,
+) -> Option<(crate::recompact::Cold, crate::recompact::Reservation)> {
+    let kind = cold_kind(state, family, found)?;
+    let reservation = state.recompact.reserve(found.fingerprint, ticket)?;
+    Some((kind, reservation))
+}
+
+/// How this request's conversation is known to be cold, if it is.
+fn cold_kind(
+    state: &ProxyState,
+    family: Option<ApiFamily>,
+    found: &Identified,
+) -> Option<crate::recompact::Cold> {
+    use crate::recompact::Cold;
+    let proxy = &state.core.config_for(family.map(ApiFamily::provider)).proxy;
+    if proxy.cold_recompact == ColdRecompact::Off || proxy.frozen_prefix != FrozenPrefix::FirstSeen
+    {
+        return None;
+    }
+    // A recompaction is being prepared, or the last one has not been answered
+    // yet: whatever the tracker holds describes the prefix before it. See
+    // `Recompact::unsettled`. Asked again, under the lock, by `reserve`.
+    if state.recompact.unsettled(found.fingerprint) {
+        return None;
+    }
+    // The provider's own answer first: evidence, where the rest is inference.
+    if state.prefixes.state(found.fingerprint) == PrefixCache::Cold {
+        return Some(Cold::Observed);
+    }
+    if proxy.cold_recompact != ColdRecompact::Predicted
+        || family != Some(ApiFamily::AnthropicMessages)
+        || !state.recompact.predicting()
+    {
+        return None;
+    }
+    // The lifetime the conversation's last request asked for. Unknown when
+    // this process has not seen one, and then nothing is predicted.
+    let lifetime = match state.drift.previous_one_hour(found.fingerprint)? {
+        true => Duration::from_secs(3_600),
+        false => Duration::from_secs(300),
+    };
+    state
+        .prefixes
+        .predicted_cold(
+            found.fingerprint,
+            found.messages,
+            lifetime + proxy.cold_recompact_margin,
+        )
+        .then_some(Cold::Predicted)
 }
 
 /// Decide what to send, then stamp the conversation's cache identity on it.
@@ -803,8 +1335,20 @@ async fn prepare(
     request_id: &str,
     provider: &str,
 ) -> Prepared {
-    let identified = prefix_identity(state, identity, family, &body, provider);
-    let fingerprint = identified.map(|(key, _)| key);
+    let identified = prefix_identity(state, identity, family, &body, provider, request_headers);
+    let fingerprint = identified.as_ref().map(|found| found.fingerprint);
+    // Refcounted: kept to tell a body forwarded as it arrived from a rewrite.
+    let original = body.clone();
+    // Before anything is decided, so tickets order requests by what each
+    // could have known of the others.
+    let ticket = state.recompact.ticket();
+    // Before `long_ttl` below, which moves the message count this reads.
+    // The reservation lives in this frame until the body it is for is built:
+    // a request abandoned inside `prepare_inner` drops it with the future.
+    let (cold, reservation) = identified
+        .as_ref()
+        .and_then(|found| cold_turn(state, family, found, ticket))
+        .unzip();
     // Decided once, here: under `adaptive` the question itself moves the
     // conversation's state. Anthropic only; the TTL is its field.
     let long_ttl = family == Some(ApiFamily::AnthropicMessages)
@@ -816,9 +1360,9 @@ async fn prepare(
         {
             CacheTtl::Default => false,
             CacheTtl::OneHour => true,
-            CacheTtl::Adaptive => {
-                identified.is_some_and(|(key, messages)| state.prefixes.long_ttl(key, messages))
-            }
+            CacheTtl::Adaptive => identified
+                .as_ref()
+                .is_some_and(|found| state.prefixes.long_ttl(found.fingerprint, found.messages)),
         };
     let mut prepared = prepare_inner(
         state,
@@ -832,12 +1376,26 @@ async fn prepare(
         provider,
         fingerprint,
         long_ttl,
+        cold,
     )
     .await;
+    // Whatever the settings: `predicted_cold` reads it when the setting is
+    // on, and the observation records the same comparison when it is off, so
+    // that a prediction is scored on the requests it would have been made on.
+    if let Some(found) = identified.as_ref() {
+        state
+            .prefixes
+            .note_messages(found.fingerprint, found.messages);
+    }
     if prepared.prefix.is_none() {
         prepared.prefix = fingerprint;
     }
-    prepared.messages = identified.map(|(_, messages)| messages);
+    prepared.ticket = ticket;
+    // Kept only for a recompaction that is waiting to be committed. Any other
+    // outcome — the engine declined, timed out, or the body did not shrink —
+    // releases the conversation here.
+    prepared.reservation = reservation.filter(|_| prepared.pending_recompaction.is_some());
+    prepared.messages = identified.as_ref().map(|found| found.messages);
     // After every way `prepare_inner` can decline, for the reason the identity
     // is stamped here: under the default marker floor Claude Code freezes its
     // whole conversation, so nearly every request is a passthrough, and a TTL
@@ -845,6 +1403,53 @@ async fn prepare(
     if long_ttl {
         extend_cache_ttl(&mut prepared);
         prepared.one_hour = true;
+    }
+    if family == Some(ApiFamily::OpenAiChat) {
+        elide_reasoning(state, identity, mode, request_id, &mut prepared).await;
+    }
+    // `proxy.sticky_beta`: decided here, so the observation below describes
+    // the header that is sent.
+    let mut sent_headers = None;
+    if family == Some(ApiFamily::AnthropicMessages)
+        && state
+            .core
+            .config_for(family.map(ApiFamily::provider))
+            .proxy
+            .sticky_beta
+        && let Some(found) = identified.as_ref()
+    {
+        let mut betas = HeaderMap::new();
+        for value in request_headers.get_all("anthropic-beta") {
+            betas.append("anthropic-beta", value.clone());
+        }
+        if state.stabilizer.keep_betas(found.fingerprint, &mut betas) {
+            prepared.betas = betas.get("anthropic-beta").cloned();
+            sent_headers = Some(betas);
+        }
+    }
+    if let Some(identified) = identified.as_ref() {
+        prepared.opening = Some(identified.opening);
+        // Asked of every conversation, on or off: the answer is fixed by the
+        // first request, and has to be on record before the setting changes.
+        compact_tool_schemas(state, identified, &mut prepared);
+        if state
+            .core
+            .config_for(family.map(ApiFamily::provider))
+            .proxy
+            .tools_order
+            == ToolsOrder::Pinned
+        {
+            pin_tool_order(state, identified, &mut prepared);
+        }
+        observe_prefix(
+            state,
+            family,
+            request_headers,
+            sent_headers.as_ref(),
+            &original,
+            identified,
+            &mut prepared,
+        );
     }
     prepared
 }
@@ -886,6 +1491,8 @@ async fn prepare_inner(
     // Whether this request will ask for one-hour cache entries, decided before
     // compression so a promotion is priced at the write it will cost.
     long_ttl: bool,
+    // This request finds the provider's cache gone; see `cold_turn`.
+    cold: Option<crate::recompact::Cold>,
 ) -> Prepared {
     // This provider's settings: `proxy.providers` applied over the defaults.
     let config = state.core.config_for(family.map(ApiFamily::provider));
@@ -966,9 +1573,17 @@ async fn prepare_inner(
             // Opus rates, re-writing a 20,000-token suffix to remove a
             // 2,000-token read needs ~125 further turns to break even, against
             // sessions that run 20 to 70.
+            //
+            // `cold_recompact` is what lets the two be had together: the
+            // replacement is then decided only on a turn whose cache is
+            // already lost and replayed on every other, so `first_seen` no
+            // longer has to withhold it.
             enable_stale_read: (!proxy.stale_read
-                || proxy.frozen_prefix == FrozenPrefix::FirstSeen)
-                .then_some(false),
+                || (proxy.frozen_prefix == FrozenPrefix::FirstSeen
+                    // A request with no conversation has no ledger to replay
+                    // from, and would decide on every run.
+                    && (proxy.cold_recompact == ColdRecompact::Off || conversation.is_none())))
+            .then_some(false),
             ..Default::default()
         }),
     );
@@ -978,8 +1593,16 @@ async fn prepare_inner(
     // pinned, goes out whole, and is compressed the turn after — the very
     // rewrite this exists to prevent. Read without recording, because the
     // floor is set by the first request that gets past the gate.
+    //
+    // A turn that finds the cache gone thaws everything: nothing is cached to
+    // keep, and what it sends is what every later turn will send. The floor
+    // itself is lowered only once that body is on its way (below), so a turn
+    // that falls open here leaves the conversation exactly as it was.
+    let recompacting = cold.filter(|_| conversation.is_some());
     if proxy.frozen_prefix == FrozenPrefix::FirstSeen
-        && let Some(held) = conversation.and_then(|key| state.prefixes.held_floor(key))
+        && let Some(held) = recompacting
+            .map(|_| 0)
+            .or_else(|| conversation.and_then(|key| state.prefixes.held_floor(key)))
         && held < walk.frozen_message_count
     {
         thaw_the_uncached_tail(&mut walk, held);
@@ -1040,6 +1663,7 @@ async fn prepare_inner(
     // `PrefixTracker::floor`.
     let frozen = match proxy.frozen_prefix {
         FrozenPrefix::Marker => walk.frozen_message_count,
+        FrozenPrefix::FirstSeen if recompacting.is_some() => 0,
         FrozenPrefix::FirstSeen => fingerprint
             .map(|key| state.prefixes.floor(key, walk.frozen_message_count))
             // Nothing frozen means no prefix to have an opinion about, and the
@@ -1118,7 +1742,27 @@ async fn prepare_inner(
 
     let messages = std::mem::take(&mut walk.messages);
 
-    let compressed = compress_with_deadline(
+    // With `cold_recompact` on the read lifecycle replays this conversation's
+    // ledger on every turn, and decides only on the one being recompacted.
+    let ledger = (proxy.cold_recompact != ColdRecompact::Off
+        && proxy.frozen_prefix == FrozenPrefix::FirstSeen)
+        .then_some(conversation)
+        .flatten()
+        .map(|key| {
+            // Staleness is always decided on a recompacted turn; what else
+            // is, is the operator's.
+            let decide = recompacting.map(|_| ReadPolicy {
+                superseded: proxy.superseded_reads,
+                matured: proxy.matured_reads.then_some(Maturity {
+                    quiesce_turns: proxy.matured_quiesce_turns,
+                    max_hold_turns: proxy.matured_max_hold_turns,
+                    min_bytes: proxy.matured_min_bytes,
+                }),
+            });
+            (state.recompact.reads(key), decide)
+        });
+
+    let compressed = compress_with_ledger(
         state,
         identity,
         messages,
@@ -1150,9 +1794,10 @@ async fn prepare_inner(
         ),
         conversation,
         proxy.compress_timeout,
+        ledger,
     )
     .await;
-    let Some((messages, saved)) = compressed else {
+    let Some((messages, saved, read_decisions)) = compressed else {
         return passthrough_with_stable_tools(proxy, options.mode, family, body, stream, model);
     };
     walk.messages = messages;
@@ -1223,6 +1868,16 @@ async fn prepare_inner(
                 injected_tool = injected,
                 "compressed"
             );
+            // Not committed here. This body still has to be re-encoded the
+            // way it arrived, and if that fails the client's original goes
+            // out instead; `run` lowers the freeze and extends the ledger
+            // once it knows which.
+            let recompacted = recompacting
+                .zip(fingerprint)
+                .map(|(kind, key)| (kind, state.recompact.would_hold(key, &read_decisions)));
+            let pending_recompaction = recompacting
+                .zip(fingerprint)
+                .map(|(_, key)| (key, read_decisions));
             Prepared {
                 body: out,
                 json: Some(value),
@@ -1234,6 +1889,16 @@ async fn prepare_inner(
                 prefix: fingerprint,
                 messages: None,
                 one_hour: false,
+                observation: None,
+                opening: None,
+                recompacted,
+                betas: None,
+                pending_recompaction,
+                reservation: None,
+                ticket: 0,
+                tools_compacted_bytes: 0,
+                tools_compactable_bytes: 0,
+                reasoning_elided_bytes: 0,
             }
         }
         Err(error) => {
@@ -1319,6 +1984,53 @@ pub(crate) async fn compress_with_deadline(
     identity: &Identity,
     messages: Vec<Message>,
     frozen_message_count: usize,
+    prefix_cache: PrefixCache,
+    options: &kompressor_engine::EngineOptions,
+    request_id: &str,
+    family: ApiFamily,
+    model: Option<&str>,
+    provider: &str,
+    keep_inline: Vec<RefId>,
+    fetches: Vec<(RefId, u32)>,
+    cache_hit_per_mille: u32,
+    outside_tokens: u32,
+    cache_pricing: Option<kompressor_engine::messages::CachePricing>,
+    conversation: Option<u64>,
+    timeout: Duration,
+) -> Option<(Vec<Message>, u32)> {
+    compress_with_ledger(
+        state,
+        identity,
+        messages,
+        frozen_message_count,
+        prefix_cache,
+        options,
+        request_id,
+        family,
+        model,
+        provider,
+        keep_inline,
+        fetches,
+        cache_hit_per_mille,
+        outside_tokens,
+        cache_pricing,
+        conversation,
+        timeout,
+        None,
+    )
+    .await
+    .map(|(messages, saved, _)| (messages, saved))
+}
+
+/// [`compress_with_deadline`], with the conversation's read ledger: what has
+/// been decided about its file reads, and what this run may decide. Also
+/// returns the decisions the run acted on. See [`crate::recompact`].
+#[allow(clippy::too_many_arguments)]
+async fn compress_with_ledger(
+    state: &ProxyState,
+    identity: &Identity,
+    messages: Vec<Message>,
+    frozen_message_count: usize,
     // Whether the provider is still serving that prefix from cache. Decided by
     // the caller from what the provider reported last time; see `prefixcache`.
     prefix_cache: PrefixCache,
@@ -1343,7 +2055,11 @@ pub(crate) async fn compress_with_deadline(
     // with no conversation of its own, which then keeps nothing pinned.
     conversation: Option<u64>,
     timeout: Duration,
-) -> Option<(Vec<Message>, u32)> {
+    ledger: Option<(
+        std::collections::BTreeMap<u64, ReadDecision>,
+        Option<ReadPolicy>,
+    )>,
+) -> Option<(Vec<Message>, u32, Vec<(u64, ReadDecision)>)> {
     let core = state.core.clone();
     let prefixes = state.prefixes.clone();
     let identity = identity.clone();
@@ -1412,6 +2128,12 @@ pub(crate) async fn compress_with_deadline(
             cache_hit_per_mille,
             outside_tokens,
             cache_pricing,
+            ledger.as_ref().map(
+                |(decided, decide)| kompressor_engine::messages::ReadLedger {
+                    decided,
+                    decide: *decide,
+                },
+            ),
         );
         let retained = core.retain(&identity, computed, &request_id, &options);
         Some((
@@ -1454,7 +2176,7 @@ pub(crate) async fn compress_with_deadline(
                 .stats
                 .tokens_in
                 .saturating_sub(outcome.stats.tokens_out);
-            Some((messages, saved))
+            Some((messages, saved, outcome.stats.read_decisions))
         }
         // Queued past the deadline: the closure declined to start. A deadline
         // that ran out is a timeout wherever it ran out, so it is counted with
@@ -2297,6 +3019,13 @@ pub(crate) struct Recorder {
     pub(crate) keep_warm: Option<KeepWarmPlan>,
     /// How the model stopped, where the path that relayed it could tell.
     pub(crate) stop_reason: Option<String>,
+    /// For the two things a response settles about a recompaction.
+    recompact: Arc<crate::recompact::Recompact>,
+    /// This request's place among all requests, by arrival.
+    ticket: u64,
+    /// This request was recompacted on a *predicted* lapse, so the provider's
+    /// answer can be held against the prediction.
+    predicted_cold: bool,
 }
 
 impl Recorder {
@@ -2315,6 +3044,7 @@ impl Recorder {
         waited: Arc<AtomicU64>,
     ) -> Recorder {
         let event = ProxyRequestEvent {
+            prefix: prepared.observation.clone(),
             context: None,
             timing: None,
             time_ms: SystemTime::now()
@@ -2362,6 +3092,11 @@ impl Recorder {
             prefix: prepared.prefix,
             keep_warm: None,
             stop_reason: None,
+            recompact: state.recompact.clone(),
+            ticket: prepared.ticket,
+            predicted_cold: prepared
+                .recompacted
+                .is_some_and(|(kind, _)| kind == crate::recompact::Cold::Predicted),
         }
     }
 
@@ -2440,6 +3175,44 @@ impl Recorder {
                 .and_then(Value::as_u64)
                 .map(|tokens| tokens as u32);
         }
+        // The provider has answered with usage: the tracker is about to hold
+        // what it says of the prefix as it now stands, so a recompaction this
+        // conversation was waiting on is settled — by this request if it was
+        // sent no earlier than the recompaction. One that was in flight when
+        // the recompaction went out is answering for the prefix before it.
+        let predates = self
+            .prefix
+            .is_some_and(|prefix| self.recompact.predates(prefix, self.ticket));
+        if let (Some(prefix), Some(_)) = (self.prefix, usage) {
+            self.recompact.settled(prefix, self.ticket);
+        }
+        // A lapse was predicted and the whole conversation rewritten on it.
+        // Was the cache alive after all? Having rewritten the conversation,
+        // there is only one sign left: the provider can still read whatever
+        // precedes the first rewritten message, so a read that reaches past
+        // the instructions and tools into the messages says their entry was
+        // there. A read of the opening alone says nothing — other
+        // conversations keep that cached — and a turn with retrieve rounds
+        // sums a later round's read of what an earlier one wrote. A cache
+        // that was alive up to a first message that was itself rewritten
+        // cannot be told from one that had lapsed, which is why the margin
+        // has to be measured before this is relied on, not after.
+        // The classifier is `PrefixObservation::prediction_was_wrong`, which
+        // the prefix report counts by too.
+        if std::mem::take(&mut self.predicted_cold)
+            && self
+                .event
+                .prefix
+                .as_ref()
+                .is_some_and(|seen| seen.prediction_was_wrong(self.event.cache_read_tokens, rounds))
+        {
+            tracing::warn!(
+                request_id = %self.event.request_id,
+                cache_read = self.event.cache_read_tokens,
+                "a predicted cache lapse was served from cache"
+            );
+            self.recompact.wrong_prediction();
+        }
         // Filed only when this request actually froze a prefix. `None` for
         // cache reads means the response carried no usage at all, which is not
         // evidence either way and is stored as such.
@@ -2462,9 +3235,13 @@ impl Recorder {
             } else {
                 self.event.prompt_tokens
             };
-            self.prefixes
-                .record(prefix, self.event.cache_read_tokens, prompt, rounds);
-            if anthropic && written > 0 {
+            // What the provider read for a request sent before the
+            // conversation was recompacted is not evidence about the prefix
+            // it holds now: filed as no evidence, or a late "read nothing,
+            // wrote nothing" would have the next turn recompacted again.
+            let cache_read = self.event.cache_read_tokens.filter(|_| !predates);
+            self.prefixes.record(prefix, cache_read, prompt, rounds);
+            if anthropic && written > 0 && !predates {
                 self.prefixes.record_rewritten(prefix);
             }
             if anthropic
@@ -2765,8 +3542,9 @@ mod tests {
                 Some(ApiFamily::OpenAiChat),
                 &body(model),
                 provider,
+                &HeaderMap::new(),
             )
-            .map(|(key, _)| key)
+            .map(|found| found.fingerprint)
         };
 
         let tenant_a = make_identity("tenant-a");

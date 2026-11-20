@@ -406,6 +406,13 @@ const V14: &str = r#"
 ALTER TABLE retrieval_events ADD COLUMN range_status TEXT;
 "#;
 
+// v15: what the proxy observed about the request's cacheable prefix
+// (`context::PrefixObservation`): segment drift, composition, volatile values
+// and idle time. NULL on rows from before, which reports read as "unknown".
+const V15: &str = r#"
+ALTER TABLE proxy_requests ADD COLUMN prefix_json TEXT;
+"#;
+
 pub const MIGRATIONS: &[(u32, &str)] = &[
     (1, V1),
     (2, V2),
@@ -421,6 +428,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (12, V12),
     (13, V13),
     (14, V14),
+    (15, V15),
 ];
 
 /// The version a freshly migrated database reports in `PRAGMA user_version`.

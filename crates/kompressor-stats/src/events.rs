@@ -295,6 +295,10 @@ pub struct ProxyRequestEvent {
     pub context: Option<crate::context::RunContext>,
     #[serde(default)]
     pub timing: Option<crate::context::ProxyTiming>,
+    /// What the proxy saw of the request's cacheable prefix; `None` where it
+    /// could not look (an unparsed body, a relayed frame, a keep-warm ping).
+    #[serde(default)]
+    pub prefix: Option<crate::context::PrefixObservation>,
     /// Request start in milliseconds since the Unix epoch.
     pub time_ms: i64,
     /// Tenant the request was billed to.

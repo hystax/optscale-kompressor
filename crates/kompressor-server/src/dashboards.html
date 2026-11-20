@@ -143,6 +143,8 @@ const VIEWS = [
   { id: "models", title: "Models", api: "stats/models" },
   { id: "activity", title: "Activity", api: "stats/activity" },
   { id: "cohorts", title: "Conversation cohorts", api: "stats/cohorts" },
+  { id: "prefix", title: "Prefix drift", api: "stats/prefix" },
+  { id: "advisor", title: "Opt-in advisor", api: "stats/advisor" },
 ];
 const view = VIEWS.find(v => v.id === SETTINGS.view) || VIEWS[0];
 const $ = id => document.getElementById(id);
@@ -599,6 +601,167 @@ RENDER.traffic = d => {
       ["Last", r => time(r.last_ms), { text: true }],
     ], d.errors, { empty: "No error text in this window." }),
       note("Digits are folded to # so one message with different ids or sizes counts once.")),
+  ];
+};
+
+const SEGMENT_TEXT = { beta: "Beta headers", tool_set: "Tools added or removed", tool_order: "Tool order", tool_defs: "Tool definitions", system: "System prompt", history: "Earlier messages" };
+RENDER.prefix = d => {
+  if (!d.available) {
+    return [note("This database was last written by a build that did not record prefix observations. They start with the first request a current build proxies.")];
+  }
+  const l = d.losses;
+  const explained = l.client.events + l.proxy.events;
+  const share = (a, b) => b ? a / b : null;
+  const lossRows = [
+    ["A segment the client changed", l.client], ["A segment only the proxy changed", l.proxy],
+    ["Compared, and nothing hashed had moved", l.none_seen], ["Nothing to compare with (first request seen, or a branch)", l.not_compared],
+    ["No observation on the row (ping, relayed frame, older row)", l.unobserved],
+  ].map(([label, b]) => ({ label, ...b }));
+  const asked = d.cold.filter(c => c.asked), assumed = d.cold.filter(c => !c.asked);
+  const coldTable = rows => table([
+    ["API family", r => r.api_family, { text: true }],
+    ["Lifetime", r => r.lifetime_s + " s"],
+    ["Margin", r => "+" + r.margin_s + " s"],
+    ["Scored", r => n(r.scored)],
+    ["Predicted cold", r => n(r.predicted)],
+    ["Expired", r => n(r.confirmed)],
+    ["Read it back", r => r.wrong ? el("span", { class: "bad" }, n(r.wrong)) : "0"],
+    ["Partly lost", r => n(r.partial || 0)],
+    ["Lost to a change", r => n(r.drift || 0)],
+    ["Lost, uncompared", r => n(r.unknown || 0)],
+    ["Missed", r => n(r.missed)],
+    ["Precision", r => r.predicted ? pct(r.precision, 2) : "–"],
+    ["Recall", r => r.confirmed + r.missed ? pct(r.recall) : "–"],
+  ], rows, { empty: "No request of a warm conversation reported usage in this window." });
+  return [
+    tiles([
+      ["Observed requests", n(d.observed), "of " + n(d.requests) + " client requests" + (d.truncated ? ", newest only" : "")],
+      ["Compared with the turn before", n(d.compared), pct(share(d.stable, d.compared)) + " with nothing moved"],
+      ["Prefix-change losses", n(l.total.events), tok(l.total.lost_tokens) + " tokens not read back", l.total.events ? "warn" : "good"],
+      ["Put down to the client", n(l.client.events), tok(l.client.lost_tokens) + " tokens"],
+      ["Put down to the proxy", n(l.proxy.events), tok(l.proxy.lost_tokens) + " tokens", l.proxy.events ? "bad" : "good"],
+      ["Explained", pct(share(explained, l.total.events)), n(l.none_seen.events) + " compared with nothing seen to move"],
+    ]),
+    section("What moved, and what it cost", table([
+      ["Segment", r => SEGMENT_TEXT[r.segment] || r.segment, { text: true }],
+      ["Client changed it", r => n(r.client_turns)],
+      ["Put back", r => n(r.repaired_turns)],
+      ["Losses", r => n(r.client_losses)],
+      ["Tokens lost", r => tok(r.client_lost_tokens)],
+      ["Cost", r => tok(r.client_cost)],
+      ["Proxy changed it", r => r.proxy_turns ? el("span", { class: "bad" }, n(r.proxy_turns)) : "0"],
+      ["Losses", r => n(r.proxy_losses)],
+      ["Tokens lost", r => tok(r.proxy_lost_tokens)],
+      ["Cost", r => tok(r.proxy_cost)],
+    ], d.drift),
+      note("Segments are listed in the order a provider renders them. A loss is put down to the earliest one that changed, because everything after the first changed byte is lost whatever else changed with it. Put back counts client changes the proxy undid before they went upstream (a pinned tool order, a kept beta token); those are never blamed for a loss. " +
+        "Cache markers, deferred tools and the string-or-single-block spelling of a message are left out of the comparison, as the provider leaves them out. Cost is in input-equivalent tokens.")),
+    section("Every prefix-change loss, by what explains it", table([
+      ["Explanation", r => r.label, { text: true }],
+      ["Losses", r => n(r.events)],
+      ["Tokens lost", r => tok(r.lost_tokens)],
+      ["Cost", r => tok(r.cost)],
+    ], lossRows)),
+    section("What a request is made of", table([
+      ["Model", r => r.model || "(none)", { text: true }],
+      ["API family", r => r.api_family, { text: true }],
+      ["Requests", r => n(r.requests)],
+      ["Request size", r => bytes(Math.round(r.body_bytes / r.requests))],
+      ["Tools", r => pct(r.tools_share)],
+      ["System", r => pct(r.system_share)],
+      ["Reasoning", r => pct(r.reasoning_share)],
+      ["Reasoning elided", r => r.reasoning_elided_bytes ? pct(share(r.reasoning_elided_bytes, r.body_bytes)) : "–"],
+      ["Opaque conversation", r => pct(r.opaque_share)],
+      ["Tools per request", r => r.tools_per_request.toFixed(1)],
+      ["Deferring", r => pct(share(r.deferring_requests, r.requests))],
+      ["With tool search", r => pct(share(r.tool_search_requests || 0, r.requests))],
+      ["12+ tools, none deferred, no tool search", r => pct(share(r.undeferred_requests, r.requests))],
+      ["Schema bytes compacted", r => r.tools_compacted_requests ? bytes(Math.round(r.tools_compacted_bytes / r.tools_compacted_requests)) + " a request" : "–"],
+    ], d.composition, { empty: "No observed request in this window." }),
+      note("Shares are of request bytes, not tokens: they rank the segments and do not price them. Opaque conversation is the part of the messages the engine holds no text for — tool-call arguments, images, structured results, signatures.")),
+    section("Volatile values in instructions and tool descriptions", tiles([
+      ["Conversations", n(d.volatile.conversations), n(d.volatile.requests) + " requests reported any"],
+      ["Date-times", n(d.volatile.with_timestamps), "requests"],
+      ["Dates", n(d.volatile.with_dates), "requests"],
+      ["UUIDs", n(d.volatile.with_uuids), "requests"],
+      ["JWT-shaped tokens", n(d.volatile.with_jwts), "requests"],
+    ]),
+      note("Counted on a conversation's first request and whenever its instructions or tools changed. A value that changes by itself sits ahead of the whole conversation in the cached prefix.")),
+    section("Predicting a lapse on the request that finds it", coldTable(asked),
+      note("Each request the proxy could have predicted on — one that continues a conversation the provider had served from cache — scored as it arrived: predicted cold when it had been idle longer than the lifetime its previous request asked for, plus the margin. " +
+        "Whether it lost its prefix is the Cache page's reckoning: the request failed to read back what the one before it left. Only a loss of the whole conversation with nothing seen to change is an expiry, and only that confirms a prediction. " +
+        "A read of the instructions and tools alone does not count as alive, since other conversations keep those cached. Partly lost, lost on a request whose prefix changed, and lost with nothing to compare are losses the idle time does not explain; they count against precision. " +
+        "Read it back is the expensive mistake — acting on that prediction would have rewritten a live prefix. Turns that were themselves recompacted are left out: what they read says what was rewritten.")),
+    section("Recompactions on a lapsed cache", tiles([
+      ["On the provider's answer", n(d.recompactions.observed), "it had read nothing and written nothing"],
+      ["On idle time", n(d.recompactions.predicted), "predicted on the turn that found it"],
+      ["Predicted wrongly", n(d.recompactions.predicted_wrong), "the read reached past the instructions and tools: a live prefix rewritten. Counted as the proxy's own breaker counts it, turns with retrieve rounds left out", d.recompactions.predicted_wrong ? "bad" : "good"],
+      ["Conversations", n(d.recompactions.conversations), n(d.recompactions.stale_reads) + " reads rewritten (stale, superseded or matured)"],
+    ]),
+      note("With proxy.cold_recompact on, the turn that finds the provider's cache gone rewrites the whole conversation, and what it decided is replayed on every later turn. Three wrong predictions in an hour end prediction until restart.")),
+    assumed.length ? section("The same, where the request names no lifetime", coldTable(assumed),
+      note("The lifetime is assumed, not asked for, so every row is one guess about the provider's retention.")) : null,
+  ].filter(Boolean);
+};
+
+const VERDICT_TEXT = { turn_on: "Turn on", not_worth_it: "Not worth it", not_enough_data: "Not enough data" };
+const VERDICT_CLASS = { turn_on: "good", not_worth_it: "", not_enough_data: "muted" };
+function factValue(f) {
+  if (f.unit === "share") return pct(f.value);
+  if (f.unit === "bytes") return bytes(Math.round(f.value));
+  if (f.unit === "tokens") return tok(f.value);
+  if (f.unit === "seconds") return f.value + " s";
+  return n(f.value);
+}
+RENDER.advisor = d => {
+  if (!d.available) {
+    return [note("This database was last written by a build that did not record prefix observations. Advice starts with the first requests a current build proxies.")];
+  }
+  const counted = v => d.advice.filter(a => a.verdict === v && a.built);
+  const acted = counted("turn_on").filter(a => a.enabled);
+  const pending = counted("turn_on").filter(a => !a.enabled);
+  const onAgainst = d.advice.filter(a => a.enabled && a.verdict === "not_worth_it");
+  const state = a => !a.built ? el("span", { class: "muted" }, "not built")
+    : a.enabled == null ? "–" : a.enabled ? el("strong", {}, "on") : "off";
+  const verdict = a => {
+    const text = !a.built && a.verdict === "turn_on" ? "Worth building" : VERDICT_TEXT[a.verdict] || a.verdict;
+    return el("strong", { class: VERDICT_CLASS[a.verdict] || "" }, text);
+  };
+  const e = d.effects;
+  return [
+    tiles([
+      ["Worth turning on", n(pending.length), pending.length ? pending.map(a => a.setting).join(", ") : "nothing the evidence asks for is off", pending.length ? "warn" : "good"],
+      ["On, and earning it", n(acted.length), acted.map(a => a.setting).join(", ") || "–"],
+      ["On, without evidence for it", n(onAgainst.length), onAgainst.map(a => a.setting).join(", ") || "–", onAgainst.length ? "warn" : ""],
+      ["Not enough data", n(counted("not_enough_data").length), n(d.compared) + " requests compared with the one before"],
+      ["Input cost in the window", tok(d.input_cost), "input-equivalent tokens; the base of every cost share" + (d.truncated ? "; newest rows only" : "")],
+    ]),
+    section("What the evidence says about each setting", table([
+      ["Setting", a => el("div", { style: "white-space:normal;min-width:20rem;max-width:34rem" },
+        el("strong", {}, a.title), " ", el("code", {}, a.setting),
+        el("div", { class: "muted", style: "margin-top:.2rem" }, a.why)), { text: true }],
+      ["Now", state, { text: true }],
+      ["Verdict", verdict, { text: true }],
+      ["Set", a => a.value ? el("code", {}, a.value) : "–", { text: true }],
+      ["Measured", a => a.measure == null ? "–" : pct(a.measure, a.measure < 0.1 ? 2 : 1)],
+      ["Bar", a => pct(a.threshold, a.threshold < 0.1 ? 1 : 0)],
+      ["Saving, at most", a => a.saving == null ? "–" : tok(a.saving)],
+    ], d.advice),
+      note("Measured and Bar are shares of what each row names: " + d.advice.map(a => a.setting + " — " + a.basis).join("; ") + ". " +
+        "A verdict is that bar applied to an estimate. The bars are the ones the design proposed, not measured optima; savings are ceilings, in input-equivalent tokens over the window, and assume the setting recovers the whole loss put down to it.")),
+    ...d.advice.map(a => section(a.title + " — the figures", table([
+      ["", f => f.label, { text: true }],
+      ["", factValue],
+    ], a.facts, { empty: "No figures in this window." }))),
+    section("What the settings that are on have done", tiles([
+      ["Tool orders put back", n(e.tool_orders_put_back), "client reorders that never reached the provider"],
+      ["Beta tokens put back", n(e.betas_put_back), "requests"],
+      ["Recompactions", n(e.recompactions_observed + e.recompactions_predicted), n(e.recompactions_predicted) + " predicted, " + n(e.predictions_wrong) + " of them wrong", e.predictions_wrong ? "bad" : ""],
+      ["Reads rewritten", n(e.reads_rewritten), "stale, superseded or matured, across the ledgers"],
+      ["Tool schema compacted", bytes(e.tools_compacted_bytes), "over the window"],
+      ["Reasoning elided", bytes(e.reasoning_elided_bytes), "over the window"],
+    ]),
+      note("All zero while everything is off. Compare with the ceilings above once a setting has been on for a while. The detail behind every row is on the Prefix drift page.")),
   ];
 };
 

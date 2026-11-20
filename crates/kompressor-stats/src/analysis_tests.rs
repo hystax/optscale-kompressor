@@ -39,6 +39,7 @@ fn proxy(time: i64, tenant: &str, id: &str, ping: bool) -> Event {
     timing.record_attempt(10.0, 15.0, Some(200), false);
     timing.record_retrieval(2.0);
     Event::ProxyRequest(ProxyRequestEvent {
+        prefix: None,
         context: Some(ctx()),
         timing: Some(timing),
         time_ms: time,

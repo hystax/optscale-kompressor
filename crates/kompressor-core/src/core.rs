@@ -239,6 +239,7 @@ impl AppCore {
             // This surface sees messages alone; nothing outside them to price.
             outside_tokens: 0,
             cache_pricing: None,
+            read_ledger: None,
         };
         let computed = Computed {
             stats: compress_messages(messages, options, &req, &mut refs),
@@ -284,6 +285,10 @@ impl AppCore {
         // The provider's prices for a promotion, when the caller knows them.
         // `None` prices it from `cache_hit_per_mille`.
         cache_pricing: Option<kompressor_engine::messages::CachePricing>,
+        // What this conversation has decided about its file reads, and
+        // whether this run may decide more. `None` is the read lifecycle as it
+        // always was; see `kompressor_engine::messages::ReadLedger`.
+        read_ledger: Option<kompressor_engine::messages::ReadLedger<'_>>,
     ) -> Computed {
         let started = Instant::now();
         let time_ms = now_ms();
@@ -298,6 +303,7 @@ impl AppCore {
             cache_hit_per_mille,
             outside_tokens,
             cache_pricing,
+            read_ledger,
         };
         let stats = compress_messages(messages, options, &req, &mut refs);
         Computed {
@@ -1068,6 +1074,7 @@ mod tests {
             &[],
             1000,
             0,
+            None,
             None,
         );
         assert!(

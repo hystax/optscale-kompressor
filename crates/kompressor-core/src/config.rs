@@ -450,6 +450,75 @@ pub enum PromptCacheRetention {
     Extended,
 }
 
+/// What to do on the turn that finds a conversation's provider cache gone.
+///
+/// A request that arrives after the cache has lapsed is written to the cache
+/// again at the write price whatever it contains, so it is the one turn on
+/// which rewriting the whole conversation costs nothing: the frozen prefix can
+/// be compressed, and a file read a later edit invalidated can be replaced.
+/// What that turn decides is recorded per conversation and replayed on every
+/// later turn, so the bytes it wrote are the bytes sent from then on.
+///
+/// Acts only under `frozen_prefix = "first_seen"`, which is what lets a
+/// conversation's freeze be lowered for good; under `marker` it does nothing.
+/// With it on, `first_seen` no longer withholds the stale-read replacement:
+/// that is decided on these turns and on no other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ColdRecompact {
+    /// A lapse is handled as it always was. The shipped default.
+    #[default]
+    Off,
+    /// Recompact when the provider's last answer showed the cache gone: it
+    /// read nothing and wrote nothing.
+    Observed,
+    /// Also when this request arrives longer after the conversation's last one
+    /// than the cache lifetime that one asked for, plus
+    /// `cold_recompact_margin`. Anthropic Messages only, where the lifetime is
+    /// in the request. Three wrong predictions in an hour turn it off for the
+    /// life of the process.
+    Predicted,
+}
+
+/// The order tool definitions go upstream in.
+///
+/// A provider renders the tool list ahead of the conversation, so a client
+/// that sends the same tools in another order on a later turn loses the cache
+/// from the first tool that moved. `pinned` keeps each conversation's tools in
+/// the order its first request sent them; a tool that appears later is added
+/// after those. Nothing is sorted, so the first request of every conversation
+/// goes out exactly as written, and a client that never reorders is never
+/// touched. Built on the evidence of the `/prefix` dashboard's `tool_order`
+/// row, and off until that row says it is worth having.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolsOrder {
+    /// The client's order, as written. The shipped default.
+    #[default]
+    Client,
+    /// The order the conversation's first request used.
+    Pinned,
+}
+
+/// Whether OpenAI requests that name no `prompt_cache_key` are given one.
+///
+/// OpenAI routes a request to a cache by a hash of its opening, and combines
+/// that with `prompt_cache_key` when the request carries one. A client that
+/// sends none leaves two conversations with the same instructions and tools
+/// competing for one route. `conversation` names the conversation by its
+/// opening messages, so every turn of it is routed alike. Codex sets its own
+/// key and is never overridden.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheKey {
+    /// The client's request goes out as written. The shipped default.
+    #[default]
+    Client,
+    /// Add a key derived from the conversation's opening where the client
+    /// named none.
+    Conversation,
+}
+
 /// Where the frozen prefix ends: what the client says, or what the provider
 /// has actually cached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -542,6 +611,95 @@ pub struct ProxyConfig {
     /// that names the field is answered by sending the request again without
     /// it, and the field is not added again for that upstream and model.
     pub prompt_cache_retention: PromptCacheRetention,
+    /// Whether an OpenAI request that names no `prompt_cache_key` is given
+    /// one. See [`PromptCacheKey`]. Applied where
+    /// [`Self::prompt_cache_retention`] is: Chat Completions and Responses
+    /// through the `openai` upstream or one on `api.openai.com`, never on the
+    /// ChatGPT-subscription route, and a 400 naming the field is answered by
+    /// sending again without it.
+    pub prompt_cache_key: PromptCacheKey,
+    /// The order tool definitions go upstream in. See [`ToolsOrder`].
+    pub tools_order: ToolsOrder,
+    /// The models whose earlier-turn reasoning is left out of the requests
+    /// that re-send it. **Empty by default**, and nothing is elided for a model
+    /// that is not named.
+    ///
+    /// Some providers return reasoning as plain text (`reasoning_content`, or
+    /// a `<think>` span) and bill it as input when the client sends it back.
+    /// For a model named here, an OpenAI Chat Completions request has the
+    /// reasoning of every assistant message *before its last user message*
+    /// replaced by a marker, with a handle in `recoverable` mode. A tool round
+    /// in progress keeps all of its reasoning, which is when a provider needs
+    /// it back.
+    ///
+    /// The step from one user turn to the next rewrites the turn just
+    /// finished, and so costs its cached prefix once per user turn. Name a
+    /// model only where its provider documents that earlier reasoning need not
+    /// be sent, and where conversations run long enough to repay that. An
+    /// entry ending in `*` matches by prefix.
+    pub reasoning_elide_models: Vec<String>,
+    /// Take out of each tool's schema what says nothing to a model: the
+    /// dialect, comments, an unreferenced identifier, a `title` that only
+    /// restates a property's name. **Off by default.**
+    ///
+    /// Nothing a model might act on is touched — descriptions, examples,
+    /// defaults, enums and constraints stay as written. Decided per
+    /// conversation when it is first seen, and never for one that was already
+    /// under way: the tool block sits at the front of the cached prefix and
+    /// must not change part-way. On Claude Code's own tools it removes about
+    /// 2% of the tool block; it exists for clients whose tools come from a
+    /// schema generator.
+    pub tools_compact: bool,
+    /// Keep sending the `anthropic-beta` tokens a conversation has already
+    /// sent. **Off by default.**
+    ///
+    /// A beta token can change how the provider renders the prompt, so a
+    /// client that sends one on some turns of a conversation and not on others
+    /// can lose its cache each time the set changes. With this on, a request
+    /// carrying fewer tokens than the conversation has sent before goes out
+    /// with all of them, in the order they were first seen. A token the client
+    /// never sent in this conversation is never added. Anthropic Messages
+    /// only.
+    pub sticky_beta: bool,
+    /// What to do on the turn that finds the provider's cache gone. See
+    /// [`ColdRecompact`].
+    pub cold_recompact: ColdRecompact,
+    /// How far past the cache lifetime a request must arrive before
+    /// `cold_recompact = "predicted"` calls the cache gone. A wrong call
+    /// rewrites a live prefix, so the margin is what keeps a slow clock or a
+    /// late response from being read as a lapse.
+    #[serde(with = "humantime_serde")]
+    pub cold_recompact_margin: Duration,
+    /// On a recompacted turn, also replace a file read that a later read of
+    /// the same file contains. **Off by default**, and does nothing unless
+    /// [`Self::cold_recompact`] is on.
+    ///
+    /// An agent that reads lines 40 to 60 of a file and later reads the whole
+    /// of it carries the twenty lines twice for the rest of the session. The
+    /// earlier read is replaced by a marker that says the file was read again
+    /// and keeps a handle to what it held. Decided only where the walker can
+    /// tell which lines each read asked for — Anthropic Messages, for a read
+    /// tool taking a path, an `offset` and a `limit`.
+    pub superseded_reads: bool,
+    /// On a recompacted turn, also compress as source a file read nothing has
+    /// touched for [`Self::matured_quiesce_turns`] assistant turns. **Off by
+    /// default**, and does nothing unless [`Self::cold_recompact`] is on.
+    ///
+    /// Function bodies go behind handles and signatures stay, whatever
+    /// `enable_code_aware` says for the provider: a profile turns that off
+    /// because a body elided from a file in use is fetched straight back, and
+    /// a file the conversation has finished with is where it is not.
+    pub matured_reads: bool,
+    /// Assistant turns a file must go unread and unwritten before a read of it
+    /// is matured. Five is where Headroom's audit of its own traffic put it
+    /// (the next touch of a file came a median of four turns later); it has
+    /// not been measured here.
+    pub matured_quiesce_turns: u32,
+    /// Assistant turns after which a read is matured however recently its file
+    /// was touched again.
+    pub matured_max_hold_turns: u32,
+    /// The smallest read worth maturing, in bytes.
+    pub matured_min_bytes: usize,
     /// Keep an Anthropic conversation's cached prefix alive while the client
     /// is busy running a tool. **On by default**; only Anthropic Messages
     /// traffic is ever pinged, so this is in effect Anthropic's default, and
@@ -867,6 +1025,20 @@ pub struct ProviderOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_retention: Option<PromptCacheRetention>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<PromptCacheKey>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools_order: Option<ToolsOrder>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sticky_beta: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools_compact: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cold_recompact: Option<ColdRecompact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_reads: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matured_reads: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_keep_warm: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_read: Option<bool>,
@@ -897,6 +1069,13 @@ impl ProviderOverrides {
             frozen_prefix,
             cache_ttl,
             prompt_cache_retention,
+            prompt_cache_key,
+            tools_order,
+            sticky_beta,
+            tools_compact,
+            cold_recompact,
+            superseded_reads,
+            matured_reads,
             cache_keep_warm,
             stale_read
         );
@@ -962,6 +1141,18 @@ impl Default for ProxyConfig {
             frozen_prefix: FrozenPrefix::Marker,
             cache_ttl: CacheTtl::Default,
             prompt_cache_retention: PromptCacheRetention::Default,
+            prompt_cache_key: PromptCacheKey::Client,
+            tools_order: ToolsOrder::Client,
+            sticky_beta: false,
+            reasoning_elide_models: Vec::new(),
+            tools_compact: false,
+            cold_recompact: ColdRecompact::Off,
+            cold_recompact_margin: Duration::from_secs(60),
+            superseded_reads: false,
+            matured_reads: false,
+            matured_quiesce_turns: 5,
+            matured_max_hold_turns: 25,
+            matured_min_bytes: 2_048,
             cache_keep_warm: true,
             cache_keep_warm_interval: Duration::from_secs(270),
             cache_keep_warm_max_pings: 11,
@@ -1505,6 +1696,78 @@ impl Config {
                     _ => self.proxy.prompt_cache_retention,
                 };
             }
+            "prompt_cache_key" => {
+                self.proxy.prompt_cache_key = match value.to_ascii_lowercase().as_str() {
+                    "client" => PromptCacheKey::Client,
+                    "conversation" => PromptCacheKey::Conversation,
+                    _ => self.proxy.prompt_cache_key,
+                };
+            }
+            "tools_order" => {
+                self.proxy.tools_order = match value.to_ascii_lowercase().as_str() {
+                    "client" => ToolsOrder::Client,
+                    "pinned" => ToolsOrder::Pinned,
+                    _ => self.proxy.tools_order,
+                };
+            }
+            "cold_recompact" => {
+                // A typo leaves the setting alone: it changes what is rewritten.
+                self.proxy.cold_recompact = match value.to_ascii_lowercase().as_str() {
+                    "off" => ColdRecompact::Off,
+                    "observed" => ColdRecompact::Observed,
+                    "predicted" => ColdRecompact::Predicted,
+                    _ => self.proxy.cold_recompact,
+                };
+            }
+            "cold_recompact_margin" => match parse_duration(value) {
+                Some(margin) => self.proxy.cold_recompact_margin = margin,
+                None => tracing::warn!(
+                    value,
+                    "KOMPRESSOR__PROXY__COLD_RECOMPACT_MARGIN is not a duration; ignored"
+                ),
+            },
+            "superseded_reads" => {
+                self.proxy.superseded_reads = parse_bool_setting(
+                    "proxy.superseded_reads",
+                    value,
+                    self.proxy.superseded_reads,
+                );
+            }
+            "matured_reads" => {
+                self.proxy.matured_reads =
+                    parse_bool_setting("proxy.matured_reads", value, self.proxy.matured_reads);
+            }
+            "matured_quiesce_turns" => {
+                if let Ok(turns) = value.parse() {
+                    self.proxy.matured_quiesce_turns = turns;
+                }
+            }
+            "matured_max_hold_turns" => {
+                if let Ok(turns) = value.parse() {
+                    self.proxy.matured_max_hold_turns = turns;
+                }
+            }
+            "matured_min_bytes" => {
+                if let Ok(bytes) = value.parse() {
+                    self.proxy.matured_min_bytes = bytes;
+                }
+            }
+            "reasoning_elide_models" => {
+                self.proxy.reasoning_elide_models = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                    .map(str::to_string)
+                    .collect();
+            }
+            "tools_compact" => {
+                self.proxy.tools_compact =
+                    parse_bool_setting("proxy.tools_compact", value, self.proxy.tools_compact);
+            }
+            "sticky_beta" => {
+                self.proxy.sticky_beta =
+                    parse_bool_setting("proxy.sticky_beta", value, self.proxy.sticky_beta);
+            }
             "cache_keep_warm" => {
                 self.proxy.cache_keep_warm =
                     parse_bool_setting("proxy.cache_keep_warm", value, self.proxy.cache_keep_warm);
@@ -1590,6 +1853,14 @@ impl Config {
             return Err(ConfigError::Invalid(format!(
                 "environment override refused: {refused}"
             )));
+        }
+        // Zero would mature a read on the turn after it was made, which is
+        // the case the setting exists to wait out.
+        if self.proxy.matured_quiesce_turns == 0 || self.proxy.matured_max_hold_turns == 0 {
+            return Err(ConfigError::Invalid(
+                "proxy.matured_quiesce_turns and proxy.matured_max_hold_turns must be at least 1"
+                    .into(),
+            ));
         }
         if self.refs.purge_interval.is_zero() {
             return Err(ConfigError::Invalid(
@@ -2097,6 +2368,163 @@ mod tests {
         assert_eq!(config.proxy.frozen_prefix, FrozenPrefix::FirstSeen);
         config.apply_env(&[("KOMPRESSOR__PROXY__FROZEN_PREFIX".into(), "marker".into())]);
         assert_eq!(config.proxy.frozen_prefix, FrozenPrefix::Marker);
+    }
+
+    #[test]
+    fn the_prefix_stabilisers_are_off_by_default_and_set_per_provider_or_from_the_environment() {
+        let mut config = Config::default();
+        assert_eq!(config.proxy.prompt_cache_key, PromptCacheKey::Client);
+        assert_eq!(config.proxy.tools_order, ToolsOrder::Client);
+        assert!(!config.proxy.sticky_beta);
+        assert!(config.proxy.reasoning_elide_models.is_empty());
+        config.apply_env(&[(
+            "KOMPRESSOR__PROXY__REASONING_ELIDE_MODELS".into(),
+            "deepseek-reasoner, kimi-k2*,".into(),
+        )]);
+        assert_eq!(
+            config.proxy.reasoning_elide_models,
+            ["deepseek-reasoner", "kimi-k2*"]
+        );
+        let listed: Config =
+            toml::from_str("[proxy]\nreasoning_elide_models = [\"glm-4.6\"]\n").unwrap();
+        assert_eq!(listed.proxy.reasoning_elide_models, ["glm-4.6"]);
+        assert!(!config.proxy.tools_compact);
+        config.apply_env(&[("KOMPRESSOR__PROXY__TOOLS_COMPACT".into(), "true".into())]);
+        assert!(config.proxy.tools_compact);
+        let per_provider: Config =
+            toml::from_str("[proxy.providers.openai]\ntools_compact = true\n").unwrap();
+        assert!(!per_provider.proxy.tools_compact);
+        assert!(
+            per_provider
+                .for_provider("openai")
+                .expect("openai has overrides")
+                .proxy
+                .tools_compact
+        );
+
+        config.apply_env(&[
+            (
+                "KOMPRESSOR__PROXY__PROMPT_CACHE_KEY".into(),
+                "conversation".into(),
+            ),
+            ("KOMPRESSOR__PROXY__TOOLS_ORDER".into(), "pinned".into()),
+            ("KOMPRESSOR__PROXY__STICKY_BETA".into(), "true".into()),
+        ]);
+        assert_eq!(config.proxy.prompt_cache_key, PromptCacheKey::Conversation);
+        assert_eq!(config.proxy.tools_order, ToolsOrder::Pinned);
+        assert!(config.proxy.sticky_beta);
+        // A typo leaves the setting alone.
+        config.apply_env(&[("KOMPRESSOR__PROXY__TOOLS_ORDER".into(), "sorted".into())]);
+        assert_eq!(config.proxy.tools_order, ToolsOrder::Pinned);
+
+        let parsed: Config = toml::from_str(
+            "[proxy.providers.anthropic]\nsticky_beta = true\ntools_order = \"pinned\"\n\
+             [proxy.providers.openai]\nprompt_cache_key = \"conversation\"\n",
+        )
+        .unwrap();
+        assert!(
+            !parsed.proxy.sticky_beta,
+            "the deployment default is untouched"
+        );
+        let anthropic = parsed
+            .for_provider("anthropic")
+            .expect("anthropic has overrides");
+        assert!(anthropic.proxy.sticky_beta);
+        assert_eq!(anthropic.proxy.tools_order, ToolsOrder::Pinned);
+        assert_eq!(anthropic.proxy.prompt_cache_key, PromptCacheKey::Client);
+        let openai = parsed.for_provider("openai").expect("openai has overrides");
+        assert_eq!(openai.proxy.prompt_cache_key, PromptCacheKey::Conversation);
+        assert!(!openai.proxy.sticky_beta);
+
+        assert!(toml::from_str::<Config>("[proxy]\ntools_order = \"sorted\"\n").is_err());
+    }
+
+    #[test]
+    fn the_read_decisions_are_off_by_default_and_set_per_provider_or_from_the_environment() {
+        let mut config = Config::default();
+        assert!(!config.proxy.superseded_reads && !config.proxy.matured_reads);
+        assert_eq!(
+            (
+                config.proxy.matured_quiesce_turns,
+                config.proxy.matured_max_hold_turns,
+                config.proxy.matured_min_bytes
+            ),
+            (5, 25, 2_048)
+        );
+        config.apply_env(&[
+            ("KOMPRESSOR__PROXY__SUPERSEDED_READS".into(), "true".into()),
+            ("KOMPRESSOR__PROXY__MATURED_READS".into(), "true".into()),
+            (
+                "KOMPRESSOR__PROXY__MATURED_QUIESCE_TURNS".into(),
+                "8".into(),
+            ),
+            (
+                "KOMPRESSOR__PROXY__MATURED_MAX_HOLD_TURNS".into(),
+                "40".into(),
+            ),
+            ("KOMPRESSOR__PROXY__MATURED_MIN_BYTES".into(), "4096".into()),
+        ]);
+        assert!(config.proxy.superseded_reads && config.proxy.matured_reads);
+        assert_eq!(
+            (
+                config.proxy.matured_quiesce_turns,
+                config.proxy.matured_max_hold_turns,
+                config.proxy.matured_min_bytes
+            ),
+            (8, 40, 4_096)
+        );
+        // Not a number: left alone.
+        config.apply_env(&[(
+            "KOMPRESSOR__PROXY__MATURED_QUIESCE_TURNS".into(),
+            "soon".into(),
+        )]);
+        assert_eq!(config.proxy.matured_quiesce_turns, 8);
+        assert!(config.validate().is_ok());
+        // Zero turns is no wait at all, and is refused.
+        config.proxy.matured_quiesce_turns = 0;
+        assert!(config.validate().is_err());
+
+        let parsed: Config = toml::from_str(
+            "[proxy.providers.anthropic]\nsuperseded_reads = true\nmatured_reads = true\n",
+        )
+        .unwrap();
+        assert!(!parsed.proxy.matured_reads);
+        let anthropic = parsed
+            .for_provider("anthropic")
+            .expect("anthropic has overrides");
+        assert!(anthropic.proxy.superseded_reads && anthropic.proxy.matured_reads);
+    }
+
+    #[test]
+    fn cold_recompaction_is_off_by_default_and_set_per_provider_or_from_the_environment() {
+        let mut config = Config::default();
+        assert_eq!(config.proxy.cold_recompact, ColdRecompact::Off);
+        assert_eq!(config.proxy.cold_recompact_margin, Duration::from_secs(60));
+
+        config.apply_env(&[
+            (
+                "KOMPRESSOR__PROXY__COLD_RECOMPACT".into(),
+                "predicted".into(),
+            ),
+            (
+                "KOMPRESSOR__PROXY__COLD_RECOMPACT_MARGIN".into(),
+                "2m".into(),
+            ),
+        ]);
+        assert_eq!(config.proxy.cold_recompact, ColdRecompact::Predicted);
+        assert_eq!(config.proxy.cold_recompact_margin, Duration::from_secs(120));
+        // A typo leaves the setting alone.
+        config.apply_env(&[("KOMPRESSOR__PROXY__COLD_RECOMPACT".into(), "always".into())]);
+        assert_eq!(config.proxy.cold_recompact, ColdRecompact::Predicted);
+
+        let parsed: Config =
+            toml::from_str("[proxy.providers.anthropic]\ncold_recompact = \"observed\"\n").unwrap();
+        assert_eq!(parsed.proxy.cold_recompact, ColdRecompact::Off);
+        let anthropic = parsed
+            .for_provider("anthropic")
+            .expect("anthropic has overrides");
+        assert_eq!(anthropic.proxy.cold_recompact, ColdRecompact::Observed);
+        assert!(toml::from_str::<Config>("[proxy]\ncold_recompact = \"always\"\n").is_err());
     }
 
     #[test]

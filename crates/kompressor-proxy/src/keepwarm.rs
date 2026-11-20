@@ -678,6 +678,7 @@ async fn send(state: &ProxyState, ping: &Ping, sent: u32) -> Outcome {
     let waited = began.elapsed();
 
     let mut event = ProxyRequestEvent {
+        prefix: None,
         context: None,
         timing: None,
         time_ms,
@@ -750,6 +751,14 @@ async fn send(state: &ProxyState, ping: &Ping, sent: u32) -> Outcome {
         }
     };
     event.total_ms = Some(began.elapsed().as_secs_f64() * 1000.0);
+    // Beside the bodies, when those are being captured: a replay of the file
+    // has no other way to know which pauses this run bridged.
+    crate::bodycapture::record_ping(
+        &crate::bodycapture::path(),
+        &event.request_id,
+        event.status,
+        event.cache_read_tokens,
+    );
     state.core.stats().send(Event::ProxyRequest(event));
     outcome
 }

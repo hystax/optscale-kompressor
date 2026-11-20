@@ -43,7 +43,7 @@ use kompressor_engine::messages::{MessageMeta, Protection, TextSlot};
 use kompressor_engine::tokens::estimate_tokens;
 
 use crate::path::SlotPath;
-use crate::tools::{ToolCall, ToolCallIndex, file_path_in_arguments};
+use crate::tools::{ToolCall, ToolCallIndex, file_path_in_arguments, read_range_in_arguments};
 use crate::{ApiFamily, Walk, WalkBuilder, Walker, model_of};
 
 /// Block keys that make a block's exact bytes load-bearing.
@@ -82,7 +82,7 @@ impl Walker for AnthropicMessagesWalker {
                 }
                 Value::Array(blocks) => {
                     let marker = cache_marker_position(blocks);
-                    let (tool_name, file_path) = tool_metadata(blocks, &uses);
+                    let (tool_name, file_path, read_range) = tool_metadata(blocks, &uses);
                     let slots = text_slots(blocks, here.key("content"), marker)?;
                     // Whether anything in this message outlives the breakpoint.
                     // When nothing does, the message is wholly inside the cached
@@ -122,6 +122,7 @@ impl Walker for AnthropicMessagesWalker {
                             block.get("type").and_then(Value::as_str) == Some("tool_result")
                                 && block.get("is_error").and_then(Value::as_bool) == Some(true)
                         }),
+                        read_range,
                     };
                     builder.push_blocks(role, meta, slots);
                 }
@@ -361,6 +362,7 @@ fn index_tool_uses(messages: &[Value]) -> ToolCallIndex {
                 ToolCall {
                     name: name.to_string(),
                     file_path,
+                    read_range: block.get("input").and_then(read_range_in_arguments),
                 },
             );
         }
@@ -376,7 +378,10 @@ fn index_tool_uses(messages: &[Value]) -> ToolCallIndex {
 /// call this request does not contain, both fields stay `None`. A wrong tool
 /// name produces a wrong staleness verdict, which replaces content the model
 /// still needs.
-fn tool_metadata(blocks: &[Value], uses: &ToolCallIndex) -> (Option<String>, Option<String>) {
+fn tool_metadata(
+    blocks: &[Value],
+    uses: &ToolCallIndex,
+) -> (Option<String>, Option<String>, Option<(u64, u64)>) {
     let mut agreed: Option<&ToolCall> = None;
     let mut seen = 0usize;
 
@@ -392,13 +397,17 @@ fn tool_metadata(blocks: &[Value], uses: &ToolCallIndex) -> (Option<String>, Opt
         match (resolved, agreed) {
             (Some(call), None) if seen == 1 => agreed = Some(call),
             (Some(call), Some(previous)) if call == previous => {}
-            _ => return (None, None),
+            _ => return (None, None, None),
         }
     }
 
     match agreed {
-        Some(call) => (Some(call.name.clone()), call.file_path.clone()),
-        None => (None, None),
+        Some(call) => (
+            Some(call.name.clone()),
+            call.file_path.clone(),
+            call.read_range,
+        ),
+        None => (None, None, None),
     }
 }
 

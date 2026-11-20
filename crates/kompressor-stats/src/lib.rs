@@ -49,6 +49,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod advisor;
 pub mod analysis;
 pub mod breakdown;
 pub mod cache;
@@ -61,6 +62,7 @@ pub mod health;
 pub mod history;
 pub mod insights;
 pub mod live;
+pub mod prefix;
 pub mod quality;
 pub mod reader;
 pub mod retention;
@@ -222,6 +224,7 @@ mod tests {
 
     fn proxy(time_ms: i64, tenant: &str, request_id: &str) -> Event {
         Event::ProxyRequest(ProxyRequestEvent {
+            prefix: None,
             context: None,
             timing: None,
             time_ms,
@@ -247,6 +250,43 @@ mod tests {
             error: None,
             keep_warm: false,
         })
+    }
+
+    /// The observation rides on the event and comes back out of the report:
+    /// the writer's column list and the reader's are the same list.
+    #[test]
+    fn a_prefix_observation_survives_the_writer() {
+        use crate::context::{DRIFT_TOOL_SET, PrefixObservation};
+        let harness = Harness::new();
+        let seen = PrefixObservation {
+            compared: true,
+            drift_out: DRIFT_TOOL_SET,
+            tools_bytes: 2_585,
+            body_bytes: 5_170,
+            ..PrefixObservation::default()
+        };
+        let observed = match proxy_in(T0, "acme", "req-1", "c0ffee") {
+            Event::ProxyRequest(mut event) => {
+                event.prefix = Some(seen);
+                Event::ProxyRequest(event)
+            }
+            other => other,
+        };
+        harness.write(vec![observed, proxy(T0 + 1, "acme", "req-2")]);
+
+        let report = harness.reader().prefix("acme", 0, i64::MAX).unwrap();
+        assert!(report.available);
+        assert_eq!(
+            (report.requests, report.observed, report.compared),
+            (2, 1, 1)
+        );
+        let tool_set = report
+            .drift
+            .iter()
+            .find(|s| s.segment == "tool_set")
+            .unwrap();
+        assert_eq!(tool_set.proxy_turns, 1);
+        assert_eq!(report.composition[0].tools_share, 0.5);
     }
 
     #[test]
@@ -1173,6 +1213,7 @@ mod tests {
                      ALTER TABLE optimization_events DROP COLUMN analysis_archived;
                      ALTER TABLE retrieval_events DROP COLUMN analysis_archived;
                      ALTER TABLE retrieval_events DROP COLUMN range_status;
+                     ALTER TABLE proxy_requests DROP COLUMN prefix_json;
                      PRAGMA user_version = 5;",
                 )
                 .unwrap();
@@ -1226,6 +1267,7 @@ mod tests {
                      ALTER TABLE optimization_events DROP COLUMN analysis_archived;
                      ALTER TABLE retrieval_events DROP COLUMN analysis_archived;
                      ALTER TABLE retrieval_events DROP COLUMN range_status;
+                     ALTER TABLE proxy_requests DROP COLUMN prefix_json;
                      PRAGMA user_version = 5;",
                 )
                 .unwrap();
@@ -1968,4 +2010,8 @@ mod tests {
 }
 
 #[cfg(test)]
+mod advisor_tests;
+#[cfg(test)]
 mod analysis_tests;
+#[cfg(test)]
+mod prefix_tests;

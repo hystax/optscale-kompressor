@@ -781,6 +781,7 @@ mod tests {
 
     fn proxied(time_ms: i64, tenant: &str, id: &str, status: Option<u16>, total_ms: f64) -> Event {
         Event::ProxyRequest(ProxyRequestEvent {
+            prefix: None,
             context: None,
             timing: None,
             time_ms,
