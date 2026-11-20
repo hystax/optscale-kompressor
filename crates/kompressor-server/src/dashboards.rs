@@ -453,6 +453,7 @@ async fn respond(
                 inflight_limit: server.inflight_limit,
                 inflight_free: server.inflight_free,
                 store_max_bytes: state.core.config().refs.max_bytes,
+                backup: backup_watch(state.core.config()),
             };
             let report: HealthReport = state
                 .with_stats(move |r| {
@@ -654,6 +655,22 @@ async fn census(state: &ServerState, tenant: &str) -> Result<(Vec<StoredRef>, bo
         })
         .collect();
     Ok((refs, census.truncated))
+}
+
+/// What the Health page's "last backup" check is told: how old one may be,
+/// and the newest archive the schedule has written. What the statistics have
+/// on record is added where the report is read.
+fn backup_watch(config: &kompressor_core::Config) -> kompressor_stats::health::BackupWatch {
+    let maintenance = &config.maintenance;
+    kompressor_stats::health::BackupWatch {
+        max_age_ms: maintenance
+            .max_age()
+            .map(|age| i64::try_from(age.as_millis()).unwrap_or(i64::MAX)),
+        last_ok_ms: (!maintenance.backup_dir.as_os_str().is_empty())
+            .then(|| kompressor_core::backup::list_archives(&maintenance.backup_dir))
+            .and_then(|archives| archives.first().map(|archive| archive.created_at_ms)),
+        last_failed_ms: None,
+    }
 }
 
 fn now_ms() -> i64 {

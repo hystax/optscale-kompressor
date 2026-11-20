@@ -389,6 +389,26 @@ pub struct StoreSample {
     pub live_bytes: i64,
 }
 
+/// One backup: taken, or tried.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupEvent {
+    /// When it finished, milliseconds since the Unix epoch.
+    pub time_ms: i64,
+    /// What asked for it: `schedule`, `http` (the Maintenance page or its
+    /// route) or `cli` (`kompressor backup`).
+    pub origin: String,
+    /// Where the archive went: a path, or `download` for one sent to the
+    /// caller and kept nowhere.
+    pub destination: String,
+    /// Size of the archive. Zero for one that failed.
+    pub bytes: i64,
+    /// Databases in it.
+    pub databases: i64,
+    pub ok: bool,
+    /// Why not, when it failed.
+    pub error: Option<String>,
+}
+
 /// Anything the writer can be handed.
 ///
 /// Externally tagged — `{"optimization": {…}}` — rather than carrying a `type`
@@ -422,6 +442,8 @@ pub enum Event {
         /// The request whose rewrite was dropped.
         request_id: String,
     },
+    /// A backup was taken, or failed.
+    Backup(BackupEvent),
     /// The fragment store was measured.
     StoreSample {
         /// When the sample was taken, milliseconds since the Unix epoch.
@@ -444,6 +466,7 @@ impl Event {
             // an amendment to a row that already carries its own timestamp
             Event::Discarded { .. } => 0,
             Event::StoreSample { time_ms, .. } => *time_ms,
+            Event::Backup(e) => e.time_ms,
         }
     }
 
@@ -455,7 +478,7 @@ impl Event {
             Event::ProtectedRefs(e) => Some(&e.tenant),
             Event::ProxyRequest(e) => Some(&e.tenant),
             Event::Discarded { tenant, .. } => Some(tenant),
-            Event::StoreSample { .. } => None,
+            Event::StoreSample { .. } | Event::Backup(_) => None,
         }
     }
 }

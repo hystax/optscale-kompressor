@@ -45,6 +45,9 @@ pub enum Unit {
     Ms,
     Count,
     Bytes,
+    /// A length of time in milliseconds that reads in hours and days: how
+    /// long ago something happened.
+    Age,
 }
 
 /// One judged figure.
@@ -79,6 +82,31 @@ pub struct Runtime {
     pub inflight_free: usize,
     /// The ref store's byte cap; 0 when it has none.
     pub store_max_bytes: u64,
+    pub backup: BackupWatch,
+}
+
+/// What is known about backups, for the "last backup" check.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BackupWatch {
+    /// How old the last backup may be before it is a warning. `None` when the
+    /// deployment has not said — no schedule, no `backup_max_age` — and then
+    /// the age is reported and not judged.
+    pub max_age_ms: Option<i64>,
+    /// When the last one that worked was taken, as far as the caller knows:
+    /// the newest archive in the backup directory. [`StatsReader::health`]
+    /// adds what the statistics have on record.
+    pub last_ok_ms: Option<i64>,
+    /// When the last one failed, if that was after the last that worked.
+    pub last_failed_ms: Option<i64>,
+}
+
+fn age_words(ms: i64) -> String {
+    let minutes = ms.max(0) / 60_000;
+    match minutes {
+        0..=89 => format!("{minutes} min"),
+        90..=2_879 => format!("{} h", minutes / 60),
+        _ => format!("{} d", minutes / 1_440),
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -422,6 +450,50 @@ pub fn assess(
         (Some(1.0), None),
         "engine",
     );
+    // The last backup. Judged only where the deployment has said how old is
+    // too old; a failed attempt since is a warning whatever the age.
+    let watch = &runtime.backup;
+    let age = watch.last_ok_ms.map(|at| (runtime.now_ms - at).max(0));
+    let failed_since = match (watch.last_failed_ms, watch.last_ok_ms) {
+        (Some(failed), Some(ok)) => failed > ok,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    let stale = match (age, watch.max_age_ms) {
+        (Some(age), Some(limit)) if age > limit.saturating_mul(3) => Level::Bad,
+        (Some(age), Some(limit)) if age > limit => Level::Warn,
+        (Some(_), Some(_)) => Level::Ok,
+        (None, Some(_)) => Level::Warn,
+        (_, None) => Level::Info,
+    };
+    let mut detail = match (age, watch.max_age_ms) {
+        (None, Some(_)) => "none on record; one is expected".to_string(),
+        (None, None) => "none on record".to_string(),
+        (Some(age), _) => format!("taken {} ago", age_words(age)),
+    };
+    if failed_since {
+        detail.push_str("; the last attempt failed");
+    } else if watch.max_age_ms.is_none() {
+        detail.push_str("; not judged: no schedule and no maintenance.backup_max_age");
+    }
+    b.push(
+        "last_backup",
+        "data",
+        "Last backup",
+        if failed_since {
+            stale.max(Level::Warn)
+        } else {
+            stale
+        },
+        age.map(|age| age as f64),
+        Unit::Age,
+        detail,
+        (
+            watch.max_age_ms.map(|limit| limit as f64),
+            watch.max_age_ms.map(|limit| limit.saturating_mul(3) as f64),
+        ),
+        "maintenance",
+    );
     let truncated = upstream.truncated || engine.truncated || store.store_truncated;
     b.push(
         "coverage",
@@ -489,6 +561,12 @@ impl StatsReader {
         let engine = self.engine(tenant, from_ms, to_ms)?;
         let now_s = (runtime.now_ms / 1_000).max(0) as u64;
         let store = self.store_health(tenant, from_ms, to_ms, store, store_truncated, now_s)?;
+        // What the statistics have on record, beside what the caller knew.
+        let mut runtime = runtime.clone();
+        let (worked, failed) = self.last_backup()?;
+        runtime.backup.last_ok_ms = runtime.backup.last_ok_ms.max(worked);
+        runtime.backup.last_failed_ms = failed;
+        let runtime = &runtime;
         let mut report = assess(&upstream, &engine, &store, runtime);
         report.last_request_ms = self.conn.query_row(
             "SELECT MAX(time_ms) FROM proxy_requests WHERE tenant = ?1 AND keep_warm = 0",

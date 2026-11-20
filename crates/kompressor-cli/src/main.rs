@@ -14,11 +14,13 @@
 mod backup;
 mod bench;
 mod compress;
+mod db;
 mod error;
 mod explain;
 mod highlight;
 mod input;
 mod report;
+mod restore;
 mod retrieve;
 mod serve;
 mod stats;
@@ -61,6 +63,11 @@ enum Command {
     CheckConfig(CheckConfigCmd),
     /// Write every database to one .tar.gz, without stopping the service.
     Backup(BackupCmd),
+    /// Put the databases in a backup back. The service must be stopped.
+    Restore(RestoreCmd),
+    /// Describe, check or checkpoint the databases, without stopping the service.
+    #[command(subcommand)]
+    Db(DbCmd),
     /// Run the HTTP API, the MCP tool server and the reverse proxy.
     Serve(ServeCmd),
     /// Serve the tools to an agent runtime that launches this process itself.
@@ -380,6 +387,47 @@ enum BenchAction {
 }
 
 #[derive(Args)]
+struct RestoreCmd {
+    /// The archive `kompressor backup` or the Maintenance page wrote.
+    archive: PathBuf,
+    /// The configuration naming where the databases are kept.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// Restore one database, `stats.db` or `refs.db`, and leave the other.
+    #[arg(long, value_name = "NAME")]
+    only: Option<String>,
+    /// Do it. Without this the archive is checked and what would happen is
+    /// printed; nothing is changed.
+    #[arg(long)]
+    yes: bool,
+    /// Print the outcome as one JSON object instead of a summary.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Subcommand)]
+enum DbCmd {
+    /// Size, write-ahead log, schema version and reclaimable space of each.
+    Status(DbArgs),
+    /// Run a full integrity check. Exits 1 if a database is damaged.
+    Check(DbArgs),
+    /// Fold the write-ahead log into the database file.
+    Checkpoint(DbArgs),
+}
+
+#[derive(Args)]
+struct DbArgs {
+    /// One database, `stats.db` or `refs.db`. Both when omitted.
+    name: Option<String>,
+    /// The configuration naming the databases.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// Print one JSON array instead of a line per database.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
 struct BackupCmd {
     /// Where to write the archive: a file to create, or a directory to put a
     /// timestamped one in. Defaults to the current directory. An existing
@@ -392,6 +440,11 @@ struct BackupCmd {
     /// Print what was written as one JSON object instead of a summary.
     #[arg(long)]
     json: bool,
+    /// After writing into a directory, keep only this many archives there
+    /// and remove the older ones. Only files named as this command names
+    /// them are ever removed.
+    #[arg(long, value_name = "N")]
+    keep: Option<u32>,
 }
 
 #[derive(Args)]
@@ -524,8 +577,27 @@ fn run(cli: Cli) -> CliResult {
         }),
         Command::Unwrap(args) => wrap::unwrap_agent(wrap::UnwrapArgs { agent: args.agent }),
         Command::CheckConfig(args) => check_config(args.config.as_deref()),
-        Command::Backup(args) => {
-            backup::run(args.config.as_deref(), args.out.as_deref(), args.json)
+        Command::Backup(args) => backup::run(
+            args.config.as_deref(),
+            args.out.as_deref(),
+            args.json,
+            args.keep,
+        ),
+        Command::Restore(args) => restore::run(
+            &args.archive,
+            args.config.as_deref(),
+            args.only.as_deref(),
+            args.yes,
+            args.json,
+        ),
+        Command::Db(DbCmd::Status(args)) => {
+            db::status(args.config.as_deref(), args.name.as_deref(), args.json)
+        }
+        Command::Db(DbCmd::Check(args)) => {
+            db::check(args.config.as_deref(), args.name.as_deref(), args.json)
+        }
+        Command::Db(DbCmd::Checkpoint(args)) => {
+            db::checkpoint(args.config.as_deref(), args.name.as_deref(), args.json)
         }
         Command::Serve(args) => {
             let config =

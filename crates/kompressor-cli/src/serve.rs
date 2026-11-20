@@ -103,6 +103,118 @@ fn maintenance(
     })
 }
 
+/// How long after a scheduled backup fails before it is tried again. A full
+/// disk does not clear in a minute, and a warning a minute buries the log.
+const BACKUP_RETRY: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Take the scheduled backups (`maintenance.backup_dir`, `backup_every`).
+///
+/// `None` when there is no schedule. Only `serve` runs this: an `mcp serve`
+/// started per agent session opens the same databases, and a dozen of them
+/// would each take the same backup.
+///
+/// Whether one is due is read from the directory each time — the newest
+/// archive's age — so a restart neither skips a backup nor takes an extra
+/// one, and a service that was down over the hour takes it on coming back.
+fn scheduled_backups(
+    core: Arc<AppCore>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let (dir, every) = core.config().maintenance.schedule()?;
+    tracing::info!(
+        dir = %dir.display(),
+        every = ?every,
+        keep = core.config().maintenance.backup_keep,
+        "backups are scheduled"
+    );
+    let tick = (every / 4).clamp(
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_secs(60),
+    );
+    let retry = BACKUP_RETRY.min(every);
+    Some(tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(tick);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut failed_at: Option<std::time::Instant> = None;
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => break,
+                _ = ticks.tick() => {
+                    if failed_at.is_some_and(|at| at.elapsed() < retry) {
+                        continue;
+                    }
+                    let for_task = core.clone();
+                    let taken = tokio::task::spawn_blocking(move || {
+                        let core = for_task;
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|since| since.as_millis() as i64)
+                            .unwrap_or(0);
+                        let config = core.config();
+                        let (dir, every) = config.maintenance.schedule()?;
+                        if kompressor_core::backup::next_due_ms(dir, every, now_ms) > now_ms {
+                            return None;
+                        }
+                        // What is still queued belongs in the snapshot.
+                        let _ = core.stats().flush();
+                        Some(kompressor_core::backup::run_scheduled(config, now_ms))
+                    })
+                    .await;
+                    // On record either way, for "when was the last backup".
+                    let record = |destination: String, bytes: u64, databases: usize, error: Option<String>| {
+                        core.stats().send(kompressor_stats::Event::Backup(
+                            kompressor_stats::events::BackupEvent {
+                                time_ms: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|since| since.as_millis() as i64)
+                                    .unwrap_or(0),
+                                origin: "schedule".to_string(),
+                                destination,
+                                bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
+                                databases: databases as i64,
+                                ok: error.is_none(),
+                                error,
+                            },
+                        ));
+                    };
+                    let directory = || {
+                        core.config().maintenance.backup_dir.display().to_string()
+                    };
+                    match taken {
+                        Ok(None) | Ok(Some(Ok(None))) => {}
+                        Ok(Some(Ok(Some(done)))) => {
+                            failed_at = None;
+                            record(
+                                done.archive.display().to_string(),
+                                done.bytes,
+                                done.manifest.databases.len(),
+                                None,
+                            );
+                            tracing::info!(
+                                archive = %done.archive.display(),
+                                bytes = done.bytes,
+                                databases = done.manifest.databases.len(),
+                                removed = done.removed.len(),
+                                "scheduled backup written"
+                            );
+                        }
+                        Ok(Some(Err(error))) => {
+                            failed_at = Some(std::time::Instant::now());
+                            record(directory(), 0, 0, Some(error.to_string()));
+                            tracing::warn!(%error, retry_in = ?retry, "scheduled backup failed");
+                        }
+                        Err(error) => {
+                            failed_at = Some(std::time::Instant::now());
+                            tracing::warn!(%error, "scheduled backup task stopped");
+                        }
+                    }
+                }
+            }
+        }
+    }))
+}
+
 /// Compose the selected surfaces into one router.
 ///
 /// Order matters, and only in one place: the proxy claims everything no other
@@ -392,6 +504,7 @@ pub async fn run(
         });
     }
 
+    let backups = scheduled_backups(core.clone(), shutdown_rx.clone());
     let upkeep = maintenance(core.clone(), shutdown_rx);
     let mut serve_error = None;
     tokio::select! {
@@ -412,6 +525,11 @@ pub async fn run(
     }
 
     let _ = upkeep.await;
+    // A backup under way when the stop came is finished, not cut short: the
+    // task checks for shutdown between backups, never inside one.
+    if let Some(backups) = backups {
+        let _ = backups.await;
+    }
 
     // Statistics are written off the request path, so a process that exits the
     // moment the listener closes loses whatever was still queued. The shutdown
@@ -722,6 +840,62 @@ mod tests {
         config.refs.backend = RefsBackend::Memory;
         config.stats.enabled = false;
         config
+    }
+
+    /// With a schedule, `serve` takes a backup without being asked — at once
+    /// when the directory holds none — keeps taking them, prunes to
+    /// `backup_keep`, and stops with the service. With none, there is no task.
+    #[tokio::test]
+    async fn scheduled_backups_are_taken_pruned_and_stop_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        let (_, idle) = tokio::sync::watch::channel(false);
+        let unscheduled = Arc::new(AppCore::new(
+            config.clone(),
+            kompressor_core::build_ref_store(&config).unwrap(),
+            kompressor_stats::null_sink(),
+        ));
+        assert!(scheduled_backups(unscheduled, idle).is_none());
+
+        config.refs.backend = RefsBackend::Sqlite;
+        config.refs.path = dir.path().join("refs.db");
+        let backups = dir.path().join("backups");
+        config.maintenance.backup_dir = backups.clone();
+        // One a second: archives are named to the second.
+        config.maintenance.backup_every = std::time::Duration::from_secs(1);
+        config.maintenance.backup_keep = 2;
+        let core = Arc::new(AppCore::new(
+            config.clone(),
+            kompressor_core::build_ref_store(&config).unwrap(),
+            kompressor_stats::null_sink(),
+        ));
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let task = scheduled_backups(core, rx).expect("a schedule");
+
+        let listed = || kompressor_core::backup::list_archives(&backups);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut seen = std::collections::BTreeSet::new();
+            while seen.len() < 3 {
+                seen.extend(listed().into_iter().map(|archive| archive.name));
+                // One over while the new archive is written: the old one
+                // goes only once its replacement is there.
+                assert!(listed().len() <= 3, "backup_keep, and the one in hand");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("three backups, the first of them at once");
+        assert!(listed().iter().all(|archive| archive.bytes > 0));
+
+        stop.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("stops with the service")
+            .unwrap();
+        let after = listed().len();
+        assert_eq!(after, 2, "settled at backup_keep");
+        tokio::time::sleep(std::time::Duration::from_millis(1_300)).await;
+        assert_eq!(listed().len(), after, "and takes no more");
     }
 
     #[test]

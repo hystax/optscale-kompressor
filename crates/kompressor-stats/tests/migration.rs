@@ -435,3 +435,73 @@ fn a_database_that_is_already_current_is_left_alone() {
     );
     assert!(conn.is_autocommit(), "no transaction left open");
 }
+
+/// v16 adds the record of backups. A v15 database — what 2.5.0 left behind —
+/// gains the table, keeps every row, and the record can be written and read.
+#[test]
+fn a_v15_database_gains_the_backup_record_and_keeps_its_rows() {
+    use kompressor_stats::events::BackupEvent;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stats.db");
+    database_at(&path, 15);
+    fill_v5(&path);
+    let before = {
+        let conn = Connection::open(&path).unwrap();
+        count(&conn, "SELECT COUNT(*) FROM optimization_events")
+    };
+    let event = |time_ms, ok| BackupEvent {
+        time_ms,
+        origin: "cli".to_string(),
+        destination: "/backups/a.tar.gz".to_string(),
+        bytes: 1_024,
+        databases: 2,
+        ok,
+        error: (!ok).then(|| "disk full".to_string()),
+    };
+    // Not migrated yet: a backup does not upgrade the schema to leave a note.
+    assert!(!kompressor_stats::writer::record_backup(&path, &event(T0, true)).unwrap());
+    assert!(
+        !kompressor_stats::writer::record_backup(&dir.path().join("absent.db"), &event(T0, true))
+            .unwrap()
+    );
+    assert!(
+        !dir.path().join("absent.db").exists(),
+        "and creates nothing"
+    );
+    let reader = kompressor_stats::StatsReader::open(&path).unwrap();
+    assert!(
+        reader.backups(10).unwrap().is_empty(),
+        "an older file has none on record"
+    );
+    assert_eq!(reader.last_backup().unwrap(), (None, None));
+    drop(reader);
+
+    StatsWriter::open(&StatsConfig::at(&path)).expect("v15 upgrades");
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(
+        count(&conn, "SELECT * FROM pragma_user_version") as u32,
+        schema::latest_version()
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM optimization_events"),
+        before
+    );
+    drop(conn);
+
+    for (time_ms, ok) in [(T0, true), (T0 + DAY, true), (T0 + 2 * DAY, false)] {
+        assert!(kompressor_stats::writer::record_backup(&path, &event(time_ms, ok)).unwrap());
+    }
+    let reader = kompressor_stats::StatsReader::open(&path).unwrap();
+    let listed = reader.backups(2).unwrap();
+    assert_eq!(listed.len(), 2, "newest first, and no more than asked");
+    assert_eq!(listed[0], event(T0 + 2 * DAY, false));
+    assert_eq!(listed[1].time_ms, T0 + DAY);
+    assert_eq!(
+        reader.last_backup().unwrap(),
+        (Some(T0 + DAY), Some(T0 + 2 * DAY)),
+        "the last that worked, and the failure since"
+    );
+    // Once one works again, the failure is history.
+    assert!(kompressor_stats::writer::record_backup(&path, &event(T0 + 3 * DAY, true)).unwrap());
+    assert_eq!(reader.last_backup().unwrap(), (Some(T0 + 3 * DAY), None));
+}

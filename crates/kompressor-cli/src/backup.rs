@@ -61,7 +61,7 @@ fn summary(manifest: &Manifest, archive: &Path, archived: u64) -> String {
     lines.join("\n")
 }
 
-pub fn run(config: Option<&Path>, out: Option<&Path>, json: bool) -> CliResult {
+pub fn run(config: Option<&Path>, out: Option<&Path>, json: bool, keep: Option<u32>) -> CliResult {
     let config = Config::load(config).map_err(|e| CliError::Usage(e.to_string()))?;
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -80,15 +80,54 @@ pub fn run(config: Option<&Path>, out: Option<&Path>, json: bool) -> CliResult {
     let manifest = backup::write_archive(&config, &archive)
         .map_err(|error| CliError::Runtime(format!("backup: {error}")))?;
     let archived = std::fs::metadata(&archive).map_or(0, |meta| meta.len());
+    // On record where the service will see it. Best effort: whoever runs
+    // this may not be able to write the statistics database, and a backup
+    // that worked is not failed for want of a note about it.
+    let recorded = config.stats.enabled
+        && kompressor_stats::writer::record_backup(
+            &config.stats.path,
+            &kompressor_stats::events::BackupEvent {
+                time_ms: now_ms,
+                origin: "cli".to_string(),
+                destination: std::path::absolute(&archive)
+                    .unwrap_or_else(|_| archive.clone())
+                    .display()
+                    .to_string(),
+                bytes: i64::try_from(archived).unwrap_or(i64::MAX),
+                databases: manifest.databases.len() as i64,
+                ok: true,
+                error: None,
+            },
+        )
+        .unwrap_or(false);
+    // Only once the new archive is written and checked, and only in a
+    // directory: an archive named outright is nobody's rotation.
+    let removed = match (keep, archive.parent()) {
+        (Some(keep), Some(dir)) if out.is_some_and(Path::is_dir) => {
+            backup::prune_archives(dir, keep)
+        }
+        _ => Vec::new(),
+    };
     if json {
         let report = serde_json::json!({
             "archive": archive.display().to_string(),
             "bytes": archived,
             "manifest": manifest,
+            "removed": removed,
+            "recorded": recorded,
         });
         println!("{report}");
     } else {
         println!("{}", summary(&manifest, &archive, archived));
+        for name in &removed {
+            println!("  removed {name}");
+        }
+        if !recorded {
+            println!(
+                "  not recorded in the statistics database (not writable from here, \
+                 or older than this build): the Health page will not count this one"
+            );
+        }
     }
     Ok(())
 }

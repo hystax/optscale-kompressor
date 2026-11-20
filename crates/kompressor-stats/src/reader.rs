@@ -1138,6 +1138,48 @@ impl StatsReader {
             .optional()?)
     }
 
+    /// The newest `limit` backups on record, newest first. Empty for a
+    /// database from before they were recorded.
+    pub fn backups(&self, limit: usize) -> Result<Vec<crate::events::BackupEvent>, StatsError> {
+        let recorded: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'backups'",
+            [],
+            |row| row.get(0),
+        )?;
+        if recorded == 0 {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.conn.prepare_cached(
+            "SELECT time_ms, origin, destination, bytes, databases, ok, error
+             FROM backups ORDER BY time_ms DESC, id DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit.min(1_000) as i64], |row| {
+            Ok(crate::events::BackupEvent {
+                time_ms: row.get(0)?,
+                origin: row.get(1)?,
+                destination: row.get(2)?,
+                bytes: row.get(3)?,
+                databases: row.get(4)?,
+                ok: row.get(5)?,
+                error: row.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// When the last backup that worked was taken, and — when one has failed
+    /// since — when that was.
+    pub fn last_backup(&self) -> Result<(Option<i64>, Option<i64>), StatsError> {
+        let recent = self.backups(200)?;
+        let worked = recent.iter().find(|backup| backup.ok).map(|b| b.time_ms);
+        let failed = recent
+            .iter()
+            .take_while(|backup| !backup.ok)
+            .map(|backup| backup.time_ms)
+            .next();
+        Ok((worked, failed))
+    }
+
     /// Daily aggregates, inclusive of both `YYYY-MM-DD` bounds.
     ///
     /// These survive [`crate::StatsWriter::prune`], so they are the only thing

@@ -60,6 +60,18 @@ path = "/var/lib/kompressor/refs.db"
 # `kompressor backup --out DIR` on this host needs no setting.
 [maintenance]
 # backup = true
+# The integrity check and checkpoint buttons on the same page:
+# actions = true
+# Have the service take a backup itself, and keep the newest few. The
+# directory must be writable by the service: under systemd, inside the state
+# directory. Copy the archives off this host — a backup on the disk it backs
+# up does not survive that disk.
+# backup_dir = "/var/lib/kompressor/backups"
+# backup_every = "1day"
+# backup_keep = 7
+# The Health page warns when the last backup is older than twice
+# backup_every. To be held to an age whoever takes them:
+# backup_max_age = "7days"
 
 [stats]
 # Optional labels recorded with requests for historical comparisons.

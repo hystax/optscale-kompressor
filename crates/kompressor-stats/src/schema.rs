@@ -413,6 +413,17 @@ const V15: &str = r#"
 ALTER TABLE proxy_requests ADD COLUMN prefix_json TEXT;
 "#;
 
+// v16: every backup taken — by the schedule, from the Maintenance page or by
+// `kompressor backup` — and whether it worked. What "when was the last
+// backup" is answered from. No tenant: an archive is every tenant's.
+const V16: &str = r#"
+CREATE TABLE backups (
+ id INTEGER PRIMARY KEY, time_ms INTEGER NOT NULL, origin TEXT NOT NULL,
+ destination TEXT NOT NULL, bytes INTEGER NOT NULL, databases INTEGER NOT NULL,
+ ok INTEGER NOT NULL, error TEXT);
+CREATE INDEX backups_time ON backups (time_ms);
+"#;
+
 pub const MIGRATIONS: &[(u32, &str)] = &[
     (1, V1),
     (2, V2),
@@ -429,6 +440,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (13, V13),
     (14, V14),
     (15, V15),
+    (16, V16),
 ];
 
 /// The version a freshly migrated database reports in `PRAGMA user_version`.
@@ -531,6 +543,30 @@ pub fn snapshot(source: &Path, destination: &Path) -> Result<u32, StatsError> {
     }
     let version: i64 = copy.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     Ok(u32::try_from(version).unwrap_or(0))
+}
+
+/// The times of the oldest and newest request the database at `path` holds,
+/// in milliseconds, or `None` when it holds none.
+///
+/// Two primary-key lookups — the first and last row — not a scan: rows are
+/// written in the order they happen.
+pub fn time_span(path: &Path) -> Result<Option<(i64, i64)>, StatsError> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+    let end = |order: &str| -> Result<Option<i64>, StatsError> {
+        let mut statement = conn.prepare(&format!(
+            "SELECT time_ms FROM proxy_requests ORDER BY id {order} LIMIT 1"
+        ))?;
+        let mut rows = statement.query([])?;
+        Ok(match rows.next()? {
+            Some(row) => Some(row.get(0)?),
+            None => None,
+        })
+    };
+    Ok(end("ASC")?.zip(end("DESC")?))
 }
 
 /// How long a writer keeps trying to put a new file into WAL mode while

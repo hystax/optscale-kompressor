@@ -403,9 +403,15 @@ function checkValue(c) {
   if (c.unit === "share") return pct(c.value, c.value < 0.1 ? 2 : 1);
   if (c.unit === "ms") return ms(c.value);
   if (c.unit === "bytes") return bytes(c.value);
+  if (c.unit === "age") return age(c.value);
   return n(c.value);
 }
-function checkLimit(c, v) { return c.unit === "share" ? pct(v, 0) : c.unit === "ms" ? ms(v) : n(v); }
+/** A length of time that reads in hours and days. */
+function age(v) {
+  const m = Math.max(0, Math.round(v / 60000));
+  return m < 90 ? m + " min" : m < 2880 ? Math.round(m / 60) + " h" : Math.round(m / 1440) + " d";
+}
+function checkLimit(c, v) { return c.unit === "share" ? pct(v, 0) : c.unit === "ms" ? ms(v) : c.unit === "age" ? age(v) : n(v); }
 function ago(t) {
   if (t == null) return "never";
   const s = Math.max(0, Math.round((Date.now() - t) / 1000));
@@ -413,6 +419,8 @@ function ago(t) {
 }
 /** A dashboard link that keeps the window when the target can show it. */
 function viewLink(id) {
+  // The one check whose page is not a dashboard.
+  if (id === "maintenance") return $("maintenance-link").getAttribute("href");
   const target = VIEWS.find(v => v.id === id);
   if (!target) return "#";
   const u = new URL(withTenant(pagePath(target)), location.origin);

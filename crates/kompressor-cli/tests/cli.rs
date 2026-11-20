@@ -1851,3 +1851,388 @@ fn backup_with_nothing_on_disk_fails_and_writes_nothing() {
         .collect();
     assert!(left.is_empty(), "{left:?}");
 }
+
+/// A configuration over on-disk databases in `dir`, holding one fragment
+/// and a statistics database a service created.
+fn on_disk_deployment(dir: &Path) -> PathBuf {
+    let config = dir.join("disk.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[refs]\nbackend = \"sqlite\"\npath = {refs:?}\n\n[stats]\nenabled = true\npath = {stats:?}\n",
+            refs = dir.join("refs.db").to_str().unwrap(),
+            stats = dir.join("stats.db").to_str().unwrap(),
+        ),
+    )
+    .unwrap();
+    run_in(dir)
+        .args([
+            "serve",
+            "--api",
+            "--listen",
+            "127.0.0.1:0",
+            "--stop-on-stdin",
+            "--config",
+        ])
+        .arg(&config)
+        .write_stdin("stop\n")
+        .assert()
+        .success();
+    let payload = dir.join("log.txt");
+    std::fs::write(&payload, varying_log()).unwrap();
+    run_in(dir)
+        .args(["compress", "--config"])
+        .arg(&config)
+        .arg(&payload)
+        .assert()
+        .success();
+    config
+}
+
+fn run_in(dir: &Path) -> Command {
+    let mut command = Command::cargo_bin("kompressor").unwrap();
+    command
+        .env_remove("KOMPRESSOR_CONFIG")
+        .env("XDG_CONFIG_HOME", no_config_dir())
+        .current_dir(dir);
+    command
+}
+
+fn json_of(assert: &assert_cmd::assert::Assert) -> serde_json::Value {
+    serde_json::from_slice(&assert.get_output().stdout).expect("JSON on stdout")
+}
+
+/// `kompressor db` describes, checks and checkpoints the databases a
+/// configuration names, and `check` fails loudly on a damaged one.
+#[test]
+fn db_describes_checks_and_checkpoints_the_databases() {
+    let dir = scratch_dir();
+    let config = on_disk_deployment(&dir);
+    let db = |args: &[&str]| {
+        let mut command = run_in(&dir);
+        command.arg("db").args(args).arg("--config").arg(&config);
+        command
+    };
+
+    let status = json_of(&db(&["status", "--json"]).assert().success());
+    assert_eq!(status[0]["name"], "stats.db");
+    assert_eq!(
+        status[0]["schema_version"],
+        status[0]["expected_schema_version"]
+    );
+    assert_eq!(status[1]["name"], "refs.db");
+    assert!(status[1]["bytes"].as_u64().unwrap() > 0);
+    assert!(status[1]["reclaimable_bytes"].is_u64());
+    db(&["status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("stats.db").and(predicate::str::contains("schema v")));
+    let one = json_of(&db(&["status", "refs.db", "--json"]).assert().success());
+    assert_eq!(one.as_array().unwrap().len(), 1);
+    db(&["status", "config.toml"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("stats.db and refs.db"));
+
+    let checked = json_of(&db(&["check", "--json"]).assert().success());
+    assert!(
+        checked
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["ok"] == true)
+    );
+    db(&["check"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ok"));
+
+    let done = json_of(&db(&["checkpoint", "--json"]).assert().success());
+    assert!(
+        done.as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["complete"] == true)
+    );
+    assert_eq!(done[1]["wal_bytes_after"], 0);
+    assert!(
+        !dir.join("refs.db-wal").exists()
+            || std::fs::metadata(dir.join("refs.db-wal")).unwrap().len() == 0
+    );
+
+    // Damage the store: `check` says which, in SQLite's words, and exits 1.
+    let path = dir.join("refs.db");
+    let mut bytes = std::fs::read(&path).unwrap();
+    for byte in &mut bytes[4_096..8_192] {
+        *byte = 0xAB;
+    }
+    std::fs::write(&path, bytes).unwrap();
+    let failed = db(&["check"]).assert().code(1);
+    let said = String::from_utf8(failed.get_output().stdout.clone()).unwrap();
+    assert!(
+        said.contains("refs.db") && said.contains("DAMAGED"),
+        "{said}"
+    );
+    assert!(
+        said.contains("stats.db") && said.contains("ok"),
+        "the other is still sound: {said}"
+    );
+    db(&["check", "stats.db"]).assert().success();
+}
+
+/// With nothing on disk, `db` says so for each and fails nothing.
+#[test]
+fn db_with_nothing_on_disk_says_so() {
+    let dir = scratch_dir();
+    let config = dir.join("memory.toml");
+    std::fs::write(&config, MCP_PLAIN).unwrap();
+    for action in ["status", "check", "checkpoint"] {
+        run_in(&dir)
+            .args(["db", action, "--config"])
+            .arg(&config)
+            .assert()
+            .success()
+            .stdout(
+                predicate::str::contains("statistics are off")
+                    .and(predicate::str::contains("the ref store is in memory")),
+            );
+    }
+}
+
+/// `backup --keep N` rotates the directory it writes into, and removes
+/// nothing it did not name itself.
+#[test]
+fn backup_keep_rotates_the_directory_it_writes_into() {
+    let dir = scratch_dir();
+    let config = on_disk_deployment(&dir);
+    let out = dir.join("backups");
+    std::fs::create_dir(&out).unwrap();
+    for stale in [
+        "kompressor-backup-20200101-000000.tar.gz",
+        "kompressor-backup-20210101-000000.tar.gz",
+    ] {
+        std::fs::write(out.join(stale), b"old").unwrap();
+    }
+    std::fs::write(out.join("notes.txt"), b"mine").unwrap();
+    let report = json_of(
+        &run_in(&dir)
+            .args(["backup", "--json", "--keep", "2", "--config"])
+            .arg(&config)
+            .arg("--out")
+            .arg(&out)
+            .assert()
+            .success(),
+    );
+    assert_eq!(
+        report["removed"],
+        serde_json::json!(["kompressor-backup-20200101-000000.tar.gz"])
+    );
+    let mut left: Vec<String> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(left.len(), 3, "{left:?}");
+    assert_eq!(left[0], "kompressor-backup-20210101-000000.tar.gz");
+    assert_eq!(left[2], "notes.txt");
+}
+
+/// How many fragments the store at `path` holds.
+fn fragments(dir: &Path, config: &Path) -> u64 {
+    let status = json_of(
+        &run_in(dir)
+            .args(["db", "status", "refs.db", "--json", "--config"])
+            .arg(config)
+            .assert()
+            .success(),
+    );
+    status[0]["bytes"].as_u64().unwrap()
+}
+
+/// `kompressor restore` rehearses by default, restores with `--yes`, moves
+/// what was there aside, and the restored deployment works.
+#[test]
+fn restore_rehearses_then_puts_a_backup_back() {
+    let dir = scratch_dir();
+    let config = on_disk_deployment(&dir);
+    let archive = dir.join("before.tar.gz");
+    let taken = json_of(
+        &run_in(&dir)
+            .args(["backup", "--json", "--config"])
+            .arg(&config)
+            .arg("-o")
+            .arg(&archive)
+            .assert()
+            .success(),
+    );
+    assert_eq!(taken["recorded"], true, "the backup is on record");
+    let handle = {
+        let out = run_in(&dir)
+            .args(["compress", "--config"])
+            .arg(&config)
+            .arg(dir.join("log.txt"))
+            .assert()
+            .success();
+        let text = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+        text.split("ref:")
+            .nth(1)
+            .map(|rest| rest[..14].to_string())
+            .expect("a handle")
+    };
+    // Wreck the store, as a bad disk or a bad day would.
+    std::fs::write(dir.join("refs.db"), b"not a database any more").unwrap();
+    let _ = std::fs::remove_file(dir.join("refs.db-wal"));
+    let _ = std::fs::remove_file(dir.join("refs.db-shm"));
+    run_in(&dir)
+        .args(["retrieve", "--config"])
+        .arg(&config)
+        .arg(&handle)
+        .assert()
+        .failure();
+
+    let restore = |extra: &[&str]| {
+        let mut command = run_in(&dir);
+        command
+            .arg("restore")
+            .arg(&archive)
+            .arg("--config")
+            .arg(&config)
+            .args(extra);
+        command
+    };
+    // A rehearsal: checked, described, nothing changed.
+    restore(&[]).assert().success().stdout(
+        predicate::str::contains("would replace")
+            .and(predicate::str::contains("nothing was changed"))
+            .and(predicate::str::contains("--yes")),
+    );
+    assert_eq!(
+        std::fs::read(dir.join("refs.db")).unwrap(),
+        b"not a database any more"
+    );
+
+    let done = json_of(&restore(&["--yes", "--json"]).assert().success());
+    assert_eq!(done["applied"], true);
+    for database in done["databases"].as_array().unwrap() {
+        assert_eq!(database["restored"], true, "{database}");
+        let aside = database["moved_aside"]
+            .as_str()
+            .expect("moved aside, not deleted");
+        assert!(aside.contains(".before-restore-"), "{aside}");
+        assert!(Path::new(aside).is_file());
+    }
+    // The wreck is kept beside it, and the fragment is back.
+    let aside = done["databases"][1]["moved_aside"].as_str().unwrap();
+    assert_eq!(std::fs::read(aside).unwrap(), b"not a database any more");
+    run_in(&dir)
+        .args(["retrieve", "--config"])
+        .arg(&config)
+        .arg(&handle)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("worker"));
+    run_in(&dir)
+        .args(["db", "check", "--config"])
+        .arg(&config)
+        .assert()
+        .success();
+    assert!(fragments(&dir, &config) > 0);
+
+    // One database only, and the things that are refused before anything moves.
+    restore(&["--only", "stats.db", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "refs.db   left alone: not asked for",
+        ));
+    restore(&["--only", "config.toml"]).assert().code(1);
+    run_in(&dir)
+        .args(["restore", "nowhere.tar.gz", "--config"])
+        .arg(&config)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("is not a file"));
+    std::fs::write(dir.join("junk.tar.gz"), b"junk").unwrap();
+    run_in(&dir)
+        .args(["restore", "junk.tar.gz", "--yes", "--config"])
+        .arg(&config)
+        .assert()
+        .code(1);
+}
+
+/// With the service running, `restore` refuses and says to stop it.
+#[test]
+fn restore_refuses_while_the_service_is_running() {
+    use std::io::{BufRead, BufReader};
+    let dir = scratch_dir();
+    let config = on_disk_deployment(&dir);
+    let archive = dir.join("b.tar.gz");
+    run_in(&dir)
+        .args(["backup", "--config"])
+        .arg(&config)
+        .arg("-o")
+        .arg(&archive)
+        .assert()
+        .success();
+
+    let mut service = std::process::Command::new(env!("CARGO_BIN_EXE_kompressor"))
+        .args([
+            "serve",
+            "--api",
+            "--listen",
+            "127.0.0.1:0",
+            "--stop-on-stdin",
+            "--config",
+        ])
+        .arg(&config)
+        .env_remove("KOMPRESSOR_CONFIG")
+        .env("XDG_CONFIG_HOME", no_config_dir())
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("serve starts");
+    // Up, with its databases open, once it says it is listening.
+    let mut lines = BufReader::new(service.stdout.take().unwrap()).lines();
+    assert!(
+        lines
+            .by_ref()
+            .map_while(Result::ok)
+            .any(|line| line.contains("listening")),
+        "serve never came up"
+    );
+    let before = std::fs::read(dir.join("refs.db")).unwrap();
+    for extra in [&[][..], &["--yes"][..]] {
+        run_in(&dir)
+            .arg("restore")
+            .arg(&archive)
+            .arg("--config")
+            .arg(&config)
+            .args(extra)
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains("stop the service first"));
+    }
+    assert_eq!(std::fs::read(dir.join("refs.db")).unwrap(), before);
+    assert!(
+        !std::fs::read_dir(&dir).unwrap().flatten().any(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .contains("before-restore")),
+        "nothing was moved"
+    );
+
+    writeln!(service.stdin.take().unwrap(), "stop").unwrap();
+    assert!(service.wait().unwrap().success());
+    // Stopped, it goes through.
+    run_in(&dir)
+        .arg("restore")
+        .arg(&archive)
+        .arg("--yes")
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Restored. Start the service."));
+}

@@ -63,6 +63,15 @@ table { border-collapse: collapse; width: 100%; margin: 6px 0 14px; }
 th, td { text-align: left; padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
 th { color: var(--muted); font-weight: 500; }
 td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+td.actions { white-space: nowrap; }
+td.actions button { padding: 3px 8px; margin-right: 4px; }
+.good { color: var(--good); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+h3 { font-size: 14px; margin: 18px 0 6px; color: var(--muted); font-weight: 600; }
+.scroll { overflow-x: auto; }
+#restore-steps { padding-left: 20px; }
+#restore-steps li { margin: 6px 0; }
+#restore-steps code { display: inline-block; padding: 2px 6px; background: var(--soft); border-radius: 4px; }
+#last-backup { margin: 0 0 12px; }
 code { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
 .muted { color: var(--muted); }
 .note { color: var(--muted); margin: 8px 0 0; max-width: 80ch; line-height: 1.45; }
@@ -92,26 +101,64 @@ code { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap:
 <p id="status" role="status">Loading…</p>
 <p id="error" role="alert"></p>
 
-<section aria-labelledby="backup-title">
-  <h2 id="backup-title">Backup</h2>
+<section aria-labelledby="databases-title">
+  <h2 id="databases-title">Databases</h2>
+  <div class="scroll">
   <table id="databases" hidden>
-    <thead><tr><th>Database</th><th>File</th><th>Size on disk</th><th>In the backup</th></tr></thead>
+    <thead><tr><th>Database</th><th>File</th><th>Size</th><th>Write-ahead log</th><th>Schema</th>
+      <th>Reclaimable</th><th>Records</th><th>Integrity</th><th></th></tr></thead>
     <tbody></tbody>
   </table>
+  </div>
+  <p id="action-result" role="status" hidden></p>
+  <p class="note" id="actions-why" hidden></p>
+  <p class="note">
+    <b>Write-ahead log</b> is what has been written and not yet folded into the file; SQLite folds it in
+    by itself, and <i>Checkpoint</i> does it now. <b>Schema</b> is the version the file holds against the
+    one this build expects. <b>Reclaimable</b> is space a vacuum would return to the disk.
+    <i>Check</i> reads every page and every index and can take a while on a large file; its result is
+    kept until the service restarts. From a shell: <code>kompressor db status</code>,
+    <code>kompressor db check</code>, <code>kompressor db checkpoint</code>.
+  </p>
+</section>
+
+<section aria-labelledby="backup-title">
+  <h2 id="backup-title">Backup</h2>
+  <p id="last-backup" class="muted">Loading…</p>
   <button id="backup" class="primary" type="button" disabled>Download backup (.tar.gz)</button>
   <p id="progress" role="status" hidden></p>
   <p id="done" role="status" hidden></p>
   <p class="note" id="why" hidden></p>
   <p class="note">
-    One gzipped tar with a consistent snapshot of every database listed above and a
+    One gzipped tar with a consistent snapshot of every database above and a
     <code>manifest.json</code>. The snapshots are taken through SQLite while the service keeps running;
     nothing is paused. The configuration and the interception CA are not included: they hold keys.
     The same archive from a shell, for a scheduled job: <code>kompressor backup --out DIR</code>.
   </p>
+  <h3>Scheduled backups</h3>
+  <p id="schedule" class="muted">Loading…</p>
+  <table id="archives" hidden>
+    <thead><tr><th>Archive</th><th>Taken</th><th>Size</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <h3>History</h3>
+  <p id="history-none" class="muted">Loading…</p>
+  <table id="history" hidden>
+    <thead><tr><th>When</th><th>By</th><th>Result</th><th>Size</th><th>Went to</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<section aria-labelledby="restore-title">
+  <h2 id="restore-title">Restore</h2>
   <p class="note">
-    To restore: stop the service, put <code>stats.db</code> and <code>refs.db</code> where the File
-    column says, remove any <code>-wal</code> and <code>-shm</code> files beside them, and start it.
+    Restoring replaces the databases, so it is done from a shell on this host with the service
+    <b>stopped</b> — not from this page. The command refuses a database that is still open, checks the
+    archive in full before touching anything, and moves the files it replaces aside
+    (<code>…before-restore-&lt;time&gt;</code>) instead of deleting them.
   </p>
+  <ol id="restore-steps" class="note"></ol>
 </section>
 </main>
 <script>
@@ -156,29 +203,232 @@ const explain = async response => {
   } catch (_) { return response.statusText; }
 };
 
+const when = ms => ms == null ? "–" : new Date(ms).toLocaleString();
+const span = (from, to) => {
+  const seconds = Math.max(0, Math.round((to - from) / 1000));
+  if (seconds < 90) return seconds + " s";
+  if (seconds < 5400) return Math.round(seconds / 60) + " min";
+  if (seconds < 129600) return Math.round(seconds / 3600) + " h";
+  return Math.round(seconds / 86400) + " d";
+};
+const every = seconds => seconds % 86400 === 0 ? seconds / 86400 + " d"
+  : seconds % 3600 === 0 ? seconds / 3600 + " h" : Math.round(seconds / 60) + " min";
+const tagged = (text, className) => {
+  const element = document.createElement("span");
+  if (className) element.className = className;
+  element.textContent = text;
+  return element;
+};
+const button = (label, title, run) => {
+  const element = document.createElement("button");
+  element.type = "button";
+  element.textContent = label;
+  element.title = title;
+  element.addEventListener("click", run);
+  return element;
+};
+
+// POST one action and say what came of it.
+async function act(path, describe) {
+  $("error").textContent = "";
+  $("action-result").hidden = false;
+  $("action-result").className = "muted";
+  $("action-result").textContent = "Working…";
+  try {
+    const response = await fetch(prefix + path, { method: "POST", headers: credentials(), cache: "no-store" });
+    if (!response.ok) throw new Error(response.status + " " + await explain(response));
+    const [text, className] = describe(await response.json());
+    $("action-result").textContent = text;
+    $("action-result").className = className;
+  } catch (error) {
+    $("action-result").hidden = true;
+    $("error").textContent = "Failed: " + (error.message || error);
+  }
+  load();
+}
+
+async function download(path, fallback) {
+  const response = await fetch(prefix + path, { headers: credentials(), cache: "no-store" });
+  if (!response.ok) throw new Error(response.status + " " + await explain(response));
+  const blob = await response.blob();
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = fallback;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  return blob.size;
+}
+
+function databaseRow(database, status) {
+  const row = document.createElement("tr");
+  const path = cell("");
+  const code = document.createElement("code");
+  code.textContent = database.path || "–";
+  path.append(code);
+
+  const schema = cell("", "num");
+  if (database.schema_version == null) {
+    schema.textContent = "–";
+  } else if (database.schema_version === database.expected_schema_version) {
+    schema.textContent = "v" + database.schema_version;
+  } else {
+    // Older is migrated at the next start; newer is a file from a later build.
+    schema.append(tagged("v" + database.schema_version + " (this build: v" + database.expected_schema_version + ")",
+      database.schema_version > database.expected_schema_version ? "bad" : "warn"));
+  }
+
+  const records = cell(database.oldest_ms == null ? "–"
+    : new Date(database.oldest_ms).toLocaleDateString() + " → " + new Date(database.newest_ms).toLocaleDateString());
+
+  const integrity = cell("");
+  if (database.error) {
+    integrity.append(tagged("unreadable: " + database.error, "bad"));
+  } else if (!database.checked) {
+    integrity.append(tagged(database.included ? "not checked since start" : "–", "muted"));
+  } else if (database.checked.ok) {
+    integrity.append(tagged("ok, " + span(database.checked.at_ms, status.now_ms) + " ago", "good"));
+  } else {
+    integrity.append(tagged("FAILED: " + database.checked.problems.slice(0, 3).join("; "), "bad"));
+  }
+
+  const actions = cell("", "actions");
+  if (database.included) {
+    const check = button("Check", "Run a full integrity check",
+      () => act("maintenance/databases/" + database.name + "/check", result => result.checked.ok
+        ? [database.name + ": integrity check passed in " + (result.checked.took_ms / 1000).toFixed(1) + " s.", "good"]
+        : [database.name + ": integrity check FAILED — " + result.checked.problems.join("; "), "bad"]));
+    const checkpoint = button("Checkpoint", "Fold the write-ahead log into the file",
+      () => act("maintenance/databases/" + database.name + "/checkpoint", result => result.complete
+        ? [database.name + ": log folded in, " + size(result.wal_bytes_before) + " → " + size(result.wal_bytes_after) + ".", "good"]
+        : [database.name + ": a reader was in the way; part of the log is still to fold in. Nothing is lost — try again.", "warn"]));
+    check.disabled = checkpoint.disabled = !status.actions.allowed;
+    actions.append(check, checkpoint);
+  }
+
+  row.append(cell(database.name), path,
+    cell(database.included ? size(database.bytes) : "– " + (database.reason || ""), "num"),
+    cell(size(database.wal_bytes), "num"), schema, cell(size(database.reclaimable_bytes), "num"),
+    records, integrity, actions);
+  return row;
+}
+
+function drawSchedule(status) {
+  const schedule = status.schedule;
+  $("archives").hidden = true;
+  if (!schedule) {
+    $("schedule").textContent = "None. Set maintenance.backup_dir (and backup_every, backup_keep) to have the service take them.";
+    return;
+  }
+  const parts = [schedule.every_s ? "Every " + every(schedule.every_s) : "No schedule (backup_every = 0)",
+    "into " + schedule.dir,
+    schedule.keep ? "keeping the newest " + schedule.keep : "keeping all"];
+  if (schedule.next_due_ms != null) {
+    parts.push(schedule.next_due_ms <= status.now_ms ? "next: due now" : "next in " + span(status.now_ms, schedule.next_due_ms));
+  }
+  $("schedule").textContent = parts.join(" · ") + (schedule.archives.length ? "" : " · none taken yet");
+  if (!schedule.archives.length) return;
+  $("archives").tBodies[0].replaceChildren(...schedule.archives.map(archive => {
+    const row = document.createElement("tr");
+    const actions = cell("", "actions");
+    const get = button("Download", "Download this archive", async () => {
+      $("error").textContent = "";
+      get.disabled = true;
+      try { await download("maintenance/backups/" + encodeURIComponent(archive.name), archive.name); }
+      catch (error) { $("error").textContent = "Download failed: " + (error.message || error); }
+      get.disabled = !status.backup.allowed;
+    });
+    get.disabled = !status.backup.allowed;
+    actions.append(get);
+    const name = cell("");
+    const code = document.createElement("code");
+    code.textContent = archive.name;
+    name.append(code);
+    row.append(name, cell(when(archive.created_at_ms) + " (" + span(archive.created_at_ms, status.now_ms) + " ago)"),
+      cell(size(archive.bytes), "num"), actions);
+    return row;
+  }));
+  $("archives").hidden = false;
+}
+
+function drawLastBackup(status) {
+  const last = status.last_backup;
+  const line = $("last-backup");
+  line.replaceChildren();
+  const limit = last.max_age_s ? " (expected at least every " + every(last.max_age_s) + ")" : "";
+  if (last.ok_ms == null) {
+    line.append(tagged("No backup on record" + (last.max_age_s ? ", and one is expected" + limit : ""), last.stale ? "warn" : "muted"));
+  } else {
+    line.append(tagged("Last backup " + span(last.ok_ms, status.now_ms) + " ago — " + when(last.ok_ms) + limit,
+      last.stale ? "warn" : "good"));
+  }
+  if (last.failed_ms != null) {
+    line.append(document.createTextNode(" · "), tagged("the last attempt, " + span(last.failed_ms, status.now_ms) + " ago, failed", "bad"));
+  }
+
+  $("history").hidden = !last.history.length;
+  $("history-none").hidden = !!last.history.length;
+  $("history-none").textContent = "None on record yet.";
+  $("history").tBodies[0].replaceChildren(...last.history.map(backup => {
+    const row = document.createElement("tr");
+    const result = cell("");
+    result.append(tagged(backup.ok ? "ok" : "failed: " + (backup.error || ""), backup.ok ? "good" : "bad"));
+    const where = cell("");
+    const code = document.createElement("code");
+    code.textContent = backup.destination;
+    where.append(code);
+    const by = { schedule: "schedule", http: "this page", cli: "kompressor backup" }[backup.origin] || backup.origin;
+    row.append(cell(when(backup.time_ms)), cell(by), result, cell(backup.ok ? size(backup.bytes) : "–", "num"), where);
+    return row;
+  }));
+}
+
+// The commands for this deployment: its own paths, its own configuration.
+function drawRestore(status) {
+  const config = status.restore.config ? " --config " + status.restore.config : "";
+  const step = (text, command) => {
+    const item = document.createElement("li");
+    item.append(document.createTextNode(text));
+    if (command) {
+      item.append(document.createElement("br"));
+      const code = document.createElement("code");
+      code.textContent = command;
+      item.append(code);
+    }
+    return item;
+  };
+  const files = status.databases.filter(database => database.path).map(database => database.path);
+  $("restore-steps").replaceChildren(
+    step("Stop the service.", status.restore.systemd ? "sudo systemctl stop kompressor" : ""),
+    step("Rehearse: the archive is checked and what would happen is printed. Nothing changes.",
+      "kompressor restore ARCHIVE.tar.gz" + config),
+    step("Restore" + (files.length ? " to " + files.join(" and ") : "") + ". Add --only stats.db or --only refs.db for one of them.",
+      "kompressor restore ARCHIVE.tar.gz" + config + " --yes"),
+    step("Start the service. A database older than this build is migrated as it starts.",
+      status.restore.systemd ? "sudo systemctl start kompressor" : ""),
+    step("When all is well, remove the files that were moved aside.", ""));
+}
+
 async function load() {
   $("error").textContent = "";
   try {
     const response = await fetch(prefix + "maintenance?format=json", { headers: credentials(), cache: "no-store" });
     if (!response.ok) throw new Error(response.status + " " + await explain(response));
     const status = await response.json();
-    const body = $("databases").tBodies[0];
-    body.replaceChildren(...status.databases.map(database => {
-      const row = document.createElement("tr");
-      const path = cell("");
-      const code = document.createElement("code");
-      code.textContent = database.path || "–";
-      path.append(code);
-      row.append(cell(database.name), path, cell(size(database.bytes), "num"),
-        cell(database.included ? "yes" : "no — " + database.reason));
-      return row;
-    }));
+    $("databases").tBodies[0].replaceChildren(...status.databases.map(database => databaseRow(database, status)));
     $("databases").hidden = false;
+    $("actions-why").textContent = status.actions.allowed ? "" : status.actions.reason;
+    $("actions-why").hidden = status.actions.allowed;
+    drawSchedule(status);
+    drawLastBackup(status);
+    drawRestore(status);
     $("backup").disabled = !status.backup.allowed;
     $("why").textContent = status.backup.allowed ? "" : status.backup.reason;
     $("why").hidden = status.backup.allowed;
     $("status").textContent = "kompressor " + status.version + " · " +
-      (status.backup.allowed ? "backup available" : "backup not available here");
+      (status.backup.allowed ? "backup available" : "backup not available here") + " · " +
+      (status.actions.allowed ? "actions available" : "actions not available here");
   } catch (error) {
     $("status").textContent = "";
     $("error").textContent = "Could not load: " + (error.message || error);

@@ -57,6 +57,11 @@ pub struct ServerState {
     /// Set while a backup archive is being written
     /// ([`crate::maintenance`]): one at a time.
     pub(crate) backup_running: std::sync::atomic::AtomicBool,
+    /// What the last integrity check of each database found, by its name.
+    /// In memory: a restart is a reason to check again, not to trust an old
+    /// answer.
+    pub(crate) integrity:
+        Mutex<std::collections::HashMap<&'static str, crate::maintenance::Checked>>,
 }
 
 impl ServerState {
@@ -76,6 +81,7 @@ impl ServerState {
             stats_path,
             store_sample: Mutex::new(None),
             backup_running: std::sync::atomic::AtomicBool::new(false),
+            integrity: Mutex::new(std::collections::HashMap::new()),
             core,
         };
         Arc::new(state)

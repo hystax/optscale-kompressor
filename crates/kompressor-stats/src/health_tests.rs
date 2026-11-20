@@ -223,3 +223,67 @@ fn the_reader_joins_the_reports_and_finds_the_last_request() {
     assert_eq!(report.last_compression_ms, None);
     assert_eq!(report.level, Level::Bad);
 }
+
+/// The last backup is reported always and judged only where the deployment
+/// said how old is too old; a failed attempt since the last good one is a
+/// warning at any age.
+#[test]
+fn the_last_backup_is_judged_against_what_the_deployment_expects() {
+    const HOUR: i64 = 60 * MIN;
+    let judged = |watch: BackupWatch| {
+        let report = assess(
+            &upstream(1_000, |_| {}),
+            &engine(500, 20.0),
+            &StoreHealth::default(),
+            &Runtime {
+                now_ms: 1_000 * HOUR,
+                backup: watch,
+                ..runtime()
+            },
+        );
+        let found = check(&report, "last_backup").clone();
+        (found.level, found.detail, found.value, report.level)
+    };
+    let day = Some(24 * HOUR);
+    let at = |hours_ago: i64| Some((1_000 - hours_ago) * HOUR);
+
+    // Nothing expected: reported, never a warning.
+    let (level, detail, value, overall) = judged(BackupWatch::default());
+    assert_eq!((level, value, overall), (Level::Info, None, Level::Ok));
+    assert!(detail.starts_with("none on record"), "{detail}");
+    let (level, detail, value, _) = judged(BackupWatch {
+        last_ok_ms: at(500),
+        ..BackupWatch::default()
+    });
+    assert_eq!(level, Level::Info);
+    assert_eq!(value, Some((500 * HOUR) as f64));
+    assert!(detail.starts_with("taken 20 d ago"), "{detail}");
+
+    // A day expected.
+    let with = |last_ok_ms, last_failed_ms| {
+        judged(BackupWatch {
+            max_age_ms: day,
+            last_ok_ms,
+            last_failed_ms,
+        })
+    };
+    assert_eq!(with(at(3), None).0, Level::Ok);
+    assert_eq!(with(at(3), None).1, "taken 3 h ago");
+    assert_eq!(with(at(30), None).0, Level::Warn);
+    let (level, _, _, overall) = with(at(80), None);
+    assert_eq!(
+        (level, overall),
+        (Level::Bad, Level::Bad),
+        "three times too old"
+    );
+    let (level, detail, ..) = with(None, None);
+    assert_eq!(level, Level::Warn);
+    assert_eq!(detail, "none on record; one is expected");
+
+    // A failure after the last good one, and one before it.
+    let (level, detail, ..) = with(at(3), at(1));
+    assert_eq!(level, Level::Warn);
+    assert!(detail.ends_with("the last attempt failed"), "{detail}");
+    assert_eq!(with(at(1), at(3)).0, Level::Ok, "it has worked since");
+    assert_eq!(with(None, at(1)).0, Level::Warn);
+}

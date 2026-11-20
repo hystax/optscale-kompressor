@@ -278,6 +278,7 @@ impl StatsWriter {
                     )?
                     .execute(params![tenant, request_id])?;
                 }
+                Event::Backup(e) => insert_backup(&tx, e)?,
                 Event::StoreSample {
                     time_ms,
                     live_refs,
@@ -637,4 +638,57 @@ fn log_failure(result: Result<(), StatsError>) {
     if let Err(e) = result {
         tracing::warn!(error = %e, "dropping a stats batch that would not commit");
     }
+}
+
+/// File one backup. Shared by the writer and by [`record_backup`].
+fn insert_backup(
+    conn: &rusqlite::Connection,
+    event: &crate::events::BackupEvent,
+) -> Result<(), StatsError> {
+    conn.prepare_cached(
+        "INSERT INTO backups (time_ms, origin, destination, bytes, databases, ok, error)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?
+    .execute(params![
+        event.time_ms,
+        event.origin,
+        event.destination,
+        event.bytes,
+        event.databases,
+        event.ok,
+        event.error,
+    ])?;
+    Ok(())
+}
+
+/// Record a backup straight into the statistics database at `path`, for a
+/// process that has no writer of its own: `kompressor backup`.
+///
+/// Returns whether it was recorded. A database that is not there is not
+/// created for the sake of one row, and one that has not been migrated this
+/// far is left alone — a backup must not be what upgrades the schema under a
+/// running service. Either is `Ok(false)`: the backup itself succeeded, and
+/// the caller says the record could not be kept.
+pub fn record_backup(
+    path: &std::path::Path,
+    event: &crate::events::BackupEvent,
+) -> Result<bool, StatsError> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+    let has_table: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'backups'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_table == 0 {
+        return Ok(false);
+    }
+    insert_backup(&conn, event)?;
+    Ok(true)
 }

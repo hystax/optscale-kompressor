@@ -624,8 +624,9 @@ are in [docs/charts/](docs/charts/).
 | Ref store  | `GET /v1/refs`: search, inspect and delete stored fragments, as JSON or a page; off unless `refs.browse = true`                                                           |
 | MCP server | `kompressor serve --mcp` (streamable HTTP): `optscale_kompressor_retrieve`, `optscale_kompressor_compress`, `optscale_kompressor_compress_raw`, `optscale_kompressor_stats` |
 | MCP proxy  | `kompressor mcp serve` (stdio): the same tools, plus those of every `[[mcp.servers]]` it fronts, with their results compressed                                            |
-| Backup     | `kompressor backup`, or the Maintenance page (`POST /v1/maintenance/backup`, off unless `maintenance.backup = true`): every database as one `.tar.gz`, service running     |
-| CLI        | `kompressor compress`, `retrieve`, `detect`, `stats`, `bench`, `backup`, `check-config`                                                                                     |
+| Backup     | `kompressor backup`, the Maintenance page (off unless `maintenance.backup = true`), or on a schedule (`maintenance.backup_dir`): every database as one `.tar.gz`, service running; each is recorded and Health warns when the last is stale; `kompressor restore` puts one back |
+| Databases  | `kompressor db status`, `check`, `checkpoint`, and the same on the Maintenance page: size, write-ahead log, schema version, reclaimable space, integrity |
+| CLI        | `kompressor compress`, `retrieve`, `detect`, `stats`, `bench`, `backup`, `restore`, `db`, `check-config`                                                                                     |
 | Library    | the `kompressor-engine` crate: compress a string or a conversation, no I/O                                                                                                  |
 
 

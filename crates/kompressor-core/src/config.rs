@@ -41,10 +41,15 @@ pub struct Config {
     /// [`Config::validate`]; never read from or written to a file.
     #[serde(skip)]
     pub refused_env: Vec<String>,
+    /// The file this configuration was read from, made absolute; `None` for
+    /// the built-in defaults. So the Maintenance page can name it in the
+    /// commands it shows. Never read from or written to a file.
+    #[serde(skip)]
+    pub source: Option<PathBuf>,
 }
 
-/// What the Maintenance page may do over HTTP.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// Backups on a schedule, and what the Maintenance page may do over HTTP.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MaintenanceConfig {
     /// Serve `POST /v1/maintenance/backup`: a gzipped tar of every database
@@ -60,6 +65,72 @@ pub struct MaintenanceConfig {
     /// `kompressor backup` on the host needs none of this: it reads the files
     /// directly, as whoever runs it.
     pub backup: bool,
+    /// Serve the housekeeping actions: `POST
+    /// /v1/maintenance/databases/{name}/check` (a full integrity check) and
+    /// `…/checkpoint` (fold the write-ahead log into the database).
+    ///
+    /// Apart from `backup` because the grant is a different one: these read
+    /// nothing out, but they are work on every tenant's database, so they are
+    /// off by default and limited to the same callers. What the page *shows*
+    /// about each database needs neither setting.
+    pub actions: bool,
+    /// Where `serve` writes a backup on a schedule. Empty, the default, takes
+    /// none. The directory is created if it is missing, readable by its
+    /// owner alone.
+    ///
+    /// Under the shipped systemd unit only the state directory is writable:
+    /// use a directory inside it (`/var/lib/kompressor/backups`), or add the
+    /// path to the unit's `ReadWritePaths`. A backup on the disk it backs up
+    /// survives a bad migration, not a dead disk — copy it off the host.
+    pub backup_dir: PathBuf,
+    /// How often. A backup is taken when the newest archive in `backup_dir`
+    /// is older than this, so the schedule holds across restarts and a
+    /// service that was down takes one when it comes back. Zero takes none.
+    #[serde(with = "humantime_serde")]
+    pub backup_every: Duration,
+    /// How many archives to keep in `backup_dir`; older ones are removed
+    /// after each scheduled backup. Zero keeps them all. Only files this
+    /// names itself (`kompressor-backup-<UTC>.tar.gz`) are ever removed.
+    pub backup_keep: u32,
+    /// How old the last backup may be before the Health page warns
+    /// (`last_backup`), and three times that before it is `bad`. Zero, the
+    /// default, follows the schedule — twice `backup_every`, so one missed
+    /// backup is a warning — and with no schedule says nothing: a deployment
+    /// that has not asked for backups is not nagged about them. Set it to be
+    /// held to an age whoever takes them.
+    #[serde(with = "humantime_serde")]
+    pub backup_max_age: Duration,
+}
+
+impl Default for MaintenanceConfig {
+    fn default() -> Self {
+        MaintenanceConfig {
+            backup: false,
+            actions: false,
+            backup_dir: PathBuf::new(),
+            backup_every: Duration::from_secs(24 * 3_600),
+            backup_keep: 7,
+            backup_max_age: Duration::ZERO,
+        }
+    }
+}
+
+impl MaintenanceConfig {
+    /// How old the last backup may be before it is a warning, when the
+    /// deployment expects backups at all: `backup_max_age`, or failing that
+    /// twice the scheduled interval.
+    pub fn max_age(&self) -> Option<Duration> {
+        if !self.backup_max_age.is_zero() {
+            return Some(self.backup_max_age);
+        }
+        self.schedule().map(|(_, every)| every.saturating_mul(2))
+    }
+
+    /// The schedule, when there is one: a directory and an interval.
+    pub fn schedule(&self) -> Option<(&std::path::Path, Duration)> {
+        (!self.backup_dir.as_os_str().is_empty() && !self.backup_every.is_zero())
+            .then_some((self.backup_dir.as_path(), self.backup_every))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1405,6 +1476,7 @@ impl Config {
             }
             None => Config::default(),
         };
+        config.source = path.map(|path| std::path::absolute(path).unwrap_or(path.to_path_buf()));
         config.apply_env(&std::env::vars().collect::<Vec<_>>());
         config.validate()?;
         Ok(config)
@@ -1502,12 +1574,33 @@ impl Config {
                 "secret" => self.auth.secret = value.to_string(),
                 _ => {}
             },
-            "maintenance" => {
-                if field == "backup" {
+            "maintenance" => match field {
+                "backup" => {
                     self.maintenance.backup =
-                        parse_bool_setting("maintenance.backup", value, self.maintenance.backup);
+                        parse_bool_setting("maintenance.backup", value, self.maintenance.backup)
                 }
-            }
+                "actions" => {
+                    self.maintenance.actions =
+                        parse_bool_setting("maintenance.actions", value, self.maintenance.actions)
+                }
+                "backup_dir" => self.maintenance.backup_dir = PathBuf::from(value),
+                "backup_every" => {
+                    if let Some(every) = parse_duration(value) {
+                        self.maintenance.backup_every = every;
+                    }
+                }
+                "backup_keep" => {
+                    if let Ok(keep) = value.parse() {
+                        self.maintenance.backup_keep = keep;
+                    }
+                }
+                "backup_max_age" => {
+                    if let Some(age) = parse_duration(value) {
+                        self.maintenance.backup_max_age = age;
+                    }
+                }
+                _ => {}
+            },
             "refs" => match field {
                 "path" => self.refs.path = PathBuf::from(value),
                 // Refused when unreadable, for the same reason as `auth.mode`:
@@ -1894,6 +1987,13 @@ impl Config {
         if self.refs.purge_interval.is_zero() {
             return Err(ConfigError::Invalid(
                 "refs.purge_interval must be greater than zero".into(),
+            ));
+        }
+        if let Some((_, every)) = self.maintenance.schedule()
+            && every < Duration::from_secs(60)
+        {
+            return Err(ConfigError::Invalid(
+                "maintenance.backup_every must be at least one minute (or zero for none)".into(),
             ));
         }
         if let Some(server) = self
@@ -2999,6 +3099,107 @@ mod tests {
         config.apply_env(&[("KOMPRESSOR__MAINTENANCE__BACKUP".into(), "true".into())]);
         assert!(config.maintenance.backup);
         assert!(toml::from_str::<Config>("[maintenance]\nbackups = true\n").is_err());
+    }
+
+    #[test]
+    fn scheduled_backups_need_a_directory_and_are_off_without_one() {
+        use std::path::Path;
+        let config = Config::default();
+        assert_eq!(
+            config.maintenance.schedule(),
+            None,
+            "no directory, no schedule"
+        );
+        assert!(!config.maintenance.actions);
+        assert_eq!(config.maintenance.backup_keep, 7);
+
+        let config: Config = toml::from_str(
+            "[maintenance]\nbackup_dir = \"/var/lib/kompressor/backups\"\nbackup_every = \"6h\"\nbackup_keep = 3\nactions = true\n",
+        )
+        .expect("parses");
+        config.validate().expect("valid");
+        assert_eq!(
+            config.maintenance.schedule(),
+            Some((
+                Path::new("/var/lib/kompressor/backups"),
+                Duration::from_secs(6 * 3_600)
+            ))
+        );
+        assert_eq!(config.maintenance.backup_keep, 3);
+        assert!(config.maintenance.actions);
+
+        // A directory with the interval set to zero is a place for manual
+        // backups, not a schedule.
+        let mut manual = config.clone();
+        manual.maintenance.backup_every = Duration::ZERO;
+        assert_eq!(manual.maintenance.schedule(), None);
+        manual.validate().expect("valid");
+        // Faster than a backup can be taken is a mistake, not a schedule.
+        let mut hasty = config.clone();
+        hasty.maintenance.backup_every = Duration::from_secs(5);
+        let error = hasty.validate().expect_err("refused").to_string();
+        assert!(error.contains("maintenance.backup_every"), "{error}");
+
+        let mut env = Config::default();
+        env.apply_env(&[
+            (
+                "KOMPRESSOR__MAINTENANCE__BACKUP_DIR".into(),
+                "/srv/b".into(),
+            ),
+            ("KOMPRESSOR__MAINTENANCE__BACKUP_EVERY".into(), "12h".into()),
+            ("KOMPRESSOR__MAINTENANCE__BACKUP_KEEP".into(), "0".into()),
+            ("KOMPRESSOR__MAINTENANCE__ACTIONS".into(), "true".into()),
+        ]);
+        assert_eq!(
+            env.maintenance.schedule(),
+            Some((Path::new("/srv/b"), Duration::from_secs(12 * 3_600)))
+        );
+        assert_eq!(env.maintenance.backup_keep, 0);
+        assert!(env.maintenance.actions);
+    }
+
+    #[test]
+    fn the_age_a_backup_may_reach_follows_the_schedule_unless_it_is_set() {
+        let mut config = Config::default();
+        assert_eq!(config.maintenance.max_age(), None, "no backups asked for");
+        config.maintenance.backup_dir = PathBuf::from("/srv/b");
+        assert_eq!(
+            config.maintenance.max_age(),
+            Some(Duration::from_secs(2 * 24 * 3_600)),
+            "one missed daily backup"
+        );
+        config.maintenance.backup_max_age = Duration::from_secs(3_600);
+        assert_eq!(
+            config.maintenance.max_age(),
+            Some(Duration::from_secs(3_600))
+        );
+        // Held to an age with no schedule: someone else takes them.
+        let alone: Config = toml::from_str("[maintenance]\nbackup_max_age = \"7days\"\n").unwrap();
+        assert_eq!(alone.maintenance.schedule(), None);
+        assert_eq!(
+            alone.maintenance.max_age(),
+            Some(Duration::from_secs(7 * 86_400))
+        );
+        let mut env = Config::default();
+        env.apply_env(&[(
+            "KOMPRESSOR__MAINTENANCE__BACKUP_MAX_AGE".into(),
+            "36h".into(),
+        )]);
+        assert_eq!(
+            env.maintenance.max_age(),
+            Some(Duration::from_secs(36 * 3_600))
+        );
+    }
+
+    #[test]
+    fn a_loaded_configuration_remembers_its_file() {
+        assert_eq!(Config::default().source, None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k.toml");
+        std::fs::write(&path, "[stats]\nenabled = false\n").unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+        assert_eq!(config.source.as_deref(), Some(path.as_path()));
+        assert!(!toml::to_string(&config).unwrap().contains("source"));
     }
 
     #[test]

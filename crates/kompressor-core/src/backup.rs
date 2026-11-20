@@ -183,6 +183,477 @@ pub fn remove_stale_scratch(dir: &Path) {
     }
 }
 
+/// One archive in a backup directory.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Archive {
+    pub name: String,
+    pub bytes: u64,
+    /// When it was taken, from its name: the name is written once and a copy
+    /// keeps it, where a file's modification time does not survive either.
+    pub created_at_ms: i64,
+}
+
+/// When the archive called `name` was taken, if `name` is one
+/// [`archive_name`] writes — exactly, so nothing else in a directory is ever
+/// taken for a backup.
+pub fn archive_time(name: &str) -> Option<i64> {
+    let stamp = name
+        .strip_prefix("kompressor-backup-")?
+        .strip_suffix(".tar.gz")?;
+    let bytes = stamp.as_bytes();
+    if bytes.len() != 15 || bytes[8] != b'-' {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| -> Option<i64> {
+        let part = &stamp[range];
+        part.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| part.parse().ok())
+            .flatten()
+    };
+    let (year, month, day) = (number(0..4)?, number(4..6)?, number(6..8)?);
+    let (hour, minute, second) = (number(9..11)?, number(11..13)?, number(13..15)?);
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    // Days from the civil date: the inverse of the conversion `archive_name`
+    // makes.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let ms = (days * 86_400 + hour * 3_600 + minute * 60 + second) * 1_000;
+    // A date that does not exist (the 31st of a 30-day month) does not come
+    // back as itself.
+    (archive_name(ms) == name).then_some(ms)
+}
+
+/// The archives in `dir`, newest first. A directory that is missing or
+/// unreadable holds none.
+pub fn list_archives(dir: &Path) -> Vec<Archive> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut archives: Vec<Archive> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let created_at_ms = archive_time(&name)?;
+            let meta = entry.metadata().ok()?;
+            meta.is_file().then_some(Archive {
+                name,
+                bytes: meta.len(),
+                created_at_ms,
+            })
+        })
+        .collect();
+    archives.sort_by_key(|archive| std::cmp::Reverse(archive.created_at_ms));
+    archives
+}
+
+/// Remove all but the `keep` newest archives in `dir`, and return the names
+/// removed. Zero keeps them all. Nothing but an archive is ever touched.
+pub fn prune_archives(dir: &Path, keep: u32) -> Vec<String> {
+    if keep == 0 {
+        return Vec::new();
+    }
+    list_archives(dir)
+        .into_iter()
+        .skip(keep as usize)
+        .filter(|archive| std::fs::remove_file(dir.join(&archive.name)).is_ok())
+        .map(|archive| archive.name)
+        .collect()
+}
+
+/// When the next scheduled backup is due: `every` after the newest archive in
+/// `dir`, or now when there is none. Read from the directory, so the schedule
+/// is the same after a restart.
+pub fn next_due_ms(dir: &Path, every: std::time::Duration, now_ms: i64) -> i64 {
+    match list_archives(dir).first() {
+        // An archive dated in the future — a clock that was wrong — must not
+        // put the next one off for ever.
+        Some(newest) if newest.created_at_ms <= now_ms => {
+            newest.created_at_ms + i64::try_from(every.as_millis()).unwrap_or(i64::MAX / 2)
+        }
+        _ => now_ms,
+    }
+}
+
+/// What a scheduled backup did.
+#[derive(Clone, Debug)]
+pub struct Scheduled {
+    pub archive: PathBuf,
+    pub bytes: u64,
+    pub manifest: Manifest,
+    /// Older archives removed to keep `maintenance.backup_keep`.
+    pub removed: Vec<String>,
+}
+
+/// Take the scheduled backup if one is due at `now_ms`: write an archive
+/// into `maintenance.backup_dir` and remove the ones past
+/// `maintenance.backup_keep`. `Ok(None)` when there is no schedule or it is
+/// not time.
+///
+/// Old archives are removed only after the new one is written and has been
+/// checked, so a backup that fails never costs one that worked.
+pub fn run_scheduled(config: &Config, now_ms: i64) -> Result<Option<Scheduled>, CoreError> {
+    let Some((dir, every)) = config.maintenance.schedule() else {
+        return Ok(None);
+    };
+    if next_due_ms(dir, every, now_ms) > now_ms {
+        return Ok(None);
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)?;
+    remove_stale_scratch(dir);
+    let archive = dir.join(archive_name(now_ms));
+    let manifest = write_archive(config, &archive)?;
+    let bytes = std::fs::metadata(&archive)?.len();
+    let removed = prune_archives(dir, config.maintenance.backup_keep);
+    Ok(Some(Scheduled {
+        archive,
+        bytes,
+        manifest,
+        removed,
+    }))
+}
+
+/// What became of one database in a restore.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Restored {
+    pub name: String,
+    /// Where it goes: `stats.path` or `refs.path`.
+    pub target: Option<String>,
+    /// Its size and schema version in the archive.
+    pub bytes: u64,
+    pub schema_version: u32,
+    /// Whether it was put in place — or, without `apply`, would be.
+    pub restored: bool,
+    /// Where the file that was there has been moved; nothing is deleted.
+    pub moved_aside: Option<String>,
+    /// Why it was left alone, when it was.
+    pub skipped: Option<String>,
+}
+
+/// What a restore did, or would do.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RestoreReport {
+    pub manifest: Manifest,
+    /// False for a rehearsal: everything was checked and nothing changed.
+    pub applied: bool,
+    pub databases: Vec<Restored>,
+    /// Things worth knowing that did not stop it.
+    pub notes: Vec<String>,
+}
+
+/// The databases an archive may hold, where `config` keeps each, and the
+/// schema version this build brings one to.
+fn restore_targets(config: &Config) -> [(&'static str, Result<PathBuf, &'static str>, u32); 2] {
+    [
+        (
+            "stats.db",
+            if config.stats.enabled {
+                Ok(config.stats.path.clone())
+            } else {
+                Err("statistics are off (stats.enabled = false)")
+            },
+            kompressor_stats::schema::latest_version(),
+        ),
+        (
+            "refs.db",
+            match config.refs.backend {
+                RefsBackend::Sqlite => Ok(config.refs.path.clone()),
+                RefsBackend::Memory => {
+                    Err("the ref store is in memory (refs.backend = \"memory\")")
+                }
+            },
+            kompressor_store::sqlite::latest_version(),
+        ),
+    ]
+}
+
+/// `path` with `suffix` appended to its file name: `stats.db` + `-wal`.
+fn beside(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Give the restored file the owner and mode of the one it replaces — or,
+/// where there was none, the owner of the directory it is in. A restore is
+/// run by whoever can stop the service, often root, and a database only root
+/// can open is a service that does not start.
+#[cfg(unix)]
+fn adopt_ownership(restored: &Path, replaced: Option<&Path>, notes: &mut Vec<String>) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let like = replaced
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map(|meta| (meta.uid(), meta.gid(), Some(meta.mode() & 0o777)))
+        .or_else(|| {
+            let parent = restored.parent()?;
+            let meta = std::fs::metadata(parent).ok()?;
+            Some((meta.uid(), meta.gid(), None))
+        });
+    let Some((uid, gid, mode)) = like else { return };
+    if let Some(mode) = mode {
+        let _ = std::fs::set_permissions(restored, std::fs::Permissions::from_mode(mode));
+    }
+    let own = std::fs::metadata(restored).map(|meta| (meta.uid(), meta.gid()));
+    if own.is_ok_and(|own| own != (uid, gid))
+        && std::os::unix::fs::chown(restored, Some(uid), Some(gid)).is_err()
+    {
+        notes.push(format!(
+            "{} is owned by whoever ran this, not by the owner of the file it replaced \
+             (uid {uid}): make sure the service can open it",
+            restored.display()
+        ));
+    }
+}
+
+#[cfg(not(unix))]
+fn adopt_ownership(_: &Path, _: Option<&Path>, _: &mut Vec<String>) {}
+
+/// Put the databases in `archive` back where `config` keeps them.
+///
+/// Everything is checked before anything is touched: the archive is one this
+/// build can read, each database in it passes a full integrity check and is
+/// no newer than this build's schema, and nothing has the databases it would
+/// replace open. Only then, and only with `apply`, is each existing file
+/// moved aside — to `<name>.before-restore-<UTC>`, with its write-ahead log;
+/// nothing is deleted — and the restored one put in its place. Without
+/// `apply` it is a rehearsal that reports what would happen.
+///
+/// `only` restores one database and leaves the other alone. An older
+/// database is migrated when the service next starts, as any other is.
+///
+/// **The service must be stopped.** A database a process has open is refused
+/// ([`kompressor_store::sqlite::in_use`]); replacing a file under a running
+/// writer loses whatever it writes next and can corrupt both.
+pub fn restore(
+    config: &Config,
+    archive: &Path,
+    only: Option<&str>,
+    apply: bool,
+    now_ms: i64,
+) -> Result<RestoreReport, CoreError> {
+    let invalid = |why: String| CoreError::BadRequest(format!("{}: {why}", archive.display()));
+    let targets = restore_targets(config);
+    if let Some(name) = only
+        && !targets.iter().any(|(known, ..)| *known == name)
+    {
+        return Err(CoreError::BadRequest(format!(
+            "no database called {name:?}; an archive holds stats.db and refs.db"
+        )));
+    }
+
+    // Unpack beside each target, so putting a file in place is a rename.
+    let mut scratches: Vec<Scratch> = Vec::new();
+    let mut unpacked: Vec<(usize, PathBuf)> = Vec::new();
+    let mut manifest: Option<Manifest> = None;
+    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(File::open(archive)?));
+    for entry in tar
+        .entries()
+        .map_err(|error| invalid(format!("not a gzipped tar ({error})")))?
+    {
+        let mut entry = entry.map_err(|error| invalid(format!("damaged ({error})")))?;
+        let name = entry
+            .path()
+            .map_err(|error| invalid(error.to_string()))?
+            .to_string_lossy()
+            .into_owned();
+        // Only the names a backup writes, as plain files: nothing in an
+        // archive chooses where it lands.
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        if name == "manifest.json" {
+            let mut text = String::new();
+            std::io::Read::read_to_string(
+                &mut std::io::Read::take(&mut entry, 1 << 20),
+                &mut text,
+            )?;
+            manifest = Some(
+                serde_json::from_str(&text)
+                    .map_err(|error| invalid(format!("unreadable manifest ({error})")))?,
+            );
+            continue;
+        }
+        let Some(index) = targets.iter().position(|(known, ..)| *known == name) else {
+            continue;
+        };
+        if unpacked.iter().any(|(seen, _)| *seen == index) {
+            return Err(invalid(format!("{name} is in it twice")));
+        }
+        let (_, Ok(target), _) = &targets[index] else {
+            continue;
+        };
+        if only.is_some_and(|only| only != name) {
+            continue;
+        }
+        if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        let scratch = Scratch::beside(target)?;
+        let path = scratch.0.join(&name);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
+        std::io::copy(&mut entry, &mut file)?;
+        file.sync_all()?;
+        scratches.push(scratch);
+        unpacked.push((index, path));
+    }
+    let manifest =
+        manifest.ok_or_else(|| invalid("no manifest.json: not a kompressor backup".into()))?;
+    if manifest.format > FORMAT {
+        return Err(invalid(format!(
+            "written in format {} by kompressor {}; this build reads up to {FORMAT}",
+            manifest.format, manifest.kompressor
+        )));
+    }
+
+    // Check everything, change nothing.
+    let mut report = RestoreReport {
+        manifest,
+        applied: apply,
+        databases: Vec::new(),
+        notes: Vec::new(),
+    };
+    let mut ready: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (index, (name, target, expected)) in targets.iter().enumerate() {
+        let mut entry = Restored {
+            name: name.to_string(),
+            target: target.as_ref().ok().map(|path| path.display().to_string()),
+            bytes: 0,
+            schema_version: 0,
+            restored: false,
+            moved_aside: None,
+            skipped: None,
+        };
+        let in_archive = report.manifest.databases.iter().any(|d| d.name == *name);
+        let copy = unpacked
+            .iter()
+            .find(|(seen, _)| *seen == index)
+            .map(|(_, p)| p);
+        match (target, copy) {
+            (_, None) if only.is_some_and(|only| only != *name) => {
+                entry.skipped = Some("not asked for".to_string());
+            }
+            (Err(reason), _) => entry.skipped = Some(reason.to_string()),
+            (Ok(_), None) if in_archive => {
+                return Err(invalid(format!(
+                    "the manifest lists {name} and it is not there"
+                )));
+            }
+            (Ok(_), None) => entry.skipped = Some("not in the archive".to_string()),
+            (Ok(target), Some(copy)) => {
+                let problems = kompressor_store::sqlite::integrity_check(copy)
+                    .unwrap_or_else(|error| vec![error.to_string()]);
+                if let Some(first) = problems.first() {
+                    return Err(invalid(format!("{name} in it is damaged: {first}")));
+                }
+                let facts = kompressor_store::sqlite::facts(copy)?;
+                if facts.schema_version > *expected {
+                    return Err(invalid(format!(
+                        "{name} in it has schema v{}, newer than this build's v{expected} \
+                         (written by kompressor {}): restore with that version or later",
+                        facts.schema_version, report.manifest.kompressor
+                    )));
+                }
+                if kompressor_store::sqlite::in_use(target) {
+                    return Err(CoreError::BadRequest(format!(
+                        "{} is open in another process: stop the service first",
+                        target.display()
+                    )));
+                }
+                entry.bytes = std::fs::metadata(copy)?.len();
+                entry.schema_version = facts.schema_version;
+                entry.restored = true;
+                if facts.schema_version < *expected {
+                    report.notes.push(format!(
+                        "{name} holds schema v{}; it is migrated to v{expected} when the service starts",
+                        facts.schema_version
+                    ));
+                }
+                ready.push((copy.clone(), target.clone()));
+            }
+        }
+        report.databases.push(entry);
+    }
+    if ready.is_empty() {
+        let reasons: Vec<String> = report
+            .databases
+            .iter()
+            .filter_map(|d| d.skipped.as_ref().map(|why| format!("{}: {why}", d.name)))
+            .collect();
+        return Err(invalid(format!(
+            "nothing in it to restore here ({})",
+            reasons.join("; ")
+        )));
+    }
+    if !apply {
+        return Ok(report);
+    }
+
+    // Now, and only now, the files move.
+    let stamp = archive_name(now_ms);
+    let stamp = stamp
+        .trim_start_matches("kompressor-backup-")
+        .trim_end_matches(".tar.gz");
+    for (copy, target) in &ready {
+        let entry = report
+            .databases
+            .iter_mut()
+            .find(|d| d.target.as_deref() == Some(&target.display().to_string()))
+            .expect("every ready database has its entry");
+        let aside = beside(target, &format!(".before-restore-{stamp}"));
+        let replaced = target.is_file();
+        if replaced {
+            std::fs::rename(target, &aside)?;
+            entry.moved_aside = Some(aside.display().to_string());
+        }
+        // The old log and index go with the old file: left behind, SQLite
+        // would replay them into the restored database.
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let stale = beside(target, suffix);
+            if stale.exists() {
+                if replaced {
+                    std::fs::rename(&stale, beside(&aside, suffix))?;
+                } else {
+                    std::fs::remove_file(&stale)?;
+                }
+            }
+        }
+        std::fs::rename(copy, target)?;
+        adopt_ownership(
+            target,
+            replaced.then_some(aside.as_path()),
+            &mut report.notes,
+        );
+    }
+    drop(scratches);
+    Ok(report)
+}
+
 /// Snapshot one database into `scratch`, or say why it is not there to take.
 fn take<E>(
     name: &str,
@@ -350,8 +821,11 @@ mod tests {
         config
     }
 
+    /// An archive's entries: name and bytes, in order.
+    type Entries = Vec<(String, Vec<u8>)>;
+
     /// Every entry of an archive, by name.
-    fn unpack(archive: &Path) -> Vec<(String, Vec<u8>)> {
+    fn unpack(archive: &Path) -> Entries {
         let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(File::open(archive).unwrap()));
         tar.entries()
             .unwrap()
@@ -536,6 +1010,480 @@ mod tests {
             archive_name(1_709_251_199_000),
             "kompressor-backup-20240229-235959.tar.gz"
         );
+    }
+
+    #[test]
+    fn an_archive_name_reads_back_as_the_time_it_was_written_for() {
+        for ms in [0, 1_795_158_930_000, 1_709_251_199_000, 951_782_400_000] {
+            assert_eq!(archive_time(&archive_name(ms)), Some(ms));
+        }
+        for not_ours in [
+            "kompressor-backup-20261120-071530.tar",
+            "kompressor-backup-20261120-071530.tar.gz.part",
+            "kompressor-backup-2026112-0071530.tar.gz",
+            "kompressor-backup-20261131-071530.tar.gz",
+            "kompressor-backup-20261120-246060.tar.gz",
+            "kompressor-backup-2026112a-071530.tar.gz",
+            "../kompressor-backup-20261120-071530.tar.gz",
+            "stats.db",
+        ] {
+            assert_eq!(archive_time(not_ours), None, "{not_ours}");
+        }
+    }
+
+    const HOUR: i64 = 3_600_000;
+
+    /// A backup directory with an archive taken at each of `hours`, and two
+    /// files that are not archives.
+    fn backup_dir(dir: &Path, hours: &[i64]) -> PathBuf {
+        let backups = dir.join("backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        for hour in hours {
+            std::fs::write(backups.join(archive_name(hour * HOUR)), b"archive").unwrap();
+        }
+        std::fs::write(backups.join("notes.txt"), b"mine").unwrap();
+        std::fs::write(backups.join("kompressor-backup-old.tar.gz"), b"mine").unwrap();
+        backups
+    }
+
+    #[test]
+    fn pruning_keeps_the_newest_and_touches_nothing_that_is_not_an_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = backup_dir(dir.path(), &[5, 1, 9, 3]);
+        let listed: Vec<i64> = list_archives(&backups)
+            .iter()
+            .map(|archive| archive.created_at_ms / HOUR)
+            .collect();
+        assert_eq!(listed, [9, 5, 3, 1], "newest first, archives only");
+        assert_eq!(
+            prune_archives(&backups, 0),
+            Vec::<String>::new(),
+            "zero keeps all"
+        );
+        assert_eq!(list_archives(&backups).len(), 4);
+
+        let removed = prune_archives(&backups, 2);
+        assert_eq!(removed, [archive_name(3 * HOUR), archive_name(HOUR)]);
+        let left: Vec<i64> = list_archives(&backups)
+            .iter()
+            .map(|archive| archive.created_at_ms / HOUR)
+            .collect();
+        assert_eq!(left, [9, 5]);
+        assert!(backups.join("notes.txt").exists());
+        assert!(backups.join("kompressor-backup-old.tar.gz").exists());
+        assert!(list_archives(&dir.path().join("missing")).is_empty());
+    }
+
+    #[test]
+    fn a_backup_is_due_an_interval_after_the_newest_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let every = std::time::Duration::from_secs(6 * 3_600);
+        let empty = dir.path().join("none");
+        assert_eq!(
+            next_due_ms(&empty, every, 50 * HOUR),
+            50 * HOUR,
+            "none yet: now"
+        );
+        let backups = backup_dir(dir.path(), &[10, 4]);
+        assert_eq!(next_due_ms(&backups, every, 11 * HOUR), 16 * HOUR);
+        // Taken by a clock that ran ahead: not a reason to wait a year.
+        std::fs::write(backups.join(archive_name(9_000 * HOUR)), b"archive").unwrap();
+        assert_eq!(next_due_ms(&backups, every, 20 * HOUR), 20 * HOUR);
+    }
+
+    #[test]
+    fn a_scheduled_backup_is_taken_when_due_and_old_ones_are_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = deployment(dir.path());
+        assert!(
+            run_scheduled(&config, 100 * HOUR).unwrap().is_none(),
+            "no schedule"
+        );
+        let backups = dir.path().join("deep").join("backups");
+        config.maintenance.backup_dir = backups.clone();
+        config.maintenance.backup_every = std::time::Duration::from_secs(6 * 3_600);
+        config.maintenance.backup_keep = 2;
+
+        let first = run_scheduled(&config, 100 * HOUR)
+            .unwrap()
+            .expect("none yet: due");
+        assert_eq!(first.archive, backups.join(archive_name(100 * HOUR)));
+        assert_eq!(first.manifest.databases.len(), 2);
+        assert_eq!(
+            first.bytes,
+            std::fs::metadata(&first.archive).unwrap().len()
+        );
+        assert!(first.removed.is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&backups).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "the directory it made is its owner's alone");
+        }
+
+        assert!(
+            run_scheduled(&config, 103 * HOUR).unwrap().is_none(),
+            "not yet"
+        );
+        assert!(run_scheduled(&config, 106 * HOUR).unwrap().is_some());
+        let third = run_scheduled(&config, 112 * HOUR).unwrap().unwrap();
+        assert_eq!(third.removed, [archive_name(100 * HOUR)]);
+        let kept: Vec<i64> = list_archives(&backups)
+            .iter()
+            .map(|archive| archive.created_at_ms / HOUR)
+            .collect();
+        assert_eq!(kept, [112, 106]);
+        assert_eq!(
+            std::fs::read_dir(&backups).unwrap().count(),
+            2,
+            "no scratch left"
+        );
+    }
+
+    /// A scheduled backup that cannot be written removes nothing: the
+    /// archives that worked are still there.
+    #[test]
+    fn a_failed_scheduled_backup_prunes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = deployment(dir.path());
+        let backups = backup_dir(dir.path(), &[1, 2, 3]);
+        config.maintenance.backup_dir = backups.clone();
+        config.maintenance.backup_every = std::time::Duration::from_secs(3_600);
+        config.maintenance.backup_keep = 1;
+        // Nothing to back up: both databases gone.
+        config.stats.enabled = false;
+        config.refs.backend = RefsBackend::Memory;
+        assert!(run_scheduled(&config, 50 * HOUR).is_err());
+        assert_eq!(list_archives(&backups).len(), 3);
+    }
+
+    /// How many samples the statistics database at `path` holds.
+    fn samples(path: &Path) -> i64 {
+        kompressor_stats::schema::open_read_write(path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM store_samples", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn add_sample(config: &Config, time_ms: i64) {
+        kompressor_stats::schema::open_read_write(&config.stats.path)
+            .unwrap()
+            .execute(
+                "INSERT INTO store_samples (time_ms, live_refs, live_bytes) VALUES (?1, 0, 0)",
+                [time_ms],
+            )
+            .unwrap();
+    }
+
+    const STAMP: i64 = 1_795_158_930_000;
+
+    #[test]
+    fn a_restore_puts_the_archive_back_and_moves_what_was_there_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = deployment(dir.path());
+        let archive = dir.path().join("backup.tar.gz");
+        write_archive(&config, &archive).unwrap();
+        // Life goes on after the backup: these rows are not in it.
+        add_sample(&config, 50);
+        add_sample(&config, 51);
+        assert_eq!(samples(&config.stats.path), 3);
+
+        // A rehearsal changes nothing and says what it would do.
+        let rehearsal = restore(&config, &archive, None, false, STAMP).unwrap();
+        assert!(!rehearsal.applied);
+        assert!(
+            rehearsal
+                .databases
+                .iter()
+                .all(|d| d.restored && d.moved_aside.is_none())
+        );
+        assert_eq!(samples(&config.stats.path), 3);
+        let before: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            before
+                .iter()
+                .all(|name| !name.to_string_lossy().contains("before-restore"))
+        );
+        assert!(
+            before
+                .iter()
+                .all(|name| !name.to_string_lossy().starts_with('.')),
+            "no scratch left: {before:?}"
+        );
+
+        let done = restore(&config, &archive, None, true, STAMP).unwrap();
+        assert!(done.applied);
+        assert_eq!(samples(&config.stats.path), 1, "as it was when backed up");
+        let stats = &done.databases[0];
+        assert_eq!((stats.name.as_str(), stats.restored), ("stats.db", true));
+        let aside = PathBuf::from(stats.moved_aside.as_ref().expect("moved, not deleted"));
+        assert_eq!(
+            aside.file_name().unwrap().to_string_lossy(),
+            "stats.db.before-restore-20261120-071530"
+        );
+        assert_eq!(samples(&aside), 3, "what was there is whole, beside it");
+        assert!(done.databases[1].moved_aside.is_some());
+        // Both open, and the store is a store.
+        kompressor_store::SqliteRefStore::open(&config.refs.path).unwrap();
+        assert!(done.notes.is_empty(), "{:?}", done.notes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_restored_file_has_the_mode_of_the_one_it_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let config = deployment(dir.path());
+        let archive = dir.path().join("backup.tar.gz");
+        write_archive(&config, &archive).unwrap();
+        std::fs::set_permissions(&config.stats.path, std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        restore(&config, &archive, None, true, STAMP).unwrap();
+        let mode = std::fs::metadata(&config.stats.path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o644,
+            "the service that could read the old one can read this"
+        );
+    }
+
+    #[test]
+    fn one_database_can_be_restored_and_the_other_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = deployment(dir.path());
+        let archive = dir.path().join("backup.tar.gz");
+        write_archive(&config, &archive).unwrap();
+        add_sample(&config, 50);
+        let refs_before = std::fs::read(&config.refs.path).unwrap();
+        // The store is in use; the statistics are not, and only they are asked for.
+        let store = kompressor_store::SqliteRefStore::open(&config.refs.path).unwrap();
+        let done = restore(&config, &archive, Some("stats.db"), true, STAMP).unwrap();
+        assert_eq!(samples(&config.stats.path), 1);
+        assert_eq!(done.databases[1].skipped.as_deref(), Some("not asked for"));
+        assert!(!done.databases[1].restored);
+        drop(store);
+        assert_eq!(
+            std::fs::read(&config.refs.path).unwrap()[..100],
+            refs_before[..100]
+        );
+        let unknown = restore(&config, &archive, Some("config.toml"), true, STAMP).unwrap_err();
+        assert!(
+            unknown.to_string().contains("stats.db and refs.db"),
+            "{unknown}"
+        );
+    }
+
+    /// A database a process has open is not replaced under it.
+    #[test]
+    fn a_database_in_use_is_refused_and_nothing_is_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = deployment(dir.path());
+        let archive = dir.path().join("backup.tar.gz");
+        write_archive(&config, &archive).unwrap();
+        add_sample(&config, 50);
+        let service = kompressor_store::SqliteRefStore::open(&config.refs.path).unwrap();
+        for apply in [false, true] {
+            let refused = restore(&config, &archive, None, apply, STAMP)
+                .unwrap_err()
+                .to_string();
+            assert!(refused.contains("stop the service first"), "{refused}");
+            assert!(refused.contains("refs.db"), "{refused}");
+        }
+        // Not half done: the statistics, which were free, were not replaced.
+        assert_eq!(samples(&config.stats.path), 2);
+        let left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("before-restore") || name.starts_with('.'))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        drop(service);
+        restore(&config, &archive, None, true, STAMP).unwrap();
+    }
+
+    /// Onto a host with no databases yet — a new machine — and the old log
+    /// of a database that is being replaced does not survive to be replayed.
+    #[test]
+    fn a_restore_onto_nothing_creates_the_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = deployment(dir.path());
+        let archive = dir.path().join("backup.tar.gz");
+        write_archive(&config, &archive).unwrap();
+        let fresh = tempfile::tempdir().unwrap();
+        let mut elsewhere = config.clone();
+        elsewhere.stats.path = fresh.path().join("data").join("stats.db");
+        elsewhere.refs.path = fresh.path().join("data").join("refs.db");
+        // A stray log from some earlier life.
+        std::fs::create_dir_all(fresh.path().join("data")).unwrap();
+        std::fs::write(fresh.path().join("data").join("stats.db-wal"), b"stale").unwrap();
+        let done = restore(&elsewhere, &archive, None, true, STAMP).unwrap();
+        assert!(
+            done.databases
+                .iter()
+                .all(|d| d.restored && d.moved_aside.is_none())
+        );
+        assert_eq!(samples(&elsewhere.stats.path), 1);
+
+        // With the store in memory there, only the statistics go back.
+        let mut partly = elsewhere.clone();
+        partly.refs.backend = RefsBackend::Memory;
+        let done = restore(&partly, &archive, None, true, STAMP + 1_000).unwrap();
+        assert!(done.databases[0].restored);
+        assert!(
+            done.databases[1]
+                .skipped
+                .as_deref()
+                .unwrap()
+                .contains("in memory")
+        );
+        // And with nowhere to put either, it is an error, not a quiet success.
+        partly.stats.enabled = false;
+        let nothing = restore(&partly, &archive, None, true, STAMP)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            nothing.contains("nothing in it to restore here"),
+            "{nothing}"
+        );
+    }
+
+    /// What is not a sound backup this build can read is refused before
+    /// anything moves.
+    #[test]
+    fn an_archive_that_cannot_be_trusted_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = deployment(dir.path());
+        let good = dir.path().join("good.tar.gz");
+        write_archive(&config, &good).unwrap();
+        let entries = unpack(&good);
+        // Rebuild the archive with `change` applied to its entries.
+        let rebuilt = |name: &str, change: &dyn Fn(&mut Entries)| {
+            let mut entries = entries.clone();
+            change(&mut entries);
+            let path = dir.path().join(name);
+            let gzip = flate2::write::GzEncoder::new(
+                File::create(&path).unwrap(),
+                flate2::Compression::fast(),
+            );
+            let mut archive = tar::Builder::new(gzip);
+            for (name, bytes) in &entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(bytes.len() as u64);
+                header.set_mode(0o600);
+                // The name written raw: the builder refuses a path with
+                // `..` in it, and a hostile archive is not built by it.
+                header.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+                header.set_cksum();
+                archive.append(&header, bytes.as_slice()).unwrap();
+            }
+            archive.into_inner().unwrap().finish().unwrap();
+            path
+        };
+        let refused = |path: &Path| {
+            restore(&config, path, None, true, STAMP)
+                .unwrap_err()
+                .to_string()
+        };
+
+        let junk = dir.path().join("junk.tar.gz");
+        std::fs::write(&junk, b"not an archive at all").unwrap();
+        assert!(refused(&junk).contains("not a gzipped tar") || refused(&junk).contains("damaged"));
+
+        let bare = rebuilt("bare.tar.gz", &|entries| {
+            entries.retain(|(name, _)| name != "manifest.json")
+        });
+        assert!(refused(&bare).contains("not a kompressor backup"));
+
+        let future = rebuilt("future.tar.gz", &|entries| {
+            let mut manifest: Manifest = serde_json::from_slice(&entries[0].1).unwrap();
+            manifest.format = FORMAT + 1;
+            entries[0].1 = serde_json::to_vec(&manifest).unwrap();
+        });
+        assert!(refused(&future).contains("this build reads up to"));
+
+        let damaged = rebuilt("damaged.tar.gz", &|entries| {
+            let bytes = &mut entries[1].1;
+            let middle = bytes.len() / 2;
+            for byte in &mut bytes[middle..middle + 4_096] {
+                *byte = 0xAB;
+            }
+        });
+        assert!(
+            refused(&damaged).contains("stats.db in it is damaged"),
+            "{}",
+            refused(&damaged)
+        );
+
+        let missing = rebuilt("missing.tar.gz", &|entries| {
+            entries.retain(|(name, _)| name != "refs.db")
+        });
+        assert!(refused(&missing).contains("lists refs.db and it is not there"));
+
+        // A database from a build newer than this one.
+        let newer = rebuilt("newer.tar.gz", &|entries| {
+            let path = dir.path().join("bump.db");
+            std::fs::write(&path, &entries[1].1).unwrap();
+            let conn = kompressor_stats::schema::open_read_write(&path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA user_version = 9999;")
+                .unwrap();
+            drop(conn);
+            entries[1].1 = std::fs::read(&path).unwrap();
+        });
+        let said = refused(&newer);
+        assert!(said.contains("newer than this build"), "{said}");
+
+        // An entry that would climb out of the directory is not one of ours,
+        // and is not written anywhere.
+        let sneaky = rebuilt("sneaky.tar.gz", &|entries| {
+            entries.push(("evil/../../escaped.db".to_string(), b"x".to_vec()));
+        });
+        restore(&config, &sneaky, None, false, STAMP).unwrap();
+        assert!(!dir.path().parent().unwrap().join("escaped.db").exists());
+
+        // Through all of that, the live databases were never moved.
+        assert_eq!(samples(&config.stats.path), 1);
+        let moved = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("before-restore"))
+            .count();
+        assert_eq!(moved, 0);
+    }
+
+    /// An archive from an older schema restores, with a note that the
+    /// service migrates it on start.
+    #[test]
+    fn an_older_database_restores_and_says_it_will_be_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = deployment(dir.path());
+        kompressor_stats::schema::open_read_write(&config.stats.path)
+            .unwrap()
+            .execute_batch("DROP TABLE backups; PRAGMA user_version = 15;")
+            .unwrap();
+        let archive = dir.path().join("old.tar.gz");
+        let manifest = write_archive(&config, &archive).unwrap();
+        assert_eq!(manifest.databases[0].schema_version, 15);
+        let done = restore(&config, &archive, None, true, STAMP).unwrap();
+        assert_eq!(done.databases[0].schema_version, 15);
+        assert!(
+            done.notes.iter().any(|note| note.contains("migrated to v")),
+            "{:?}",
+            done.notes
+        );
+        // Opening it as the service does brings it up.
+        let conn = kompressor_stats::schema::open_read_write(&config.stats.path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version as u32, kompressor_stats::schema::latest_version());
     }
 
     #[test]

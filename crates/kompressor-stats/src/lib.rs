@@ -1214,6 +1214,7 @@ mod tests {
                      ALTER TABLE retrieval_events DROP COLUMN analysis_archived;
                      ALTER TABLE retrieval_events DROP COLUMN range_status;
                      ALTER TABLE proxy_requests DROP COLUMN prefix_json;
+                     DROP TABLE backups;
                      PRAGMA user_version = 5;",
                 )
                 .unwrap();
@@ -1268,6 +1269,7 @@ mod tests {
                      ALTER TABLE retrieval_events DROP COLUMN analysis_archived;
                      ALTER TABLE retrieval_events DROP COLUMN range_status;
                      ALTER TABLE proxy_requests DROP COLUMN prefix_json;
+                     DROP TABLE backups;
                      PRAGMA user_version = 5;",
                 )
                 .unwrap();

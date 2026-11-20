@@ -1349,8 +1349,11 @@ prefix answers 404 rather than an empty report — an empty report would read as
 | `GET /v1/refs?q&kind&request_id&expired&order&offset&limit&preview&tenant&format` | the ref browser (§8.3.1): one page of the tenant's fragments with a preview each, the match total, a count per kind and what the tenant holds live. JSON, or a page for `?format=html` or a browser's `Accept`. Off — 404 — unless `refs.browse = true` |
 | `GET /v1/refs/{handle}?history&tenant` | one fragment in full, read without touching it, with its retention and every recorded ask for it (`retrieval_events`) |
 | `DELETE /v1/refs/{handle}?tenant` | remove a fragment from the store and the recent-write cache; a later retrieval is a miss |
-| `GET /v1/maintenance?format` | the Maintenance page, or as JSON which databases there are (`stats.db`, `refs.db`: path, size on disk with its WAL, whether a backup would hold it) and whether this caller may back them up |
-| `POST /v1/maintenance/backup` | a backup (`kompressor_core::backup`): `application/gzip`, an attachment named `kompressor-backup-<UTC>.tar.gz` holding `manifest.json` and a snapshot of each database on disk. Each snapshot is taken with `VACUUM INTO` on a read-only connection — consistent while the writer runs, WAL folded in — and passes `PRAGMA quick_check` before it is packed; queued statistics are flushed first. Written to a file beside the databases (0600) and streamed from it, removed once sent; one at a time per process, a second is 409. 404 unless `maintenance.backup = true`; 403 under `auth.mode = "api_keys"` unless the caller presents `auth.secret`, because the archive is every tenant's data. The configuration and the interception CA are not in it. `kompressor backup [--out PATH]` writes the same archive from the host with no setting and no listener; restoring is stopping the service and putting the files back |
+| `GET /v1/maintenance?format` | the Maintenance page, or as JSON: each database (`stats.db`, `refs.db`) as SQLite sees it — path, size on disk and how much of it is write-ahead log, the schema version it holds against the one this build expects, the bytes a `VACUUM` would reclaim (`freelist_count × page_size`), for the statistics the times of its first and last row, and what the last integrity check since start found; the backup schedule with the archives in `maintenance.backup_dir`, newest first, and when the next is due; `last_backup` — when the last one that worked was taken (the newest on record in the `backups` table, schema v16, or in the directory), a failure since, the age it may reach (`maintenance.backup_max_age`, else twice `backup_every`, else none), whether it is `stale`, and the ten newest on record with what took each (`schedule`, `http`, `cli`); `restore` — the configuration file the service was started with and whether it runs under systemd, which is what the page's restore steps are written from; and whether this caller may take a backup (`backup`) or run an action (`actions`). Describing reads file headers and two rows, and needs no setting. The same answer is the `last_backup` check on `/v1/stats/health`: `info` where no backups are expected, `warn` past the age or after a failed attempt, `bad` past three times it |
+| `POST /v1/maintenance/databases/{name}/check` | `PRAGMA integrity_check` on a read-only connection: every page and every index. A damaged file — or one SQLite cannot read at all — is a 200 with `ok: false` and SQLite's own account, logged at `error` and kept on the status until restart. 404 unless `maintenance.actions = true`; 403 under API keys without `auth.secret`. `kompressor db check` does the same from the host and exits 1 on damage |
+| `POST /v1/maintenance/databases/{name}/checkpoint` | `PRAGMA wal_checkpoint(TRUNCATE)`: folds the write-ahead log into the file and truncates it, waiting at most two seconds for readers and reporting `complete: false` rather than holding writers. Same gate; `kompressor db checkpoint` from the host |
+| `GET /v1/maintenance/backups/{name}` | one of the scheduled archives, by exactly the name the schedule writes (`kompressor-backup-<UTC>.tar.gz`; anything else is 404, so nothing else in the directory can be fetched). Gated as taking a backup is |
+| `POST /v1/maintenance/backup` | a backup (`kompressor_core::backup`): `application/gzip`, an attachment named `kompressor-backup-<UTC>.tar.gz` holding `manifest.json` and a snapshot of each database on disk. Each snapshot is taken with `VACUUM INTO` on a read-only connection — consistent while the writer runs, WAL folded in — and passes `PRAGMA quick_check` before it is packed; queued statistics are flushed first. Written to a file beside the databases (0600) and streamed from it, removed once sent; one at a time per process, a second is 409. 404 unless `maintenance.backup = true`; 403 under `auth.mode = "api_keys"` unless the caller presents `auth.secret`, because the archive is every tenant's data. The configuration and the interception CA are not in it. `kompressor backup [--out PATH] [--keep N]` writes the same archive from the host with no setting and no listener; **Restoring** is `kompressor restore ARCHIVE [--only NAME] [--yes]` on the host with the service stopped, and deliberately has no route: without `--yes` it rehearses; it reads only `manifest.json`, `stats.db` and `refs.db` out of the archive, as plain files, into a scratch directory beside each target; refuses an archive in a newer format, a database that fails `PRAGMA integrity_check` or holds a schema newer than this build's, and a target another process has open (found by asking SQLite to leave WAL mode, which it refuses while any other connection exists, and putting the mode back); and only then renames each existing file — with its `-wal`, `-shm` — to `<name>.before-restore-<UTC>` and the restored one into place, giving it the owner and mode of the file it replaced so a restore run as root leaves something the service can open. **On a schedule:** with `maintenance.backup_dir` set, `serve` (not `mcp serve`, of which there may be many) writes an archive there whenever the newest one is older than `backup_every` — read from the directory each minute, so a restart neither skips nor repeats one and a service that was down takes it on coming back — then removes all but the newest `backup_keep`, only after the new one is written and only files of that name. A failure is logged and retried after 15 minutes; a backup under way at shutdown is finished |
 | `GET /metrics` | Prometheus (§15) |
 
 Responses are JSON; `?format=csv` on the tabular ones. The same queries back `kompressor stats …` on the CLI (direct SQLite, no server needed).
@@ -2345,6 +2348,11 @@ payloads = false                    # DEBUG: bodies and fragments (API), relay f
 
 [maintenance]
 backup = false                      # serve POST /v1/maintenance/backup (§10.1): every database, whole
+actions = false                     # serve the integrity check and checkpoint (§10.1)
+backup_dir = ""                     # where `serve` writes scheduled backups; empty = none
+backup_every = "1day"               # a backup when the newest in backup_dir is older; "0s" = none
+backup_keep = 7                     # archives kept in backup_dir; 0 = all
+backup_max_age = "0s"               # Health warns past this; 0 = twice backup_every, or never with no schedule
 ```
 
 Durations are humantime strings (`2s`, `100ms`, `10m`); sizes are **plain byte
@@ -3759,6 +3767,16 @@ ALTER TABLE retrieval_events ADD COLUMN range_status TEXT;
 -- (`context::PrefixObservation`): segment drift, composition, volatile values
 -- and idle time. NULL on rows from before, which reports read as "unknown".
 ALTER TABLE proxy_requests ADD COLUMN prefix_json TEXT;
+
+-- v16: every backup taken — by the schedule, from the Maintenance page or by
+-- `kompressor backup` — and whether it worked. No tenant: an archive is
+-- every tenant's. `origin` is schedule | http | cli; `destination` a path, or
+-- `download` for one sent to the caller and kept nowhere.
+CREATE TABLE backups (
+ id INTEGER PRIMARY KEY, time_ms INTEGER NOT NULL, origin TEXT NOT NULL,
+ destination TEXT NOT NULL, bytes INTEGER NOT NULL, databases INTEGER NOT NULL,
+ ok INTEGER NOT NULL, error TEXT);
+CREATE INDEX backups_time ON backups (time_ms);
 ```
 
 ## C. Configuration reference — flat environment mapping

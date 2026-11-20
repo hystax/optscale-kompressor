@@ -376,10 +376,58 @@ off by default, and with API keys configured a tenant's key does not unlock it:
 send the shared secret (`x-kompressor-secret`). The configuration and the
 interception CA are not included — they hold keys.
 
-To restore, stop the service, put `stats.db` and `refs.db` back where
-`stats.path` and `refs.path` point, remove any `-wal` and `-shm` files beside
-them, and start it. `manifest.json` in the archive says which version wrote it
-and the schema each database holds; an older database is migrated on start.
+To have the service take them itself, give it a directory:
+
+```toml
+[maintenance]
+backup_dir = "/var/lib/kompressor/backups"
+backup_every = "1day"
+backup_keep = 7
+```
+
+`serve` then writes an archive whenever the newest one there is older than
+`backup_every`, and keeps the newest `backup_keep`. The schedule is read from
+the directory, so it holds across restarts. Under the shipped systemd unit only
+the state directory is writable, which is why the example is inside it — and a
+backup on the disk it backs up survives a bad upgrade, not a dead disk, so copy
+the archives off the host. The Maintenance page lists them and, with
+`backup = true`, downloads them. From a shell, `kompressor backup --out DIR
+--keep 7` does one round of the same.
+
+The same page describes each database — size, write-ahead log, schema version,
+the space a vacuum would reclaim — with nothing turned on. Two actions need
+`actions = true`: *Check* runs a full integrity check and *Checkpoint* folds
+the write-ahead log into the file. From a shell:
+
+```bash
+kompressor db status --config /etc/kompressor/config.toml
+kompressor db check --config /etc/kompressor/config.toml
+kompressor db checkpoint --config /etc/kompressor/config.toml
+```
+
+`db check` exits 1 if a database is damaged, so a scheduled job can alarm on it.
+
+Every backup — scheduled, downloaded, or taken with `kompressor backup` — is
+recorded, and the Maintenance page shows when the last one was and the recent
+history. The Health page carries it as a check: with a schedule it warns when
+the last backup is older than twice `backup_every` (one was missed), and you
+can set the age yourself with `backup_max_age = "7days"`. With neither, the age
+is shown and not judged.
+
+To restore, stop the service and run, on the host:
+
+```bash
+kompressor restore kompressor-backup-20261120-071530.tar.gz --config /etc/kompressor/config.toml
+```
+
+That is a rehearsal: the archive is checked in full — it is a backup this build
+can read, each database in it passes an integrity check — and what would happen
+is printed. Nothing changes until you add `--yes`. Then each existing database
+is moved aside to `<name>.before-restore-<time>`, never deleted, and the
+restored one takes its place with the same owner and permissions. `--only
+stats.db` or `--only refs.db` restores one and leaves the other. It refuses to
+run while the service has the databases open. An older database is migrated
+when the service starts; one written by a newer build is refused.
 
 ---
 

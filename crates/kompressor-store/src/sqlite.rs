@@ -1020,6 +1020,148 @@ pub fn snapshot(source: &Path, destination: &Path) -> Result<u32, StoreError> {
     Ok(u32::try_from(version).unwrap_or(0))
 }
 
+/// The schema version a store this build opens is brought to.
+pub fn latest_version() -> u32 {
+    MIGRATIONS.last().map_or(0, |(version, _)| *version)
+}
+
+/// What SQLite says about a database file. Any SQLite file: the statistics
+/// database is described through this too, by whoever holds its path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DatabaseFacts {
+    /// `PRAGMA user_version`: the schema the file holds.
+    pub schema_version: u32,
+    pub page_size: u64,
+    pub page_count: u64,
+    /// Pages in the file that hold nothing: what a `VACUUM` would give back.
+    pub free_pages: u64,
+    /// Whether the file is in write-ahead-log mode.
+    pub wal: bool,
+}
+
+impl DatabaseFacts {
+    /// Bytes a `VACUUM` would return to the filesystem.
+    pub fn reclaimable_bytes(&self) -> u64 {
+        self.free_pages * self.page_size
+    }
+}
+
+fn read_only(path: &Path) -> Result<Connection, StoreError> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+    Ok(conn)
+}
+
+/// Read [`DatabaseFacts`] from the file at `path`, as one more reader: four
+/// header fields, no table is scanned.
+pub fn facts(path: &Path) -> Result<DatabaseFacts, StoreError> {
+    let conn = read_only(path)?;
+    let number = |pragma: &str| -> Result<u64, StoreError> {
+        let value: i64 = conn.query_row(&format!("PRAGMA {pragma}"), [], |row| row.get(0))?;
+        Ok(value.max(0) as u64)
+    };
+    let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    Ok(DatabaseFacts {
+        schema_version: number("user_version")?.min(u64::from(u32::MAX)) as u32,
+        page_size: number("page_size")?,
+        page_count: number("page_count")?,
+        free_pages: number("freelist_count")?,
+        wal: mode.eq_ignore_ascii_case("wal"),
+    })
+}
+
+/// Run `PRAGMA integrity_check` on the file at `path` and return what it
+/// found: empty when the database is sound, otherwise up to a hundred
+/// problems in SQLite's own words.
+///
+/// The full check, not `quick_check`: every page, every index against its
+/// table. It reads the whole file — seconds for hundreds of megabytes — on a
+/// read-only connection, so writers carry on.
+pub fn integrity_check(path: &Path) -> Result<Vec<String>, StoreError> {
+    let conn = read_only(path)?;
+    let mut statement = conn.prepare("PRAGMA integrity_check")?;
+    let lines = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+    Ok(lines.into_iter().filter(|line| line != "ok").collect())
+}
+
+/// Whether another connection — another process, in practice the running
+/// service — has the database at `path` open.
+///
+/// SQLite will not take a database out of write-ahead-log mode while anyone
+/// else has it open, however idle, and says so at once; nothing else it
+/// offers sees an idle connection. So this asks for exactly that and, when it
+/// is granted, puts the mode back: the file is left as it was found.
+///
+/// `false` for a file that is missing, is not in WAL mode, or cannot be read
+/// as a database at all — none of which a running service is quietly using.
+pub fn in_use(path: &Path) -> bool {
+    let Ok(conn) = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return false;
+    };
+    let mode = |sql: &str| conn.query_row(sql, [], |row| row.get::<_, String>(0));
+    match mode("PRAGMA journal_mode") {
+        Ok(current) if current.eq_ignore_ascii_case("wal") => {}
+        _ => return false,
+    }
+    match mode("PRAGMA journal_mode=DELETE") {
+        Ok(now) if now.eq_ignore_ascii_case("delete") => {
+            let _ = mode("PRAGMA journal_mode=WAL");
+            false
+        }
+        // Still "wal": refused, without an error, because someone has it.
+        Ok(_) => true,
+        Err(rusqlite::Error::SqliteFailure(error, _)) => matches!(
+            error.code,
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+        ),
+        Err(_) => false,
+    }
+}
+
+/// What a checkpoint did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Checkpointed {
+    /// False when a reader or writer was in the way and part of the log is
+    /// still to be folded in. Nothing is lost; the next one finishes it.
+    pub complete: bool,
+    /// Frames the log held, and how many of them reached the database.
+    pub log_frames: u64,
+    pub moved_frames: u64,
+}
+
+/// Fold the write-ahead log of the database at `path` into the file and
+/// truncate the log (`PRAGMA wal_checkpoint(TRUNCATE)`).
+///
+/// SQLite does this itself as the log grows; doing it by hand matters before
+/// copying a file by other means, and after a burst left a large log behind.
+/// It waits up to two seconds for readers to move on and then says it could
+/// not finish rather than holding writers any longer.
+pub fn checkpoint(path: &Path) -> Result<Checkpointed, StoreError> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.execute_batch("PRAGMA busy_timeout=2000;")?;
+    let (busy, log, moved): (i64, i64, i64) =
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    Ok(Checkpointed {
+        complete: busy == 0,
+        // -1 for a database that is not in WAL mode: nothing to do.
+        log_frames: log.max(0) as u64,
+        moved_frames: moved.max(0) as u64,
+    })
+}
+
 /// Connection pragmas, applied before the schema.
 fn configure(conn: &Connection) -> Result<(), StoreError> {
     // The timeout first: what follows takes the file's lock, and a process
@@ -1291,6 +1433,118 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version as u32, MIGRATIONS.last().unwrap().0);
+    }
+
+    /// Forty fragments of a few kilobytes each, and their handles.
+    fn filled(store: &SqliteRefStore, tag: &str) -> Vec<RefId> {
+        (0..40)
+            .map(|index| {
+                let text = format!("{tag} fragment {index} {}", "x".repeat(4_000));
+                let id = ref_for(&text);
+                store
+                    .put_many(&Tenant::anonymous(), &[(id, text)], &meta())
+                    .unwrap();
+                id
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_database_file_is_described_checked_and_checkpointed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("refs.db");
+        let store = SqliteRefStore::open(&path).unwrap();
+        let ids = filled(&store, "a");
+        let described = facts(&path).unwrap();
+        assert_eq!(described.schema_version, latest_version());
+        assert!(described.wal);
+        assert!(described.page_size >= 512 && described.page_count > 0);
+        assert_eq!(integrity_check(&path).unwrap(), Vec::<String>::new());
+
+        let log = dir.path().join("refs.db-wal");
+        assert!(
+            std::fs::metadata(&log).unwrap().len() > 0,
+            "writes are in the log"
+        );
+        let done = checkpoint(&path).unwrap();
+        assert!(done.complete);
+        assert_eq!(
+            std::fs::metadata(&log).unwrap().len(),
+            0,
+            "and now in the file"
+        );
+        assert!(
+            store.get(&Tenant::anonymous(), &ids[0], false).is_ok(),
+            "the store carries on"
+        );
+        // Again, with nothing in the log, is nothing to do.
+        assert!(checkpoint(&path).unwrap().complete);
+
+        // Deleted rows leave free pages: what a vacuum would reclaim.
+        RefBrowse::remove(&store, &Tenant::anonymous(), &ids).unwrap();
+        checkpoint(&path).unwrap();
+        let after = facts(&path).unwrap();
+        assert!(after.free_pages > 0, "{after:?}");
+        assert_eq!(
+            after.reclaimable_bytes(),
+            after.free_pages * after.page_size
+        );
+        drop(store);
+
+        // A file that is not a database is an error, not a clean bill.
+        let junk = dir.path().join("junk.db");
+        std::fs::write(&junk, vec![7u8; 8_192]).unwrap();
+        assert!(facts(&junk).is_err());
+        assert!(integrity_check(&junk).is_err());
+        assert!(facts(&dir.path().join("missing.db")).is_err());
+    }
+
+    #[test]
+    fn a_database_someone_has_open_is_in_use_and_is_left_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("refs.db");
+        assert!(!in_use(&path), "nothing there");
+        let store = SqliteRefStore::open(&path).unwrap();
+        filled(&store, "c");
+        assert!(in_use(&path), "held by an idle connection");
+        assert!(in_use(&path), "and asking changed nothing");
+        assert!(facts(&path).unwrap().wal);
+        drop(store);
+        assert!(!in_use(&path), "closed");
+        assert!(
+            facts(&path).unwrap().wal,
+            "left in the mode it was found in"
+        );
+        let reopened = SqliteRefStore::open(&path).unwrap();
+        assert_eq!(reopened.stats().unwrap().live_refs, 40);
+        drop(reopened);
+
+        let junk = dir.path().join("junk.db");
+        std::fs::write(&junk, vec![7u8; 8_192]).unwrap();
+        assert!(!in_use(&junk));
+    }
+
+    /// A page of the file overwritten is found.
+    #[test]
+    fn a_damaged_database_fails_its_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("refs.db");
+        let store = SqliteRefStore::open(&path).unwrap();
+        filled(&store, "b");
+        drop(store);
+        assert!(checkpoint(&path).unwrap().complete);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let page = facts(&path).unwrap().page_size as usize;
+        assert!(bytes.len() > page * 4);
+        for byte in &mut bytes[page * 2..page * 3] {
+            *byte = 0xAB;
+        }
+        std::fs::write(&path, bytes).unwrap();
+        let found = integrity_check(&path);
+        assert!(
+            found.as_ref().map_or(true, |problems| !problems.is_empty()),
+            "a clean bill for a damaged file: {found:?}"
+        );
     }
 
     /// Several processes creating one store at the same moment all get it.
