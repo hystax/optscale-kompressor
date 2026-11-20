@@ -144,6 +144,7 @@ const VIEWS = [
   { id: "activity", title: "Activity", api: "stats/activity" },
   { id: "cohorts", title: "Conversation cohorts", api: "stats/cohorts" },
   { id: "prefix", title: "Prefix drift", api: "stats/prefix" },
+  { id: "advisor", title: "Opt-in advisor", api: "stats/advisor" },
 ];
 const view = VIEWS.find(v => v.id === SETTINGS.view) || VIEWS[0];
 const $ = id => document.getElementById(id);
@@ -696,6 +697,67 @@ RENDER.prefix = d => {
     assumed.length ? section("The same, where the request names no lifetime", coldTable(assumed),
       note("The lifetime is assumed, not asked for, so every row is one guess about the provider's retention.")) : null,
   ].filter(Boolean);
+};
+
+const VERDICT_TEXT = { turn_on: "Turn on", not_worth_it: "Not worth it", not_enough_data: "Not enough data" };
+const VERDICT_CLASS = { turn_on: "good", not_worth_it: "", not_enough_data: "muted" };
+function factValue(f) {
+  if (f.unit === "share") return pct(f.value);
+  if (f.unit === "bytes") return bytes(Math.round(f.value));
+  if (f.unit === "tokens") return tok(f.value);
+  if (f.unit === "seconds") return f.value + " s";
+  return n(f.value);
+}
+RENDER.advisor = d => {
+  if (!d.available) {
+    return [note("This database was last written by a build that did not record prefix observations. Advice starts with the first requests a current build proxies.")];
+  }
+  const counted = v => d.advice.filter(a => a.verdict === v && a.built);
+  const acted = counted("turn_on").filter(a => a.enabled);
+  const pending = counted("turn_on").filter(a => !a.enabled);
+  const onAgainst = d.advice.filter(a => a.enabled && a.verdict === "not_worth_it");
+  const state = a => !a.built ? el("span", { class: "muted" }, "not built")
+    : a.enabled == null ? "–" : a.enabled ? el("strong", {}, "on") : "off";
+  const verdict = a => {
+    const text = !a.built && a.verdict === "turn_on" ? "Worth building" : VERDICT_TEXT[a.verdict] || a.verdict;
+    return el("strong", { class: VERDICT_CLASS[a.verdict] || "" }, text);
+  };
+  const e = d.effects;
+  return [
+    tiles([
+      ["Worth turning on", n(pending.length), pending.length ? pending.map(a => a.setting).join(", ") : "nothing the evidence asks for is off", pending.length ? "warn" : "good"],
+      ["On, and earning it", n(acted.length), acted.map(a => a.setting).join(", ") || "–"],
+      ["On, without evidence for it", n(onAgainst.length), onAgainst.map(a => a.setting).join(", ") || "–", onAgainst.length ? "warn" : ""],
+      ["Not enough data", n(counted("not_enough_data").length), n(d.compared) + " requests compared with the one before"],
+      ["Input cost in the window", tok(d.input_cost), "input-equivalent tokens; the base of every cost share" + (d.truncated ? "; newest rows only" : "")],
+    ]),
+    section("What the evidence says about each setting", table([
+      ["Setting", a => el("div", { style: "white-space:normal;min-width:20rem;max-width:34rem" },
+        el("strong", {}, a.title), " ", el("code", {}, a.setting),
+        el("div", { class: "muted", style: "margin-top:.2rem" }, a.why)), { text: true }],
+      ["Now", state, { text: true }],
+      ["Verdict", verdict, { text: true }],
+      ["Set", a => a.value ? el("code", {}, a.value) : "–", { text: true }],
+      ["Measured", a => a.measure == null ? "–" : pct(a.measure, a.measure < 0.1 ? 2 : 1)],
+      ["Bar", a => pct(a.threshold, a.threshold < 0.1 ? 1 : 0)],
+      ["Saving, at most", a => a.saving == null ? "–" : tok(a.saving)],
+    ], d.advice),
+      note("Measured and Bar are shares of what each row names: " + d.advice.map(a => a.setting + " — " + a.basis).join("; ") + ". " +
+        "A verdict is that bar applied to an estimate. The bars are the ones the design proposed, not measured optima; savings are ceilings, in input-equivalent tokens over the window, and assume the setting recovers the whole loss put down to it.")),
+    ...d.advice.map(a => section(a.title + " — the figures", table([
+      ["", f => f.label, { text: true }],
+      ["", factValue],
+    ], a.facts, { empty: "No figures in this window." }))),
+    section("What the settings that are on have done", tiles([
+      ["Tool orders put back", n(e.tool_orders_put_back), "client reorders that never reached the provider"],
+      ["Beta tokens put back", n(e.betas_put_back), "requests"],
+      ["Recompactions", n(e.recompactions_observed + e.recompactions_predicted), n(e.recompactions_predicted) + " predicted, " + n(e.predictions_wrong) + " of them wrong", e.predictions_wrong ? "bad" : ""],
+      ["Reads rewritten", n(e.reads_rewritten), "stale, superseded or matured, across the ledgers"],
+      ["Tool schema compacted", bytes(e.tools_compacted_bytes), "over the window"],
+      ["Reasoning elided", bytes(e.reasoning_elided_bytes), "over the window"],
+    ]),
+      note("All zero while everything is off. Compare with the ceilings above once a setting has been on for a while. The detail behind every row is on the Prefix drift page.")),
+  ];
 };
 
 const QUALITY_AREAS = [["requests", "Proxied requests"], ["engine", "Engine runs"], ["retrieval", "Retrievals"], ["limits", "What the database cannot hold"]];

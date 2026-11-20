@@ -129,6 +129,24 @@ pub struct PrefixObservation {
     /// out of this request.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub reasoning_elided_bytes: u32,
+    /// Whether the client named a `prompt_cache_key` itself. `None` on a
+    /// family that has no such field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_cache_key: Option<bool>,
+    /// What `proxy.tools_compact` would take out of this request's tool
+    /// definitions, measured without doing it. Zero where it is doing it.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub tools_compactable_bytes: u32,
+    /// Bytes of file reads a recompaction would rewrite at this point in the
+    /// conversation, by what it would decide about them: invalidated by a
+    /// later write, contained in a later read, or left alone long enough to
+    /// compress as source. Measured on every request, acted on by none.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub stale_read_bytes: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub superseded_read_bytes: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub quiet_read_bytes: u32,
 }
 
 fn is_zero(count: &u32) -> bool {

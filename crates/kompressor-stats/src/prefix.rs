@@ -252,14 +252,16 @@ fn blame(observation: &PrefixObservation) -> Option<(&'static str, bool)> {
     })
 }
 
-struct Observed {
-    request_id: String,
-    api_family: String,
-    model: String,
-    conversation: Option<String>,
+pub(crate) struct Observed {
+    pub(crate) request_id: String,
+    pub(crate) api_family: String,
+    pub(crate) model: String,
+    pub(crate) conversation: Option<String>,
     /// The provider's cache read, when it reported usage at all.
-    read: Option<i64>,
-    observation: PrefixObservation,
+    pub(crate) read: Option<i64>,
+    /// The prompt tokens the provider reported, as it reports them.
+    pub(crate) prompt: i64,
+    pub(crate) observation: PrefixObservation,
 }
 
 fn score(api_family: &str, lifetime_s: u32, asked: bool, margin_s: u32) -> ColdScore {
@@ -543,7 +545,7 @@ impl StatsReader {
         Ok(report)
     }
 
-    fn prefix_rows(
+    pub(crate) fn prefix_rows(
         &self,
         tenant: &str,
         from_ms: i64,
@@ -554,7 +556,7 @@ impl StatsReader {
                     CASE WHEN prompt_tokens IS NULL AND cache_read_tokens IS NULL
                               AND cache_write_tokens IS NULL
                          THEN NULL ELSE COALESCE(cache_read_tokens, 0) END,
-                    prefix_json
+                    prefix_json, COALESCE(prompt_tokens, 0)
              FROM proxy_requests
              WHERE tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3
                AND keep_warm = 0 AND prefix_json IS NOT NULL
@@ -577,6 +579,7 @@ impl StatsReader {
                 model: row.get(2)?,
                 conversation: row.get(3)?,
                 read: row.get(4)?,
+                prompt: row.get(6)?,
                 observation,
             });
         }

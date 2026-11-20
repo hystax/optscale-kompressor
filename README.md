@@ -669,7 +669,7 @@ accept the same `from`/`to` pair. Analysis uses retained raw events; daily
 archives cannot reconstruct turn history. Token reduction remains an estimate
 per request, not a monetary saving or a count of unique content.
 
-Fifteen more pages sit beside those on the statistics listener, linked from each
+Sixteen more pages sit beside those on the statistics listener, linked from each
 other and from every page's **Dashboards** link:
 
 - `/health`: one verdict for the last hour (or any window) — upstream incidents
@@ -748,6 +748,19 @@ other and from every page's **Dashboards** link:
   request that finds it, per lifetime and margin. Observation only: no byte of
   any request changes.
 
+- `/advisor`: which of the opt-in settings would pay on this traffic. One row
+  per setting — pinned tool order, kept beta tokens, an OpenAI cache key,
+  schema compaction, recompaction on a lapsed cache, the read decisions,
+  reasoning elision, and tool deferral, which is not built — with whether it
+  is on now, a verdict (turn on, not worth it, not enough data), the value to
+  set, the figure the verdict rests on beside the bar it was held against, a
+  ceiling on the saving, and the reason in a sentence. Under it, the figures
+  behind each row and what the settings that are on have actually done. The
+  bars are the design's proposals, printed with each verdict, not measured
+  optima; three of the figures (what compaction would remove, what a
+  recompaction would rewrite, whether a client names its own cache key) are
+  measured on every request without acting on them.
+
 ### Statistics JSON API for automation
 
 Every dashboard is backed by a JSON route, and a client that sends no `Accept`
@@ -777,6 +790,7 @@ statistics listener (`server.stats_listen`) as well.
 | `GET /v1/stats/activity?window=7d` | requests, pings, pass-through, billed input, cache writes and engine savings per weekday and hour (UTC), the busiest cell and the busiest eight consecutive hours |
 | `GET /v1/stats/cohorts?window=7d` | conversations bucketed by client turns, each with its billed input, cost share, net saving and median length, and the share of conversations that carries half the cost |
 | `GET /v1/stats/prefix?window=24h` | compared requests and how many moved nothing; per prompt segment the turns the client changed it and the turns only the proxy did, with the prefix-change losses, tokens and cost put down to each; losses the observations cannot explain; request composition per model; volatile values in instructions; predicted-cold precision and recall per lifetime and margin |
+| `GET /v1/stats/advisor?window=24h` | one `advice` row per opt-in setting: `verdict` (`turn_on`, `not_worth_it`, `not_enough_data`), `value` to set, `enabled` now, `built`, the `measure` and `threshold` with what they are a share of, a `saving` ceiling in input-equivalent tokens, `why`, and the `facts` behind it; plus `effects`, what the settings that are on did in the window |
 | `GET /v1/stats/summary`, `histogram`, `by_type`, `retrievals`, `requests?request_id=`, `store` | the aggregate reports `kompressor stats` prints |
 
 `from`/`to` are epoch milliseconds (`to` exclusive, at most 90 days apart).
@@ -848,7 +862,8 @@ sent them. These do not, each is off by default, and none has been measured on
 live traffic yet: turn one on for a client the `/prefix` page shows needs it.
 All are `[proxy]` keys, most also settable per provider;
 [DESIGN.md §12.10](docs/DESIGN.md#1210-telling-a-live-provider-cache-from-a-lapsed-one)
-has the reasoning for each.
+has the reasoning for each. The `/advisor` page reads the evidence and says,
+per setting, whether it clears the bar.
 
 | Setting | What it does |
 | --- | --- |
@@ -899,7 +914,7 @@ Good first issues are labelled
 | `make harbor-gates` | every live-agent benchmark gate, with no provider spend                                        |
 
 
-`cargo test --workspace` runs **1,868 tests** across ten crates; clippy and rustfmt
+`cargo test --workspace` runs **1,882 tests** across ten crates; clippy and rustfmt
 are clean. `make bench-save` and `make golden` move what the tests compare against,
 so both ask before they run.
 

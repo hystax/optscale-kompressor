@@ -49,6 +49,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod advisor;
 pub mod analysis;
 pub mod breakdown;
 pub mod cache;
@@ -2008,6 +2009,8 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod advisor_tests;
 #[cfg(test)]
 mod analysis_tests;
 #[cfg(test)]

@@ -623,6 +623,8 @@ struct Prepared {
     pending_recompaction: Option<(u64, Vec<(u64, ReadDecision)>)>,
     /// Bytes `proxy.tools_compact` took out of the tool definitions.
     tools_compacted_bytes: usize,
+    /// Bytes it would take out, where it is not applied.
+    tools_compactable_bytes: usize,
     /// Bytes of earlier-turn reasoning taken out of the conversation.
     reasoning_elided_bytes: usize,
 }
@@ -640,6 +642,7 @@ impl Prepared {
             betas: None,
             pending_recompaction: None,
             tools_compacted_bytes: 0,
+            tools_compactable_bytes: 0,
             reasoning_elided_bytes: 0,
             body,
             json: None,
@@ -752,6 +755,7 @@ fn passthrough_with_stable_tools(
         betas: None,
         pending_recompaction: None,
         tools_compacted_bytes: 0,
+        tools_compactable_bytes: 0,
         reasoning_elided_bytes: 0,
     }
 }
@@ -838,6 +842,9 @@ struct Identified {
     /// across a restart: what `prompt_cache_key` is derived from.
     opening: u64,
     family: ApiFamily,
+    /// What a recompaction would decide about this conversation's file reads
+    /// right now, in bytes. Measured for the statistics; acted on nowhere.
+    reads: kompressor_engine::messages::ReadOpportunity,
 }
 
 fn prefix_identity(
@@ -903,6 +910,18 @@ fn prefix_identity(
         state.drift.previous_messages(fingerprint),
     );
     let text_bytes = opening.iter().map(|text| text.len() as u64).sum();
+    let proxy = &state.core.config_for(Some(family.provider())).proxy;
+    let reads = kompressor_engine::messages::read_opportunity(
+        &walk.messages,
+        &ReadPolicy {
+            superseded: true,
+            matured: Some(Maturity {
+                quiesce_turns: proxy.matured_quiesce_turns,
+                max_hold_turns: proxy.matured_max_hold_turns,
+                min_bytes: proxy.matured_min_bytes,
+            }),
+        },
+    );
     // The same history with the model left out, so that a conversation the
     // client moves to another model is recognised as one this proxy carried;
     // see `PrefixTracker::floor_for`.
@@ -930,6 +949,7 @@ fn prefix_identity(
         tool_names,
         opening: opening_key,
         family,
+        reads,
     })
 }
 
@@ -1027,6 +1047,30 @@ fn compact_tool_schemas(state: &ProxyState, identified: &Identified, prepared: &
         identified.incoming.messages,
         configured,
     ) {
+        // Not compacting: measure what it would take out, once for these
+        // tool definitions, so the statistics can say whether it would pay.
+        let defs = identified.incoming.tool_defs();
+        prepared.tools_compactable_bytes = state
+            .tool_policies
+            .measured(identified.fingerprint, defs)
+            .unwrap_or_else(|| {
+                let parsed;
+                let value = match prepared.json.as_ref() {
+                    Some(value) => Some(value),
+                    None => {
+                        parsed = serde_json::from_slice::<Value>(&prepared.body).ok();
+                        parsed.as_ref()
+                    }
+                };
+                let bytes = value
+                    .and_then(|value| value.get("tools"))
+                    .and_then(Value::as_array)
+                    .map_or(0, |tools| crate::toolcompact::compactable_bytes(tools));
+                state
+                    .tool_policies
+                    .measure(identified.fingerprint, defs, bytes);
+                bytes
+            });
         return;
     }
     let mut parsed = None;
@@ -1138,6 +1182,11 @@ fn observe_prefix(
     );
     observation.reasoning_elided_bytes =
         u32::try_from(prepared.reasoning_elided_bytes).unwrap_or(u32::MAX);
+    let clamp = |bytes: u64| u32::try_from(bytes).unwrap_or(u32::MAX);
+    observation.tools_compactable_bytes = clamp(prepared.tools_compactable_bytes as u64);
+    observation.stale_read_bytes = clamp(identified.reads.stale);
+    observation.superseded_read_bytes = clamp(identified.reads.superseded);
+    observation.quiet_read_bytes = clamp(identified.reads.matured);
     observation.tools_compacted_bytes =
         u32::try_from(prepared.tools_compacted_bytes).unwrap_or(u32::MAX);
     if let Some((kind, held)) = prepared.recompacted {
@@ -1770,6 +1819,7 @@ async fn prepare_inner(
                 betas: None,
                 pending_recompaction,
                 tools_compacted_bytes: 0,
+                tools_compactable_bytes: 0,
                 reasoning_elided_bytes: 0,
             }
         }

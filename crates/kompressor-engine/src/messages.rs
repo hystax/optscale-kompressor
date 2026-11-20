@@ -336,6 +336,51 @@ pub fn read_key(index: usize, message: &Message) -> u64 {
     hash
 }
 
+/// How much of a conversation a deciding run would rewrite, in bytes of file
+/// read, by what it would decide. See [`read_opportunity`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadOpportunity {
+    /// Reads a later write has invalidated.
+    pub stale: u64,
+    /// Reads a later read of the same file contains.
+    pub superseded: u64,
+    /// Reads left alone long enough to be compressed as source.
+    pub matured: u64,
+}
+
+/// What [`decide_reads`] would decide about this conversation right now, as
+/// sizes, without rewriting anything: the measurement behind whether turning
+/// the read decisions on would be worth it.
+///
+/// A cache breakpoint does not shield a read here, as it does not on the turn
+/// this describes — one where the cache is already lost. An operator's own
+/// `protected` flag still does.
+pub fn read_opportunity(messages: &[Message], policy: &ReadPolicy) -> ReadOpportunity {
+    let view: Vec<LedgerMessage> = messages
+        .iter()
+        .map(|m| LedgerMessage {
+            tool_name: m.meta.tool_name.as_deref(),
+            path: m.meta.file_path.as_deref(),
+            protected: m.meta.protected,
+            failed: m.meta.tool_error
+                || (m.meta.file_path.is_some() && reports_failure(&m.content.joined_text())),
+            range: m.meta.read_range,
+            assistant: m.role.eq_ignore_ascii_case("assistant"),
+            bytes: m.content.text_len(),
+        })
+        .collect();
+    let mut found = ReadOpportunity::default();
+    for (index, decision) in decide_reads(&view, policy) {
+        let bytes = view[index].bytes as u64;
+        match decision {
+            ReadDecision::Stale => found.stale += bytes,
+            ReadDecision::Superseded => found.superseded += bytes,
+            ReadDecision::Matured => found.matured += bytes,
+        }
+    }
+    found
+}
+
 impl Default for RequestOptions<'_> {
     /// Hand-written for one field. `#[derive(Default)]` would make
     /// `cache_hit_per_mille` zero, which does not mean "unknown" — it means
@@ -2591,6 +2636,52 @@ mod tests {
         assert_eq!(
             stronger.values().copied().collect::<Vec<_>>(),
             [ReadDecision::Stale]
+        );
+    }
+
+    #[test]
+    fn the_opportunity_is_sized_without_rewriting_anything() {
+        let file = "x = 1\n".repeat(400);
+        let size = file.len() as u64;
+        let mut conversation = vec![
+            // Edited afterwards: stale.
+            block_read("src/a.rs", file.clone(), Some((1, 2_001))),
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text("The file was updated.".into()),
+                meta: MessageMeta {
+                    tool_name: Some("Edit".into()),
+                    file_path: Some("src/a.rs".into()),
+                    ..Default::default()
+                },
+            },
+            // Read again in full afterwards: superseded.
+            block_read("src/b.rs", file.clone(), Some((40, 60))),
+            block_read("src/b.rs", file.clone(), Some((1, 2_001))),
+            // Left alone: matured once six turns have passed.
+            block_read("src/c.rs", file.clone(), Some((1, 2_001))),
+        ];
+        // Pinned by a cache breakpoint, which a lapsed cache does not honour.
+        conversation[0].meta.cache_control = true;
+        conversation.extend((0..6).map(|n| assistant(&format!("Step {n}."))));
+        let before = conversation.clone();
+
+        let policy = ReadPolicy {
+            superseded: true,
+            ..MATURING
+        };
+        let found = read_opportunity(&conversation, &policy);
+        assert_eq!(conversation, before, "a measurement, not a rewrite");
+        assert_eq!(found.stale, size);
+        assert_eq!(found.superseded, size);
+        assert_eq!(found.matured, 2 * size, "the whole read of b, and c");
+
+        // An operator's own flag still shields a read.
+        conversation[0].meta.protected = true;
+        assert_eq!(read_opportunity(&conversation, &policy).stale, 0);
+        assert_eq!(
+            read_opportunity(&conversation, &ReadPolicy::default()),
+            ReadOpportunity::default()
         );
     }
 

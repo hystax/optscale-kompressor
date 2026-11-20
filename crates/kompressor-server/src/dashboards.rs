@@ -2,10 +2,11 @@
 //! yield, a conversation timeline, store health, keep-warm return, cache
 //! losses set against compression, upstream health, traffic composition, the
 //! engine, data quality, a per-model scorecard, activity by hour of the week,
-//! conversation cohorts and what moved in the cacheable prefix.
+//! conversation cohorts, what moved in the cacheable prefix, and which opt-in
+//! settings that evidence says would pay.
 //!
 //! Each view has a JSON route under each version prefix —
-//! `/v1/stats/{health,trends,yield,store-health,keepwarm,cache-loss,upstream,traffic,engine,quality,models,activity,cohorts,prefix}`
+//! `/v1/stats/{health,trends,yield,store-health,keepwarm,cache-loss,upstream,traffic,engine,quality,models,activity,cohorts,prefix,advisor}`
 //! — and one
 //! shared page that draws whichever view it was opened on. The timeline has no
 //! route of its own: it draws a conversation's turns from
@@ -13,7 +14,7 @@
 //! statistics listener the pages are at `/health`, `/trends`, `/yield`,
 //! `/timeline`, `/cache-loss`, `/traffic`, `/quality`,
 //! `/store`, `/keepwarm`, `/upstream`, `/engine`, `/models`, `/activity`,
-//! `/cohorts` and `/prefix`.
+//! `/cohorts`, `/prefix` and `/advisor`.
 //!
 //! Credentials, tenant scoping, formats and the page-shell rule are the cache
 //! route's: the shell is served to anyone, the data only to a request that
@@ -32,6 +33,7 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use kompressor_stats::advisor::AdvisorReport;
 use kompressor_stats::cache::compression::CompressionCacheReport;
 use kompressor_stats::cache::keepwarm::KeepWarmReport;
 use kompressor_stats::dashboards::{
@@ -84,10 +86,11 @@ pub(crate) enum View {
     Activity,
     Cohorts,
     Prefix,
+    Advisor,
 }
 
 impl View {
-    pub(crate) const ALL: [View; 15] = [
+    pub(crate) const ALL: [View; 16] = [
         View::Health,
         View::Trends,
         View::Yield,
@@ -103,6 +106,7 @@ impl View {
         View::Activity,
         View::Cohorts,
         View::Prefix,
+        View::Advisor,
     ];
 
     /// The page's path on the statistics listener.
@@ -123,6 +127,7 @@ impl View {
             View::Activity => "/activity",
             View::Cohorts => "/cohorts",
             View::Prefix => "/prefix",
+            View::Advisor => "/advisor",
         }
     }
 
@@ -144,6 +149,7 @@ impl View {
             View::Activity => "/stats/activity",
             View::Cohorts => "/stats/cohorts",
             View::Prefix => "/stats/prefix",
+            View::Advisor => "/stats/advisor",
         }
     }
 
@@ -164,6 +170,7 @@ impl View {
             View::Activity => "activity",
             View::Cohorts => "cohorts",
             View::Prefix => "prefix",
+            View::Advisor => "advisor",
         }
     }
 }
@@ -459,6 +466,45 @@ async fn respond(
             let report: CompressionCacheReport = state
                 .with_stats(move |r| r.compression_cache(&tenant, from_ms, to_ms, conversations))
                 .await?;
+            Ok(answer(format, view, now, window, report))
+        }
+        View::Advisor => {
+            let mut report: AdvisorReport = state
+                .with_stats(move |r| r.advisor(&tenant, from_ms, to_ms))
+                .await?;
+            // The report knows the traffic; only this side knows what is on.
+            // "On" is on for any provider the setting can apply to.
+            use kompressor_core::config::{ColdRecompact, PromptCacheKey, ToolsOrder};
+            let core = &state.core;
+            let any = |on: &dyn Fn(&kompressor_core::config::ProxyConfig) -> bool| {
+                [None, Some("anthropic"), Some("openai")]
+                    .into_iter()
+                    .any(|provider| on(&core.config_for(provider).proxy))
+            };
+            for (setting, enabled) in [
+                ("tools_order", any(&|p| p.tools_order == ToolsOrder::Pinned)),
+                ("sticky_beta", any(&|p| p.sticky_beta)),
+                (
+                    "prompt_cache_key",
+                    any(&|p| p.prompt_cache_key == PromptCacheKey::Conversation),
+                ),
+                ("tools_compact", any(&|p| p.tools_compact)),
+                (
+                    "cold_recompact",
+                    any(&|p| p.cold_recompact != ColdRecompact::Off),
+                ),
+                (
+                    "superseded_reads, matured_reads",
+                    any(&|p| p.superseded_reads || p.matured_reads),
+                ),
+                (
+                    "reasoning_elide_models",
+                    any(&|p| !p.reasoning_elide_models.is_empty()),
+                ),
+                ("tool deferral", false),
+            ] {
+                report.mark_enabled(setting, enabled);
+            }
             Ok(answer(format, view, now, window, report))
         }
         View::Prefix => {

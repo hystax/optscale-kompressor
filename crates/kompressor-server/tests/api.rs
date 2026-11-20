@@ -2145,6 +2145,92 @@ async fn the_prefix_dashboard_says_which_segment_moved_and_who_moved_it() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
+/// The advisor over HTTP: a row per opt-in setting, each marked with whether
+/// this deployment has it on, under both version prefixes and as a page.
+#[tokio::test]
+async fn the_advisor_gives_a_verdict_per_setting_and_says_what_is_on() {
+    use kompressor_stats::context::PrefixObservation;
+
+    let harness = Harness::with_stats();
+    let (_, empty) = harness.get("/v1/stats/cache").await;
+    let tenant = text(&empty["tenant"]);
+    let t = now_ms() - 3_000_000;
+    // A hundred and twenty turns of one conversation, each read back in full,
+    // carrying tool definitions a twentieth of which is schema bookkeeping.
+    for turn in 0..120u32 {
+        let seen = PrefixObservation {
+            compared: turn > 0,
+            body_bytes: 10_000,
+            tools_bytes: 4_000,
+            tools_count: 12,
+            tools_compactable_bytes: 200,
+            ..PrefixObservation::default()
+        };
+        let read = if turn == 0 {
+            0
+        } else {
+            40_000 + 10 * (turn - 1)
+        };
+        let write = if turn == 0 { 40_000 } else { 10 };
+        let event = match proxied_turn(t + i64::from(turn) * 1_000, &tenant, read, write, false) {
+            kompressor_stats::Event::ProxyRequest(mut event) => {
+                event.prefix = Some(seen);
+                kompressor_stats::Event::ProxyRequest(event)
+            }
+            other => other,
+        };
+        harness.sink.send(event);
+    }
+    harness.sink.flush().expect("the batch commits");
+
+    for version in ["v1", "v2"] {
+        let (status, report) = harness
+            .get(&format!("/{version}/stats/advisor?window=1h"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{report}");
+        assert_eq!(report["available"], true);
+        assert_eq!(report["compared"], 119);
+        let advice = report["advice"].as_array().unwrap();
+        assert_eq!(advice.len(), 8);
+        let of = |setting: &str| {
+            advice
+                .iter()
+                .find(|row| row["setting"] == setting)
+                .unwrap_or_else(|| panic!("no {setting} in {report}"))
+        };
+        assert_eq!(of("tools_compact")["verdict"], "turn_on");
+        assert_eq!(of("tools_compact")["value"], "true");
+        assert_eq!(of("tools_compact")["measure"], 0.05);
+        assert_eq!(of("tools_order")["verdict"], "not_worth_it");
+        assert_eq!(of("cold_recompact")["verdict"], "not_worth_it");
+        assert_eq!(of("prompt_cache_key")["verdict"], "not_enough_data");
+        // Nothing is on in the default deployment, and it says so rather
+        // than leaving the column blank.
+        for row in advice {
+            assert_eq!(row["enabled"], false, "{}", row["setting"]);
+        }
+        assert_eq!(of("tool deferral")["built"], false);
+        assert_eq!(report["effects"]["recompactions_observed"], 0);
+    }
+
+    let path = "/v1/stats/advisor?format=jsonl&window=1h";
+    let (status, content_type, _, body) = get_raw(&harness, path, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(content_type, "application/x-ndjson");
+    assert!(
+        jsonl_lines(&body)
+            .iter()
+            .any(|line| line["record"] == "advice"),
+        "{body}"
+    );
+
+    let (status, page) = harness.get("/v1/stats/advisor?format=html").await;
+    assert_eq!(status, StatusCode::OK);
+    let page = text(&page);
+    assert!(page.contains("\"view\":\"advisor\""));
+    assert!(page.contains("RENDER.advisor = ") && page.contains("api: \"stats/advisor\""));
+}
+
 /// The three scorecard views — models, activity, cohorts — over HTTP: the
 /// JSON under both version prefixes, the JSON-lines download, the page shell,
 /// and the pages on the statistics listener.

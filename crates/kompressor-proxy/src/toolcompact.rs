@@ -217,6 +217,17 @@ pub(crate) fn compact_tool(tool: &mut Value) -> bool {
     compact_schema(schema, &named, Some(keep_id))
 }
 
+/// How many bytes [`compact_tools`] would take out of `tools`, without
+/// changing them.
+pub(crate) fn compactable_bytes(tools: &[Value]) -> usize {
+    let size = |tools: &[Value]| serde_json::to_vec(tools).map_or(0, |bytes| bytes.len());
+    let mut copy = tools.to_vec();
+    if compact_tools(&mut copy) == 0 {
+        return 0;
+    }
+    size(tools).saturating_sub(size(&copy))
+}
+
 /// Compact every tool the client declared. Returns how many changed.
 ///
 /// The retrieve tool this proxy adds is left alone: it is written compact.
@@ -232,6 +243,10 @@ pub(crate) fn compact_tools(tools: &mut [Value]) -> usize {
 #[derive(Default)]
 pub struct ToolPolicies {
     decided: Mutex<HashMap<u64, (Instant, bool)>>,
+    /// What compaction would take out of a conversation it is not applied
+    /// to, by the tool definitions it was measured on. Kept so the
+    /// measurement is taken once per conversation and not once per request.
+    measured: Mutex<HashMap<u64, (Instant, u64, usize)>>,
 }
 
 impl ToolPolicies {
@@ -263,6 +278,35 @@ impl ToolPolicies {
         let policy = configured && messages <= OPENING_MESSAGES;
         decided.insert(conversation, (Instant::now(), policy));
         policy
+    }
+
+    /// What compaction would take out of this conversation's tools, if that
+    /// has been measured for these definitions.
+    pub(crate) fn measured(&self, conversation: u64, tool_defs: u64) -> Option<usize> {
+        let mut measured = self.measured.lock().ok()?;
+        let (used, defs, bytes) = measured.get_mut(&conversation)?;
+        if *defs != tool_defs {
+            return None;
+        }
+        *used = Instant::now();
+        Some(*bytes)
+    }
+
+    /// Record a measurement for [`Self::measured`] to return.
+    pub(crate) fn measure(&self, conversation: u64, tool_defs: u64, bytes: usize) {
+        let Ok(mut measured) = self.measured.lock() else {
+            return;
+        };
+        if measured.len() >= REMEMBER
+            && !measured.contains_key(&conversation)
+            && let Some(oldest) = measured
+                .iter()
+                .min_by_key(|(_, (at, _, _))| *at)
+                .map(|(key, _)| *key)
+        {
+            measured.remove(&oldest);
+        }
+        measured.insert(conversation, (Instant::now(), tool_defs, bytes));
     }
 
     /// Conversations with a policy. For tests.
@@ -594,6 +638,33 @@ mod tests {
             policies.compacting(0, 21, true),
             "still compacted: an entry lost here would be re-decided as under way"
         );
+    }
+
+    #[test]
+    fn a_dry_run_measures_without_touching_and_is_remembered_per_definition() {
+        let tools = vec![generated(), generated()];
+        let before = tools.clone();
+        let bytes = compactable_bytes(&tools);
+        assert_eq!(tools, before);
+        let mut compacted = tools.clone();
+        compact_tools(&mut compacted);
+        assert_eq!(
+            bytes,
+            serde_json::to_vec(&tools).unwrap().len()
+                - serde_json::to_vec(&compacted).unwrap().len()
+        );
+        assert_eq!(compactable_bytes(&compacted), 0, "nothing left to take");
+
+        let policies = ToolPolicies::default();
+        assert_eq!(policies.measured(1, 77), None);
+        policies.measure(1, 77, bytes);
+        assert_eq!(policies.measured(1, 77), Some(bytes));
+        assert_eq!(
+            policies.measured(1, 78),
+            None,
+            "other definitions: measure again"
+        );
+        assert_eq!(policies.measured(2, 77), None);
     }
 
     #[test]

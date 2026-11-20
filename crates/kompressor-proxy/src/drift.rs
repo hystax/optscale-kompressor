@@ -220,6 +220,9 @@ pub(crate) struct Segments {
     pub(crate) one_hour: bool,
     /// Conversation items the request carried, instructions left out.
     pub(crate) messages: usize,
+    /// Whether the client named a `prompt_cache_key`; `None` where the family
+    /// has no such field.
+    client_cache_key: Option<bool>,
     volatile: Volatile,
 }
 
@@ -374,6 +377,11 @@ impl Segments {
             ..Segments::default()
         };
         segments.hashes.beta = beta_hash(headers);
+        segments.client_cache_key = (family != ApiFamily::AnthropicMessages).then(|| {
+            body.get("prompt_cache_key")
+                .and_then(Value::as_str)
+                .is_some_and(|key| !key.is_empty())
+        });
 
         // The conversation, and the instructions some families carry in it.
         let conversation_key = match family {
@@ -480,6 +488,11 @@ impl Segments {
 }
 
 impl Segments {
+    /// What names this request's tool definitions: the same while they are.
+    pub(crate) fn tool_defs(&self) -> u64 {
+        self.hashes.tool_defs
+    }
+
     /// The same request with the beta tokens that actually go upstream, when
     /// `proxy.sticky_beta` put back what the client left out.
     pub(crate) fn with_beta(&self, headers: &HeaderMap) -> Segments {
@@ -829,6 +842,12 @@ pub(crate) fn observation(
         ledger_reads: 0,
         tools_compacted_bytes: 0,
         reasoning_elided_bytes: 0,
+        client_cache_key: incoming.client_cache_key,
+        // Stamped by the caller, which measures them.
+        tools_compactable_bytes: 0,
+        stale_read_bytes: 0,
+        superseded_read_bytes: 0,
+        quiet_read_bytes: 0,
     }
 }
 

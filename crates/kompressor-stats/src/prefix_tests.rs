@@ -9,9 +9,9 @@ use crate::context::{
 use crate::prefix::{ColdScore, PrefixReport};
 use crate::{StatsReader, schema};
 
-const SEC: i64 = 1_000;
+pub(crate) const SEC: i64 = 1_000;
 
-fn database() -> (TempDir, Connection) {
+pub(crate) fn database() -> (TempDir, Connection) {
     let dir = TempDir::new().unwrap();
     let conn = schema::open_read_write(&dir.path().join("stats.db")).unwrap();
     (dir, conn)
@@ -24,16 +24,16 @@ fn report(dir: &TempDir) -> PrefixReport {
         .unwrap()
 }
 
-struct Row<'a> {
-    time: i64,
-    conversation: &'a str,
-    family: &'a str,
-    read: i64,
-    write: i64,
-    observation: Option<PrefixObservation>,
+pub(crate) struct Row<'a> {
+    pub(crate) time: i64,
+    pub(crate) conversation: &'a str,
+    pub(crate) family: &'a str,
+    pub(crate) read: i64,
+    pub(crate) write: i64,
+    pub(crate) observation: Option<PrefixObservation>,
 }
 
-fn insert(conn: &Connection, row: Row<'_>) {
+pub(crate) fn insert(conn: &Connection, row: Row<'_>) {
     conn.execute(
         "INSERT INTO proxy_requests (time_ms, tenant, request_id, api_family, model, upstream,
            status, stream, prompt_tokens, cache_read_tokens, cache_write_tokens, conversation,
