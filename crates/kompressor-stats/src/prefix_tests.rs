@@ -662,6 +662,46 @@ fn a_recompacted_turn_with_retrieve_rounds_is_not_a_wrong_prediction() {
     assert_eq!((seen.predicted, seen.predicted_wrong), (2, 1));
 }
 
+/// The numbers of the run that found this: Claude Code's opening is 7,374
+/// bytes of instructions and 30,687 of tools, 40,705 once the proxy's retrieve
+/// tool is in it, and the provider reads it back as 14,482 tokens. Sized from
+/// the client's bytes at a token per three it came to 13,711, so three correct
+/// predictions were called wrong and prediction ended for the run.
+#[test]
+fn a_read_of_a_tool_heavy_opening_is_not_a_read_of_the_conversation() {
+    let seen = PrefixObservation {
+        compared: true,
+        system_bytes: 7_374,
+        tools_bytes: 30_687,
+        opening_bytes: 40_705,
+        ..PrefixObservation::default()
+    };
+    assert!(!seen.read_reaches_messages(14_482));
+    assert!(!seen.prediction_was_wrong(Some(14_482), 0));
+    assert!(
+        seen.prediction_was_wrong(Some(22_017), 0),
+        "a read well into the messages still counts"
+    );
+    // A row from before the opening was recorded falls back on the client's
+    // bytes, and still clears the same read.
+    let old = PrefixObservation {
+        opening_bytes: 0,
+        ..seen.clone()
+    };
+    assert!(!old.read_reaches_messages(14_482));
+    assert!(old.read_reaches_messages(22_017));
+    // What went upstream is what counts where the two differ.
+    let grown = PrefixObservation {
+        system_bytes: 1_000,
+        tools_bytes: 1_000,
+        opening_bytes: 40_000,
+        ..PrefixObservation::default()
+    };
+    assert!(!grown.read_reaches_messages(14_000));
+    let json = serde_json::to_string(&old).unwrap();
+    assert!(!json.contains("opening_bytes"), "{json}");
+}
+
 /// What a lost prefix is put down to, case by case.
 #[test]
 fn a_loss_is_classified_by_what_else_was_true_of_the_request() {

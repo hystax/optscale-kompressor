@@ -921,6 +921,7 @@ pub(crate) struct Idle {
 pub(crate) fn observation(
     family: ApiFamily,
     incoming: &Segments,
+    outgoing: &Segments,
     compared: Compared,
     text_bytes: u64,
     idle: Option<Idle>,
@@ -944,6 +945,9 @@ pub(crate) fn observation(
         tools_bytes: clamp(incoming.tools_bytes),
         tools_count: incoming.tools_count,
         tools_deferred: incoming.tools_deferred,
+        // What the provider caches in front of the conversation is what was
+        // sent, not what arrived: the retrieve tool is in it.
+        opening_bytes: clamp(outgoing.system_bytes + outgoing.tools_bytes),
         tool_search: incoming.tool_search,
         messages_bytes: clamp(incoming.messages_bytes),
         messages_count: clamp(incoming.hashes.messages_count as u64),
@@ -1355,6 +1359,49 @@ mod tests {
         assert!(!none.any(), "{none:?}");
     }
 
+    /// The provider caches what was sent, so the opening is sized from the
+    /// outgoing body: a tool the proxy added is in it, a deferred one is not.
+    #[test]
+    fn the_opening_is_sized_from_what_went_upstream() {
+        let incoming = turn(json!([{"role": "user", "content": "hello"}]));
+        let mut outgoing = incoming.clone();
+        let added = json!({
+            "name": "optscale_kompressor_retrieve",
+            "description": "fetch back elided content ".repeat(40),
+            "input_schema": {"type": "object"}
+        });
+        let deferred =
+            json!({"name": "Later", "description": "x".repeat(900), "defer_loading": true});
+        if let Some(tools) = outgoing["tools"].as_array_mut() {
+            tools.push(added.clone());
+            tools.push(deferred);
+        }
+        let (client, sent) = (anthropic(&incoming), anthropic(&outgoing));
+        let seen = observation(
+            ApiFamily::AnthropicMessages,
+            &client,
+            &sent,
+            Compared::default(),
+            5,
+            None,
+        );
+        let arrived = seen.system_bytes + seen.tools_bytes;
+        assert!(arrived > 0);
+        assert_eq!(
+            u64::from(seen.opening_bytes),
+            u64::from(arrived) + size_of(&added)
+        );
+        let unchanged = observation(
+            ApiFamily::AnthropicMessages,
+            &client,
+            &client,
+            Compared::default(),
+            5,
+            None,
+        );
+        assert_eq!(unchanged.opening_bytes, arrived);
+    }
+
     #[test]
     fn volatile_values_are_reported_only_where_they_are_news() {
         let mut body = turn(json!([{"role": "user", "content": "2026-11-20"}]));
@@ -1364,6 +1411,7 @@ mod tests {
         segments.scan_volatile(&body, ApiFamily::AnthropicMessages);
         let first = observation(
             ApiFamily::AnthropicMessages,
+            &segments,
             &segments,
             Compared::default(),
             10,
@@ -1381,6 +1429,7 @@ mod tests {
         };
         let later = observation(
             ApiFamily::AnthropicMessages,
+            &segments,
             &segments,
             settled,
             10,

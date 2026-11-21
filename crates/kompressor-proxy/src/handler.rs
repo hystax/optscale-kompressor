@@ -1219,15 +1219,17 @@ fn observe_prefix(
         ),
         None => outgoing,
     };
+    let outgoing = outgoing.as_ref().unwrap_or(&identified.incoming);
     let compared = state.drift.observe(
         identified.fingerprint,
         &identified.incoming,
-        outgoing.as_ref().unwrap_or(&identified.incoming),
+        outgoing,
         prepared.ticket,
     );
     let mut observation = crate::drift::observation(
         family,
         &identified.incoming,
+        outgoing,
         compared,
         identified.text_bytes,
         identified.idle,

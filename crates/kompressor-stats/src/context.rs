@@ -91,6 +91,13 @@ pub struct PrefixObservation {
     pub tools_count: u32,
     /// Tools marked `defer_loading`, which the provider does not render.
     pub tools_deferred: u32,
+    /// Instructions and rendered tool definitions as they went upstream,
+    /// which is what the provider caches in front of the conversation: the
+    /// client's own plus whatever the proxy added (its retrieve tool) or took
+    /// out. Zero on a row written before this was recorded, where
+    /// `system_bytes + tools_bytes` stands in for it.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub opening_bytes: u32,
     /// Whether the rendered list carries the provider's own tool-search tool.
     /// A client that sends one loads tools on demand, whether or not any tool
     /// in this list is itself marked `defer_loading`.
@@ -237,11 +244,27 @@ impl PrefixObservation {
     /// On Anthropic that opening is often shared: other conversations keep it
     /// cached, so a conversation whose own entries have lapsed still reads it.
     /// A read is evidence that *this conversation's* cache was alive only if
-    /// it goes further. The opening is sized at a token per three bytes of its
-    /// JSON, which errs high, plus the smallest prefix a provider caches.
+    /// it goes further.
+    ///
+    /// The opening is sized from what went upstream (`opening_bytes`), at two
+    /// tokens per five bytes of its JSON, plus the smallest prefix a provider
+    /// caches. Claude Code's opening was measured at a token per 2.8 bytes;
+    /// the first version of this sized the client's bytes at a token per
+    /// three, came out below the real opening, and so called three correct
+    /// predictions wrong and ended prediction for the run. Erring high costs
+    /// only sight of a read that stops within the first few messages.
     pub fn read_reaches_messages(&self, read: u32) -> bool {
-        let opening = (u64::from(self.system_bytes) + u64::from(self.tools_bytes)) / 3;
-        u64::from(read) > opening + 1_024
+        u64::from(read) > self.opening_tokens() + 1_024
+    }
+
+    /// An upper estimate of the tokens the provider caches in front of the
+    /// conversation.
+    fn opening_tokens(&self) -> u64 {
+        let bytes = match self.opening_bytes {
+            0 => u64::from(self.system_bytes) + u64::from(self.tools_bytes),
+            sent => u64::from(sent),
+        };
+        bytes * 2 / 5
     }
 }
 

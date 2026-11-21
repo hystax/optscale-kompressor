@@ -64,6 +64,14 @@ th, td { text-align: left; padding: 6px 10px 6px 0; border-bottom: 1px solid var
 th { color: var(--muted); font-weight: 500; }
 td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
 td.actions { white-space: nowrap; }
+/* A path under the name it belongs to: whole when there is room, broken only
+   at a slash when there is not, never a letter to a line. */
+code.path { display: block; margin-top: 2px; color: var(--muted); font-size: 12px;
+  overflow-wrap: normal; word-break: normal; max-width: 44ch; }
+/* Five buttons in a row push the table past the page; let them take two. */
+#databases td.actions { white-space: normal; min-width: 200px; }
+#databases td.actions button { margin-bottom: 4px; }
+code.slashes { overflow-wrap: normal; word-break: normal; }
 td.actions button { padding: 3px 8px; margin-right: 4px; }
 .good { color: var(--good); } .warn { color: var(--warn); } .bad { color: var(--bad); }
 h3 { font-size: 14px; margin: 18px 0 6px; color: var(--muted); font-weight: 600; }
@@ -139,11 +147,11 @@ td.last { font-size: 13px; }
 <section aria-labelledby="databases-title">
   <h2 id="databases-title">Databases</h2>
   <div class="scroll">
-  <table id="databases" hidden>
-    <thead><tr><th>Database</th><th>File</th><th>Size</th><th>Write-ahead log</th><th>Schema</th>
+  <div class="scroll"><table id="databases" hidden>
+    <thead><tr><th>Database</th><th>Size</th><th>Write-ahead log</th><th>Schema</th>
       <th>Reclaimable</th><th>Records</th><th>Planner</th><th>Integrity</th><th>Last done</th><th></th></tr></thead>
     <tbody></tbody>
-  </table>
+  </table></div>
   </div>
   <p id="action-result" role="status" hidden></p>
   <p class="note" id="actions-why" hidden></p>
@@ -442,12 +450,21 @@ async function download(path, fallback) {
   return blob.size;
 }
 
+// A path that may break after a slash and nowhere else.
+function pathCode(path) {
+  const code = document.createElement("code");
+  code.className = "path";
+  path.split("/").forEach((part, index) => {
+    if (index) code.append("/", document.createElement("wbr"));
+    code.append(part);
+  });
+  return code;
+}
+
 function databaseRow(database, status) {
   const row = document.createElement("tr");
-  const path = cell("");
-  const code = document.createElement("code");
-  code.textContent = database.path || "–";
-  path.append(code);
+  const named = cell(database.name, "named");
+  if (database.path) named.append(pathCode(database.path));
 
   const schema = cell("", "num");
   if (database.schema_version == null) {
@@ -513,7 +530,7 @@ function databaseRow(database, status) {
   if (database.auto_vacuum === 2) {
     reclaimable.append(document.createElement("br"), tagged("handed back by itself", "muted"));
   }
-  row.append(cell(database.name), path,
+  row.append(named,
     cell(database.included ? size(database.bytes) : "– " + (database.reason || ""), "num"),
     cell(size(database.wal_bytes), "num"), schema, reclaimable,
     records, planner, integrity, lastDone(database, status), actions);
@@ -651,9 +668,8 @@ function drawStorage(status) {
   $("volumes").tBodies[0].replaceChildren(...storage.volumes.map(volume => {
     const row = document.createElement("tr");
     const path = cell("");
-    const code = document.createElement("code");
-    code.textContent = volume.path;
-    path.append(code);
+    path.append(pathCode(volume.path));
+    path.firstChild.className = "slashes";
     const used = volume.total_bytes && volume.free_bytes != null ? 100 * (1 - volume.free_bytes / volume.total_bytes) : null;
     const share = cell("", "num");
     if (used == null) share.textContent = "–";
