@@ -317,6 +317,15 @@ struct BuildInfo {
     /// The configuration file it was started with, when it has one.
     config: Option<String>,
     systemd: bool,
+    /// `release` or `debug`: a debug build compresses several times slower.
+    profile: &'static str,
+    /// When it was built, in milliseconds; `None` when the build could not
+    /// tell. The first build of this commit, see `build.rs`.
+    built_at_ms: Option<i64>,
+    /// What it was built for, as `os/architecture`.
+    target: String,
+    /// Whether the code-aware grammars are compiled in.
+    code_aware: bool,
 }
 
 /// The JSON body of `GET /v1/maintenance`.
@@ -628,6 +637,17 @@ async fn status(
                     .as_ref()
                     .map(|path| path.display().to_string()),
                 systemd: std::env::var_os("INVOCATION_ID").is_some(),
+                profile: if cfg!(debug_assertions) {
+                    "debug"
+                } else {
+                    "release"
+                },
+                built_at_ms: option_env!("KOMPRESSOR_BUILD_EPOCH")
+                    .and_then(|epoch| epoch.parse::<i64>().ok())
+                    .filter(|epoch| *epoch > 0)
+                    .map(|epoch| epoch.saturating_mul(1000)),
+                target: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
+                code_aware: kompressor_engine::CODE_AWARE,
             },
             now_ms,
             last_backup: LastBackup::default(),

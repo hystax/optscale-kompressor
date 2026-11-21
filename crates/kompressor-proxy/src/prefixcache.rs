@@ -1360,6 +1360,24 @@ impl PrefixTracker {
     pub fn tracked(&self) -> usize {
         self.seen.lock().map(|seen| seen.len()).unwrap_or(0)
     }
+
+    /// Of the conversations remembered, how many hold a frozen prefix and
+    /// how many have been moved to one-hour entries: what a restart forgets,
+    /// for the Maintenance page.
+    pub fn held(&self) -> (usize, usize, usize) {
+        self.seen
+            .lock()
+            .map(|seen| {
+                (
+                    seen.len(),
+                    seen.values()
+                        .filter(|entry| entry.floor.is_some_and(|floor| floor > 0))
+                        .count(),
+                    seen.values().filter(|entry| entry.idled_past_ttl).count(),
+                )
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// A stable identifier for the *conversation* whose prefix is frozen.

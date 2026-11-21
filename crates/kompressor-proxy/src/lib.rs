@@ -145,16 +145,35 @@ impl ProxyState {
     /// deliberately is not.
     pub fn new(core: Arc<AppCore>, client: reqwest::Client) -> ProxyState {
         let ttl = core.config().proxy.prefix_cache_ttl;
+        let prefixes = Arc::new(prefixcache::PrefixTracker::new(ttl));
+        let keepwarm = Arc::new(keepwarm::KeepWarm::default());
+        let recompact = Arc::new(recompact::Recompact::default());
+        // All of it lives in this process alone, which is what a restart
+        // costs: the Maintenance page asks for the count.
+        let held = (prefixes.clone(), keepwarm.clone(), recompact.clone());
+        core.runtime().holding(move || {
+            let (prefixes, keepwarm, recompact) = &held;
+            let (conversations, frozen, one_hour) = prefixes.held();
+            kompressor_core::runtime::Held {
+                conversations,
+                frozen,
+                one_hour,
+                keep_warm: keepwarm.armed(),
+                recompacted: recompact.tracked(),
+                predicting: recompact.predicting(),
+                wrong_predictions: recompact.wrong_predictions(),
+            }
+        });
         ProxyState {
             core,
             client,
             failopen: Arc::new(FailOpen::default()),
-            prefixes: Arc::new(prefixcache::PrefixTracker::new(ttl)),
-            keepwarm: Arc::new(keepwarm::KeepWarm::default()),
+            prefixes,
+            keepwarm,
             retention: Arc::new(retention::Rejections::default()),
             drift: Arc::new(drift::DriftTracker::default()),
             stabilizer: Arc::new(stabilize::Stabilizer::default()),
-            recompact: Arc::new(recompact::Recompact::default()),
+            recompact,
             tool_policies: Arc::new(toolcompact::ToolPolicies::default()),
             encode_fault: Arc::default(),
         }
@@ -175,6 +194,12 @@ impl ProxyState {
     /// Maintenance page shows. Exposed on the same terms as `prefixes`.
     pub fn under_way(&self) -> kompressor_core::runtime::InFlight {
         self.core.runtime().in_flight()
+    }
+
+    /// What this proxy holds in memory alone, as the Maintenance page shows
+    /// it. Exposed on the same terms as `prefixes`.
+    pub fn held(&self) -> Option<kompressor_core::runtime::Held> {
+        self.core.runtime().held()
     }
 
     /// What each conversation's cold turns decided, and how its lapse

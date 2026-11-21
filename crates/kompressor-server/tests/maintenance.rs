@@ -1316,6 +1316,18 @@ async fn the_status_says_what_is_running_and_shows_the_configuration() {
     );
     assert!(build["commit"].is_null() || build["commit"].as_str().is_some_and(|c| !c.is_empty()));
 
+    assert_eq!(
+        build["profile"],
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    );
+    assert!(build["built_at_ms"].as_i64().unwrap() > 1_700_000_000_000);
+    assert!(build["target"].as_str().unwrap().contains('/'));
+    assert_eq!(build["code_aware"], kompressor_engine::CODE_AWARE);
+
     // How it is set and what it is doing, with no key or secret in it.
     let running = &status["running"];
     assert_eq!(running["mode"], "recoverable");
@@ -1327,6 +1339,8 @@ async fn the_status_says_what_is_running_and_shows_the_configuration() {
     assert_eq!(running["load"]["backup_running"], false);
     assert!(running["load"]["engine_limit"].as_u64().unwrap() > 0);
     assert!(running["listeners"].is_array() && running["features"].is_array());
+    assert!(running["env"].is_array() && running["opened"].is_array());
+    assert!(running["memory"].is_null(), "no proxy in this deployment");
     let text = running.to_string();
     assert!(!text.contains("sk-alpha") && !text.contains("the-shared-secret"));
 

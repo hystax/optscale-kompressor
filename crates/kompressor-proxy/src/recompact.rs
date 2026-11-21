@@ -373,7 +373,7 @@ impl Recompact {
         self.predicting()
     }
 
-    /// Conversations holding a ledger. For tests.
+    /// Conversations holding a ledger. For tests and the Maintenance page.
     pub fn tracked(&self) -> usize {
         self.ledgers.lock().map_or(0, |ledgers| ledgers.len())
     }

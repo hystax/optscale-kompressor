@@ -858,6 +858,36 @@ function runningFacts(running) {
       + (load.backup_running ? "; a backup is being written" : ""),
     tagged(busy ? "a restart now would interrupt this" : "idle: a restart now interrupts no one", busy ? "warn" : "muted"),
   ];
+  const env = running.env || [];
+  const named = effect => env.filter(one => one.effect === effect).map(one => one.name);
+  const variables = [];
+  if (named("applied").length) variables.push("changed a setting: " + named("applied").join(", "));
+  if (named("no_effect").length) {
+    const line = document.createElement("span");
+    line.append(tagged("changed nothing", "warn"), " " + named("no_effect").join(", ")
+      + " — an unknown name, a value that could not be read, or the value already in force");
+    variables.push(line);
+  }
+  if (named("elsewhere").length) variables.push("not settings: " + named("elsewhere").join(", "));
+  const took = ms => ms < 1000 ? ms + " ms" : (ms / 1000).toFixed(1) + " s";
+  const opened = (running.opened || []).map(one => one.database + ": "
+    + (one.from == null ? "created at v" + one.to
+      : one.from === one.to ? "v" + one.to + ", no migration"
+      : "migrated v" + one.from + " → v" + one.to)
+    + " (opened in " + took(one.took_ms) + ")");
+  const memory = running.memory;
+  const held = !memory ? "nothing: the proxy is not running in this process" : [
+    plural(memory.conversations, "conversation", "conversations") + " remembered, "
+      + count(memory.frozen) + " with a frozen prefix, " + count(memory.one_hour) + " on one-hour cache entries",
+    plural(memory.keep_warm, "keep-warm timer", "keep-warm timers") + " running, "
+      + plural(memory.recompacted, "conversation", "conversations") + " recompacted after a lapse",
+    memory.prediction === "unused" ? "lapse prediction: not in use"
+      : memory.prediction === "on"
+        ? "lapse prediction: on, " + plural(memory.wrong_predictions, "wrong prediction", "wrong predictions") + " since start"
+        : tagged("lapse prediction: switched off until restart, after "
+            + plural(memory.wrong_predictions, "wrong prediction", "wrong predictions"), "warn"),
+    tagged("a restart forgets all of this", "muted"),
+  ];
   return [
     ["Listening on", running.listeners.length
       ? running.listeners.map(listener => listener.address + " — " + listener.serves.join(", "))
@@ -870,8 +900,11 @@ function runningFacts(running) {
     ["Opt-in settings", Object.keys(scopes).length
       ? Object.entries(scopes).map(([scope, set]) => (scope === "all" ? "every provider" : scope) + ": " + set.join(", "))
       : "all as shipped"],
+    ["Environment", variables.length ? variables : "no KOMPRESSOR_ variable set"],
+    ["Schema at start", opened.length ? opened : "not on record"],
     ["Process", about.join(", ")],
     ["Right now", now],
+    ["Held in memory", held],
   ];
 }
 
@@ -879,6 +912,9 @@ function drawBuild(status) {
   const build = status.build, running = status.running;
   const facts = [
     ["Version", "kompressor " + build.version + (build.commit ? " (" + build.commit + ")" : " (commit unknown)")],
+    ["Build", build.profile + " build for " + build.target
+      + (build.built_at_ms ? ", built " + when(build.built_at_ms) : "")
+      + "; code-aware grammars " + (build.code_aware ? "compiled in" : "not compiled in")],
     ["Running since", when(build.started_at_ms) + " — up " + span(0, build.uptime_s * 1000)],
     ["Binary", build.binary || "–"],
     ["Configuration", build.config || "none: defaults and the environment"],

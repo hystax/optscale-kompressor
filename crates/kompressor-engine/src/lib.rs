@@ -33,6 +33,10 @@
 
 #![forbid(unsafe_code)]
 
+/// Whether this build has the tree-sitter grammars `enable_code_aware` needs.
+/// Without them the setting is accepted and code is compressed as text.
+pub const CODE_AWARE: bool = cfg!(feature = "code-aware");
+
 pub mod adaptive;
 pub mod code;
 pub mod configs;

@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::Router;
 use kompressor_core::{AppCore, Config, build_ref_store};
@@ -47,7 +48,33 @@ struct Running {
 
 /// Build the shared core from a configuration.
 fn build_core(config: Config) -> Result<(Arc<AppCore>, Running), CliError> {
+    // What each file holds before it is opened, since opening migrates it:
+    // the Maintenance page says whether this start changed a schema.
+    let before = |path: &std::path::Path| {
+        path.is_file()
+            .then(|| kompressor_store::sqlite::facts(path).ok())
+            .flatten()
+            .map(|facts| facts.schema_version)
+    };
+    let sqlite = config.refs.backend == kompressor_core::config::RefsBackend::Sqlite;
+    let (refs_before, stats_before) = (before(&config.refs.path), before(&config.stats.path));
+    let mut opened = Vec::new();
+    let mut record = |database: &str, path: &std::path::Path, from, started: Instant| {
+        if let Ok(facts) = kompressor_store::sqlite::facts(path) {
+            opened.push(kompressor_core::runtime::Opened {
+                database: database.into(),
+                from,
+                to: facts.schema_version,
+                took_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            });
+        }
+    };
+
+    let started = Instant::now();
     let refs = build_ref_store(&config).map_err(|e| CliError::Runtime(e.to_string()))?;
+    if sqlite {
+        record("refs.db", &config.refs.path, refs_before, started);
+    }
 
     let mut stats_config = kompressor_stats::config::StatsConfig::at(config.stats.path.clone());
     stats_config.enabled = config.stats.enabled;
@@ -61,10 +88,17 @@ fn build_core(config: Config) -> Result<(Arc<AppCore>, Running), CliError> {
     {
         std::fs::create_dir_all(parent).map_err(|e| CliError::Runtime(e.to_string()))?;
     }
+    let started = Instant::now();
     let (sink, handle) = kompressor_stats::writer::spawn(&stats_config)
         .map_err(|e| CliError::Runtime(e.to_string()))?;
+    if config.stats.enabled {
+        record("stats.db", &config.stats.path, stats_before, started);
+    }
 
     let core = Arc::new(AppCore::new(config, refs, sink));
+    for opened in opened {
+        core.runtime().opened(opened);
+    }
     Ok((core, Running { stats: handle }))
 }
 
@@ -1246,6 +1280,52 @@ mod tests {
         assert!(private.api && private.mcp && !private.proxy);
         let shared = groups.get("127.0.0.1:9000").unwrap();
         assert!(!shared.api && !shared.mcp && shared.proxy);
+    }
+
+    /// The first start creates both databases and the second finds them as
+    /// the first left them: what the Maintenance page says of a migration.
+    #[test]
+    fn each_database_opening_is_on_record_with_what_was_found() {
+        let dir = tempfile::tempdir().expect("dir");
+        let config = || {
+            let mut config = Config::default();
+            config.refs.path = dir.path().join("refs.db");
+            config.stats.path = dir.path().join("stats.db");
+            config
+        };
+        let found = |core: &AppCore| -> Vec<(String, Option<u32>, u32)> {
+            core.runtime()
+                .openings()
+                .into_iter()
+                .map(|opened| (opened.database, opened.from, opened.to))
+                .collect()
+        };
+        let (refs, stats) = (
+            kompressor_store::sqlite::latest_version(),
+            kompressor_stats::schema::latest_version(),
+        );
+        let (core, running) = build_core(config()).expect("first start");
+        assert_eq!(
+            found(&core),
+            [
+                ("refs.db".into(), None, refs),
+                ("stats.db".into(), None, stats)
+            ]
+        );
+        drop(core);
+        running.stats.shutdown().expect("statistics stop");
+        let (core, running) = build_core(config()).expect("second start");
+        assert_eq!(
+            found(&core),
+            [
+                ("refs.db".into(), Some(refs), refs),
+                ("stats.db".into(), Some(stats), stats)
+            ]
+        );
+        running.stats.shutdown().expect("statistics stop");
+
+        let (core, _running) = build_core(test_config()).expect("no files");
+        assert_eq!(found(&core), [], "nothing on disk, nothing opened");
     }
 
     fn app(surfaces: Surfaces) -> Router {

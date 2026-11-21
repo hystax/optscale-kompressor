@@ -5,6 +5,11 @@
 //! `KOMPRESSOR_GIT_COMMIT` from the environment wins (a packaging build from
 //! a tarball has no `.git`); otherwise `git rev-parse`. Neither is empty, and
 //! the page says the build could not tell.
+//!
+//! And when it was built: `SOURCE_DATE_EPOCH` where a reproducible build sets
+//! it, else the clock. This script reruns when `HEAD` moves, not on every
+//! build, so the time is that of the first build of this commit in this
+//! target directory — a rebuild after an uncommitted edit keeps it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -28,6 +33,18 @@ fn main() {
         })
         .unwrap_or_default();
     println!("cargo:rustc-env=KOMPRESSOR_GIT_COMMIT={commit}");
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    let built = std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|epoch| epoch.trim().parse::<u64>().ok())
+        .or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|since| since.as_secs())
+        })
+        .unwrap_or(0);
+    println!("cargo:rustc-env=KOMPRESSOR_BUILD_EPOCH={built}");
 }
 
 /// Rebuild when HEAD moves: `HEAD` itself, and the branch it names. Only

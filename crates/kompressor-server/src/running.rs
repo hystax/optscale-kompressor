@@ -1,13 +1,14 @@
 //! What the Maintenance page says is running, beyond the build: where the
-//! process listens, how it is set to treat a request, the process itself and
-//! what it is in the middle of.
+//! process listens, how it is set to treat a request, what its environment
+//! changed, what it found in its databases, the process itself, what it is in
+//! the middle of and what it holds only in memory.
 //!
 //! Nothing here is a secret or a tenant's: no key, no header value, and an
 //! upstream's address with any credentials in it taken out.
 
 use kompressor_core::AppCore;
-use kompressor_core::config::{AuthMode, Config, PROVIDERS};
-use kompressor_core::runtime::Listener;
+use kompressor_core::config::{AuthMode, ColdRecompact, Config, EnvOverride, PROVIDERS};
+use kompressor_core::runtime::{Held, Listener, Opened};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -42,8 +43,26 @@ pub(crate) struct Running {
     upstreams: Vec<Upstream>,
     /// Opt-in settings that differ from what ships.
     features: Vec<Feature>,
+    /// The `KOMPRESSOR_*` variables the process was started with, by name,
+    /// and whether each changed a setting. Never a value.
+    env: Vec<EnvOverride>,
+    /// Each database as it was found and left when this process opened it.
+    /// Empty when whoever built the core did not say.
+    opened: Vec<Opened>,
     process: Process,
     load: Load,
+    /// What the proxy remembers in memory alone; absent without the proxy.
+    memory: Option<Memory>,
+}
+
+/// What a restart forgets.
+#[derive(Debug, Serialize)]
+struct Memory {
+    #[serde(flatten)]
+    held: Held,
+    /// `unused` where nothing is set to predict a lapse, else `on`, or `off`
+    /// once wrong predictions have ended it until restart.
+    prediction: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,9 +143,30 @@ pub(crate) fn running(core: &AppCore, load: Load) -> Running {
             })
             .collect(),
         features: features(core),
+        env: config.env.clone(),
+        opened: core.runtime().openings(),
         process: process(),
         load,
+        memory: core.runtime().held().map(|held| Memory {
+            held,
+            prediction: if !predicts(core) {
+                "unused"
+            } else if held.predicting {
+                "on"
+            } else {
+                "off"
+            },
+        }),
     }
+}
+
+/// Whether any provider is set to predict a lapsed cache.
+fn predicts(core: &AppCore) -> bool {
+    PROVIDERS
+        .iter()
+        .map(|provider| core.config_for(Some(provider)))
+        .chain([core.config()])
+        .any(|config| config.proxy.cold_recompact == ColdRecompact::Predicted)
 }
 
 /// `base_url` with any `user:password@` taken out of it.
@@ -258,7 +298,6 @@ fn linux(process: &mut Process) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kompressor_core::config::ColdRecompact;
     use kompressor_store::MemoryRefStore;
     use std::sync::Arc;
 
@@ -304,6 +343,49 @@ mod tests {
         assert_eq!((seen.auth.keys, seen.auth.secret), (0, false));
         assert!(seen.listeners.is_empty());
         assert_eq!(seen.process.pid, std::process::id());
+        assert!(seen.env.is_empty() && seen.opened.is_empty());
+        assert!(seen.memory.is_none(), "nothing here runs the proxy");
+    }
+
+    #[test]
+    fn prediction_is_reported_only_where_something_predicts() {
+        let held = |predicting| Held {
+            conversations: 4,
+            predicting,
+            wrong_predictions: 3,
+            ..Held::default()
+        };
+        let stock = core(Config::default());
+        stock.runtime().holding(move || held(true));
+        let memory = running(&stock, Load::default()).memory.expect("memory");
+        assert_eq!(
+            (memory.prediction, memory.held.conversations),
+            ("unused", 4)
+        );
+
+        let config: Config =
+            toml::from_str("[proxy.providers.anthropic]\ncold_recompact = \"predicted\"\n")
+                .expect("config");
+        for (predicting, shown) in [(true, "on"), (false, "off")] {
+            let core = core(config.clone());
+            core.runtime().holding(move || held(predicting));
+            let seen = running(&core, Load::default());
+            assert_eq!(seen.memory.as_ref().map(|m| m.prediction), Some(shown));
+            let json = serde_json::to_value(&seen).expect("json");
+            assert_eq!(json["memory"]["wrong_predictions"], 3);
+        }
+    }
+
+    #[test]
+    fn the_environment_is_listed_by_name_and_never_by_value() {
+        let mut config = Config::default();
+        config.apply_env(&[
+            ("KOMPRESSOR__AUTH__SECRET".into(), "s3cret".into()),
+            ("KOMPRESSOR__PROXY__CACHE_KEEP_WARM".into(), "treu".into()),
+        ]);
+        let json = serde_json::to_string(&running(&core(config), Load::default())).expect("json");
+        assert!(json.contains("KOMPRESSOR__AUTH__SECRET") && json.contains("no_effect"));
+        assert!(!json.contains("s3cret") && !json.contains("treu"), "{json}");
     }
 
     #[test]

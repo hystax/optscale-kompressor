@@ -273,8 +273,16 @@ async fn predictions_that_keep_reading_from_cache_end_prediction() {
         prefixes.age_for_test(conversation_id, Duration::from_secs(420));
         harness.post(MESSAGES, &conversation(1 + wrong)).await;
         assert_eq!(recompact.wrong_predictions(), wrong as u64);
+        let held = harness.state.held().expect("the proxy says what it holds");
+        assert_eq!(
+            held.predicting,
+            wrong < 3,
+            "as the Maintenance page shows it"
+        );
     }
     assert!(!recompact.predicting());
+    let held = harness.state.held().expect("held");
+    assert_eq!((held.conversations, held.wrong_predictions), (1, 3));
     proxy_rows(&harness.events);
 
     harness.post(MESSAGES, &conversation(5)).await;

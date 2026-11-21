@@ -41,12 +41,53 @@ pub struct Config {
     /// [`Config::validate`]; never read from or written to a file.
     #[serde(skip)]
     pub refused_env: Vec<String>,
+    /// Every `KOMPRESSOR_*` variable [`Config::apply_env`] was given, and
+    /// whether it changed anything. Names only: a value can be a secret.
+    /// Never read from or written to a file.
+    #[serde(skip)]
+    pub env: Vec<EnvOverride>,
     /// The file this configuration was read from, made absolute; `None` for
     /// the built-in defaults. So the Maintenance page can name it in the
     /// commands it shows. Never read from or written to a file.
     #[serde(skip)]
     pub source: Option<PathBuf>,
 }
+
+/// One `KOMPRESSOR_*` variable the process was started with.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct EnvOverride {
+    /// The variable's name, as it was spelt.
+    pub name: String,
+    pub effect: EnvEffect,
+}
+
+/// What a `KOMPRESSOR_*` variable did to the configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvEffect {
+    /// It changed a setting from what the file and the defaults gave.
+    Applied,
+    /// It changed nothing: the name is not a setting, the value could not be
+    /// read, or the value is the one already in force. The three cannot be
+    /// told apart here, and the first two are the ones worth a look.
+    NoEffect,
+    /// Not a setting: read somewhere else, for something else.
+    Elsewhere,
+}
+
+/// `KOMPRESSOR_*` variables that are not settings and are read where they are
+/// used: the file to load, `wrap`'s home, the capture files, the build's
+/// commit, and the credentials `mcp serve` takes its tenant from.
+const ENV_READ_ELSEWHERE: [&str; 8] = [
+    "CONFIG",
+    "HOME",
+    "BODY_CAPTURE",
+    "WS_CAPTURE",
+    "GIT_COMMIT",
+    "API_KEY",
+    "SECRET",
+    "TENANT",
+];
 
 /// Backups on a schedule, and what the Maintenance page may do over HTTP.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1541,17 +1582,53 @@ impl Config {
     pub fn apply_env(&mut self, vars: &[(String, String)]) {
         let named = || {
             vars.iter()
-                .filter(|(_, value)| !value.is_empty())
-                .filter_map(|(key, value)| Some((key.strip_prefix("KOMPRESSOR_")?, value)))
+                .filter_map(|(key, value)| Some((key, key.strip_prefix("KOMPRESSOR_")?, value)))
         };
-        for (rest, value) in named().filter(|(rest, _)| !rest.starts_with('_')) {
-            self.apply_flat(rest, value);
-        }
-        for (rest, value) in named() {
-            if let Some(rest) = rest.strip_prefix('_') {
-                self.apply_structured(rest, value);
+        // What each variable did is read off the configuration itself, before
+        // and after: the parsers below ignore what they cannot read in a dozen
+        // different ways, and this sees all of them.
+        let mut before = self.settings();
+        let mut apply = |config: &mut Config, name: &String, apply: &dyn Fn(&mut Config)| {
+            let refused = config.refused_env.len();
+            apply(config);
+            let after = config.settings();
+            let changed = after != before || config.refused_env.len() != refused;
+            before = after;
+            config.env.push(EnvOverride {
+                name: name.clone(),
+                effect: if changed {
+                    EnvEffect::Applied
+                } else {
+                    EnvEffect::NoEffect
+                },
+            });
+        };
+        for (name, rest, value) in named().filter(|(_, rest, _)| !rest.starts_with('_')) {
+            if ENV_READ_ELSEWHERE.contains(&rest) {
+                self.env.push(EnvOverride {
+                    name: name.clone(),
+                    effect: EnvEffect::Elsewhere,
+                });
+            } else if value.is_empty() {
+                apply(self, name, &|_| {});
+            } else {
+                apply(self, name, &|config| config.apply_flat(rest, value));
             }
         }
+        for (name, rest, value) in named() {
+            if let Some(rest) = rest.strip_prefix('_') {
+                if value.is_empty() {
+                    apply(self, name, &|_| {});
+                } else {
+                    apply(self, name, &|config| config.apply_structured(rest, value));
+                }
+            }
+        }
+    }
+
+    /// Every setting as one value, for telling whether something changed any.
+    fn settings(&self) -> Option<String> {
+        serde_json::to_string(self).ok()
     }
 
     fn apply_structured(&mut self, key: &str, value: &str) {
@@ -2976,6 +3053,62 @@ mod tests {
         let before = config.engine.max_array_items;
         config.apply_env(&[("KOMPRESSOR_MAX_ARRAY_ITEMS".into(), String::new())]);
         assert_eq!(config.engine.max_array_items, before);
+    }
+
+    /// A mistyped value used to be ignored without a trace; the record says
+    /// which variables changed a setting and which did not, by name alone.
+    #[test]
+    fn what_each_environment_variable_did_is_on_record() {
+        let mut config = Config::default();
+        config.apply_env(&[
+            ("PATH".into(), "/usr/bin".into()),
+            (
+                "KOMPRESSOR__PROXY__COLD_RECOMPACT".into(),
+                "predicted".into(),
+            ),
+            ("KOMPRESSOR__PROXY__CACHE_KEEP_WARM".into(), "treu".into()),
+            ("KOMPRESSOR__PROXY__RETRIEVE_TOOOL".into(), "always".into()),
+            ("KOMPRESSOR__ENGINE__MAX_ARRAY_ITEMS".into(), String::new()),
+            ("KOMPRESSOR_MAX_ARRAY_ITEMS".into(), "7".into()),
+            (
+                "KOMPRESSOR_CONFIG".into(),
+                "/etc/kompressor/config.toml".into(),
+            ),
+            ("KOMPRESSOR__AUTH__MODE".into(), "apikeys?".into()),
+        ]);
+        let effect = |name: &str| {
+            let found: Vec<EnvEffect> = config
+                .env
+                .iter()
+                .filter(|one| one.name == name)
+                .map(|one| one.effect)
+                .collect();
+            assert_eq!(found.len(), 1, "{name}: {:?}", config.env);
+            found[0]
+        };
+        assert_eq!(config.env.len(), 7, "only this service's variables");
+        assert_eq!(
+            effect("KOMPRESSOR__PROXY__COLD_RECOMPACT"),
+            EnvEffect::Applied
+        );
+        assert_eq!(effect("KOMPRESSOR_MAX_ARRAY_ITEMS"), EnvEffect::Applied);
+        assert_eq!(
+            effect("KOMPRESSOR__PROXY__CACHE_KEEP_WARM"),
+            EnvEffect::NoEffect
+        );
+        assert_eq!(
+            effect("KOMPRESSOR__PROXY__RETRIEVE_TOOOL"),
+            EnvEffect::NoEffect
+        );
+        assert_eq!(
+            effect("KOMPRESSOR__ENGINE__MAX_ARRAY_ITEMS"),
+            EnvEffect::NoEffect
+        );
+        assert_eq!(effect("KOMPRESSOR_CONFIG"), EnvEffect::Elsewhere);
+        // Refused, which stops the server: it did something.
+        assert_eq!(effect("KOMPRESSOR__AUTH__MODE"), EnvEffect::Applied);
+        let text = toml::to_string(&config).expect("toml");
+        assert!(!text.contains("KOMPRESSOR"), "the record is not a setting");
     }
 
     #[test]
