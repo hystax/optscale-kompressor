@@ -20,7 +20,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use blake2::Blake2b;
 use blake2::Digest;
 use blake2::digest::consts::U9;
-use std::collections::HashSet;
+use crate::types::Kind;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 /// Every handle reads `k_` + [`HANDLE_WIDTH`] url-safe characters.
@@ -167,6 +168,12 @@ pub struct RefCollector {
     max_ref_bytes: usize,
     pairs: Vec<(RefId, String)>,
     seen: HashSet<RefId>,
+    /// The kind of payload being compressed, as the route that is running
+    /// reported it. Stamped on each fragment `stash` retains.
+    kind: Kind,
+    /// The kind each retained fragment came out of, for the store's `kind`
+    /// column. Absent for a fragment stashed before any route set a kind.
+    kinds: HashMap<RefId, Kind>,
     /// Every handle `stash` answered, repeats included, in order. `pairs`
     /// holds a fragment once, so a later message eliding the same bytes left
     /// no trace of it; this is how a caller sees what one message elided.
@@ -220,6 +227,8 @@ impl RefCollector {
             max_ref_bytes,
             pairs: Vec::new(),
             seen: HashSet::new(),
+            kind: Kind::Text,
+            kinds: HashMap::new(),
             stashed: Vec::new(),
             oversized_attempts: 0,
             oversized_refusals: 0,
@@ -235,6 +244,8 @@ impl RefCollector {
             max_ref_bytes: 0,
             pairs: Vec::new(),
             seen: HashSet::new(),
+            kind: Kind::Text,
+            kinds: HashMap::new(),
             stashed: Vec::new(),
             oversized_attempts: 0,
             oversized_refusals: 0,
@@ -281,6 +292,7 @@ impl RefCollector {
         let id = ref_for(fragment);
         if self.seen.insert(id) {
             self.pairs.push((id, fragment.to_owned()));
+            self.kinds.insert(id, self.kind);
         }
         self.stashed.push(id);
         Some(id)
@@ -342,6 +354,7 @@ impl RefCollector {
     pub fn rollback(&mut self, mark: Mark) {
         for (id, _) in self.pairs.drain(mark.pairs..) {
             self.seen.remove(&id);
+            self.kinds.remove(&id);
         }
         self.stashed.truncate(mark.stashed);
         // The refusals go back too. A candidate that was discarded did not
@@ -392,6 +405,8 @@ impl RefCollector {
             max_ref_bytes: self.max_ref_bytes,
             pairs: Vec::new(),
             seen: HashSet::new(),
+            kind: self.kind,
+            kinds: HashMap::new(),
             stashed: Vec::new(),
             oversized_attempts: 0,
             oversized_refusals: 0,
@@ -407,9 +422,13 @@ impl RefCollector {
         self.oversized_attempts += other.oversized_attempts;
         self.oversized_refusals += other.oversized_refusals;
         self.gated += other.gated;
-        for (_, fragment) in other.pairs {
+        let outer = self.kind;
+        for (id, fragment) in other.pairs {
+            // each fragment keeps the kind its own route stamped on it
+            self.kind = other.kinds.get(&id).copied().unwrap_or(outer);
             self.stash(&fragment);
         }
+        self.kind = outer;
     }
 
     /// Replay fragments taken from a previous `pairs()` snapshot.
@@ -439,6 +458,17 @@ impl RefCollector {
             .map(|(_, fragment)| fragment.as_str())
     }
 
+    /// Record what kind of payload the fragments stashed from here on come
+    /// out of. Kept for statistics and the store browser; nothing routes on it.
+    pub fn set_kind(&mut self, kind: Kind) {
+        self.kind = kind;
+    }
+
+    /// The kind of payload `id` was elided from; `Text` if none was recorded.
+    pub fn kind_of(&self, id: &RefId) -> Kind {
+        self.kinds.get(id).copied().unwrap_or(Kind::Text)
+    }
+
     pub fn pairs(&self) -> &[(RefId, String)] {
         &self.pairs
     }
@@ -463,6 +493,23 @@ impl RefCollector {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_fragment_remembers_the_kind_it_was_stashed_under() {
+        let mut refs = RefCollector::new(1024);
+        let text = refs.stash("plain").unwrap();
+        refs.set_kind(Kind::Json);
+        let json = refs.stash("{\"a\":1}").unwrap();
+        assert_eq!(refs.kind_of(&text), Kind::Text);
+        assert_eq!(refs.kind_of(&json), Kind::Json);
+
+        let mut scratch = refs.scratch();
+        scratch.set_kind(Kind::SourceCode);
+        let code = scratch.stash("fn main() {}").unwrap();
+        refs.set_kind(Kind::Log);
+        refs.adopt(scratch);
+        assert_eq!(refs.kind_of(&code), Kind::SourceCode);
+    }
+
     use super::*;
 
     #[test]

@@ -631,7 +631,7 @@ impl AppCore {
             .iter()
             .map(|(id, fragment)| (*id, fragment.clone()))
             .collect();
-        let meta = PutMeta::new(Kind::Text)
+        let base = PutMeta::new(Kind::Text)
             .with_ttl(options.ref_ttl_seconds)
             // Saturating, as `with_ttl` already is. `validate()` accepts any
             // positive TTL, including one a per-request patch supplies, so the
@@ -644,9 +644,22 @@ impl AppCore {
                     .saturating_mul(options.ref_max_lifetime_multiplier as u64),
             )
             .with_request_id(request_id.to_string());
-        if let Err(error) = self.refs.put_many(&identity.tenant, &pairs, &meta) {
-            tracing::warn!(%error, "could not retain elided fragments");
-            return false;
+        // One batch per kind: the store records a kind per `PutMeta`, and a
+        // request's fragments come out of payloads of different types.
+        let mut by_kind: Vec<(Kind, Vec<_>)> = Vec::new();
+        for pair in &pairs {
+            let kind = refs.kind_of(&pair.0);
+            match by_kind.iter_mut().find(|(k, _)| *k == kind) {
+                Some((_, group)) => group.push(pair.clone()),
+                None => by_kind.push((kind, vec![pair.clone()])),
+            }
+        }
+        for (kind, group) in &by_kind {
+            let meta = PutMeta { kind: *kind, ..base.clone() };
+            if let Err(error) = self.refs.put_many(&identity.tenant, group, &meta) {
+                tracing::warn!(%error, "could not retain elided fragments");
+                return false;
+            }
         }
         // A store can accept a batch and immediately evict part of it to obey
         // its byte cap. Never ship a handle that already misses at this point.
@@ -927,6 +940,36 @@ mod tests {
             Arc::new(MemoryRefStore::new()),
             kompressor_stats::writer::null_sink(),
         )
+    }
+
+    /// The store's `kind` column used to read `text` for every row, because
+    /// one `PutMeta` covered the whole request.
+    #[test]
+    fn retained_fragments_keep_the_kind_they_were_elided_from() {
+        let store = Arc::new(MemoryRefStore::new());
+        let core = AppCore::new(
+            Config::default(),
+            store.clone(),
+            kompressor_stats::writer::null_sink(),
+        );
+        let identity = Identity::anonymous();
+        let options = core.options_for(&identity, None);
+        let mut refs = options.collector();
+        refs.set_kind(Kind::Json);
+        let json = refs.stash("{\"a\": 1}").unwrap();
+        refs.set_kind(Kind::SourceCode);
+        let code = refs.stash("fn main() {}").unwrap();
+        refs.set_kind(Kind::Json);
+        let json2 = refs.stash("{\"b\": 2}").unwrap();
+
+        assert!(core.retain_fragments(&identity, &refs, "req-1", &options));
+
+        for (id, want) in [(json, "json"), (code, "source_code"), (json2, "json")] {
+            match store.verify(&identity.tenant, &id).unwrap() {
+                Lookup::Hit(record) => assert_eq!(record.kind, want),
+                other => panic!("{id} not stored: {other:?}"),
+            }
+        }
     }
 
     fn log_payload(lines: usize) -> String {

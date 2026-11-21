@@ -518,6 +518,15 @@ fn route_whole(
 ) -> Option<(String, Kind)> {
     let mark = refs.mark();
 
+    // Fragments stashed below are stamped with the kind the route reports.
+    match forced {
+        Some(ForcedType::Json) => refs.set_kind(Kind::Json),
+        Some(ForcedType::Log) => refs.set_kind(Kind::Log),
+        Some(ForcedType::Text) => refs.set_kind(Kind::Text),
+        Some(ForcedType::Config) => refs.set_kind(Kind::Config),
+        None => {}
+    }
+
     let (out, kind, folded_instead) = match forced {
         Some(ForcedType::Json) => (
             guarded(|| crush_json(content, opts, ctx, refs)),
@@ -556,6 +565,7 @@ fn route_whole(
             } else {
                 detection.content_type.kind()
             };
+            refs.set_kind(kind);
             let out = match strategy {
                 Strategy::SmartCrusher => guarded(|| crush_json(content, opts, ctx, refs)),
                 Strategy::Log => {
@@ -966,6 +976,19 @@ mod tests {
         let (out, kind) =
             compress_content(content, "tool", opts, None, &mut refs, &ctx, &mut applied);
         (out, kind, refs, applied)
+    }
+
+    #[test]
+    fn fragments_are_stamped_with_the_route_that_elided_them() {
+        let opts = EngineOptions::default();
+        let content = three_fold_groups();
+        let (_, kind, refs, _) = run(&content, &opts);
+        let kind = kind.expect("the payload is claimed");
+        assert!(!refs.is_empty(), "the fold retained fragments");
+        for (id, _) in refs.pairs() {
+            assert_eq!(refs.kind_of(id), kind, "not the Text default");
+        }
+        assert_ne!(kind, Kind::Text, "a log is not reported as text");
     }
 
     /// Three templates folded independently, sized so that exactly one of the
