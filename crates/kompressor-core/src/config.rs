@@ -109,6 +109,12 @@ pub struct MaintenanceConfig {
     /// held to an age whoever takes them.
     #[serde(with = "humantime_serde")]
     pub backup_max_age: Duration,
+    /// How often `serve` gathers the query planner's statistics on each
+    /// database (`ANALYZE`, sampled: quick on a large file) — what the page's
+    /// Optimize does by hand. Due when the last optimize on record is older
+    /// than this, so it holds across restarts. Zero takes none.
+    #[serde(with = "humantime_serde")]
+    pub optimize_every: Duration,
 }
 
 impl Default for MaintenanceConfig {
@@ -121,6 +127,7 @@ impl Default for MaintenanceConfig {
             backup_every: Duration::from_secs(24 * 3_600),
             backup_keep: 7,
             backup_max_age: Duration::ZERO,
+            optimize_every: Duration::from_secs(24 * 3_600),
         }
     }
 }
@@ -429,6 +436,12 @@ pub struct StatsFileConfig {
     #[serde(with = "humantime_serde")]
     pub flush_interval: Duration,
     pub retention_days: u32,
+    /// Days a request keeps its copy of the effective settings
+    /// (`request_context.context`, most of a busy `stats.db`) before it is
+    /// emptied, the request kept. The analysis history is archived first, so
+    /// no breakdown loses a request. Zero, the default, keeps it as long as
+    /// the request; a value no shorter than `retention_days` changes nothing.
+    pub context_retention_days: u32,
 }
 
 impl Default for StatsFileConfig {
@@ -441,6 +454,7 @@ impl Default for StatsFileConfig {
             queue_size: 16_384,
             flush_interval: Duration::from_millis(100),
             retention_days: 90,
+            context_retention_days: 0,
         }
     }
 }
@@ -1613,6 +1627,11 @@ impl Config {
                         self.maintenance.backup_max_age = age;
                     }
                 }
+                "optimize_every" => {
+                    if let Some(every) = parse_duration(value) {
+                        self.maintenance.optimize_every = every;
+                    }
+                }
                 _ => {}
             },
             "refs" => match field {
@@ -1640,6 +1659,16 @@ impl Config {
             },
             "stats" => match field {
                 "path" => self.stats.path = PathBuf::from(value),
+                "retention_days" => {
+                    if let Ok(days) = value.parse() {
+                        self.stats.retention_days = days;
+                    }
+                }
+                "context_retention_days" => {
+                    if let Ok(days) = value.parse() {
+                        self.stats.context_retention_days = days;
+                    }
+                }
                 "enabled" => {
                     self.stats.enabled =
                         parse_bool_setting("stats.enabled", value, self.stats.enabled)
@@ -3126,6 +3155,15 @@ mod tests {
         );
         assert!(!config.maintenance.actions);
         assert!(!config.maintenance.erase, "nothing is erased by default");
+        assert_eq!(
+            config.maintenance.optimize_every,
+            Duration::from_secs(24 * 3_600),
+            "the planner's figures are refreshed daily"
+        );
+        assert_eq!(
+            config.stats.context_retention_days, 0,
+            "kept with the request"
+        );
         assert_eq!(config.maintenance.backup_keep, 7);
 
         let config: Config = toml::from_str(
@@ -3165,7 +3203,22 @@ mod tests {
             ("KOMPRESSOR__MAINTENANCE__BACKUP_KEEP".into(), "0".into()),
             ("KOMPRESSOR__MAINTENANCE__ACTIONS".into(), "true".into()),
             ("KOMPRESSOR__MAINTENANCE__ERASE".into(), "true".into()),
+            (
+                "KOMPRESSOR__MAINTENANCE__OPTIMIZE_EVERY".into(),
+                "6h".into(),
+            ),
+            ("KOMPRESSOR__STATS__RETENTION_DAYS".into(), "30".into()),
+            (
+                "KOMPRESSOR__STATS__CONTEXT_RETENTION_DAYS".into(),
+                "7".into(),
+            ),
         ]);
+        assert_eq!(
+            env.maintenance.optimize_every,
+            Duration::from_secs(6 * 3_600)
+        );
+        assert_eq!(env.stats.retention_days, 30);
+        assert_eq!(env.stats.context_retention_days, 7);
         assert_eq!(
             env.maintenance.schedule(),
             Some((Path::new("/srv/b"), Duration::from_secs(12 * 3_600)))

@@ -1794,9 +1794,14 @@ fn backup_writes_one_archive_of_every_database_and_never_replaces_one() {
         .map(|database| database["name"].as_str().unwrap())
         .collect();
     assert_eq!(names, ["stats.db", "refs.db"]);
-    // A gzip, and nothing else left beside it.
+    // A gzip and its checksum, in the format `sha256sum -c` reads, and
+    // nothing else left beside it.
     assert_eq!(std::fs::read(&archive).unwrap()[..2], [0x1f, 0x8b]);
-    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 2);
+    let sum = kompressor_core::backup::read_checksum(&archive).expect("a checksum beside it");
+    assert_eq!(sum, kompressor_core::backup::sha256_file(&archive).unwrap());
+    let line = std::fs::read_to_string(kompressor_core::backup::checksum_path(&archive)).unwrap();
+    assert_eq!(line, format!("{sum}  {name}\n"));
 
     // Named outright, the summary is for a person; asked twice, it refuses.
     let named = dir.join("mine.tar.gz");
@@ -2032,9 +2037,10 @@ fn backup_keep_rotates_the_directory_it_writes_into() {
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     left.sort();
-    assert_eq!(left.len(), 3, "{left:?}");
+    assert_eq!(left.len(), 4, "the new archive with its checksum: {left:?}");
     assert_eq!(left[0], "kompressor-backup-20210101-000000.tar.gz");
-    assert_eq!(left[2], "notes.txt");
+    assert!(left[2].ends_with(".tar.gz.sha256"), "{left:?}");
+    assert_eq!(left[3], "notes.txt");
 }
 
 /// How many fragments the store at `path` holds.

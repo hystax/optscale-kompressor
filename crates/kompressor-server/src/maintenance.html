@@ -87,6 +87,20 @@ code { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap:
 #status, #progress { color: var(--muted); margin: 8px 0 0; }
 #done { color: var(--good); margin: 8px 0 0; }
 [hidden] { display: none !important; }
+dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 0; }
+dl.facts dt { color: var(--muted); }
+dl.facts dd { margin: 0; overflow-wrap: anywhere; }
+#config-text { max-height: 420px; overflow: auto; background: var(--soft); padding: 10px; border-radius: 5px;
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre; }
+.banner { border: 1px solid var(--warn); color: var(--warn); border-radius: 5px; padding: 8px 10px; margin: 10px 0 0; }
+form.purge { display: flex; gap: 10px 14px; flex-wrap: wrap; align-items: end; margin: 8px 0; }
+form.purge label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); }
+form.purge fieldset { border: 0; padding: 0; margin: 0; display: flex; gap: 12px; }
+form.purge fieldset label { flex-direction: row; align-items: center; color: var(--ink); }
+#purge-confirm { margin-top: 10px; padding: 12px; border: 1px solid var(--warn); border-radius: 5px; max-width: 80ch; }
+#purge-confirm p { margin: 0 0 10px; line-height: 1.45; }
+#purge-confirm button { margin-right: 6px; }
+td.last { font-size: 13px; }
 #theme-toggle:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 </style>
 </head>
@@ -109,12 +123,25 @@ code { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap:
 <p id="status" role="status">Loading…</p>
 <p id="error" role="alert"></p>
 
+<section aria-labelledby="build-title">
+  <h2 id="build-title">What is running</h2>
+  <dl class="facts" id="build"></dl>
+  <p id="restart-pending" class="banner" hidden>
+    The binary on disk has been replaced since this process started: an upgrade was installed and the service
+    not restarted, so what runs here is not what is installed. Restart the service to run it.
+  </p>
+  <p><button id="show-config" type="button">Show effective configuration</button></p>
+  <pre id="config-text" hidden></pre>
+  <p class="note">The configuration as this process reads it — file, then environment — with every key and
+    secret replaced. From a shell: <code>kompressor check-config</code>.</p>
+</section>
+
 <section aria-labelledby="databases-title">
   <h2 id="databases-title">Databases</h2>
   <div class="scroll">
   <table id="databases" hidden>
     <thead><tr><th>Database</th><th>File</th><th>Size</th><th>Write-ahead log</th><th>Schema</th>
-      <th>Reclaimable</th><th>Records</th><th>Planner</th><th>Integrity</th><th></th></tr></thead>
+      <th>Reclaimable</th><th>Records</th><th>Planner</th><th>Integrity</th><th>Last done</th><th></th></tr></thead>
     <tbody></tbody>
   </table>
   </div>
@@ -127,8 +154,10 @@ code { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap:
     <i>Vacuum</i> returns it: the file is rewritten, which needs about twice its size free and holds
     writes to it until it is done. <b>Planner</b> says whether SQLite has statistics to choose indexes
     by; <i>Optimize</i> gathers them, and again whenever the data has changed shape.
-    <i>Check</i> reads every page and every index and can take a while on a large file; its result is
-    kept until the service restarts. <i>Space</i> reads every page too. From a shell:
+    <i>Check</i> reads every page and every index and can take a while on a large file. <i>Space</i> reads
+    every page too. <b>Last done</b> is the newest of each on record, by the page or the schedule, across
+    restarts. A vacuum of <code>refs.db</code> also switches it to incremental auto-vacuum, after which the
+    fragment sweep hands freed pages back by itself. From a shell:
     <code>kompressor db status</code>, <code>kompressor db check</code>,
     <code>kompressor db checkpoint</code>.
   </p>
@@ -159,8 +188,11 @@ code { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap:
   <p class="note">
     What keeps the databases from growing without bound. Requests older than
     <code>stats.retention_days</code> are archived into daily rollups, which are kept, and then
-    removed; expired fragments are swept out of the ref store every <code>refs.purge_interval</code>.
-    <b>Last run</b> is since the service started.
+    removed; expired fragments are swept out of the ref store every <code>refs.purge_interval</code>, and the
+    pages they held handed back to the disk. With <code>stats.context_retention_days</code> set, requests older
+    than that keep their row and lose their copy of the settings, most of a busy <code>stats.db</code>; the
+    analysis history is archived first, so no breakdown loses a request. The planner's statistics are
+    refreshed every <code>maintenance.optimize_every</code>. <b>Last run</b> is since the service started.
   </p>
 </section>
 
@@ -195,10 +227,16 @@ code { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap:
   <h3>Scheduled backups</h3>
   <p id="schedule" class="muted">Loading…</p>
   <table id="archives" hidden>
-    <thead><tr><th>Archive</th><th>Taken</th><th>Size</th><th></th></tr></thead>
+    <thead><tr><th>Archive</th><th>Taken</th><th>Size</th><th>Verified</th><th></th></tr></thead>
     <tbody></tbody>
   </table>
 
+  <p class="note">
+    <i>Verify</i> checks an archive as a restore would — the checksum written beside it when it was taken, its
+    manifest, and a full integrity check of every database in it — without stopping or touching anything. It
+    unpacks into the backup directory for as long as it runs. Each archive has a <code>.sha256</code> beside it:
+    a copy taken off this host is checked with <code>sha256sum -c</code>.
+  </p>
   <h3>History</h3>
   <p id="history-none" class="muted">Loading…</p>
   <table id="history" hidden>
@@ -216,6 +254,57 @@ code { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap:
     (<code>…before-restore-&lt;time&gt;</code>) instead of deleting them.
   </p>
   <ol id="restore-steps" class="note"></ol>
+</section>
+
+<section aria-labelledby="purge-title">
+  <h2 id="purge-title">Trim or delete statistics</h2>
+  <form class="purge" id="purge-form">
+    <fieldset>
+      <label><input type="radio" name="purge-kind" value="context" checked/> Trim the settings each request carries</label>
+      <label><input type="radio" name="purge-kind" value="rows"/> Delete the requests</label>
+    </fieldset>
+  </form>
+  <form class="purge" id="purge-scope">
+    <label>Before (UTC day) <input id="purge-before" type="date"/></label>
+    <label>Tenant <input id="purge-tenant" type="text" size="14" autocomplete="off" spellcheck="false"/></label>
+    <label>Run <input id="purge-run" type="text" size="18" autocomplete="off" spellcheck="false"/></label>
+    <label>Experiment <input id="purge-experiment" type="text" size="14" autocomplete="off" spellcheck="false"/></label>
+    <button id="purge-preview" type="submit">Preview</button>
+  </form>
+  <p class="note" id="purge-why" hidden></p>
+  <p id="purge-result" role="status" hidden></p>
+  <div class="scroll"><table id="purge-tables" hidden>
+    <thead><tr><th>Table</th><th>Rows</th></tr></thead><tbody></tbody>
+  </table></div>
+  <div id="purge-confirm" hidden>
+    <p id="purge-confirm-text"></p>
+    <p id="purge-phrase-row" hidden><label for="purge-phrase">To confirm, type <code>delete statistics</code> below.</label><br/>
+      <input id="purge-phrase" type="text" size="24" autocomplete="off" spellcheck="false"/></p>
+    <button id="purge-go" class="primary" type="button">Go ahead</button>
+    <button id="purge-cancel" type="button">Cancel</button>
+  </div>
+  <p class="note">
+    Every field given narrows it: requests from before a day, of a tenant, recorded under a run or an experiment
+    label (<code>stats.run_id</code>, <code>stats.experiment_id</code>). <b>Trimming</b> keeps every request and
+    empties only its copy of the effective settings; the analysis history is archived first, so nothing it
+    reports changes. <b>Deleting</b> by a day alone is retention brought forward — each day is rolled up first,
+    as the hourly pass would — while deleting a tenant's, a run's or an experiment's requests makes them not to
+    have happened, and keeps only aggregates already archived. <i>Preview</i> does the work and undoes it, so
+    what it reports is exact. Freed space is reused by what is written next; <i>Vacuum</i> above hands it back to
+    the disk. Trimming is an action (<code>maintenance.actions</code>); deleting is the danger zone's
+    (<code>maintenance.erase</code>).
+  </p>
+</section>
+
+<section aria-labelledby="work-title">
+  <h2 id="work-title">Maintenance history</h2>
+  <p id="work-none" class="muted">Loading…</p>
+  <div class="scroll"><table id="work" hidden>
+    <thead><tr><th>When</th><th>What</th><th>On</th><th>By</th><th>Result</th><th>Size</th><th>Took</th></tr></thead>
+    <tbody></tbody>
+  </table></div>
+  <p class="note">Every check, checkpoint, vacuum, optimize, trim, delete, erase and verification, from this page
+    and the schedule, newest first. Kept through an erase.</p>
 </section>
 
 <section class="danger" aria-labelledby="danger-title">
@@ -378,7 +467,7 @@ function databaseRow(database, status) {
   if (database.error) {
     integrity.append(tagged("unreadable: " + database.error, "bad"));
   } else if (!database.checked) {
-    integrity.append(tagged(database.included ? "not checked since start" : "–", "muted"));
+    integrity.append(tagged(database.included ? "never checked" : "–", "muted"));
   } else if (database.checked.ok) {
     integrity.append(tagged("ok, " + span(database.checked.at_ms, status.now_ms) + " ago", "good"));
   } else {
@@ -420,15 +509,37 @@ function databaseRow(database, status) {
     planner.textContent = "–";
   }
 
+  const reclaimable = cell(size(database.reclaimable_bytes), "num");
+  if (database.auto_vacuum === 2) {
+    reclaimable.append(document.createElement("br"), tagged("handed back by itself", "muted"));
+  }
   row.append(cell(database.name), path,
     cell(database.included ? size(database.bytes) : "– " + (database.reason || ""), "num"),
-    cell(size(database.wal_bytes), "num"), schema, cell(size(database.reclaimable_bytes), "num"),
-    records, planner, integrity, actions);
+    cell(size(database.wal_bytes), "num"), schema, reclaimable,
+    records, planner, integrity, lastDone(database, status), actions);
   return row;
 }
 
 const count = number => number == null ? "–" : Number(number).toLocaleString();
 const ago = (ms, now) => span(ms, now) + " ago";
+const BY = { schedule: "schedule", http: "this page", cli: "a shell" };
+const by = work => (BY[work.origin] || work.origin) + (work.actor ? " (" + work.actor + ")" : "");
+
+// The newest of each kind of work on record for one database.
+function lastDone(database, status) {
+  const td = cell("", "last");
+  const done = database.last || {};
+  const lines = ["vacuum", "optimize", "checkpoint", "trim", "delete", "erase"]
+    .filter(action => done[action])
+    .map(action => {
+      const work = done[action];
+      return tagged(action + " " + ago(work.time_ms, status.now_ms) + (work.ok ? "" : ", FAILED"),
+        work.ok ? "" : "bad");
+    });
+  if (!lines.length) { td.append(tagged("–", "muted")); return td; }
+  lines.forEach((line, index) => { if (index) td.append(document.createElement("br")); td.append(line); });
+  return td;
+}
 
 // Where one database's bytes are. Asked for, not loaded with the page: it
 // reads the whole file.
@@ -487,6 +598,36 @@ function drawRetention(status) {
       cell(total == null ? "–" : count(total) + " rows" + (total ? " (" + count(removed.proxy_requests) + " requests)" : "")),
       backlog);
     rows.push(row);
+
+    const settings = document.createElement("tr");
+    const settingsRule = cell("");
+    if (stats.context_cutoff_ms != null) {
+      settingsRule.textContent = "emptied after " + stats.context_retention_days + " d, the request kept; now before "
+        + new Date(stats.context_cutoff_ms).toLocaleDateString();
+    } else if (stats.context_retention_days) {
+      settingsRule.append(tagged("stats.context_retention_days = " + stats.context_retention_days
+        + " is no shorter than the requests' own window: nothing to do", "muted"));
+    } else {
+      settingsRule.append(tagged("kept as long as the request (stats.context_retention_days = 0)", "muted"));
+    }
+    const trimmed = stats.last && stats.last.contexts_trimmed;
+    settings.append(cell("Request settings (request_context)"), settingsRule,
+      cell(stats.context_cutoff_ms != null ? "every " + every(stats.every_s) : "–"),
+      stats.context_cutoff_ms != null ? lastRun(stats.last) : cell("–"),
+      cell(trimmed == null ? "–" : count(trimmed) + " requests trimmed"), cell("–"));
+    rows.push(settings);
+
+    const planner = document.createElement("tr");
+    const optimized = status.databases.map(database => database.last && database.last.optimize).filter(Boolean)
+      .sort((a, b) => b.time_ms - a.time_ms)[0];
+    const plannerLast = cell("");
+    if (!optimized) plannerLast.append(tagged("none on record", "muted"));
+    else plannerLast.append(tagged(ago(optimized.time_ms, now) + " by " + by(optimized) + (optimized.ok ? "" : ", FAILED"),
+      optimized.ok ? "good" : "bad"));
+    planner.append(cell("Planner statistics (both)"),
+      cell(stats.optimize_every_s ? "refreshed on a schedule" : "by hand only (maintenance.optimize_every = 0)"),
+      cell(stats.optimize_every_s ? "every " + every(stats.optimize_every_s) : "–"), plannerLast, cell("–"), cell("–"));
+    rows.push(planner);
   }
   const refs = status.retention.refs;
   const row = document.createElement("tr");
@@ -497,7 +638,8 @@ function drawRetention(status) {
   holding.append(tagged(held, full ? "warn" : ""));
   row.append(cell("Fragments (ref store)"), cell("each until its own time-to-live runs out"),
     cell("every " + every(refs.every_s)), lastRun(refs.last),
-    cell(refs.last && refs.last.removed != null ? count(refs.last.removed) + " fragments" : "–"), holding);
+    cell(refs.last && refs.last.removed != null ? count(refs.last.removed) + " fragments"
+      + (refs.last.reclaimed_bytes ? ", " + size(refs.last.reclaimed_bytes) + " handed back" : "") : "–"), holding);
   rows.push(row);
   $("retention").tBodies[0].replaceChildren(...rows);
   $("retention").hidden = false;
@@ -588,13 +730,29 @@ function drawSchedule(status) {
       get.disabled = !status.backup.allowed;
     });
     get.disabled = !status.backup.allowed;
-    actions.append(get);
+    const check = button("Verify", "Check this archive as a restore would, without restoring it",
+      () => act("maintenance/backups/" + encodeURIComponent(archive.name) + "/verify", result => {
+        const verified = result.verified;
+        const sum = { matches: "checksum matches", differs: "checksum DIFFERS", absent: "no checksum to compare" }[verified.checksum];
+        return verified.ok
+          ? [archive.name + ": sound — " + verified.databases.length + " databases pass a full check, " + sum
+              + ", in " + (result.took_ms / 1000).toFixed(1) + " s.", "good"]
+          : [archive.name + ": FAILED — " + verified.problems.join("; "), "bad"];
+      }));
+    check.disabled = !status.actions.allowed;
+    actions.append(get, check);
     const name = cell("");
     const code = document.createElement("code");
     code.textContent = archive.name;
+    if (archive.sha256) code.title = "sha256 " + archive.sha256;
     name.append(code);
+    const verdict = cell("");
+    const verified = (schedule.verified || {})[archive.name];
+    if (!verified) verdict.append(tagged("not yet", "muted"));
+    else verdict.append(tagged((verified.ok ? "sound, " : "FAILED, ") + ago(verified.time_ms, status.now_ms),
+      verified.ok ? "good" : "bad"));
     row.append(name, cell(when(archive.created_at_ms) + " (" + span(archive.created_at_ms, status.now_ms) + " ago)"),
-      cell(size(archive.bytes), "num"), actions);
+      cell(size(archive.bytes), "num"), verdict, actions);
     return row;
   }));
   $("archives").hidden = false;
@@ -658,6 +816,156 @@ function drawRestore(status) {
     step("When all is well, remove the files that were moved aside.", ""));
 }
 
+function drawBuild(status) {
+  const build = status.build;
+  const facts = [
+    ["Version", "kompressor " + build.version + (build.commit ? " (" + build.commit + ")" : " (commit unknown)")],
+    ["Running since", when(build.started_at_ms) + " — up " + span(0, build.uptime_s * 1000)],
+    ["Binary", build.binary || "–"],
+    ["Configuration", build.config || "none: defaults and the environment"],
+    ["Supervised by", build.systemd ? "systemd" : "not systemd"],
+  ];
+  $("build").replaceChildren(...facts.flatMap(([term, value]) => {
+    const dt = document.createElement("dt"), dd = document.createElement("dd");
+    dt.textContent = term;
+    dd.textContent = value;
+    return [dt, dd];
+  }));
+  $("restart-pending").hidden = !build.restart_pending;
+  $("show-config").disabled = !status.space.allowed;
+  $("show-config").title = status.space.allowed ? "" : status.space.reason;
+}
+
+function drawWork(status) {
+  const history = status.history || [];
+  $("work").hidden = !history.length;
+  $("work-none").hidden = !!history.length;
+  $("work-none").textContent = "None on record yet.";
+  $("work").tBodies[0].replaceChildren(...history.map(work => {
+    const row = document.createElement("tr");
+    const result = cell("");
+    result.append(tagged(work.ok ? "ok" : "failed: " + (work.error || ""), work.ok ? "good" : "bad"));
+    const target = cell("");
+    const code = document.createElement("code");
+    code.textContent = work.target;
+    target.append(code);
+    const sized = work.bytes_before == null ? "–"
+      : work.bytes_after == null ? size(work.bytes_before) : size(work.bytes_before) + " → " + size(work.bytes_after);
+    row.append(cell(when(work.time_ms)), cell(work.action), target, cell(by(work)), result, cell(sized, "num"),
+      cell(work.took_ms < 1000 ? work.took_ms + " ms" : (work.took_ms / 1000).toFixed(1) + " s", "num"));
+    return row;
+  }));
+}
+
+// Trim or delete: always previewed first, and a delete asks for its phrase.
+const DELETE_PHRASE = "delete statistics";
+let lastStatus = null;
+const purgeKind = () => document.querySelector("input[name=purge-kind]:checked").value;
+const purgeScope = () => {
+  const scope = {};
+  const day = $("purge-before").value;
+  if (day) scope.before_ms = Date.parse(day + "T00:00:00Z");
+  if ($("purge-tenant").value.trim()) scope.tenant = $("purge-tenant").value.trim();
+  if ($("purge-run").value.trim()) scope.run_id = $("purge-run").value.trim();
+  if ($("purge-experiment").value.trim()) scope.experiment_id = $("purge-experiment").value.trim();
+  return scope;
+};
+function drawPurgeGrant() {
+  if (!lastStatus) return;
+  const grant = purgeKind() === "rows" ? lastStatus.erase : lastStatus.actions;
+  $("purge-preview").disabled = !grant.allowed;
+  $("purge-why").textContent = grant.allowed ? "" : grant.reason;
+  $("purge-why").hidden = grant.allowed;
+  $("purge-go").textContent = purgeKind() === "rows" ? "Delete these requests" : "Trim these requests";
+  $("purge-go").className = purgeKind() === "rows" ? "danger" : "primary";
+}
+function closePurge() {
+  $("purge-confirm").hidden = true;
+  $("purge-phrase").value = "";
+}
+async function purge(dryRun) {
+  $("error").textContent = "";
+  const kind = purgeKind(), scope = purgeScope();
+  const body = { kind, scope, dry_run: dryRun };
+  if (!dryRun && kind === "rows") body.confirm = $("purge-phrase").value.trim();
+  $("purge-result").hidden = false;
+  $("purge-result").className = "muted";
+  $("purge-result").textContent = dryRun ? "Rehearsing…" : "Working…";
+  const headers = credentials();
+  headers["content-type"] = "application/json";
+  const response = await fetch(prefix + "maintenance/statistics/delete",
+    { method: "POST", headers, cache: "no-store", body: JSON.stringify(body) });
+  if (!response.ok) throw new Error(response.status + " " + await explain(response));
+  const purged = (await response.json()).purged;
+  const entries = Object.entries(purged.tables);
+  $("purge-tables").tBodies[0].replaceChildren(...entries.map(([table, rows]) => {
+    const row = document.createElement("tr");
+    row.append(cell(table), cell(count(rows), "num"));
+    return row;
+  }));
+  $("purge-tables").hidden = !entries.length;
+  const what = kind === "rows" ? "deletes " + count(purged.rows) + " rows" : "empties the settings of " + count(purged.rows) + " requests";
+  const space = (purged.content_bytes != null ? size(purged.content_bytes) + " of settings" : "")
+    + (purged.freed_bytes ? (purged.content_bytes != null ? ", " : "") + size(purged.freed_bytes) + " of whole pages freed" : "");
+  $("purge-result").className = dryRun ? "" : "good";
+  $("purge-result").textContent = (dryRun ? "This " + what : "Done: it " + what.replace(/^deletes/, "deleted").replace(/^empties/, "emptied"))
+    + (space ? " — " + space : "") + (purged.rolled_up ? "; the days were rolled up first" : "") + ".";
+  return purged;
+}
+$("purge-scope").addEventListener("submit", async event => {
+  event.preventDefault();
+  closePurge();
+  try {
+    const purged = await purge(true);
+    if (!purged.rows) return;
+    $("purge-confirm-text").textContent = purgeKind() === "rows"
+      ? "Delete these " + count(purged.rows) + " rows? This cannot be undone from here — only by restoring a backup"
+        + (lastStatus && lastStatus.last_backup.ok_ms != null ? " (the last was taken " + ago(lastStatus.last_backup.ok_ms, lastStatus.now_ms) + ")." : "; there is none on record.")
+      : "Empty the settings of these " + count(purged.rows) + " requests? Every request stays, and the analysis history keeps what it reports.";
+    $("purge-phrase-row").hidden = purgeKind() !== "rows";
+    $("purge-go").disabled = purgeKind() === "rows";
+    $("purge-confirm").hidden = false;
+  } catch (error) {
+    $("purge-result").hidden = true;
+    $("error").textContent = "Preview failed: " + (error.message || error);
+  }
+});
+$("purge-phrase").addEventListener("input", () => {
+  $("purge-go").disabled = $("purge-phrase").value.trim() !== DELETE_PHRASE;
+});
+$("purge-go").addEventListener("click", async () => {
+  try {
+    await purge(false);
+  } catch (error) {
+    $("purge-result").hidden = true;
+    $("error").textContent = "Failed: " + (error.message || error);
+  }
+  closePurge();
+  load();
+});
+$("purge-cancel").addEventListener("click", closePurge);
+document.querySelectorAll("input[name=purge-kind]").forEach(input => input.addEventListener("change", () => {
+  closePurge();
+  $("purge-result").hidden = true;
+  $("purge-tables").hidden = true;
+  drawPurgeGrant();
+}));
+["purge-before", "purge-tenant", "purge-run", "purge-experiment"].forEach(id => $(id).addEventListener("input", closePurge));
+
+$("show-config").addEventListener("click", async () => {
+  $("error").textContent = "";
+  if (!$("config-text").hidden) { $("config-text").hidden = true; $("show-config").textContent = "Show effective configuration"; return; }
+  try {
+    const response = await fetch(prefix + "maintenance/config", { headers: credentials(), cache: "no-store" });
+    if (!response.ok) throw new Error(response.status + " " + await explain(response));
+    $("config-text").textContent = await response.text();
+    $("config-text").hidden = false;
+    $("show-config").textContent = "Hide effective configuration";
+  } catch (error) {
+    $("error").textContent = "Could not read the configuration: " + (error.message || error);
+  }
+});
+
 async function load() {
   $("error").textContent = "";
   try {
@@ -674,10 +982,14 @@ async function load() {
     drawRetention(status);
     drawStorage(status);
     drawDanger(status);
+    drawBuild(status);
+    drawWork(status);
+    lastStatus = status;
+    drawPurgeGrant();
     $("backup").disabled = !status.backup.allowed;
     $("why").textContent = status.backup.allowed ? "" : status.backup.reason;
     $("why").hidden = status.backup.allowed;
-    $("status").textContent = "kompressor " + status.version + " · " +
+    $("status").textContent = "kompressor " + status.version + (status.build.commit ? " (" + status.build.commit + ")" : "") + " · " +
       (status.backup.allowed ? "backup available" : "backup not available here") + " · " +
       (status.actions.allowed ? "actions available" : "actions not available here");
   } catch (error) {

@@ -191,6 +191,9 @@ pub struct Archive {
     /// When it was taken, from its name: the name is written once and a copy
     /// keeps it, where a file's modification time does not survive either.
     pub created_at_ms: i64,
+    /// Its SHA-256, from the `.sha256` file written beside it; absent for
+    /// one taken before those were.
+    pub sha256: Option<String>,
 }
 
 /// When the archive called `name` was taken, if `name` is one
@@ -248,7 +251,8 @@ pub fn list_archives(dir: &Path) -> Vec<Archive> {
             let name = entry.file_name().to_string_lossy().into_owned();
             let created_at_ms = archive_time(&name)?;
             let meta = entry.metadata().ok()?;
-            meta.is_file().then_some(Archive {
+            meta.is_file().then(|| Archive {
+                sha256: read_checksum(&entry.path()),
                 name,
                 bytes: meta.len(),
                 created_at_ms,
@@ -269,6 +273,9 @@ pub fn prune_archives(dir: &Path, keep: u32) -> Vec<String> {
         .into_iter()
         .skip(keep as usize)
         .filter(|archive| std::fs::remove_file(dir.join(&archive.name)).is_ok())
+        .inspect(|archive| {
+            let _ = std::fs::remove_file(checksum_path(&dir.join(&archive.name)));
+        })
         .map(|archive| archive.name)
         .collect()
 }
@@ -295,6 +302,9 @@ pub struct Scheduled {
     pub manifest: Manifest,
     /// Older archives removed to keep `maintenance.backup_keep`.
     pub removed: Vec<String>,
+    /// The archive's SHA-256, also written beside it; absent when that file
+    /// could not be written.
+    pub sha256: Option<String>,
 }
 
 /// Take the scheduled backup if one is due at `now_ms`: write an archive
@@ -323,13 +333,256 @@ pub fn run_scheduled(config: &Config, now_ms: i64) -> Result<Option<Scheduled>, 
     let archive = dir.join(archive_name(now_ms));
     let manifest = write_archive(config, &archive)?;
     let bytes = std::fs::metadata(&archive)?.len();
+    // The archive is good without it: a checksum that cannot be written is a
+    // warning, not a failed backup.
+    let sha256 = write_checksum(&archive)
+        .map_err(|error| tracing::warn!(%error, "the archive's checksum was not written"))
+        .ok();
     let removed = prune_archives(dir, config.maintenance.backup_keep);
     Ok(Some(Scheduled {
         archive,
         bytes,
         manifest,
         removed,
+        sha256,
     }))
+}
+
+/// Where the checksum of `archive` is kept: beside it, as `<name>.sha256`.
+pub fn checksum_path(archive: &Path) -> PathBuf {
+    let mut path = archive.as_os_str().to_owned();
+    path.push(".sha256");
+    PathBuf::from(path)
+}
+
+/// The SHA-256 of the file at `path`, as lowercase hex. Read a buffer at a
+/// time: an archive can be larger than memory.
+pub fn sha256_file(path: &Path) -> std::io::Result<String> {
+    let mut file = File::open(path)?;
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buffer = vec![0u8; 256 * 1024];
+    loop {
+        let read = std::io::Read::read(&mut file, &mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        context.update(&buffer[..read]);
+    }
+    Ok(context
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+/// Write the SHA-256 of `archive` beside it, in the format `sha256sum`
+/// writes — `<hex>  <name>` — so `sha256sum -c` checks a copy anywhere.
+/// Returns the checksum.
+pub fn write_checksum(archive: &Path) -> Result<String, CoreError> {
+    let sum = sha256_file(archive)?;
+    let name = archive
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(checksum_path(archive))?;
+    writeln!(file, "{sum}  {name}")?;
+    Ok(sum)
+}
+
+/// The checksum written beside `archive`, when there is a readable one.
+pub fn read_checksum(archive: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(checksum_path(archive)).ok()?;
+    let sum = text.split_whitespace().next()?.to_ascii_lowercase();
+    (sum.len() == 64 && sum.bytes().all(|b| b.is_ascii_hexdigit())).then_some(sum)
+}
+
+/// Whether an archive matches the checksum written when it was taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChecksumMatch {
+    Matches,
+    /// The bytes have changed since: a damaged or replaced file.
+    Differs,
+    /// None was written: an archive from before they were, or a copy.
+    Absent,
+}
+
+/// One database in an archive, as [`verify_archive`] found it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedDatabase {
+    pub name: String,
+    pub bytes: u64,
+    pub schema_version: u32,
+    /// What SQLite's full integrity check found; empty when it is sound.
+    pub problems: Vec<String>,
+}
+
+/// What [`verify_archive`] found: whether `kompressor restore` would accept
+/// the archive, without stopping anything or touching a database.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Verified {
+    pub ok: bool,
+    pub bytes: u64,
+    pub sha256: String,
+    pub checksum: ChecksumMatch,
+    /// Absent when there was none to read.
+    pub manifest: Option<Manifest>,
+    pub databases: Vec<VerifiedDatabase>,
+    /// Everything wrong with it, in words; empty when `ok`.
+    pub problems: Vec<String>,
+}
+
+/// Check the archive at `archive` as a restore would, and say what is wrong
+/// with it: the checksum written beside it, the manifest, and every database
+/// in it unpacked and put through a full integrity check against what the
+/// manifest says it holds.
+///
+/// Unpacked into a private directory beside the archive, removed afterwards,
+/// so it needs the archive's uncompressed size free there for as long as it
+/// runs. An archive that is damaged is a verdict, not an error: `Err` is for
+/// one that cannot be read at all.
+pub fn verify_archive(archive: &Path) -> Result<Verified, CoreError> {
+    let bytes = std::fs::metadata(archive)?.len();
+    let sha256 = sha256_file(archive)?;
+    let checksum = match read_checksum(archive) {
+        None => ChecksumMatch::Absent,
+        Some(written) if written == sha256 => ChecksumMatch::Matches,
+        Some(_) => ChecksumMatch::Differs,
+    };
+    let mut verified = Verified {
+        ok: false,
+        bytes,
+        sha256,
+        checksum,
+        manifest: None,
+        databases: Vec::new(),
+        problems: Vec::new(),
+    };
+    if checksum == ChecksumMatch::Differs {
+        verified
+            .problems
+            .push("its bytes differ from the checksum written when it was taken".to_string());
+    }
+    let scratch = Scratch::beside(archive)?;
+    let mut unpacked: Vec<(String, PathBuf)> = Vec::new();
+    let unpacking = (|| -> Result<(), String> {
+        let file = File::open(archive).map_err(|error| error.to_string())?;
+        let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
+        for entry in tar
+            .entries()
+            .map_err(|error| format!("not a gzipped tar ({error})"))?
+        {
+            let mut entry = entry.map_err(|error| format!("damaged ({error})"))?;
+            let name = entry
+                .path()
+                .map_err(|error| error.to_string())?
+                .to_string_lossy()
+                .into_owned();
+            // Only the names a backup writes, as plain files: nothing in an
+            // archive chooses where it lands.
+            if !entry.header().entry_type().is_file() {
+                continue;
+            }
+            if name == "manifest.json" {
+                let mut text = String::new();
+                std::io::Read::read_to_string(
+                    &mut std::io::Read::take(&mut entry, 1 << 20),
+                    &mut text,
+                )
+                .map_err(|error| format!("damaged ({error})"))?;
+                verified.manifest = Some(
+                    serde_json::from_str(&text)
+                        .map_err(|error| format!("unreadable manifest ({error})"))?,
+                );
+                continue;
+            }
+            if !matches!(name.as_str(), "stats.db" | "refs.db") {
+                continue;
+            }
+            if unpacked.iter().any(|(seen, _)| *seen == name) {
+                return Err(format!("{name} is in it twice"));
+            }
+            let path = scratch.0.join(&name);
+            let mut out = File::create(&path).map_err(|error| error.to_string())?;
+            std::io::copy(&mut entry, &mut out).map_err(|error| format!("damaged ({error})"))?;
+            unpacked.push((name, path));
+        }
+        Ok(())
+    })();
+    if let Err(problem) = unpacking {
+        verified.problems.push(problem);
+    }
+    match &verified.manifest {
+        None => verified
+            .problems
+            .push("no manifest.json: not a kompressor backup".to_string()),
+        Some(manifest) if manifest.format > FORMAT => verified.problems.push(format!(
+            "written in format {} by kompressor {}; this build reads up to {FORMAT}",
+            manifest.format, manifest.kompressor
+        )),
+        Some(_) => {}
+    }
+    let listed = verified
+        .manifest
+        .as_ref()
+        .map(|manifest| manifest.databases.clone())
+        .unwrap_or_default();
+    for expected in &listed {
+        if !unpacked.iter().any(|(name, _)| *name == expected.name) {
+            verified.problems.push(format!(
+                "the manifest lists {} and it is not there",
+                expected.name
+            ));
+        }
+    }
+    for (name, path) in &unpacked {
+        let size = std::fs::metadata(path).map_or(0, |meta| meta.len());
+        let mut problems = kompressor_store::sqlite::integrity_check(path)
+            .unwrap_or_else(|error| vec![error.to_string()]);
+        let schema_version =
+            kompressor_store::sqlite::facts(path).map_or(0, |facts| facts.schema_version);
+        match listed.iter().find(|database| database.name == *name) {
+            None => problems.push("it is not in the manifest".to_string()),
+            Some(expected) => {
+                if expected.bytes != size {
+                    problems.push(format!(
+                        "{size} bytes where the manifest says {}",
+                        expected.bytes
+                    ));
+                }
+                if expected.schema_version != schema_version {
+                    problems.push(format!(
+                        "schema v{schema_version} where the manifest says v{}",
+                        expected.schema_version
+                    ));
+                }
+            }
+        }
+        for problem in problems.iter().take(3) {
+            verified.problems.push(format!("{name}: {problem}"));
+        }
+        verified.databases.push(VerifiedDatabase {
+            name: name.clone(),
+            bytes: size,
+            schema_version,
+            problems,
+        });
+    }
+    if verified.manifest.is_some() && verified.databases.is_empty() && verified.problems.is_empty()
+    {
+        verified.problems.push("it holds no database".to_string());
+    }
+    verified.ok = verified.problems.is_empty();
+    drop(scratch);
+    Ok(verified)
 }
 
 /// What became of one database in a restore.
@@ -1135,9 +1388,91 @@ mod tests {
         assert_eq!(kept, [112, 106]);
         assert_eq!(
             std::fs::read_dir(&backups).unwrap().count(),
-            2,
-            "no scratch left"
+            4,
+            "two archives and their checksums; no scratch left, and the pruned one's checksum \
+             went with it"
         );
+        let newest = &list_archives(&backups)[0];
+        assert_eq!(newest.sha256.as_deref(), third.sha256.as_deref());
+        let line = std::fs::read_to_string(checksum_path(&third.archive)).unwrap();
+        assert_eq!(
+            line,
+            format!("{}  {}\n", third.sha256.unwrap(), archive_name(112 * HOUR)),
+            "the format sha256sum -c reads"
+        );
+    }
+
+    /// A good archive passes, and each way one can go bad is named.
+    #[test]
+    fn an_archive_is_verified_without_restoring_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = deployment(dir.path());
+        let good = dir.path().join("good.tar.gz");
+        write_archive(&config, &good).unwrap();
+
+        let verified = verify_archive(&good).unwrap();
+        assert!(verified.ok, "{verified:?}");
+        assert_eq!(verified.checksum, ChecksumMatch::Absent, "none written yet");
+        assert_eq!(verified.databases.len(), 2);
+        assert!(verified.databases.iter().all(|d| d.problems.is_empty()));
+        assert_eq!(verified.sha256, sha256_file(&good).unwrap());
+
+        let sum = write_checksum(&good).unwrap();
+        assert_eq!(read_checksum(&good).as_deref(), Some(sum.as_str()));
+        assert_eq!(
+            verify_archive(&good).unwrap().checksum,
+            ChecksumMatch::Matches
+        );
+        let leftovers = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(SCRATCH_PREFIX))
+            .count();
+        assert_eq!(leftovers, 0, "nothing unpacked is left behind");
+
+        // The same bytes and one more: the checksum notices.
+        let grown = dir.path().join("grown.tar.gz");
+        let mut bytes = std::fs::read(&good).unwrap();
+        bytes.push(0);
+        std::fs::write(&grown, &bytes).unwrap();
+        std::fs::copy(checksum_path(&good), checksum_path(&grown)).unwrap();
+        let differs = verify_archive(&grown).unwrap();
+        assert_eq!(differs.checksum, ChecksumMatch::Differs);
+        assert!(!differs.ok);
+
+        // Damage in the middle of the compressed stream.
+        let damaged = dir.path().join("damaged.tar.gz");
+        let mut bytes = std::fs::read(&good).unwrap();
+        let middle = bytes.len() / 2;
+        for byte in &mut bytes[middle..middle + 64] {
+            *byte ^= 0x5A;
+        }
+        std::fs::write(&damaged, &bytes).unwrap();
+        let found = verify_archive(&damaged).unwrap();
+        assert!(!found.ok);
+        assert!(!found.problems.is_empty(), "{found:?}");
+
+        // A tar of a database and nothing else is not one of ours.
+        let bare = dir.path().join("bare.tar.gz");
+        let gzip = flate2::write::GzEncoder::new(
+            File::create(&bare).unwrap(),
+            flate2::Compression::fast(),
+        );
+        let mut tar = tar::Builder::new(gzip);
+        tar.append_path_with_name(&config.refs.path, "refs.db")
+            .unwrap();
+        tar.into_inner().unwrap().finish().unwrap();
+        let foreign = verify_archive(&bare).unwrap();
+        assert!(!foreign.ok);
+        assert!(
+            foreign
+                .problems
+                .iter()
+                .any(|p| p.contains("not a kompressor backup")),
+            "{foreign:?}"
+        );
+
+        assert!(verify_archive(&dir.path().join("absent.tar.gz")).is_err());
     }
 
     /// A scheduled backup that cannot be written removes nothing: the
@@ -1466,7 +1801,9 @@ mod tests {
         let config = deployment(dir.path());
         kompressor_stats::schema::open_read_write(&config.stats.path)
             .unwrap()
-            .execute_batch("DROP TABLE backups; PRAGMA user_version = 15;")
+            .execute_batch(
+                "DROP TABLE backups; DROP TABLE maintenance_events; PRAGMA user_version = 15;",
+            )
             .unwrap();
         let archive = dir.path().join("old.tar.gz");
         let manifest = write_archive(&config, &archive).unwrap();

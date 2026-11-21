@@ -1263,3 +1263,400 @@ async fn with_tenants_only_the_shared_secret_erases_or_reads_the_breakdown() {
         StatusCode::OK
     );
 }
+
+/// Commit what the writer holds, so the status reads it back.
+fn flushed(deployment: &Deployment) {
+    deployment.sink.flush().expect("the writer commits");
+}
+
+/// The configuration the deployment's files are under, for writing an
+/// archive of them from outside the server.
+fn files_of(deployment: &Deployment) -> Config {
+    let mut config = Config::default();
+    config.stats.path = deployment.dir.path().join("stats.db");
+    config.refs.backend = RefsBackend::Sqlite;
+    config.refs.path = deployment.dir.path().join("refs.db");
+    config
+}
+
+/// The page says what is running — version, since when, from which binary
+/// and configuration — and, to a caller who may act for every tenant, the
+/// effective configuration with its secrets taken out.
+#[tokio::test]
+async fn the_status_says_what_is_running_and_shows_the_configuration() {
+    let deployment = deployment(
+        |config| {
+            config.auth.mode = AuthMode::ApiKeys;
+            config.auth.secret = "the-shared-secret".to_string();
+            config.auth.keys = vec![ApiKey {
+                key: "sk-alpha".to_string(),
+                tenant: "alpha".to_string(),
+                ..Default::default()
+            }];
+        },
+        kompressor_server::router,
+    );
+    let key = [("x-kompressor-key", "sk-alpha")];
+    let secret = [("x-kompressor-secret", "the-shared-secret")];
+    let status = send(&deployment, "GET", "/v1/maintenance?format=json", &key)
+        .await
+        .json();
+    let build = &status["build"];
+    assert_eq!(build["version"], env!("CARGO_PKG_VERSION"));
+    assert!(build["started_at_ms"].as_i64().unwrap() > 0);
+    assert!(build["uptime_s"].is_u64());
+    assert_eq!(
+        build["restart_pending"], false,
+        "the test binary is what runs"
+    );
+    assert!(
+        build["binary"]
+            .as_str()
+            .is_some_and(|path| !path.is_empty())
+    );
+    assert!(build["commit"].is_null() || build["commit"].as_str().is_some_and(|c| !c.is_empty()));
+
+    let path = "/v1/maintenance/config";
+    assert_eq!(
+        send(&deployment, "GET", path, &key).await.status,
+        StatusCode::FORBIDDEN
+    );
+    let shown = send(&deployment, "GET", path, &secret).await;
+    assert_eq!(shown.status, StatusCode::OK);
+    let text = String::from_utf8(shown.body).unwrap();
+    assert!(text.contains("[maintenance]"), "{text}");
+    assert!(!text.contains("the-shared-secret"), "secrets are taken out");
+    assert!(!text.contains("sk-alpha"), "and so are keys");
+}
+
+/// Each action is put on record — what, on what, by whom, what came of it —
+/// and the status shows the newest of each per database and the history.
+#[tokio::test]
+async fn maintenance_work_is_on_record_and_shown_per_database() {
+    let deployment = deployment(acting, kompressor_server::router);
+    for (database, action) in [
+        ("stats.db", "check"),
+        ("refs.db", "checkpoint"),
+        ("refs.db", "vacuum"),
+        ("stats.db", "optimize"),
+    ] {
+        let answer = send(
+            &deployment,
+            "POST",
+            &format!("/v1/maintenance/databases/{database}/{action}"),
+            &[],
+        )
+        .await;
+        assert_eq!(answer.status, StatusCode::OK, "{database} {action}");
+    }
+    flushed(&deployment);
+    let status = send(&deployment, "GET", "/v1/maintenance?format=json", &[])
+        .await
+        .json();
+    let history = status["history"].as_array().unwrap();
+    let actions: Vec<&str> = history
+        .iter()
+        .map(|w| w["action"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        actions,
+        ["optimize", "vacuum", "checkpoint", "check"],
+        "newest first"
+    );
+    assert!(
+        history
+            .iter()
+            .all(|w| w["origin"] == "http" && w["ok"] == true)
+    );
+    assert!(
+        history[0]["actor"].is_null(),
+        "no one in particular without auth"
+    );
+    assert!(history[1]["bytes_before"].is_i64() && history[1]["bytes_after"].is_i64());
+
+    let database = |name: &str| {
+        status["databases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == name)
+            .unwrap()
+            .clone()
+    };
+    let (stats, refs) = (database("stats.db"), database("refs.db"));
+    assert_eq!(stats["last"]["check"]["ok"], true);
+    assert_eq!(stats["last"]["optimize"]["target"], "stats.db");
+    assert!(stats["last"]["vacuum"].is_null());
+    assert!(refs["last"]["vacuum"]["time_ms"].is_i64());
+    assert_eq!(stats["checked"]["ok"], true);
+    assert_eq!(
+        refs["auto_vacuum"], 2,
+        "a new ref store is incremental, and a vacuum keeps it so"
+    );
+}
+
+/// Midnight UTC ten days ago: recent enough that retention leaves it alone.
+fn base_day_ms() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    now.div_euclid(86_400_000) * 86_400_000 - 10 * 86_400_000
+}
+
+/// Seed `n` requests of `tenant`, each with its copy of the settings, on the
+/// UTC day `day` days after [`base_day_ms`].
+fn requests(deployment: &Deployment, tenant: &str, run: &str, day: i64, n: usize) {
+    let conn = rusqlite::Connection::open(deployment.dir.path().join("stats.db")).unwrap();
+    let time = base_day_ms() + day * 86_400_000;
+    for i in 0..n {
+        let id = format!("{tenant}-{run}-{day}-{i}");
+        conn.execute(
+            "INSERT INTO proxy_requests (time_ms, tenant, request_id, api_family, upstream,
+                status, stream, prompt_tokens)
+             VALUES (?1, ?2, ?3, 'anthropic', 'u', 200, 0, 1200)",
+            rusqlite::params![time + i as i64, tenant, id],
+        )
+        .unwrap();
+        let context = json!({
+            "build_version": "t", "config_fingerprint": "f", "experiment_id": null,
+            "run_id": run, "settings": {"padding": "x".repeat(2_000)},
+        });
+        conn.execute(
+            "INSERT INTO request_context (tenant, request_id, time_ms, model, mode, context)
+             VALUES (?1, ?2, ?3, 'm', 'recoverable', ?4)",
+            rusqlite::params![tenant, id, time + i as i64, context.to_string()],
+        )
+        .unwrap();
+    }
+}
+
+/// Trimming is an action; deleting rows is the danger zone's and must be
+/// spelled out. Both rehearse exactly, and both go on record.
+#[tokio::test]
+async fn statistics_are_trimmed_and_deleted_by_scope() {
+    let path = "/v1/maintenance/statistics/delete";
+    let off = deployment(|_| {}, kompressor_server::router);
+    let trim = json!({"kind": "context", "scope": {"run_id": "bench"}, "dry_run": true});
+    assert_eq!(
+        post_json(&off, path, trim.clone()).await.status,
+        StatusCode::NOT_FOUND
+    );
+
+    let deployment = deployment(acting, kompressor_server::router);
+    requests(&deployment, "default", "bench", 0, 6);
+    requests(&deployment, "default", "prod", 0, 4);
+    requests(&deployment, "default", "prod", 3, 5);
+
+    let preview = post_json(&deployment, path, trim).await;
+    assert_eq!(preview.status, StatusCode::OK, "{:?}", preview.json());
+    let purged = &preview.json()["purged"];
+    assert_eq!(purged["dry_run"], true);
+    assert_eq!(purged["tables"]["request_context"], 6);
+    assert!(purged["content_bytes"].as_u64().unwrap() > 6 * 2_000);
+    assert_eq!(
+        rows(&deployment, "request_context WHERE context IS NULL"),
+        0,
+        "a rehearsal"
+    );
+
+    let done = post_json(
+        &deployment,
+        path,
+        json!({"kind": "context", "scope": {"run_id": "bench"}}),
+    )
+    .await;
+    assert_eq!(done.status, StatusCode::OK);
+    assert_eq!(
+        rows(&deployment, "request_context WHERE context IS NULL"),
+        6
+    );
+    assert_eq!(
+        rows(&deployment, "proxy_requests"),
+        15,
+        "every request stays"
+    );
+
+    let rows_by_day = json!({"kind": "rows", "scope": {"before_ms": base_day_ms() + 86_400_000}});
+    assert_eq!(
+        post_json(&deployment, path, rows_by_day.clone())
+            .await
+            .status,
+        StatusCode::NOT_FOUND,
+        "deleting rows needs maintenance.erase"
+    );
+
+    let dangerous = deployment_with_erase();
+    requests(&dangerous, "default", "prod", 0, 4);
+    requests(&dangerous, "default", "prod", 3, 5);
+    let unconfirmed = post_json(&dangerous, path, rows_by_day.clone()).await;
+    assert_eq!(unconfirmed.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(String::from_utf8_lossy(&unconfirmed.body).contains("delete statistics"));
+    let mut rehearsal = rows_by_day.clone();
+    rehearsal["dry_run"] = json!(true);
+    let rehearsed = post_json(&dangerous, path, rehearsal).await.json();
+    assert_eq!(rehearsed["purged"]["tables"]["proxy_requests"], 4);
+    assert_eq!(rows(&dangerous, "proxy_requests"), 9);
+    let mut confirmed = rows_by_day;
+    confirmed["confirm"] = json!("delete statistics");
+    let deleted = post_json(&dangerous, path, confirmed).await;
+    assert_eq!(deleted.status, StatusCode::OK);
+    assert_eq!(deleted.json()["purged"]["rolled_up"], true);
+    assert_eq!(rows(&dangerous, "proxy_requests"), 5);
+    assert_eq!(
+        rows(&dangerous, "daily_requests"),
+        1,
+        "the day was rolled up first"
+    );
+
+    let empty = post_json(
+        &dangerous,
+        path,
+        json!({"kind": "rows", "scope": {}, "dry_run": true}),
+    )
+    .await;
+    assert_eq!(empty.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let unknown = post_json(
+        &dangerous,
+        path,
+        json!({"kind": "rows", "scope": {"day": 1}}),
+    )
+    .await;
+    assert_eq!(
+        unknown.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "an unknown filter is no filter"
+    );
+
+    flushed(&deployment);
+    flushed(&dangerous);
+    let recorded = |d: &Deployment| -> Vec<String> {
+        rusqlite::Connection::open(d.dir.path().join("stats.db"))
+            .unwrap()
+            .prepare("SELECT action FROM maintenance_events ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert_eq!(
+        recorded(&deployment),
+        ["trim"],
+        "a rehearsal is not on record"
+    );
+    assert_eq!(recorded(&dangerous), ["delete"]);
+}
+
+fn deployment_with_erase() -> Deployment {
+    deployment(
+        |config| {
+            acting(config);
+            erasing(config);
+        },
+        kompressor_server::router,
+    )
+}
+
+/// A scheduled archive is verified as a restore would check it; the verdict
+/// is kept and shown beside the archive, a damaged one fails, and only names
+/// the schedule writes are opened.
+#[tokio::test]
+async fn a_scheduled_archive_is_verified_and_the_verdict_kept() {
+    use kompressor_core::backup::{archive_name, write_archive, write_checksum};
+    let backups = tempfile::tempdir().unwrap();
+    let dir = backups.path().to_path_buf();
+    let schedule_dir = dir.clone();
+    let deployment = deployment(
+        move |config| {
+            acting(config);
+            config.maintenance.backup_dir = schedule_dir;
+        },
+        kompressor_server::router,
+    );
+    flushed(&deployment);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let good = archive_name(now - 3_600_000);
+    write_archive(&files_of(&deployment), &dir.join(&good)).unwrap();
+    let sum = write_checksum(&dir.join(&good)).unwrap();
+    let bad = archive_name(now - 7_200_000);
+    std::fs::write(dir.join(&bad), b"not a gzip at all").unwrap();
+
+    let answer = send(
+        &deployment,
+        "POST",
+        &format!("/v1/maintenance/backups/{good}/verify"),
+        &[],
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{:?}", answer.json());
+    let verified = &answer.json()["verified"];
+    assert_eq!(verified["ok"], true, "{verified}");
+    assert_eq!(verified["checksum"], "matches");
+    assert_eq!(verified["sha256"], sum);
+    assert_eq!(verified["databases"].as_array().unwrap().len(), 2);
+
+    let answer = send(
+        &deployment,
+        "POST",
+        &format!("/v1/maintenance/backups/{bad}/verify"),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        answer.status,
+        StatusCode::OK,
+        "a damaged archive is a verdict"
+    );
+    assert_eq!(answer.json()["verified"]["ok"], false);
+
+    for not_ours in ["notes.txt", "..%2Fstats.db", &archive_name(now)] {
+        let answer = send(
+            &deployment,
+            "POST",
+            &format!("/v1/maintenance/backups/{not_ours}/verify"),
+            &[],
+        )
+        .await;
+        assert_eq!(answer.status, StatusCode::NOT_FOUND, "{not_ours}");
+    }
+
+    flushed(&deployment);
+    let status = send(&deployment, "GET", "/v1/maintenance?format=json", &[])
+        .await
+        .json();
+    let schedule = &status["schedule"];
+    assert_eq!(schedule["verified"][&good]["ok"], true);
+    assert_eq!(schedule["verified"][&bad]["ok"], false);
+    assert_eq!(schedule["archives"][0]["name"], good.as_str());
+    assert_eq!(schedule["archives"][0]["sha256"], sum);
+    assert!(schedule["archives"][1]["sha256"].is_null());
+    assert!(
+        std::fs::read_dir(&dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".kompressor")),
+        "nothing unpacked is left behind"
+    );
+
+    let refused = crate::deployment(
+        |config: &mut Config| config.maintenance.backup_dir = dir.clone(),
+        kompressor_server::router,
+    );
+    assert_eq!(
+        send(
+            &refused,
+            "POST",
+            &format!("/v1/maintenance/backups/{good}/verify"),
+            &[]
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND,
+        "verifying is an action"
+    );
+}

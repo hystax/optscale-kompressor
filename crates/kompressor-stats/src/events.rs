@@ -409,6 +409,36 @@ pub struct BackupEvent {
     pub error: Option<String>,
 }
 
+/// One piece of maintenance work: run, or tried. The Maintenance page's
+/// history, and what "when was this database last checked / vacuumed /
+/// optimized" is answered from after a restart.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceEvent {
+    /// When it finished, milliseconds since the Unix epoch.
+    pub time_ms: i64,
+    /// `check`, `checkpoint`, `vacuum`, `optimize`, `erase`, `delete`,
+    /// `trim` or `verify`.
+    pub action: String,
+    /// What it worked on: a database (`stats.db`, `refs.db`) or an archive's
+    /// name.
+    pub target: String,
+    /// What asked for it: `http` (the Maintenance page or its route),
+    /// `schedule` or `cli`.
+    pub origin: String,
+    /// Who asked, when a caller did: the tenant the credential resolved to.
+    pub actor: Option<String>,
+    pub took_ms: i64,
+    pub ok: bool,
+    /// The target's size before and after, where the action changes it.
+    pub bytes_before: Option<i64>,
+    pub bytes_after: Option<i64>,
+    /// What it found or did, as JSON: an integrity check's problems, the
+    /// rows a delete removed, an archive's verdict.
+    pub detail: Option<String>,
+    /// Why not, when it failed.
+    pub error: Option<String>,
+}
+
 /// Anything the writer can be handed.
 ///
 /// Externally tagged — `{"optimization": {…}}` — rather than carrying a `type`
@@ -444,6 +474,8 @@ pub enum Event {
     },
     /// A backup was taken, or failed.
     Backup(BackupEvent),
+    /// Maintenance work was done on a database or an archive.
+    Maintenance(MaintenanceEvent),
     /// The fragment store was measured.
     StoreSample {
         /// When the sample was taken, milliseconds since the Unix epoch.
@@ -467,6 +499,7 @@ impl Event {
             Event::Discarded { .. } => 0,
             Event::StoreSample { time_ms, .. } => *time_ms,
             Event::Backup(e) => e.time_ms,
+            Event::Maintenance(e) => e.time_ms,
         }
     }
 
@@ -478,7 +511,7 @@ impl Event {
             Event::ProtectedRefs(e) => Some(&e.tenant),
             Event::ProxyRequest(e) => Some(&e.tenant),
             Event::Discarded { tenant, .. } => Some(tenant),
-            Event::StoreSample { .. } | Event::Backup(_) => None,
+            Event::StoreSample { .. } | Event::Backup(_) | Event::Maintenance(_) => None,
         }
     }
 }

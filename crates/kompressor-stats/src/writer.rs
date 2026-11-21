@@ -183,8 +183,12 @@ pub struct Upkeep {
     /// When it ran, and for how long.
     pub at_ms: i64,
     pub took_ms: u64,
-    /// The rows it archived and removed, by table. Absent when it failed.
+    /// The rows it archived and removed, by table. Absent when it failed, or
+    /// with `retention_days` zero.
     pub removed: Option<crate::PruneCounts>,
+    /// Requests whose copy of the settings it emptied
+    /// (`context_retention_days`). Absent when that is off or it failed.
+    pub contexts_trimmed: Option<u64>,
     /// Why it failed, when it did.
     pub error: Option<String>,
 }
@@ -280,6 +284,16 @@ impl StatsWriter {
         })
     }
 
+    /// Empty the copy of the settings on requests from before
+    /// `older_than_ms`, a bounded number per call, and return how many.
+    /// See [`crate::purge`].
+    pub fn trim_contexts(&mut self, older_than_ms: i64) -> Result<u64, StatsError> {
+        let tx = self.conn.transaction()?;
+        let trimmed = crate::purge::trim_contexts(&tx, older_than_ms, CONTEXTS_PER_PASS)?;
+        tx.commit()?;
+        Ok(trimmed)
+    }
+
     /// The underlying connection, for maintenance queries.
     pub fn connection(&self) -> &Connection {
         &self.conn
@@ -341,6 +355,7 @@ impl StatsWriter {
                     .execute(params![tenant, request_id])?;
                 }
                 Event::Backup(e) => insert_backup(&tx, e)?,
+                Event::Maintenance(e) => insert_maintenance(&tx, e)?,
                 Event::StoreSample {
                     time_ms,
                     live_refs,
@@ -614,6 +629,11 @@ pub fn spawn(config: &StatsConfig) -> Result<(StatsSink, StatsHandle), StatsErro
 /// anything faster re-asks a question whose answer cannot have changed.
 const UPKEEP_INTERVAL: Duration = Duration::from_secs(3600);
 
+/// Requests whose settings one hourly pass empties: a busy day's worth, so a
+/// first pass over months of history catches up within a day of uptime
+/// without one transaction holding the writer for long.
+const CONTEXTS_PER_PASS: usize = 50_000;
+
 /// The drain loop: commit on whichever comes first, the interval or the batch
 /// cap.
 fn run(
@@ -640,19 +660,34 @@ fn run(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as i64;
-            if let Some(cutoff) = retention.retention_cutoff_ms(now_ms) {
+            let cutoff = retention.retention_cutoff_ms(now_ms);
+            let context_cutoff = retention.context_cutoff_ms(now_ms);
+            if cutoff.is_some() || context_cutoff.is_some() {
                 let started = Instant::now();
-                let result = writer.maintain(cutoff);
-                if let Err(error) = &result {
+                let result = cutoff.map(|cutoff| writer.maintain(cutoff));
+                if let Some(Err(error)) = &result {
                     tracing::warn!(%error, "statistics retention failed");
                 }
+                let trimmed = context_cutoff.map(|cutoff| writer.trim_contexts(cutoff));
+                if let Some(Err(error)) = &trimmed {
+                    tracing::warn!(%error, "trimming request settings failed");
+                }
+                let error = [
+                    result.as_ref().and_then(|r| r.as_ref().err()),
+                    trimmed.as_ref().and_then(|r| r.as_ref().err()),
+                ]
+                .into_iter()
+                .flatten()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
                 *last_upkeep
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Upkeep {
                     at_ms: now_ms,
                     took_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    removed: result.as_ref().ok().copied(),
-                    error: result.err().map(|error| error.to_string()),
+                    removed: result.and_then(Result::ok),
+                    contexts_trimmed: trimmed.and_then(Result::ok),
+                    error: (!error.is_empty()).then(|| error.join("; ")),
                 });
             }
             upkeep = Instant::now() + UPKEEP_INTERVAL;
@@ -772,5 +807,57 @@ pub fn record_backup(
         return Ok(false);
     }
     insert_backup(&conn, event)?;
+    Ok(true)
+}
+
+/// File one piece of maintenance work. Shared by the writer and by
+/// [`record_maintenance`].
+fn insert_maintenance(
+    conn: &rusqlite::Connection,
+    event: &crate::events::MaintenanceEvent,
+) -> Result<(), StatsError> {
+    conn.prepare_cached(
+        "INSERT INTO maintenance_events (time_ms, action, target, origin, actor, took_ms, ok,
+                                         bytes_before, bytes_after, detail, error)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+    )?
+    .execute(params![
+        event.time_ms,
+        event.action,
+        event.target,
+        event.origin,
+        event.actor,
+        event.took_ms,
+        event.ok,
+        event.bytes_before,
+        event.bytes_after,
+        event.detail,
+        event.error,
+    ])?;
+    Ok(())
+}
+
+/// Record maintenance work straight into the statistics database at `path`,
+/// for a process that has no writer of its own: `kompressor db …`.
+///
+/// Returns whether it was recorded, under the rule [`record_backup`]
+/// follows: a database that is not there, or not yet migrated this far, is
+/// left alone and the answer is `Ok(false)`.
+pub fn record_maintenance(
+    path: &std::path::Path,
+    event: &crate::events::MaintenanceEvent,
+) -> Result<bool, StatsError> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+    if !crate::schema::has_table(&conn, "maintenance_events")? {
+        return Ok(false);
+    }
+    insert_maintenance(&conn, event)?;
     Ok(true)
 }

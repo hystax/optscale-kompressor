@@ -78,9 +78,13 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use kompressor_core::AppCore;
+use kompressor_core::auth::Identity;
 use kompressor_core::backup;
 use kompressor_core::config::{AuthMode, Config, RefsBackend};
+use kompressor_stats::MaintenanceEvent;
+use kompressor_stats::purge::{PurgeKind, PurgeScope};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::api::authenticate;
 use crate::error::ApiError;
@@ -160,6 +164,13 @@ struct DatabaseStatus {
     /// Whether the query planner has statistics to choose indexes by: false
     /// until an optimize has run on the file.
     analyzed: Option<bool>,
+    /// `PRAGMA auto_vacuum`: 0 none, 1 full, 2 incremental. Incremental lets
+    /// freed pages go back to the disk without a full vacuum.
+    auto_vacuum: Option<u8>,
+    /// The last of each kind of work on record for it — `check`,
+    /// `checkpoint`, `vacuum`, `optimize`, `erase`, `delete`, `trim` — by
+    /// action. Across restarts; empty with statistics off.
+    last: BTreeMap<String, MaintenanceEvent>,
 }
 
 /// A filesystem this deployment writes to.
@@ -207,6 +218,14 @@ struct StatsRetention {
     backlog_days: Option<u64>,
     /// The last pass since this process started.
     last: Option<kompressor_stats::Upkeep>,
+    /// `stats.context_retention_days`: requests older than this keep their
+    /// row and lose their copy of the settings. Zero is off.
+    context_retention_days: u32,
+    /// Absent when that is off, or no shorter than the requests' own window.
+    context_cutoff_ms: Option<i64>,
+    /// Seconds between scheduled optimizes (`maintenance.optimize_every`);
+    /// absent when there are none.
+    optimize_every_s: Option<u64>,
 }
 
 /// The sweep of expired fragments out of the ref store.
@@ -249,6 +268,8 @@ struct ScheduleStatus {
     next_due_ms: Option<i64>,
     /// Newest first.
     archives: Vec<backup::Archive>,
+    /// The last verification on record of each archive, by its name.
+    verified: BTreeMap<String, MaintenanceEvent>,
 }
 
 /// When a backup was last taken, and whether that is recent enough.
@@ -278,10 +299,31 @@ struct RestoreHint {
     systemd: bool,
 }
 
+/// What is running: the build, since when, and whether the binary on disk is
+/// still the one that is.
+#[derive(Debug, Serialize)]
+struct BuildInfo {
+    version: &'static str,
+    /// The commit it was built from, when the build could tell.
+    commit: Option<&'static str>,
+    started_at_ms: i64,
+    uptime_s: u64,
+    /// The executable this process runs.
+    binary: Option<String>,
+    /// The file at `binary` has been replaced since this process started —
+    /// an upgrade was installed and the service not restarted, so what runs
+    /// is not what is installed.
+    restart_pending: bool,
+    /// The configuration file it was started with, when it has one.
+    config: Option<String>,
+    systemd: bool,
+}
+
 /// The JSON body of `GET /v1/maintenance`.
 #[derive(Debug, Serialize)]
 struct MaintenanceStatus {
     version: &'static str,
+    build: BuildInfo,
     now_ms: i64,
     last_backup: LastBackup,
     restore: RestoreHint,
@@ -295,6 +337,8 @@ struct MaintenanceStatus {
     /// Absent when `maintenance.backup_dir` is not set.
     schedule: Option<ScheduleStatus>,
     databases: Vec<DatabaseStatus>,
+    /// The newest maintenance work on record, newest first.
+    history: Vec<MaintenanceEvent>,
 }
 
 /// The maintenance routes, mounted under each version prefix by the API
@@ -304,12 +348,15 @@ pub(crate) fn maintenance_routes() -> Router<Arc<ServerState>> {
         .route("/maintenance", get(status))
         .route("/maintenance/backup", post(take_backup))
         .route("/maintenance/backups/{name}", get(stored_backup))
+        .route("/maintenance/backups/{name}/verify", post(verify))
+        .route("/maintenance/config", get(effective_config))
         .route("/maintenance/databases/{name}/check", post(check))
         .route("/maintenance/databases/{name}/checkpoint", post(checkpoint))
         .route("/maintenance/databases/{name}/vacuum", post(vacuum))
         .route("/maintenance/databases/{name}/optimize", post(optimize))
         .route("/maintenance/databases/{name}/space", get(space))
         .route("/maintenance/statistics/erase", post(erase))
+        .route("/maintenance/statistics/delete", post(delete))
 }
 
 /// The page at `/maintenance` on the statistics listener.
@@ -409,11 +456,11 @@ fn grant(wanted: Wanted, config: &Config, trusted: bool) -> Grant {
 
 /// Authenticate, and refuse a caller who may not do `wanted`: 404 with how
 /// to turn it on when it is off, 403 when it is on and not this caller's.
-fn permit(state: &ServerState, headers: &HeaderMap, wanted: Wanted) -> Result<(), ApiError> {
+fn permit(state: &ServerState, headers: &HeaderMap, wanted: Wanted) -> Result<Identity, ApiError> {
     let identity = authenticate(state, headers)?;
     let config = state.core.config();
     match refusal(wanted, config, identity.trusted) {
-        None => Ok(()),
+        None => Ok(identity),
         Some(reason) if !wanted.enabled(config) => Err(ApiError::NotFound(reason)),
         Some(_) => {
             tracing::warn!(tenant = %identity.tenant.as_str(), "a maintenance request was refused");
@@ -488,6 +535,7 @@ fn database(config: &Config, name: &'static str) -> DatabaseStatus {
             status.schema_version = Some(facts.schema_version);
             status.reclaimable_bytes = Some(facts.reclaimable_bytes());
             status.analyzed = Some(facts.analyzed);
+            status.auto_vacuum = Some(facts.auto_vacuum);
         }
         Err(error) => status.error = Some(error.to_string()),
     }
@@ -520,6 +568,7 @@ fn schedule(config: &Config, now_ms: i64) -> Option<ScheduleStatus> {
             .schedule()
             .map(|(dir, every)| backup::next_due_ms(dir, every, now_ms)),
         archives: backup::list_archives(dir),
+        verified: BTreeMap::new(),
     })
 }
 
@@ -548,13 +597,28 @@ async fn status(
     }
     let identity = authenticate(&state, &headers)?;
     let core = state.core.clone();
+    let info = crate::live::server_info(&state);
     // Off the runtime: it opens each database and lists a directory.
     let mut status = tokio::task::spawn_blocking(move || {
+        let binary = running_binary(info.started_at_ms);
         let config = core.config();
         let now_ms = now_ms();
         let databases = databases(config);
         MaintenanceStatus {
             version: env!("CARGO_PKG_VERSION"),
+            build: BuildInfo {
+                version: env!("CARGO_PKG_VERSION"),
+                commit: option_env!("KOMPRESSOR_GIT_COMMIT").filter(|commit| !commit.is_empty()),
+                started_at_ms: info.started_at_ms,
+                uptime_s: info.uptime_s,
+                binary: binary.0,
+                restart_pending: binary.1,
+                config: config
+                    .source
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                systemd: std::env::var_os("INVOCATION_ID").is_some(),
+            },
             now_ms,
             last_backup: LastBackup::default(),
             restore: RestoreHint {
@@ -573,6 +637,7 @@ async fn status(
             storage: storage(config, &databases),
             schedule: schedule(config, now_ms),
             databases,
+            history: Vec::new(),
         }
     })
     .await
@@ -589,13 +654,35 @@ async fn status(
         status.schedule.as_ref(),
         status.now_ms,
     );
+    let (latest, history) = state
+        .with_stats(|reader| Ok((reader.latest_maintenance()?, reader.maintenance(20)?)))
+        .await
+        .unwrap_or_default();
+    status.history = history;
+    for work in latest {
+        if work.action == "verify" {
+            if let Some(schedule) = status.schedule.as_mut() {
+                schedule.verified.insert(work.target.clone(), work);
+            }
+        } else if let Some(database) = status
+            .databases
+            .iter_mut()
+            .find(|database| database.name == work.target)
+        {
+            database.last.insert(work.action.clone(), work);
+        }
+    }
     {
         let checks = state
             .integrity
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for database in &mut status.databases {
-            database.checked = checks.get(database.name).cloned();
+            // This process's own check, or failing that the last on record.
+            database.checked = checks
+                .get(database.name)
+                .cloned()
+                .or_else(|| database.last.get("check").map(checked_from_record));
         }
     }
     if let Some(sample) = state.store_sample().await {
@@ -606,6 +693,88 @@ async fn status(
 }
 
 const DAY_MS: i64 = 86_400_000;
+
+/// The statistics writer's view of the configuration: the windows it prunes
+/// and trims by.
+fn stats_config(config: &Config) -> kompressor_stats::StatsConfig {
+    kompressor_stats::StatsConfig {
+        retention_days: config.stats.retention_days,
+        context_retention_days: config.stats.context_retention_days,
+        ..kompressor_stats::StatsConfig::at(&config.stats.path)
+    }
+}
+
+/// The executable this process runs, and whether it has been replaced since
+/// `started_at_ms`. Linux names a replaced one `… (deleted)`; elsewhere a file
+/// newer than the process says the same.
+fn running_binary(started_at_ms: i64) -> (Option<String>, bool) {
+    let Ok(exe) = std::env::current_exe() else {
+        return (None, false);
+    };
+    let shown = exe.display().to_string();
+    if let Some(path) = shown.strip_suffix(" (deleted)") {
+        return (Some(path.to_string()), true);
+    }
+    let newer = std::fs::metadata(&exe)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+        .is_some_and(|at| i64::try_from(at.as_millis()).unwrap_or(i64::MAX) > started_at_ms);
+    (Some(shown), newer)
+}
+
+/// An integrity check as it was put on record.
+fn checked_from_record(work: &MaintenanceEvent) -> Checked {
+    let problems = work
+        .detail
+        .as_deref()
+        .and_then(|detail| serde_json::from_str::<serde_json::Value>(detail).ok())
+        .and_then(|detail| serde_json::from_value(detail["problems"].clone()).ok())
+        .unwrap_or_else(|| work.error.iter().cloned().collect());
+    Checked {
+        at_ms: work.time_ms,
+        took_ms: u64::try_from(work.took_ms).unwrap_or(0),
+        ok: work.ok,
+        problems,
+    }
+}
+
+/// A piece of maintenance work done for `identity`, to be filled in and
+/// [`record`]ed.
+fn work(
+    action: &str,
+    target: &str,
+    identity: &Identity,
+    started: std::time::Instant,
+) -> MaintenanceEvent {
+    MaintenanceEvent {
+        time_ms: now_ms(),
+        action: action.to_string(),
+        target: target.to_string(),
+        origin: "http".to_string(),
+        // No one in particular under `auth.mode = "none"`: the one tenant
+        // there has no name.
+        actor: Some(identity.tenant.as_str().to_string()).filter(|tenant| !tenant.is_empty()),
+        took_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+        ok: true,
+        bytes_before: None,
+        bytes_after: None,
+        detail: None,
+        error: None,
+    }
+}
+
+/// Put `work` on record. With statistics off there is no record to keep.
+fn record(state: &ServerState, work: MaintenanceEvent) {
+    state
+        .core
+        .stats()
+        .send(kompressor_stats::Event::Maintenance(work));
+}
+
+fn bytes(n: u64) -> Option<i64> {
+    Some(i64::try_from(n).unwrap_or(i64::MAX))
+}
 
 fn retention(core: &AppCore, databases: &[DatabaseStatus], now_ms: i64) -> Retention {
     let config = core.config();
@@ -629,6 +798,10 @@ fn retention(core: &AppCore, databases: &[DatabaseStatus], now_ms: i64) -> Reten
                 })
             }),
             last: core.stats().upkeep(),
+            context_retention_days: config.stats.context_retention_days,
+            context_cutoff_ms: stats_config(config).context_cutoff_ms(now_ms),
+            optimize_every_s: (!config.maintenance.optimize_every.is_zero())
+                .then_some(config.maintenance.optimize_every.as_secs()),
         }
     });
     Retention {
@@ -775,7 +948,7 @@ async fn check(
     headers: HeaderMap,
     UrlPath(name): UrlPath<String>,
 ) -> Result<Response, ApiError> {
-    permit(&state, &headers, Wanted::Action)?;
+    let identity = permit(&state, &headers, Wanted::Action)?;
     let (name, path) = named(state.core.config(), &name)?;
     let started = std::time::Instant::now();
     let problems =
@@ -805,6 +978,15 @@ async fn check(
             "integrity check FAILED"
         );
     }
+    record(
+        &state,
+        MaintenanceEvent {
+            ok: checked.ok,
+            detail: Some(serde_json::json!({"problems": checked.problems}).to_string()),
+            error: checked.problems.first().cloned(),
+            ..work("check", name, &identity, started)
+        },
+    );
     state
         .integrity
         .lock()
@@ -822,15 +1004,36 @@ async fn checkpoint(
     headers: HeaderMap,
     UrlPath(name): UrlPath<String>,
 ) -> Result<Response, ApiError> {
-    permit(&state, &headers, Wanted::Action)?;
+    let identity = permit(&state, &headers, Wanted::Action)?;
     let (name, path) = named(state.core.config(), &name)?;
     let before = sizes_on_disk(&path).map_or(0, |(_, wal)| wal);
     let for_task = path.clone();
+    let started = std::time::Instant::now();
     let done = tokio::task::spawn_blocking(move || kompressor_store::sqlite::checkpoint(&for_task))
         .await
         .map_err(|error| ApiError::Internal(format!("checkpoint: {error}")))?
-        .map_err(|error| ApiError::Internal(format!("checkpoint of {name}: {error}")))?;
+        .map_err(|error| {
+            record(
+                &state,
+                MaintenanceEvent {
+                    ok: false,
+                    error: Some(error.to_string()),
+                    ..work("checkpoint", name, &identity, started)
+                },
+            );
+            ApiError::Internal(format!("checkpoint of {name}: {error}"))
+        })?;
     let after = sizes_on_disk(&path).map_or(0, |(_, wal)| wal);
+    record(
+        &state,
+        MaintenanceEvent {
+            ok: done.complete,
+            bytes_before: bytes(before),
+            bytes_after: bytes(after),
+            detail: Some(serde_json::json!({"complete": done.complete}).to_string()),
+            ..work("checkpoint", name, &identity, started)
+        },
+    );
     tracing::info!(
         database = name,
         complete = done.complete,
@@ -854,7 +1057,8 @@ fn busy() -> Response {
         StatusCode::CONFLICT,
         json_response(&serde_json::json!({"error": {
             "code": "maintenance_running",
-            "message": "a backup, vacuum or erase is already running; wait for it to finish",
+            "message": "a backup, vacuum, delete, erase or verification is already running; \
+                        wait for it to finish",
         }})),
     )
         .into_response()
@@ -889,7 +1093,7 @@ async fn vacuum(
     headers: HeaderMap,
     UrlPath(name): UrlPath<String>,
 ) -> Result<Response, ApiError> {
-    permit(&state, &headers, Wanted::Action)?;
+    let identity = permit(&state, &headers, Wanted::Action)?;
     let (name, path) = named(state.core.config(), &name)?;
     let Some(slot) = Slot::take(&state) else {
         return Ok(busy());
@@ -916,13 +1120,41 @@ async fn vacuum(
     let started = std::time::Instant::now();
     let done = tokio::task::spawn_blocking(move || {
         let _slot = slot;
-        alone(&core, name, move || kompressor_store::sqlite::vacuum(&path))
+        alone(&core, name, move || {
+            // The ref store is converted to incremental auto-vacuum on the
+            // way, so its sweep hands pages back by itself from then on.
+            if name == REFS_DB {
+                kompressor_store::sqlite::vacuum_incremental(&path)
+            } else {
+                kompressor_store::sqlite::vacuum(&path)
+            }
+        })
     })
     .await
     .map_err(|error| ApiError::Internal(format!("vacuum: {error}")))?
-    .map_err(|error| ApiError::Internal(format!("vacuum of {name}: {error}")))?
-    .map_err(|error| ApiError::Internal(format!("vacuum of {name}: {error}")))?;
+    .and_then(|done| done.map_err(|error| error.to_string()))
+    .map_err(|error| {
+        record(
+            &state,
+            MaintenanceEvent {
+                ok: false,
+                bytes_before: bytes(size),
+                error: Some(error.clone()),
+                ..work("vacuum", name, &identity, started)
+            },
+        );
+        ApiError::Internal(format!("vacuum of {name}: {error}"))
+    })?;
     let took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    record(
+        &state,
+        MaintenanceEvent {
+            bytes_before: bytes(done.bytes_before),
+            bytes_after: bytes(done.bytes_after),
+            detail: Some(serde_json::json!({"folded": done.folded}).to_string()),
+            ..work("vacuum", name, &identity, started)
+        },
+    );
     tracing::info!(
         database = name,
         bytes_before = done.bytes_before,
@@ -947,7 +1179,7 @@ async fn optimize(
     headers: HeaderMap,
     UrlPath(name): UrlPath<String>,
 ) -> Result<Response, ApiError> {
-    permit(&state, &headers, Wanted::Action)?;
+    let identity = permit(&state, &headers, Wanted::Action)?;
     let (name, path) = named(state.core.config(), &name)?;
     let core = state.core.clone();
     let started = std::time::Instant::now();
@@ -958,9 +1190,26 @@ async fn optimize(
     })
     .await
     .map_err(|error| ApiError::Internal(format!("optimize: {error}")))?
-    .map_err(|error| ApiError::Internal(format!("optimize of {name}: {error}")))?
-    .map_err(|error| ApiError::Internal(format!("optimize of {name}: {error}")))?;
+    .and_then(|done| done.map_err(|error| error.to_string()))
+    .map_err(|error| {
+        record(
+            &state,
+            MaintenanceEvent {
+                ok: false,
+                error: Some(error.clone()),
+                ..work("optimize", name, &identity, started)
+            },
+        );
+        ApiError::Internal(format!("optimize of {name}: {error}"))
+    })?;
     let took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    record(
+        &state,
+        MaintenanceEvent {
+            detail: Some(serde_json::json!({"described": described}).to_string()),
+            ..work("optimize", name, &identity, started)
+        },
+    );
     tracing::info!(database = name, described, took_ms, "optimize");
     Ok(json_response(&serde_json::json!({
         "database": name,
@@ -1017,7 +1266,7 @@ async fn erase(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    permit(&state, &headers, Wanted::Erase)?;
+    let identity = permit(&state, &headers, Wanted::Erase)?;
     let asked = serde_json::from_slice::<EraseRequest>(&body)
         .ok()
         .is_some_and(|request| request.confirm == ERASE_PHRASE);
@@ -1039,9 +1288,30 @@ async fn erase(
     })
     .await
     .map_err(|error| ApiError::Internal(format!("erase: {error}")))?
-    .map_err(|error| ApiError::Internal(format!("erase: {error}")))?
-    .map_err(|error| ApiError::Internal(format!("erase: {error}")))?;
+    .and_then(|done| done.map_err(|error| error.to_string()))
+    .map_err(|error| {
+        record(
+            &state,
+            MaintenanceEvent {
+                ok: false,
+                error: Some(error.clone()),
+                ..work("erase", name, &identity, started)
+            },
+        );
+        ApiError::Internal(format!("erase: {error}"))
+    })?;
     let took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    record(
+        &state,
+        MaintenanceEvent {
+            bytes_before: bytes(erased.bytes_before),
+            bytes_after: bytes(erased.bytes_after),
+            detail: Some(
+                serde_json::json!({"rows": erased.rows, "tables": erased.tables}).to_string(),
+            ),
+            ..work("erase", name, &identity, started)
+        },
+    );
     // Loud, and on record in the one place the erase cannot reach.
     tracing::warn!(
         rows = erased.rows,
@@ -1057,6 +1327,219 @@ async fn erase(
     })))
 }
 
+/// What a scoped delete must be asked for with, word for word.
+pub(crate) const DELETE_PHRASE: &str = "delete statistics";
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteRequest {
+    #[serde(default)]
+    kind: PurgeKind,
+    scope: PurgeScope,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    confirm: Option<String>,
+}
+
+/// `POST /v1/maintenance/statistics/delete`: delete part of the statistics
+/// (`"kind": "rows"`) — before a day, for a tenant, a run or an experiment —
+/// or empty the copy of the settings those requests carry
+/// (`"kind": "context"`). `"dry_run": true` says what it would do.
+///
+/// Deleting rows is the danger zone's (`maintenance.erase`) and a real one
+/// must say `{"confirm": "delete statistics"}`; trimming loses no request
+/// and nothing the analysis history reports, and is an action's
+/// (`maintenance.actions`).
+async fn delete(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let request: DeleteRequest = serde_json::from_slice(&body).map_err(|error| {
+        ApiError::Invalid(format!(
+            "expected {{\"kind\": \"rows\" | \"context\", \"scope\": {{\"before_ms\", \
+             \"tenant\", \"run_id\", \"experiment_id\"}}, \"dry_run\": bool}}: {error}"
+        ))
+    })?;
+    let wanted = match request.kind {
+        PurgeKind::Rows => Wanted::Erase,
+        PurgeKind::Context => Wanted::Action,
+    };
+    let identity = permit(&state, &headers, wanted)?;
+    if request.kind == PurgeKind::Rows
+        && !request.dry_run
+        && request.confirm.as_deref() != Some(DELETE_PHRASE)
+    {
+        return Err(ApiError::Invalid(format!(
+            "this deletes statistics and cannot be undone; rehearse it with \"dry_run\": true, \
+             and to go ahead send \"confirm\": \"{DELETE_PHRASE}\""
+        )));
+    }
+    let (name, path) = named(state.core.config(), STATS_DB)?;
+    let Some(slot) = Slot::take(&state) else {
+        return Ok(busy());
+    };
+    let core = state.core.clone();
+    let started = std::time::Instant::now();
+    let (kind, dry_run) = (request.kind, request.dry_run);
+    let scope = request.scope;
+    let done = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        alone(&core, name, move || {
+            kompressor_stats::purge::purge(&path, scope, kind, dry_run)
+        })
+    })
+    .await
+    .map_err(|error| ApiError::Internal(format!("delete: {error}")))?
+    .map_err(|error| ApiError::Internal(format!("delete: {error}")))?;
+    let action = match kind {
+        PurgeKind::Rows => "delete",
+        PurgeKind::Context => "trim",
+    };
+    let purged = match done {
+        Ok(purged) => purged,
+        Err(kompressor_stats::StatsError::Invalid(reason)) => {
+            return Err(ApiError::Invalid(reason));
+        }
+        Err(error) => {
+            if !dry_run {
+                record(
+                    &state,
+                    MaintenanceEvent {
+                        ok: false,
+                        error: Some(error.to_string()),
+                        ..work(action, name, &identity, started)
+                    },
+                );
+            }
+            return Err(ApiError::Internal(format!("delete: {error}")));
+        }
+    };
+    let took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if !dry_run {
+        tracing::warn!(
+            kind = action,
+            rows = purged.rows,
+            tenant = purged.scope.tenant.as_deref(),
+            run_id = purged.scope.run_id.as_deref(),
+            experiment_id = purged.scope.experiment_id.as_deref(),
+            before_ms = purged.scope.before_ms,
+            took_ms,
+            "statistics deleted on request"
+        );
+        record(
+            &state,
+            MaintenanceEvent {
+                detail: serde_json::to_string(&purged).ok(),
+                ..work(action, name, &identity, started)
+            },
+        );
+    }
+    Ok(json_response(&serde_json::json!({
+        "purged": purged,
+        "took_ms": took_ms,
+    })))
+}
+
+/// The archive in the backup directory called `name`, when it is one the
+/// schedule wrote: no separator, no `..`, nothing else that happens to be in
+/// the directory.
+fn stored_archive(config: &Config, name: &str) -> Result<PathBuf, ApiError> {
+    if config.maintenance.backup_dir.as_os_str().is_empty() || backup::archive_time(name).is_none()
+    {
+        return Err(ApiError::NotFound(format!("no backup called {name:?}")));
+    }
+    let path = config.maintenance.backup_dir.join(name);
+    if !path.is_file() {
+        return Err(ApiError::NotFound(format!("no backup called {name:?}")));
+    }
+    Ok(path)
+}
+
+/// `POST /v1/maintenance/backups/{name}/verify`: check a scheduled archive
+/// as a restore would — its checksum, its manifest, a full integrity check
+/// of every database in it — without stopping or touching anything.
+async fn verify(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    UrlPath(name): UrlPath<String>,
+) -> Result<Response, ApiError> {
+    let identity = permit(&state, &headers, Wanted::Action)?;
+    let path = stored_archive(state.core.config(), &name)?;
+    let Some(slot) = Slot::take(&state) else {
+        return Ok(busy());
+    };
+    let started = std::time::Instant::now();
+    let found = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        backup::verify_archive(&path)
+    })
+    .await
+    .map_err(|error| ApiError::Internal(format!("verify: {error}")))?;
+    let verified = match found {
+        Ok(verified) => verified,
+        Err(error) => {
+            record(
+                &state,
+                MaintenanceEvent {
+                    ok: false,
+                    error: Some(error.to_string()),
+                    ..work("verify", &name, &identity, started)
+                },
+            );
+            return Err(ApiError::Internal(format!("verify of {name}: {error}")));
+        }
+    };
+    let took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if verified.ok {
+        tracing::info!(archive = %name, took_ms, "archive verified");
+    } else {
+        tracing::error!(archive = %name, problems = ?verified.problems, "archive FAILED verification");
+    }
+    record(
+        &state,
+        MaintenanceEvent {
+            ok: verified.ok,
+            bytes_before: bytes(verified.bytes),
+            detail: Some(
+                serde_json::json!({
+                    "checksum": verified.checksum,
+                    "sha256": verified.sha256,
+                    "databases": verified.databases.len(),
+                    "problems": verified.problems,
+                })
+                .to_string(),
+            ),
+            error: verified.problems.first().cloned(),
+            ..work("verify", &name, &identity, started)
+        },
+    );
+    Ok(json_response(&serde_json::json!({
+        "archive": name,
+        "verified": verified,
+        "took_ms": took_ms,
+    })))
+}
+
+/// `GET /v1/maintenance/config`: the effective configuration with every
+/// secret replaced, for the page's build panel. It names upstreams, paths
+/// and tenants, so it is for the callers that may act for every tenant.
+async fn effective_config(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    permit(&state, &headers, Wanted::Space)?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        state.core.config().redacted_toml(),
+    )
+        .into_response())
+}
+
 /// `GET /v1/maintenance/backups/{name}`: one of the scheduled archives.
 async fn stored_backup(
     State(state): State<Arc<ServerState>>,
@@ -1064,15 +1547,8 @@ async fn stored_backup(
     UrlPath(name): UrlPath<String>,
 ) -> Result<Response, ApiError> {
     permit(&state, &headers, Wanted::Backup)?;
-    let config = state.core.config();
-    // Only a name `archive_name` writes is ever opened: no separator, no
-    // `..`, nothing else that happens to be in the directory.
     let missing = || ApiError::NotFound(format!("no backup called {name:?}"));
-    if config.maintenance.backup_dir.as_os_str().is_empty() || backup::archive_time(&name).is_none()
-    {
-        return Err(missing());
-    }
-    let path = config.maintenance.backup_dir.join(&name);
+    let path = stored_archive(state.core.config(), &name)?;
     let opened = tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&path)?;
         let meta = file.metadata()?;
@@ -1265,6 +1741,34 @@ mod tests {
         // One does not grant the other.
         config.maintenance.backup = true;
         assert!(refusal(Wanted::Action, &config, true).is_some());
+    }
+
+    /// After a restart the last check on record stands in for one this
+    /// process ran, problems and all.
+    #[test]
+    fn a_check_on_record_reads_back_as_a_check() {
+        let recorded = MaintenanceEvent {
+            time_ms: 42,
+            action: "check".into(),
+            target: STATS_DB.into(),
+            origin: "http".into(),
+            actor: None,
+            took_ms: 7,
+            ok: false,
+            bytes_before: None,
+            bytes_after: None,
+            detail: Some(r#"{"problems":["row 3 missing from index"]}"#.into()),
+            error: Some("row 3 missing from index".into()),
+        };
+        let checked = checked_from_record(&recorded);
+        assert_eq!((checked.at_ms, checked.took_ms, checked.ok), (42, 7, false));
+        assert_eq!(checked.problems, ["row 3 missing from index"]);
+        // A record with no detail still says what was wrong.
+        let bare = checked_from_record(&MaintenanceEvent {
+            detail: None,
+            ..recorded
+        });
+        assert_eq!(bare.problems, ["row 3 missing from index"]);
     }
 
     #[test]

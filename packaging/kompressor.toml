@@ -76,6 +76,8 @@ path = "/var/lib/kompressor/refs.db"
 # The Health page warns when the last backup is older than twice
 # backup_every. To be held to an age whoever takes them:
 # backup_max_age = "7days"
+# `serve` refreshes the query planner's statistics this often ("0s" = never):
+# optimize_every = "1day"
 
 [stats]
 # Optional labels recorded with requests for historical comparisons.
@@ -83,6 +85,10 @@ path = "/var/lib/kompressor/refs.db"
 # run_id = "baseline-01" # Otherwise generated once for each AppCore instance.
 enabled = true
 path = "/var/lib/kompressor/stats.db"
+# Each request keeps a copy of the effective settings, most of a busy
+# stats.db. Empty it after this many days; the request and every analysis
+# breakdown stay. 0 keeps it as long as the request.
+# context_retention_days = 14
 
 [log]
 level = "info"

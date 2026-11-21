@@ -51,6 +51,13 @@ pub struct StatsConfig {
     /// value is the most destructive setting it has is a trap, so it is spelled
     /// out here and enforced in [`StatsConfig::retention_cutoff_ms`].
     pub retention_days: u32,
+
+    /// Age at which a request's copy of the effective settings
+    /// (`request_context.context`) is emptied, the request itself kept. That
+    /// copy is most of a busy database; the analysis history is archived
+    /// before it goes, so no breakdown loses a request. Zero, the default,
+    /// keeps it as long as the request.
+    pub context_retention_days: u32,
 }
 
 impl Default for StatsConfig {
@@ -62,6 +69,7 @@ impl Default for StatsConfig {
             flush_interval: DEFAULT_FLUSH_INTERVAL,
             batch_max: DEFAULT_BATCH_MAX,
             retention_days: DEFAULT_RETENTION_DAYS,
+            context_retention_days: 0,
         }
     }
 }
@@ -82,5 +90,14 @@ impl StatsConfig {
     /// pruning everything — see the field's documentation.
     pub fn retention_cutoff_ms(&self, now_ms: i64) -> Option<i64> {
         (self.retention_days > 0).then(|| now_ms - i64::from(self.retention_days) * 86_400_000)
+    }
+
+    /// The cutoff for emptying requests' settings: `None` with
+    /// `context_retention_days` zero, or when it is no shorter than
+    /// `retention_days` and the requests go first anyway.
+    pub fn context_cutoff_ms(&self, now_ms: i64) -> Option<i64> {
+        let days = self.context_retention_days;
+        (days > 0 && (self.retention_days == 0 || days < self.retention_days))
+            .then(|| now_ms - i64::from(days) * 86_400_000)
     }
 }

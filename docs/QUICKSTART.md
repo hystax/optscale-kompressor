@@ -411,6 +411,28 @@ kompressor db checkpoint --config /etc/kompressor/config.toml
 
 `db check` exits 1 if a database is damaged, so a scheduled job can alarm on it.
 
+Every check, checkpoint, vacuum, optimize, trim, delete and verification is
+recorded — from the page or the schedule — and the page shows each database's
+last of each and the recent history; the record survives restarts and erases.
+The top of the page says what is running: version and commit, uptime, the
+binary, and a warning when an upgrade was installed and the service not
+restarted.
+
+`stats.db` is mostly each request's copy of the effective settings. *Trim or
+delete statistics* empties that copy (the requests and every analysis breakdown
+stay), or deletes the requests themselves — before a day, of a tenant, or of
+one `run_id`/`experiment_id`. Always preview first; deleting needs
+`erase = true` and the phrase `delete statistics`, trimming needs only
+`actions = true`. To trim continuously, set in `[stats]`:
+
+```toml
+context_retention_days = 14
+```
+
+`serve` refreshes the planner's statistics daily (`optimize_every = "1day"`),
+and new `refs.db` files hand freed pages back after each sweep; *Vacuum* on an
+older `refs.db` converts it once.
+
 The page ends with a danger zone: *Nuke all stats* deletes every statistic
 recorded, for every tenant, and leaves the fragments and the record of backups
 alone. It is off unless `erase = true`, asks twice, and can only be undone by
@@ -422,6 +444,11 @@ history. The Health page carries it as a check: with a schedule it warns when
 the last backup is older than twice `backup_every` (one was missed), and you
 can set the age yourself with `backup_max_age = "7days"`. With neither, the age
 is shown and not judged.
+
+Each scheduled archive (and each from `kompressor backup --out DIR`) has a
+`<name>.sha256` beside it; check a copy anywhere with `sha256sum -c`. *Verify*
+on the page checks an archive as a restore would — checksum, manifest and a
+full integrity check of each database — without stopping anything.
 
 To restore, stop the service and run, on the host:
 

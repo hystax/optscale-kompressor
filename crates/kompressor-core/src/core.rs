@@ -117,6 +117,9 @@ pub struct RefsSweep {
     pub took_ms: u64,
     /// Fragments it removed. Absent when it failed.
     pub removed: Option<u64>,
+    /// Bytes of free pages it then handed back to the disk
+    /// (`RefStore::reclaim`). Absent when it failed.
+    pub reclaimed_bytes: Option<u64>,
     /// Why it failed, when it did.
     pub error: Option<String>,
 }

@@ -54,6 +54,7 @@ fn build_core(config: Config) -> Result<(Arc<AppCore>, Running), CliError> {
     stats_config.channel_capacity = config.stats.queue_size;
     stats_config.flush_interval = config.stats.flush_interval;
     stats_config.retention_days = config.stats.retention_days;
+    stats_config.context_retention_days = config.stats.context_retention_days;
     if config.stats.enabled
         && let Some(parent) = config.stats.path.parent()
         && !parent.as_os_str().is_empty()
@@ -89,10 +90,17 @@ fn maintenance(
                         if let Err(error) = &purged {
                             tracing::warn!(%error, "fragment retention failed");
                         }
+                        // What the sweep freed goes back to the disk a bounded
+                        // step at a time, on a store that can do that.
+                        let reclaimed = purged.as_ref().ok().map(|_| core.refs().reclaim());
+                        if let Some(Err(error)) = &reclaimed {
+                            tracing::warn!(%error, "fragment store did not give pages back");
+                        }
                         core.note_refs_sweep(kompressor_core::RefsSweep {
                             at_ms: now.as_millis() as i64,
                             took_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                             removed: purged.as_ref().ok().copied(),
+                            reclaimed_bytes: reclaimed.and_then(Result::ok),
                             error: purged.err().map(|error| error.to_string()),
                         });
                         match core.refs().stats() {
@@ -221,6 +229,141 @@ fn scheduled_backups(
             }
         }
     }))
+}
+
+/// Whether an optimize last done at `last_ms` (none on record: never) is due
+/// again at `now_ms`.
+fn optimize_due(last_ms: Option<i64>, every: std::time::Duration, now_ms: i64) -> bool {
+    let every = i64::try_from(every.as_millis()).unwrap_or(i64::MAX);
+    // A record dated in the future — a clock that was wrong — must not put
+    // the next one off for ever.
+    last_ms.is_none_or(|last| last > now_ms || now_ms - last >= every)
+}
+
+/// Refresh the query planner's statistics on each database every
+/// `maintenance.optimize_every`, as the page's Optimize does by hand.
+///
+/// `None` when that is zero. Only `serve` runs this, as it runs the backups.
+/// When each was last done is read from the record of maintenance work, so a
+/// restart neither skips one nor repeats it; with statistics off it is this
+/// process's own memory.
+fn scheduled_optimize(
+    core: Arc<AppCore>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let every = core.config().maintenance.optimize_every;
+    if every.is_zero() {
+        return None;
+    }
+    let tick = (every / 4).clamp(
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_secs(600),
+    );
+    Some(tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(tick);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let done_here: Arc<std::sync::Mutex<BTreeMap<&'static str, i64>>> = Arc::default();
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => break,
+                _ = ticks.tick() => {
+                    let core = core.clone();
+                    let done_here = done_here.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        optimize_what_is_due(&core, every, &done_here);
+                    })
+                    .await;
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "scheduled optimize stopped");
+                    }
+                }
+            }
+        }
+    }))
+}
+
+fn optimize_what_is_due(
+    core: &AppCore,
+    every: std::time::Duration,
+    done_here: &std::sync::Mutex<BTreeMap<&'static str, i64>>,
+) {
+    let config = core.config();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as i64);
+    let recorded: Vec<kompressor_stats::MaintenanceEvent> =
+        if config.stats.enabled && config.stats.path.is_file() {
+            kompressor_stats::StatsReader::open(&config.stats.path)
+                .and_then(|reader| reader.latest_maintenance())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+    let mut databases: Vec<(&'static str, PathBuf)> = Vec::new();
+    if config.stats.enabled && config.stats.path.is_file() {
+        databases.push(("stats.db", config.stats.path.clone()));
+    }
+    if config.refs.backend == kompressor_core::config::RefsBackend::Sqlite
+        && config.refs.path.is_file()
+    {
+        databases.push(("refs.db", config.refs.path.clone()));
+    }
+    for (name, path) in databases {
+        let on_record = recorded
+            .iter()
+            .filter(|work| work.target == name && work.action == "optimize" && work.ok)
+            .map(|work| work.time_ms)
+            .max();
+        let here = done_here
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(name)
+            .copied();
+        if !optimize_due(on_record.max(here), every, now_ms) {
+            continue;
+        }
+        let started = std::time::Instant::now();
+        let result = if name == "stats.db" {
+            core.stats()
+                .exclusive(move || kompressor_store::sqlite::optimize(&path))
+                .map_err(|error| error.to_string())
+                .and_then(|done| done.map_err(|error| error.to_string()))
+        } else {
+            kompressor_store::sqlite::optimize(&path).map_err(|error| error.to_string())
+        };
+        let finished_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(now_ms, |since| since.as_millis() as i64);
+        // Not tried again before the interval, failed or not: a failure is
+        // on record and in the log, and one an interval is enough.
+        done_here
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(name, finished_ms);
+        match &result {
+            Ok(described) => tracing::info!(database = name, described, "scheduled optimize"),
+            Err(error) => tracing::warn!(database = name, %error, "scheduled optimize failed"),
+        }
+        core.stats().send(kompressor_stats::Event::Maintenance(
+            kompressor_stats::MaintenanceEvent {
+                time_ms: finished_ms,
+                action: "optimize".to_string(),
+                target: name.to_string(),
+                origin: "schedule".to_string(),
+                actor: None,
+                took_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+                ok: result.is_ok(),
+                bytes_before: None,
+                bytes_after: None,
+                detail: result
+                    .as_ref()
+                    .ok()
+                    .map(|described| serde_json::json!({"described": described}).to_string()),
+                error: result.err(),
+            },
+        ));
+    }
 }
 
 /// Compose the selected surfaces into one router.
@@ -513,6 +656,7 @@ pub async fn run(
     }
 
     let backups = scheduled_backups(core.clone(), shutdown_rx.clone());
+    let optimizes = scheduled_optimize(core.clone(), shutdown_rx.clone());
     let upkeep = maintenance(core.clone(), shutdown_rx);
     let mut serve_error = None;
     tokio::select! {
@@ -537,6 +681,9 @@ pub async fn run(
     // task checks for shutdown between backups, never inside one.
     if let Some(backups) = backups {
         let _ = backups.await;
+    }
+    if let Some(optimizes) = optimizes {
+        let _ = optimizes.await;
     }
 
     // Statistics are written off the request path, so a process that exits the
@@ -904,6 +1051,68 @@ mod tests {
         assert_eq!(after, 2, "settled at backup_keep");
         tokio::time::sleep(std::time::Duration::from_millis(1_300)).await;
         assert_eq!(listed().len(), after, "and takes no more");
+    }
+
+    #[test]
+    fn an_optimize_is_due_an_interval_after_the_last() {
+        let day = std::time::Duration::from_secs(86_400);
+        let now = 10 * 86_400_000;
+        assert!(optimize_due(None, day, now), "never done: due now");
+        assert!(!optimize_due(Some(now - 3_600_000), day, now));
+        assert!(optimize_due(Some(now - 86_400_000), day, now));
+        assert!(
+            optimize_due(Some(now + 3_600_000), day, now),
+            "a record from the future"
+        );
+    }
+
+    /// Each database on disk is optimized when due, put on record as the
+    /// schedule's work, and not again within the interval.
+    #[tokio::test]
+    async fn scheduled_optimizes_are_recorded_and_not_repeated() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.refs.backend = RefsBackend::Sqlite;
+        config.refs.path = dir.path().join("refs.db");
+        let (sink, events) = kompressor_stats::writer::capturing_sink(32);
+        let core = Arc::new(AppCore::new(
+            config.clone(),
+            kompressor_core::build_ref_store(&config).unwrap(),
+            sink,
+        ));
+        let every = std::time::Duration::from_secs(3_600);
+        let done_here = std::sync::Mutex::new(BTreeMap::new());
+        optimize_what_is_due(&core, every, &done_here);
+        let work: Vec<_> = events
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                kompressor_stats::Event::Maintenance(work) => Some(work),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(work.len(), 1, "the ref store; statistics are off: {work:?}");
+        assert_eq!(work[0].target, "refs.db");
+        assert_eq!(work[0].action, "optimize");
+        assert_eq!(work[0].origin, "schedule");
+        assert!(work[0].ok, "{work:?}");
+        assert!(
+            kompressor_store::sqlite::facts(&config.refs.path)
+                .unwrap()
+                .analyzed
+        );
+        optimize_what_is_due(&core, every, &done_here);
+        assert!(events.drain().is_empty(), "not again within the interval");
+
+        let mut off = config.clone();
+        off.maintenance.optimize_every = std::time::Duration::ZERO;
+        let (_, idle) = tokio::sync::watch::channel(false);
+        let unscheduled = Arc::new(AppCore::new(
+            off.clone(),
+            kompressor_core::build_ref_store(&off).unwrap(),
+            kompressor_stats::null_sink(),
+        ));
+        assert!(scheduled_optimize(unscheduled, idle).is_none());
     }
 
     #[test]

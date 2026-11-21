@@ -131,45 +131,57 @@ impl StatsWriter {
         older_than_ms: i64,
         max_days: usize,
     ) -> Result<PruneCounts, StatsError> {
-        // A zero cap archives nothing, and the horizon below would still fall
-        // through to the full cutoff — deleting every eligible row with no copy
-        // taken. Nothing to do is the only safe reading of "zero days".
-        if max_days == 0 {
-            return Ok(PruneCounts::default());
-        }
-        let cutoff = older_than_ms.div_euclid(86_400_000) * 86_400_000;
         let tx = self.connection_mut().transaction()?;
-        let days = {
-            let mut statement = tx.prepare(
-                "SELECT DISTINCT date(time_ms/1000,'unixepoch') FROM (
+        let counts = maintain_on(&tx, older_than_ms, max_days)?;
+        tx.commit()?;
+        Ok(counts)
+    }
+}
+
+/// [`StatsWriter::maintain_bounded`] inside a transaction the caller holds:
+/// roll each complete UTC day before `older_than_ms` up, then prune as far as
+/// the days rolled up reach. Also what a delete "before a date" from the
+/// Maintenance page is, so it keeps the aggregates retention would.
+pub(crate) fn maintain_on(
+    tx: &rusqlite::Connection,
+    older_than_ms: i64,
+    max_days: usize,
+) -> Result<PruneCounts, StatsError> {
+    // A zero cap archives nothing, and the horizon below would still fall
+    // through to the full cutoff — deleting every eligible row with no copy
+    // taken. Nothing to do is the only safe reading of "zero days".
+    if max_days == 0 {
+        return Ok(PruneCounts::default());
+    }
+    let cutoff = older_than_ms.div_euclid(86_400_000) * 86_400_000;
+    let days = {
+        let mut statement = tx.prepare(
+            "SELECT DISTINCT date(time_ms/1000,'unixepoch') FROM (
                    SELECT time_ms FROM optimization_events WHERE time_ms < ?1
                    UNION ALL SELECT time_ms FROM retrieval_events WHERE time_ms < ?1
                    UNION ALL SELECT time_ms FROM proxy_requests WHERE time_ms < ?1
                  ) ORDER BY 1",
-            )?;
+        )?;
 
-            statement
-                .query_map(params![cutoff], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        // When the backlog is longer than one pass allows, prune only as far as
-        // the days actually archived: deleting past that would drop rows whose
-        // rollup has not been written yet.
-        let capped = days.len() > max_days;
-        let days = &days[..days.len().min(max_days)];
-        for day in days {
-            rollup_on(&tx, day, false)?;
-            requests_rollup_on(&tx, day, false)?;
-            conversations_rollup_on(&tx, day, false)?;
-        }
-        let horizon = match (capped, days.last()) {
-            (true, Some(last)) => day_after_ms(&tx, last)?.min(cutoff),
-            _ => cutoff,
-        };
-        let counts = prune_on(&tx, horizon)?;
-        tx.commit()?;
-        Ok(counts)
+        statement
+            .query_map(params![cutoff], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    // When the backlog is longer than one pass allows, prune only as far as
+    // the days actually archived: deleting past that would drop rows whose
+    // rollup has not been written yet.
+    let capped = days.len() > max_days;
+    let days = &days[..days.len().min(max_days)];
+    for day in days {
+        rollup_on(tx, day, false)?;
+        requests_rollup_on(tx, day, false)?;
+        conversations_rollup_on(tx, day, false)?;
     }
+    let horizon = match (capped, days.last()) {
+        (true, Some(last)) => day_after_ms(tx, last)?.min(cutoff),
+        _ => cutoff,
+    };
+    prune_on(tx, horizon)
 }
 
 fn rollup_on(
@@ -333,7 +345,10 @@ fn day_after_ms(conn: &rusqlite::Connection, day: &str) -> Result<i64, StatsErro
     )?)
 }
 
-fn prune_on(conn: &rusqlite::Connection, older_than_ms: i64) -> Result<PruneCounts, StatsError> {
+pub(crate) fn prune_on(
+    conn: &rusqlite::Connection,
+    older_than_ms: i64,
+) -> Result<PruneCounts, StatsError> {
     crate::history::archive_before(conn, older_than_ms)?;
     let counts = PruneCounts {
         optimization_events: conn.execute(

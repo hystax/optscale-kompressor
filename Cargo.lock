@@ -1348,6 +1348,7 @@ dependencies = [
  "kompressor-engine",
  "kompressor-stats",
  "kompressor-store",
+ "ring",
  "serde",
  "serde_json",
  "tar",

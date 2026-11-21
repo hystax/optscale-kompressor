@@ -424,6 +424,20 @@ CREATE TABLE backups (
 CREATE INDEX backups_time ON backups (time_ms);
 "#;
 
+// v17: every piece of maintenance work — a check, checkpoint, vacuum,
+// optimize, erase, delete, trim or archive verification — who asked for it
+// and what came of it. What the Maintenance page's history and each
+// database's "last vacuumed" are read from, across restarts. No tenant: the
+// work is on every tenant's file.
+const V17: &str = r#"
+CREATE TABLE maintenance_events (
+ id INTEGER PRIMARY KEY, time_ms INTEGER NOT NULL, action TEXT NOT NULL,
+ target TEXT NOT NULL, origin TEXT NOT NULL, actor TEXT, took_ms INTEGER NOT NULL,
+ ok INTEGER NOT NULL, bytes_before INTEGER, bytes_after INTEGER, detail TEXT, error TEXT);
+CREATE INDEX maintenance_events_time ON maintenance_events (time_ms);
+CREATE INDEX maintenance_events_target ON maintenance_events (target, action, time_ms);
+"#;
+
 pub const MIGRATIONS: &[(u32, &str)] = &[
     (1, V1),
     (2, V2),
@@ -441,6 +455,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (14, V14),
     (15, V15),
     (16, V16),
+    (17, V17),
 ];
 
 /// The version a freshly migrated database reports in `PRAGMA user_version`.
@@ -508,6 +523,18 @@ pub fn apply(conn: &Connection) -> Result<u32, StatsError> {
     }
 
     Ok(current)
+}
+
+/// Whether the database `conn` is open on has a table called `name`: what a
+/// reader or a one-row writer asks before touching a table a file from an
+/// older build does not have yet.
+pub fn has_table(conn: &Connection, name: &str) -> Result<bool, StatsError> {
+    let found: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |row| row.get(0),
+    )?;
+    Ok(found > 0)
 }
 
 /// Write a consistent copy of the database at `source` to `destination`,
@@ -583,8 +610,9 @@ pub struct Erased {
 
 /// The one table [`erase`] leaves: the record of backups taken is about the
 /// deployment, not about traffic, and "when was the last backup" matters
-/// most right after everything else has been deleted.
-const KEPT_BY_ERASE: &str = "backups";
+/// most right after everything else has been deleted. So is the record of
+/// maintenance, which is where the erase itself is put on record.
+const KEPT_BY_ERASE: [&str; 2] = ["backups", "maintenance_events"];
 
 /// Delete every statistic in the database at `path` — every request, event
 /// and sample, and the daily rollups that outlive retention — and hand the
@@ -610,11 +638,12 @@ pub fn erase(path: &Path) -> Result<Erased, StatsError> {
     let tables = {
         let mut statement = conn.prepare(
             "SELECT name FROM sqlite_schema
-             WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' AND name <> ?1
+             WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
+               AND name <> ?1 AND name <> ?2
              ORDER BY name",
         )?;
         statement
-            .query_map([KEPT_BY_ERASE], |row| row.get::<_, String>(0))?
+            .query_map(KEPT_BY_ERASE, |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<String>, _>>()?
     };
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -646,6 +675,11 @@ pub fn erase(path: &Path) -> Result<Erased, StatsError> {
 /// another process is doing the same. The connection's busy timeout, in the
 /// one place that timeout is not consulted.
 const WAL_SWITCH_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The size a write-ahead log is cut back to after a checkpoint
+/// (`PRAGMA journal_size_limit`): a few checkpoints' worth at the default
+/// 1,000-page interval.
+pub const JOURNAL_SIZE_LIMIT: u64 = 16 * 1024 * 1024;
 
 /// Pragmas every connection to `stats.db` sets, read-only ones included.
 ///
@@ -688,7 +722,13 @@ fn set_pragmas(conn: &Connection, read_only: bool) -> Result<(), StatsError> {
                 Err(error) => return Err(error.into()),
             }
         }
-        conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
+        // SQLite reuses the write-ahead log rather than shrinking it, so one
+        // burst — a vacuum, a large delete — leaves a log the size of that
+        // burst on disk for good. This truncates it back after the
+        // checkpoint that follows.
+        conn.execute_batch(&format!(
+            "PRAGMA synchronous=NORMAL; PRAGMA journal_size_limit={JOURNAL_SIZE_LIMIT};"
+        ))?;
     }
     if read_only {
         // Report queries sort and group whole windows (percentiles, per-request

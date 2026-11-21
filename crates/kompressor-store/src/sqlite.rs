@@ -613,6 +613,30 @@ impl RefStore for SqliteRefStore {
         Ok(removed)
     }
 
+    fn reclaim(&self) -> Result<u64, StoreError> {
+        let conn = self.conn.lock();
+        let number = |pragma: &str| -> Result<i64, StoreError> {
+            Ok(conn.query_row(&format!("PRAGMA {pragma}"), [], |row| row.get(0))?)
+        };
+        // Only a file in incremental mode can give pages back piecemeal; one
+        // that is not yet waits for a vacuum to convert it.
+        if number("auto_vacuum")? != 2 {
+            return Ok(0);
+        }
+        let before = number("freelist_count")?;
+        if before == 0 {
+            return Ok(0);
+        }
+        // It frees one page per step: stepped to the end, not run once.
+        let mut statement = conn.prepare(&format!("PRAGMA incremental_vacuum({RECLAIM_PAGES})"))?;
+        let mut rows = statement.query([])?;
+        while rows.next()?.is_some() {}
+        drop(rows);
+        drop(statement);
+        let after = number("freelist_count")?;
+        Ok(((before - after).max(0) * number("page_size")?.max(0)) as u64)
+    }
+
     fn ping(&self) -> Result<(), StoreError> {
         let conn = self.conn.lock();
         conn.prepare_cached(SQL_PING)?
@@ -1039,6 +1063,9 @@ pub struct DatabaseFacts {
     pub wal: bool,
     /// Whether it holds planner statistics: [`optimize`] has run on it.
     pub analyzed: bool,
+    /// `PRAGMA auto_vacuum`: 0 none, 1 full, 2 incremental — whether freed
+    /// pages can go back to the disk without a full vacuum.
+    pub auto_vacuum: u8,
 }
 
 impl DatabaseFacts {
@@ -1073,6 +1100,7 @@ pub fn facts(path: &Path) -> Result<DatabaseFacts, StoreError> {
         free_pages: number("freelist_count")?,
         wal: mode.eq_ignore_ascii_case("wal"),
         analyzed: number("table_info(sqlite_stat1)").is_ok(),
+        auto_vacuum: number("auto_vacuum")?.min(2) as u8,
     })
 }
 
@@ -1205,9 +1233,23 @@ pub struct Vacuumed {
 /// service that owns the file holds its own writes for the duration rather
 /// than race this (`StatsSink::exclusive` in the statistics crate).
 pub fn vacuum(path: &Path) -> Result<Vacuumed, StoreError> {
+    vacuum_with(path, None)
+}
+
+/// [`vacuum`], converting the file to `auto_vacuum = INCREMENTAL` on the way:
+/// the one moment that can be done on a file that already has tables. For
+/// the ref store, whose sweep then hands pages back by itself.
+pub fn vacuum_incremental(path: &Path) -> Result<Vacuumed, StoreError> {
+    vacuum_with(path, Some("INCREMENTAL"))
+}
+
+fn vacuum_with(path: &Path, auto_vacuum: Option<&str>) -> Result<Vacuumed, StoreError> {
     let size = || on_disk(path);
     let bytes_before = size();
     let conn = read_write(path)?;
+    if let Some(mode) = auto_vacuum {
+        conn.execute_batch(&format!("PRAGMA auto_vacuum={mode};"))?;
+    }
     conn.execute_batch("VACUUM;")?;
     drop(conn);
     let folded = checkpoint(path)?.complete;
@@ -1282,6 +1324,16 @@ fn configure(conn: &Connection) -> Result<(), StoreError> {
     // The timeout first: what follows takes the file's lock, and a process
     // opening the same file at the same moment has to wait rather than fail.
     conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+    // Before anything creates a table: on a new file this is what lets the
+    // sweep hand freed pages back to the disk a few at a time
+    // ([`RefStore::reclaim`]) instead of keeping them until a full vacuum.
+    // Only on a file with no tables yet: on one that has them it would
+    // change nothing until a vacuum (which converts it) and still write the
+    // header, so merely opening a store would modify the file.
+    let tables: i64 = conn.query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))?;
+    if tables == 0 {
+        conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")?;
+    }
     // `PRAGMA journal_mode` answers with the mode it settled on, so it is a
     // query: an in-memory database keeps "memory" and that is fine.
     //
@@ -1307,12 +1359,23 @@ fn configure(conn: &Connection) -> Result<(), StoreError> {
             Err(error) => return Err(error.into()),
         }
     }
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "PRAGMA synchronous=NORMAL;
-         PRAGMA temp_store=MEMORY;",
-    )?;
+         PRAGMA temp_store=MEMORY;
+         PRAGMA journal_size_limit={JOURNAL_SIZE_LIMIT};"
+    ))?;
     Ok(())
 }
+
+/// The size a write-ahead log is cut back to after a checkpoint
+/// (`PRAGMA journal_size_limit`). SQLite reuses the log rather than shrinking
+/// it, so without this one burst — a vacuum, a sweep of a full store — leaves
+/// a log that size on disk for good.
+pub const JOURNAL_SIZE_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// Free pages one [`RefStore::reclaim`] hands back: 8 MiB at the default page
+/// size, so it holds the store's lock for milliseconds.
+const RECLAIM_PAGES: i64 = 2_048;
 
 /// Bring the schema up to the last entry of [`MIGRATIONS`].
 fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -1639,6 +1702,74 @@ mod tests {
         assert!(facts(&junk).is_err());
         assert!(integrity_check(&junk).is_err());
         assert!(facts(&dir.path().join("missing.db")).is_err());
+    }
+
+    /// A new store hands freed pages back by itself; one from before is
+    /// converted by its next vacuum and does from then on.
+    #[test]
+    fn freed_pages_go_back_to_the_disk_without_a_full_vacuum() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("refs.db");
+        let store = SqliteRefStore::open(&path).unwrap();
+        assert_eq!(
+            facts(&path).unwrap().auto_vacuum,
+            2,
+            "incremental from birth"
+        );
+        assert_eq!(store.reclaim().unwrap(), 0, "nothing free yet");
+        let ids = filled(&store, "a");
+        RefBrowse::remove(&store, &Tenant::anonymous(), &ids).unwrap();
+        checkpoint(&path).unwrap();
+        let free = facts(&path).unwrap().reclaimable_bytes();
+        assert!(free > 0);
+        let reclaimed = store.reclaim().unwrap();
+        assert_eq!(reclaimed, free, "every free page, under the per-call bound");
+        checkpoint(&path).unwrap();
+        assert_eq!(facts(&path).unwrap().free_pages, 0);
+        assert_eq!(integrity_check(&path).unwrap(), Vec::<String>::new());
+        drop(store);
+
+        // A file written before this, with auto-vacuum off.
+        let old = dir.path().join("old.db");
+        {
+            let conn = Connection::open(&old).unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL; CREATE TABLE t (x BLOB);
+                 INSERT INTO t SELECT randomblob(4000) FROM generate_series(1, 50);
+                 DELETE FROM t;",
+            )
+            .or_else(|_| {
+                // generate_series is an extension; a recursive CTE is not.
+                conn.execute_batch(
+                    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 50)
+                     INSERT INTO t SELECT randomblob(4000) FROM n; DELETE FROM t;",
+                )
+            })
+            .unwrap();
+        }
+        assert_eq!(facts(&old).unwrap().auto_vacuum, 0);
+        assert!(vacuum(&old).is_ok());
+        assert_eq!(
+            facts(&old).unwrap().auto_vacuum,
+            0,
+            "a plain vacuum keeps the mode"
+        );
+        let converted = vacuum_incremental(&old).unwrap();
+        assert!(converted.folded);
+        assert_eq!(facts(&old).unwrap().auto_vacuum, 2, "converted");
+    }
+
+    /// One burst must not leave a log its size on disk for good.
+    #[test]
+    fn the_write_ahead_log_is_cut_back_after_a_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteRefStore::open(dir.path().join("refs.db")).unwrap();
+        let limit: i64 = store
+            .conn
+            .lock()
+            .query_row("PRAGMA journal_size_limit", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(limit as u64, JOURNAL_SIZE_LIMIT);
     }
 
     #[test]

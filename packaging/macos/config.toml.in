@@ -61,6 +61,8 @@ path = "@STATE@/refs.db"
 # The Health page warns when the last backup is older than twice
 # backup_every. To be held to an age whoever takes them:
 # backup_max_age = "7days"
+# `serve` refreshes the query planner's statistics this often ("0s" = never):
+# optimize_every = "1day"
 
 [stats]
 enabled = true

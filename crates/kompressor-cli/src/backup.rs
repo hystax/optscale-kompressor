@@ -80,6 +80,11 @@ pub fn run(config: Option<&Path>, out: Option<&Path>, json: bool, keep: Option<u
     let manifest = backup::write_archive(&config, &archive)
         .map_err(|error| CliError::Runtime(format!("backup: {error}")))?;
     let archived = std::fs::metadata(&archive).map_or(0, |meta| meta.len());
+    // Beside it, in the format `sha256sum -c` reads; the Maintenance page's
+    // Verify compares against it. The archive is good without one.
+    if let Err(error) = backup::write_checksum(&archive) {
+        eprintln!("warning: the archive's checksum was not written: {error}");
+    }
     // On record where the service will see it. Best effort: whoever runs
     // this may not be able to write the statistics database, and a backup
     // that worked is not failed for want of a note about it.

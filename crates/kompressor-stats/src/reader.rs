@@ -1167,6 +1167,56 @@ impl StatsReader {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// The newest `limit` pieces of maintenance work on record, newest
+    /// first. Empty for a database from before they were recorded.
+    pub fn maintenance(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::events::MaintenanceEvent>, StatsError> {
+        self.maintenance_where("1", limit)
+    }
+
+    /// The newest piece of each kind of work on each target: what the page
+    /// shows as a database's last check, checkpoint, vacuum and optimize, and
+    /// an archive's last verification.
+    pub fn latest_maintenance(&self) -> Result<Vec<crate::events::MaintenanceEvent>, StatsError> {
+        self.maintenance_where(
+            "id IN (SELECT max(id) FROM maintenance_events GROUP BY target, action)",
+            1_000,
+        )
+    }
+
+    fn maintenance_where(
+        &self,
+        filter: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::events::MaintenanceEvent>, StatsError> {
+        if !crate::schema::has_table(&self.conn, "maintenance_events")? {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.conn.prepare_cached(&format!(
+            "SELECT time_ms, action, target, origin, actor, took_ms, ok, bytes_before,
+                    bytes_after, detail, error
+             FROM maintenance_events WHERE {filter} ORDER BY time_ms DESC, id DESC LIMIT ?1"
+        ))?;
+        let rows = statement.query_map([limit.min(1_000) as i64], |row| {
+            Ok(crate::events::MaintenanceEvent {
+                time_ms: row.get(0)?,
+                action: row.get(1)?,
+                target: row.get(2)?,
+                origin: row.get(3)?,
+                actor: row.get(4)?,
+                took_ms: row.get(5)?,
+                ok: row.get(6)?,
+                bytes_before: row.get(7)?,
+                bytes_after: row.get(8)?,
+                detail: row.get(9)?,
+                error: row.get(10)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// When the last backup that worked was taken, and — when one has failed
     /// since — when that was.
     pub fn last_backup(&self) -> Result<(Option<i64>, Option<i64>), StatsError> {

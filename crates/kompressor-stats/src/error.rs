@@ -51,6 +51,11 @@ pub enum StatsError {
     #[error("the stats writer thread is not running")]
     WriterGone,
 
+    /// A request the caller can fix: what it asked for is not something
+    /// this database can do as asked.
+    #[error("{0}")]
+    Invalid(String),
+
     /// The writer thread panicked. The batch it held is lost; the database is
     /// intact, because every batch is one transaction.
     #[error("the stats writer thread panicked")]

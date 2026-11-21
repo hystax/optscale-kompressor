@@ -342,6 +342,14 @@ pub trait RefStore: Send + Sync {
     /// For readiness probes, which run every few seconds and need a yes or no,
     /// not the count [`Self::stats`] scans the whole store for. The default is
     /// that scan, for stores where it is cheap anyway.
+    /// Hand free pages back to the disk, a bounded number at a time, and
+    /// return the bytes given back. What the sweep calls after removing
+    /// expired fragments; zero for a store with nothing to give back, which
+    /// is every store but a file in incremental auto-vacuum mode.
+    fn reclaim(&self) -> Result<u64, StoreError> {
+        Ok(0)
+    }
+
     fn ping(&self) -> Result<(), StoreError> {
         self.stats().map(|_| ())
     }

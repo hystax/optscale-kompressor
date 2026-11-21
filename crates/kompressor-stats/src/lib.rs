@@ -63,6 +63,7 @@ pub mod history;
 pub mod insights;
 pub mod live;
 pub mod prefix;
+pub mod purge;
 pub mod quality;
 pub mod reader;
 pub mod retention;
@@ -77,8 +78,8 @@ pub use config::{
 };
 pub use error::StatsError;
 pub use events::{
-    Event, OptimizationEvent, ProtectedRefEvent, ProxyRequestEvent, RetrievalEvent, StoreSample,
-    Surface,
+    BackupEvent, Event, MaintenanceEvent, OptimizationEvent, ProtectedRefEvent, ProxyRequestEvent,
+    RetrievalEvent, StoreSample, Surface,
 };
 pub use reader::{
     Bucket, BucketRow, DailyRollup, ModeTotals, ProviderCoverage, ProxyRow, RefCount,
@@ -1215,6 +1216,7 @@ mod tests {
                      ALTER TABLE retrieval_events DROP COLUMN range_status;
                      ALTER TABLE proxy_requests DROP COLUMN prefix_json;
                      DROP TABLE backups;
+                     DROP TABLE maintenance_events;
                      PRAGMA user_version = 5;",
                 )
                 .unwrap();
@@ -1270,6 +1272,7 @@ mod tests {
                      ALTER TABLE retrieval_events DROP COLUMN range_status;
                      ALTER TABLE proxy_requests DROP COLUMN prefix_json;
                      DROP TABLE backups;
+                     DROP TABLE maintenance_events;
                      PRAGMA user_version = 5;",
                 )
                 .unwrap();
