@@ -46,6 +46,7 @@ pub mod live;
 pub mod maintenance;
 mod ops;
 pub mod refs;
+mod running;
 mod stats_api;
 
 pub use api::api_router;

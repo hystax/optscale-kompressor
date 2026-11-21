@@ -324,6 +324,8 @@ struct BuildInfo {
 struct MaintenanceStatus {
     version: &'static str,
     build: BuildInfo,
+    /// Where it listens, how it is set, the process and its load.
+    running: crate::running::Running,
     now_ms: i64,
     last_backup: LastBackup,
     restore: RestoreHint,
@@ -598,6 +600,14 @@ async fn status(
     let identity = authenticate(&state, &headers)?;
     let core = state.core.clone();
     let info = crate::live::server_info(&state);
+    let under_way = state.core.runtime().in_flight();
+    let load = crate::running::Load {
+        requests: under_way.requests,
+        streams: under_way.streams,
+        engine_busy: info.inflight_limit.saturating_sub(info.inflight_free),
+        engine_limit: info.inflight_limit,
+        backup_running: state.backup_running.load(Ordering::Acquire),
+    };
     // Off the runtime: it opens each database and lists a directory.
     let mut status = tokio::task::spawn_blocking(move || {
         let binary = running_binary(info.started_at_ms);
@@ -629,6 +639,7 @@ async fn status(
                 // systemd sets this for every unit it starts.
                 systemd: std::env::var_os("INVOCATION_ID").is_some(),
             },
+            running: crate::running::running(&core, load),
             backup: grant(Wanted::Backup, config, identity.trusted),
             actions: grant(Wanted::Action, config, identity.trusted),
             erase: grant(Wanted::Erase, config, identity.trusted),

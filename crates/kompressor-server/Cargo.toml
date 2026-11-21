@@ -44,6 +44,8 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 http-body-util = { workspace = true }
 tempfile = "3"
+# To write a configuration the way an operator would, in a test.
+toml = { workspace = true }
 # To open the backup archive the maintenance route answers with.
 tar = { workspace = true }
 flate2 = { workspace = true }

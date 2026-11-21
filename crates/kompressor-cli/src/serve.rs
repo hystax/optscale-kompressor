@@ -587,6 +587,7 @@ pub async fn run(
             enabled.push("proxy");
         }
         tracing::info!(address = %addr, surfaces = %enabled.join(","), mode = %core.config().engine.mode, "listening");
+        core.runtime().listening(addr.to_string(), &enabled);
         let app = compose(&core, selected, client.clone());
         let mut rx = shutdown_rx.clone();
         servers.spawn(async move {
@@ -603,6 +604,7 @@ pub async fn run(
     }
     if let Some((addr, listener)) = stats_listener {
         tracing::info!(address = %addr, "live statistics at http://{addr}/, cache analysis at http://{addr}/cache");
+        core.runtime().listening(addr.to_string(), &["statistics"]);
         let app = kompressor_server::stats_listener_router(ServerState::new(core.clone()));
         let mut rx = shutdown_rx.clone();
         servers.spawn(async move {
@@ -639,6 +641,8 @@ pub async fn run(
             fingerprint = %bound.fingerprint(),
             "intercepting"
         );
+        core.runtime()
+            .listening(bound.address().to_string(), &["interception"]);
         let app = compose(&core, surfaces_for_intercept(&core), client.clone());
         let mut rx = shutdown_rx.clone();
         servers.spawn(async move {

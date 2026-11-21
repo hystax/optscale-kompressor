@@ -171,6 +171,12 @@ impl ProxyState {
         self.prefixes.clone()
     }
 
+    /// The proxied requests under way as this is called, which the
+    /// Maintenance page shows. Exposed on the same terms as `prefixes`.
+    pub fn under_way(&self) -> kompressor_core::runtime::InFlight {
+        self.core.runtime().in_flight()
+    }
+
     /// What each conversation's cold turns decided, and how its lapse
     /// predictions have fared. Exposed on the same terms as `prefixes`.
     pub fn recompact(&self) -> Arc<recompact::Recompact> {

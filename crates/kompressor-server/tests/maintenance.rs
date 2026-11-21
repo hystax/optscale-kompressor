@@ -1316,6 +1316,20 @@ async fn the_status_says_what_is_running_and_shows_the_configuration() {
     );
     assert!(build["commit"].is_null() || build["commit"].as_str().is_some_and(|c| !c.is_empty()));
 
+    // How it is set and what it is doing, with no key or secret in it.
+    let running = &status["running"];
+    assert_eq!(running["mode"], "recoverable");
+    assert_eq!(running["auth"]["mode"], "api_keys");
+    assert_eq!(running["auth"]["keys"], 1);
+    assert_eq!(running["auth"]["secret"], true);
+    assert_eq!(running["process"]["pid"], std::process::id());
+    assert_eq!(running["load"]["requests"], 0);
+    assert_eq!(running["load"]["backup_running"], false);
+    assert!(running["load"]["engine_limit"].as_u64().unwrap() > 0);
+    assert!(running["listeners"].is_array() && running["features"].is_array());
+    let text = running.to_string();
+    assert!(!text.contains("sk-alpha") && !text.contains("the-shared-secret"));
+
     let path = "/v1/maintenance/config";
     assert_eq!(
         send(&deployment, "GET", path, &key).await.status,

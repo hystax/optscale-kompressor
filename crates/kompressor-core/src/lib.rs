@@ -15,6 +15,7 @@ pub mod config;
 pub mod core;
 pub mod error;
 pub mod retrieve;
+pub mod runtime;
 
 pub use auth::{Authenticator, Credentials, Identity};
 pub use config::Config;

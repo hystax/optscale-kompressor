@@ -76,6 +76,27 @@ async fn an_upstream_using_the_default_family_detects_known_endpoints() {
     assert!(sent["messages"][3]["content"].as_str().unwrap().len() < input.len());
 }
 
+/// A request is among those under way while the provider is answering and
+/// not after, so "nothing under way" can be trusted before a restart.
+#[tokio::test]
+async fn a_request_is_counted_under_way_only_while_it_is() {
+    let harness = Harness::new().await;
+    Mock::given(any())
+        .respond_with(answered().set_delay(Duration::from_millis(600)))
+        .mount(&harness.server)
+        .await;
+    assert_eq!(harness.state.under_way().requests, 0);
+    let body = chat_body(&log_payload(400));
+    let sending = harness.post("/v1/chat/completions", &body);
+    let watching = async {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        harness.state.under_way()
+    };
+    let (_, during) = tokio::join!(sending, watching);
+    assert_eq!((during.requests, during.streams), (1, 0));
+    assert_eq!(harness.state.under_way().requests, 0);
+}
+
 #[tokio::test]
 async fn an_ordinary_request_is_untouched_by_the_websocket_relay() {
     // The relay ships on, and "on" has to mean *as well as*, not instead.

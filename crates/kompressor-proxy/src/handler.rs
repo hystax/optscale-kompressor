@@ -3028,6 +3028,8 @@ pub(crate) struct Recorder {
     /// This request was recompacted on a *predicted* lapse, so the provider's
     /// answer can be held against the prediction.
     predicted_cold: bool,
+    /// Counts this request among those under way for as long as it is.
+    _under_way: kompressor_core::runtime::Entered,
 }
 
 impl Recorder {
@@ -3086,6 +3088,7 @@ impl Recorder {
             keep_warm: false,
         };
         Recorder {
+            _under_way: state.core.runtime().enter(event.stream),
             core: state.core.clone(),
             event,
             waited,

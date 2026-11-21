@@ -832,19 +832,66 @@ function drawRestore(status) {
     step("When all is well, remove the files that were moved aside.", ""));
 }
 
+// Where it listens, how it is set, the process, and what it is doing now.
+function runningFacts(running) {
+  if (!running) return [];
+  const plural = (n, one, many) => count(n) + " " + (n === 1 ? one : many);
+  const auth = running.auth.mode === "none" ? "none (one anonymous tenant)"
+    : "API keys (" + plural(running.auth.keys, "key", "keys") + ")";
+  const scopes = {};
+  running.features.forEach(feature => {
+    (scopes[feature.scope] = scopes[feature.scope] || []).push(feature.setting + " = " + feature.value);
+  });
+  const process = running.process, load = running.load;
+  const about = ["pid " + process.pid];
+  if (process.user) about.push("user " + process.user);
+  if (process.memory_bytes != null) about.push(size(process.memory_bytes) + " in memory");
+  if (process.open_files != null) {
+    about.push(count(process.open_files) + (process.open_files_limit ? " of " + count(process.open_files_limit) : "") + " files open");
+  }
+  const busy = load.requests || load.engine_busy || load.backup_running;
+  const now = [
+    load.requests ? plural(load.requests, "request", "requests") + " under way through the proxy, "
+        + (load.streams ? count(load.streams) + " streaming" : "none streaming")
+      : "no request under way through the proxy",
+    "engine: " + load.engine_busy + " of " + load.engine_limit + " slots busy"
+      + (load.backup_running ? "; a backup is being written" : ""),
+    tagged(busy ? "a restart now would interrupt this" : "idle: a restart now interrupts no one", busy ? "warn" : "muted"),
+  ];
+  return [
+    ["Listening on", running.listeners.length
+      ? running.listeners.map(listener => listener.address + " — " + listener.serves.join(", "))
+      : "not on record"],
+    ["Mode", running.mode + "; authentication: " + auth + (running.auth.secret ? ", shared secret set" : "")],
+    ["Upstreams", !running.proxy_enabled ? "the proxy is off"
+      : running.upstreams.length
+        ? running.upstreams.map(upstream => upstream.name + ": " + upstream.path_prefix + " → " + upstream.base_url + " (" + upstream.api_family + ")")
+        : "none configured"],
+    ["Opt-in settings", Object.keys(scopes).length
+      ? Object.entries(scopes).map(([scope, set]) => (scope === "all" ? "every provider" : scope) + ": " + set.join(", "))
+      : "all as shipped"],
+    ["Process", about.join(", ")],
+    ["Right now", now],
+  ];
+}
+
 function drawBuild(status) {
-  const build = status.build;
+  const build = status.build, running = status.running;
   const facts = [
     ["Version", "kompressor " + build.version + (build.commit ? " (" + build.commit + ")" : " (commit unknown)")],
     ["Running since", when(build.started_at_ms) + " — up " + span(0, build.uptime_s * 1000)],
     ["Binary", build.binary || "–"],
     ["Configuration", build.config || "none: defaults and the environment"],
     ["Supervised by", build.systemd ? "systemd" : "not systemd"],
+    ...runningFacts(running),
   ];
   $("build").replaceChildren(...facts.flatMap(([term, value]) => {
     const dt = document.createElement("dt"), dd = document.createElement("dd");
     dt.textContent = term;
-    dd.textContent = value;
+    [].concat(value).forEach((line, index) => {
+      if (index) dd.append(document.createElement("br"));
+      dd.append(line);
+    });
     return [dt, dd];
   }));
   $("restart-pending").hidden = !build.restart_pending;

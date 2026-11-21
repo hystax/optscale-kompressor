@@ -49,6 +49,8 @@ pub struct AppCore {
     /// What the last sweep of expired fragments did. In memory, as the
     /// integrity checks are: it is about this process.
     refs_sweep: std::sync::Mutex<Option<RefsSweep>>,
+    /// The listeners this process is bound to and the requests it carries.
+    runtime: Arc<crate::runtime::Runtime>,
 }
 
 /// What one compression run produced, beyond the mutated messages.
@@ -142,7 +144,13 @@ impl AppCore {
             stats,
             config,
             refs_sweep: std::sync::Mutex::new(None),
+            runtime: Arc::default(),
         }
+    }
+
+    /// The process's record of its listeners and of the requests under way.
+    pub fn runtime(&self) -> &Arc<crate::runtime::Runtime> {
+        &self.runtime
     }
 
     /// Put on record what a sweep of expired fragments did, for the
