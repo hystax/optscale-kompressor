@@ -93,7 +93,11 @@ impl BodyEncoding {
         }
         let reader: Box<dyn Read> = match self {
             BodyEncoding::Zstd => Box::new(zstd::stream::read::Decoder::new(raw).ok()?),
-            BodyEncoding::Gzip => Box::new(flate2::read::GzDecoder::new(raw)),
+            // `Multi`: a gzip stream may be several members end to end, and
+            // `GzDecoder` stops at the end of the first without an error —
+            // the body comes back cut short, and the limit below is checked
+            // against the part that was read.
+            BodyEncoding::Gzip => Box::new(flate2::read::MultiGzDecoder::new(raw)),
             BodyEncoding::Deflate => Box::new(flate2::read::ZlibDecoder::new(raw)),
             BodyEncoding::Identity => unreachable!("handled above"),
         };
@@ -216,6 +220,45 @@ mod tests {
             let decoded = coding.decode(&encoded, 1 << 20).expect("decodes");
             assert_eq!(&decoded[..], &plain[..], "{coding:?} did not round-trip");
         }
+    }
+
+    /// RFC 1952 lets a gzip stream be several members end to end, and a client
+    /// that compresses in chunks sends exactly that. Read to the first
+    /// member's end, the body is cut short without an error: JSON that spans
+    /// members does not parse and is forwarded uncompressed, and a first
+    /// member that happens to be whole JSON would be rewritten and sent on
+    /// without the rest.
+    #[test]
+    fn gzip_reads_all_members_and_checks_the_combined_limit() {
+        let mut encoded = BodyEncoding::Gzip.encode(b"first").unwrap().to_vec();
+        encoded.extend_from_slice(&BodyEncoding::Gzip.encode(b"second").unwrap());
+        assert_eq!(
+            BodyEncoding::Gzip.decode(&encoded, 11).unwrap(),
+            "firstsecond"
+        );
+        // The limit is on what all the members decode to, not on each.
+        assert!(BodyEncoding::Gzip.decode(&encoded, 10).is_none());
+        // A second member cut short is a body that did not arrive whole.
+        let mut truncated = encoded.clone();
+        truncated.pop();
+        assert!(BodyEncoding::Gzip.decode(&truncated, 100).is_none());
+        // And bytes after the last member that are no member at all are not
+        // dropped on the floor: the body is forwarded as it came instead.
+        encoded.extend_from_slice(b"not gzip");
+        assert!(BodyEncoding::Gzip.decode(&encoded, 100).is_none());
+    }
+
+    /// The same holds for zstd, which is what codex sends: frames end to end
+    /// are one body.
+    #[test]
+    fn zstd_reads_all_frames_and_checks_the_combined_limit() {
+        let mut encoded = BodyEncoding::Zstd.encode(b"first").unwrap().to_vec();
+        encoded.extend_from_slice(&BodyEncoding::Zstd.encode(b"second").unwrap());
+        assert_eq!(
+            BodyEncoding::Zstd.decode(&encoded, 11).unwrap(),
+            "firstsecond"
+        );
+        assert!(BodyEncoding::Zstd.decode(&encoded, 10).is_none());
     }
 
     #[test]

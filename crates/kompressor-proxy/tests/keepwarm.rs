@@ -173,6 +173,71 @@ async fn it_can_be_turned_off() {
     assert!(pings(&harness).await.is_empty());
 }
 
+/// What is kept warm at once is bounded, because each timer holds the request
+/// it re-sends. A wait past the bound is left to lapse; one already being kept
+/// warm goes on, and takes over its own slot when its conversation moves on.
+#[tokio::test]
+async fn no_more_conversations_are_kept_warm_at_once_than_the_deployment_allows() {
+    let harness = Harness::with(|config| {
+        config.proxy.cache_keep_warm = true;
+        // Long enough that nothing ends on its own while this looks.
+        config.proxy.cache_keep_warm_interval = Duration::from_secs(60);
+        config.proxy.cache_keep_warm_max_pings = 3;
+        config.proxy.cache_keep_warm_max_conversations = 1;
+    })
+    .await;
+    answering(&harness, "tool_use", 4000).await;
+    let another = |turns| {
+        let mut body = conversation(turns);
+        body["messages"][0]["content"] = json!("Deploy the project.");
+        body
+    };
+
+    harness.post("/v1/messages", &conversation(1)).await;
+    assert_eq!(harness.state.keepwarm().armed(), 1);
+    assert_eq!(harness.state.keepwarm().refused(), 0);
+
+    harness.post("/v1/messages", &another(1)).await;
+    assert_eq!(
+        (
+            harness.state.keepwarm().armed(),
+            harness.state.keepwarm().refused()
+        ),
+        (1, 1),
+        "a second conversation is not armed past the limit"
+    );
+
+    // The first conversation's next turn replaces its own timer.
+    harness.post("/v1/messages", &conversation(2)).await;
+    assert_eq!(
+        (
+            harness.state.keepwarm().armed(),
+            harness.state.keepwarm().refused()
+        ),
+        (1, 1),
+        "a conversation already kept warm is never refused"
+    );
+}
+
+/// And `0` is no limit at all.
+#[tokio::test]
+async fn the_limit_on_conversations_kept_warm_can_be_lifted() {
+    let harness = Harness::with(|config| {
+        config.proxy.cache_keep_warm = true;
+        config.proxy.cache_keep_warm_interval = Duration::from_secs(60);
+        config.proxy.cache_keep_warm_max_conversations = 0;
+    })
+    .await;
+    answering(&harness, "tool_use", 4000).await;
+    let mut other = conversation(1);
+    other["messages"][0]["content"] = json!("Deploy the project.");
+
+    harness.post("/v1/messages", &conversation(1)).await;
+    harness.post("/v1/messages", &other).await;
+    assert_eq!(harness.state.keepwarm().armed(), 2);
+    assert_eq!(harness.state.keepwarm().refused(), 0);
+}
+
 #[tokio::test]
 async fn the_clients_next_request_stops_the_pings() {
     let harness = keeping_warm(20).await;

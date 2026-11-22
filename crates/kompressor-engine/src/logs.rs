@@ -383,15 +383,11 @@ fn fold(
     }
 
     let templated = fold_templates(lines, opts, identity, refs, echoed);
-    // collected before the rollback: handles are content-addressed, so
-    // re-stashing these exact fragments reproduces the very handles the
-    // templated reading's markers already carry
-    let templated_fragments: Vec<String> = refs.pairs()[mark.pairs..]
-        .iter()
-        .map(|(_, fragment)| fragment.clone())
-        .collect();
+    // Set aside rather than snapshotted from `pairs()`: a fold that elides
+    // under a handle an earlier message already holds adds nothing to `pairs`,
+    // and a snapshot of it would bring the reading back without that stash.
+    let templated_shelved = refs.shelve(mark);
     let templated_len = templated.as_deref().map(chars_len);
-    refs.rollback(mark);
 
     match crush_scored(lines, opts, refs) {
         Some(out)
@@ -400,9 +396,9 @@ fn fold(
         {
             return Some(out);
         }
-        _ => refs.rollback(mark),
+        _ => {}
     }
-    refs.restash_all(&templated_fragments);
+    refs.reinstate(mark, &templated_shelved);
     templated
 }
 

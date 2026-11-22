@@ -186,6 +186,25 @@ def classify_change(before, after, incoming_before=None, incoming_after=None):
     return "PROVIDER_CANDIDATE", "captured prefix unchanged; provider/cache cause unproven"
 
 
+def captured_request_id(row: dict) -> str:
+    """The request whose captured bodies say what `row` sent.
+
+    A keep-warm ping has a row of its own, `<request>.keepwarm<N>`, and no body
+    in the capture: it re-sends what the proxy sent for `<request>`, with
+    `max_tokens` and `stream` changed and nothing else (`Ping::for_request`),
+    so that request's body is the ping's prompt. The capture holds one
+    `proxy->upstream` body per request -- the one `prepare` produced; a hidden
+    retrieval round is not captured, and is not what a ping repeats either.
+
+    Only for a row filed as a ping: a client is free to choose an id that ends
+    the same way.
+    """
+    request_id = row["request_id"]
+    if row.get("keep_warm"):
+        return re.sub(r"\.keepwarm\d+$", "", request_id)
+    return request_id
+
+
 def analyse(run: Path, module) -> int:
     stats, bodies = run / "kompressor-stats.db", run / "kompressor-bodies.jsonl"
     if not stats.exists() or not bodies.exists():
@@ -204,23 +223,25 @@ def analyse(run: Path, module) -> int:
     rows = [dict(r) for r in con.execute(
         "SELECT p.*, o.messages_total FROM proxy_requests p "
         "LEFT JOIN optimization_events o USING (request_id) ORDER BY p.time_ms")]
+    con.close()
     order = {r["request_id"]: n + 1 for n, r in enumerate(rows)}
 
     out = {}
     incoming = {}
-    for line in open(bodies, encoding="utf-8", errors="replace"):
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        # The same file carries the relay's per-frame decisions, which have a
-        # `dir` and no `body`.
-        if "body" in record and record.get("dir") == "proxy->upstream":
-            # First round matches the client request's compression decision;
-            # hidden retrieval rounds must not overwrite this capture.
-            out.setdefault(record["request_id"], record["body"])
-        elif "body" in record and record.get("dir") == "client->proxy":
-            incoming.setdefault(record["request_id"], record["body"])
+    with open(bodies, encoding="utf-8", errors="replace") as capture:
+        for line in capture:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            # The same file carries the relay's per-frame decisions, which have a
+            # `dir` and no `body`.
+            if "body" in record and record.get("dir") == "proxy->upstream":
+                # First round matches the client request's compression decision;
+                # hidden retrieval rounds must not overwrite this capture.
+                out.setdefault(record["request_id"], record["body"])
+            elif "body" in record and record.get("dir") == "client->proxy":
+                incoming.setdefault(record["request_id"], record["body"])
 
     fetched = {}
     events = run / "retrieval_events.json"
@@ -246,12 +267,15 @@ def analyse(run: Path, module) -> int:
         by_id = {row["request_id"]: row for row in rows}
         before = by_id.get(loss.get("before_request_id"))
         after = by_id.get(loss.get("request_id"))
-        if not (before and after and before["request_id"] in out and after["request_id"] in out):
+        before_id = captured_request_id(before) if before else None
+        after_id = captured_request_id(after) if after else None
+        if not (before_id in out and after_id in out):
             print("    no body pair captured for this turn; cannot say")
             continue
 
-        a_ours, a_theirs, a_instr, a_msgs = parts(out[before["request_id"]])
-        b_ours, b_theirs, b_instr, b_msgs = parts(out[after["request_id"]])
+        before_body, after_body = out[before_id], out[after_id]
+        a_ours, a_theirs, a_instr, a_msgs = parts(before_body)
+        b_ours, b_theirs, b_instr, b_msgs = parts(after_body)
         print(f"    our tool identical {a_ours == b_ours}   "
               f"agent tools identical {a_theirs == b_theirs}   "
               f"instructions identical {a_instr == b_instr}")
@@ -264,8 +288,7 @@ def analyse(run: Path, module) -> int:
         print(f"    messages {len(a_msgs)} -> {len(b_msgs)}, first differing index: {differing}")
 
         owner, reason = classify_change(
-            out[before["request_id"]], out[after["request_id"]],
-            incoming.get(before["request_id"]), incoming.get(after["request_id"]))
+            before_body, after_body, incoming.get(before_id), incoming.get(after_id))
         print(f"    -> {owner}: {reason}")
         if owner == "METADATA":
             print("       content unchanged after normalization; metadata/representation "

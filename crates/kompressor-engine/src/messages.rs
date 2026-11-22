@@ -3421,6 +3421,47 @@ mod skip_reason_tests {
         );
     }
 
+    /// The same, for a reading that won an arbitration. Such a reading is set
+    /// aside while its rival runs and brought back when it wins, and the
+    /// collector used to bring back only the fragments it had newly stored — so
+    /// a second read, whose fragment the first already holds, came back with
+    /// no stash at all and was elided again as if nobody had asked twice.
+    ///
+    /// No grammar needed: a terminal that redraws a progress line is routed
+    /// plain and folded, and the shorter reading is the one reinstated.
+    #[test]
+    fn a_reading_brought_back_from_an_arbitration_is_still_a_second_read() {
+        let redrawn: String = (0..100)
+            .map(|n| format!("progress {n}%\r"))
+            .chain(std::iter::once("done\n".to_string()))
+            .chain((0..60).map(|n| format!("step {n} ok in {}ms\n", n * 3)))
+            .collect();
+        let mut messages = vec![
+            msg("tool", &redrawn),
+            msg("user", "run it again"),
+            msg("tool", &redrawn),
+        ];
+        let mut refs = RefCollector::new(1 << 20);
+        let stats = compress_messages(
+            &mut messages,
+            &opts(),
+            &RequestOptions::default(),
+            &mut refs,
+        );
+
+        assert!(
+            messages[0].content.joined_text().contains("ref:k_"),
+            "the first read is elided under a handle"
+        );
+        assert_eq!(
+            messages[2].content.joined_text(),
+            redrawn,
+            "the second read ships whole"
+        );
+        assert_eq!(stats.skipped_by_reason.get("read_again"), Some(&1));
+        assert_eq!(refs.pairs().len(), 1, "and nothing is stored twice");
+    }
+
     /// A large fragment read twice stays elided: shipping it whole on every
     /// later turn costs more than fetching the part that is wanted.
     #[test]

@@ -110,6 +110,18 @@ impl Harness {
         .await
     }
 
+    /// POST bytes already in `coding`, as a client that compressed them itself.
+    pub async fn post_encoded(&self, path: &str, coding: &str, encoded: Vec<u8>) -> Reply {
+        self.send(
+            Request::post(path)
+                .header("content-type", "application/json")
+                .header("content-encoding", coding)
+                .body(Body::from(encoded))
+                .unwrap(),
+        )
+        .await
+    }
+
     /// POST with extra client headers.
     pub async fn post_with(&self, path: &str, body: &Value, extra: &[(&str, &str)]) -> Reply {
         let mut request = Request::post(path).header("content-type", "application/json");
