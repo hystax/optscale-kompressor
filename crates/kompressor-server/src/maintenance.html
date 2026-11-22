@@ -245,6 +245,28 @@ td.last { font-size: 13px; }
     unpacks into the backup directory for as long as it runs. Each archive has a <code>.sha256</code> beside it:
     a copy taken off this host is checked with <code>sha256sum -c</code>.
   </p>
+  <h3>Off-site copy (S3-compatible storage)</h3>
+  <p id="s3-state" class="muted">Loading…</p>
+  <p id="s3-buttons" hidden>
+    <button id="s3-test" type="button" title="List the bucket and write a small object to it">Test connection</button>
+    <button id="s3-upload" type="button" title="Take a backup now and upload it to the bucket">Back up to S3 now</button>
+    <button id="s3-list" type="button" title="List the archives in the bucket">List bucket</button>
+  </p>
+  <p id="s3-result" role="status" hidden></p>
+  <p class="note" id="s3-why" hidden></p>
+  <table id="s3-archives" hidden>
+    <thead><tr><th>Archive in the bucket</th><th>Taken</th><th>Size</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <p class="note">
+    Copies each scheduled archive, and its <code>.sha256</code>, to a bucket on AWS S3, MinIO, Cloudflare R2,
+    Backblaze B2, Wasabi or any other S3-compatible store, so a dead disk does not take the backups with it.
+    It is off until <code>[maintenance.s3]</code> is set (<code>enabled</code>, <code>bucket</code>,
+    <code>access_key_id</code>, <code>secret_access_key</code>, and <code>endpoint</code> for anything but AWS);
+    the key is never shown here. To restore, fetch an archive with any S3 client, check it with
+    <code>sha256sum -c</code>, and follow Restore below. The bucket should be private: an archive holds every
+    tenant's data.
+  </p>
   <h3>History</h3>
   <p id="history-none" class="muted">Loading…</p>
   <table id="history" hidden>
@@ -757,6 +779,11 @@ function drawSchedule(status) {
       }));
     check.disabled = !status.actions.allowed;
     actions.append(get, check);
+    if (status.s3.enabled && !status.s3.problem) {
+      const up = button("Upload to S3", "Copy this archive to the bucket", () => s3Upload(archive.name));
+      up.disabled = !status.backup.allowed;
+      actions.append(up);
+    }
     const name = cell("");
     const code = document.createElement("code");
     code.textContent = archive.name;
@@ -773,6 +800,80 @@ function drawSchedule(status) {
   }));
   $("archives").hidden = false;
 }
+
+// The off-site copy: where it goes, and what may be done to it.
+function drawS3(status) {
+  const s3 = status.s3;
+  const allowed = status.backup.allowed;
+  if (!s3.enabled) $("s3-archives").hidden = true;
+  $("s3-buttons").hidden = !s3.enabled || !!s3.problem;
+  ["s3-test", "s3-upload", "s3-list"].forEach(id => { $(id).disabled = !allowed; });
+  $("s3-why").hidden = !s3.enabled || allowed;
+  $("s3-why").textContent = allowed ? "" : status.backup.reason;
+  const state = $("s3-state");
+  state.replaceChildren();
+  if (!s3.enabled) {
+    state.append(tagged("Off. Set maintenance.s3.enabled = true and name a bucket to copy backups off this host.", "muted"));
+  } else if (s3.problem) {
+    state.append(tagged("Misconfigured: " + s3.problem, "bad"));
+  } else {
+    const kept = s3.keep ? "keeping the newest " + s3.keep : "keeping all";
+    state.append(tagged("On — " + (s3.scheduled ? "each scheduled backup is copied to " : "no backup schedule; copies are made by hand to ")
+      + s3.destination + " (" + s3.endpoint + "), " + kept, s3.scheduled ? "good" : "warn"));
+  }
+}
+
+// One call to the bucket, and what came of it.
+async function s3call(method, path, body, describe) {
+  $("error").textContent = "";
+  $("s3-result").hidden = false;
+  $("s3-result").className = "muted";
+  $("s3-result").textContent = "Working…";
+  ["s3-test", "s3-upload", "s3-list"].forEach(id => { $(id).disabled = true; });
+  try {
+    const headers = credentials();
+    const request = { method, headers, cache: "no-store" };
+    if (body !== undefined) {
+      headers["content-type"] = "application/json";
+      request.body = JSON.stringify(body);
+    }
+    const response = await fetch(prefix + path, request);
+    if (!response.ok) throw new Error(response.status + " " + await explain(response));
+    const [text, className] = describe(await response.json());
+    $("s3-result").textContent = text;
+    $("s3-result").className = className;
+  } catch (error) {
+    $("s3-result").className = "bad";
+    $("s3-result").textContent = "Failed: " + (error.message || error);
+  }
+  load();
+}
+
+function s3Upload(name) {
+  return s3call("POST", "maintenance/s3/upload", name ? { name } : undefined, result => {
+    const uploaded = result.uploaded;
+    return ["Uploaded " + uploaded.name + " (" + size(uploaded.bytes) + ") to " + uploaded.destination
+      + (uploaded.removed.length ? "; removed " + uploaded.removed.length + " older from the bucket" : "") + ".", "good"];
+  });
+}
+
+$("s3-test").addEventListener("click", () => s3call("POST", "maintenance/s3/test", undefined,
+  result => ["Connected to " + result.destination + " — listed and wrote in " + result.took_ms + " ms.", "good"]));
+$("s3-upload").addEventListener("click", () => s3Upload());
+$("s3-list").addEventListener("click", () => s3call("GET", "maintenance/s3", undefined, result => {
+  $("s3-archives").tBodies[0].replaceChildren(...result.archives.map(archive => {
+    const row = document.createElement("tr");
+    const name = cell("");
+    const code = document.createElement("code");
+    code.textContent = archive.name;
+    name.append(code);
+    row.append(name, cell(when(archive.created_at_ms)), cell(size(archive.bytes), "num"));
+    return row;
+  }));
+  $("s3-archives").hidden = !result.archives.length;
+  return [result.archives.length ? result.archives.length + " archive(s) in " + result.destination + "."
+    : "No archives in " + result.destination + " yet.", result.archives.length ? "good" : "muted"];
+}));
 
 function drawLastBackup(status) {
   const last = status.last_backup;
@@ -1077,6 +1178,7 @@ async function load() {
     $("actions-why").hidden = status.actions.allowed;
     drawSchedule(status);
     drawLastBackup(status);
+    drawS3(status);
     drawRestore(status);
     drawRetention(status);
     drawStorage(status);

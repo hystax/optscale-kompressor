@@ -156,6 +156,119 @@ pub struct MaintenanceConfig {
     /// than this, so it holds across restarts. Zero takes none.
     #[serde(with = "humantime_serde")]
     pub optimize_every: Duration,
+    /// An off-site copy of every archive, on S3-compatible object storage.
+    pub s3: S3Config,
+}
+
+/// Where backup archives are copied to, off this host: any S3-compatible
+/// object store (AWS S3, MinIO, Cloudflare R2, Backblaze B2, Wasabi, Ceph…).
+///
+/// Off by default. When on, `serve` uploads each scheduled archive (with its
+/// `.sha256`) after writing it, and the Maintenance page can upload one on
+/// demand. Nothing is ever downloaded or restored from here by the service:
+/// fetch an archive with any S3 client and give it to `kompressor restore`.
+///
+/// The archive holds every tenant's statistics and fragments, so the bucket
+/// should be private, and the credentials should be able to write (and, with
+/// `keep`, delete) under `prefix` and nothing else.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct S3Config {
+    /// Copy archives to the bucket below.
+    pub enabled: bool,
+    /// The service's URL, `https://minio.internal:9000`. Empty is AWS S3 in
+    /// `region`.
+    pub endpoint: String,
+    /// The region requests are signed for. Most S3-compatible stores accept
+    /// any value; some (R2) want `auto`.
+    pub region: String,
+    pub bucket: String,
+    /// A key prefix ("folder") the archives are kept under.
+    pub prefix: String,
+    pub access_key_id: String,
+    /// Replaced by `<redacted>` wherever the configuration is shown.
+    pub secret_access_key: String,
+    /// Address the bucket as `endpoint/bucket/key` rather than
+    /// `bucket.endpoint/key`. What a store at your own address needs; AWS
+    /// takes either.
+    pub path_style: bool,
+    /// How many archives to keep in the bucket; older ones (and their
+    /// `.sha256`) are removed after each upload. Zero keeps them all, and is
+    /// the default: a bucket's own lifecycle rules are the safer place to
+    /// expire objects. Only names this writes itself are ever removed.
+    pub keep: u32,
+}
+
+impl Default for S3Config {
+    fn default() -> Self {
+        S3Config {
+            enabled: false,
+            endpoint: String::new(),
+            region: "us-east-1".to_string(),
+            bucket: String::new(),
+            prefix: "kompressor/".to_string(),
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
+            path_style: true,
+            keep: 0,
+        }
+    }
+}
+
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("enabled", &self.enabled)
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field("path_style", &self.path_style)
+            .field("keep", &self.keep)
+            .finish()
+    }
+}
+
+impl S3Config {
+    /// Where the archives go, for people: `s3://bucket/prefix/`.
+    pub fn location(&self) -> String {
+        let prefix = self.prefix.trim().trim_matches('/');
+        if prefix.is_empty() {
+            format!("s3://{}/", self.bucket.trim())
+        } else {
+            format!("s3://{}/{prefix}/", self.bucket.trim())
+        }
+    }
+
+    /// What is wrong with the settings, when something is. Only checked when
+    /// `enabled`.
+    pub fn problem(&self) -> Option<String> {
+        if self.bucket.trim().is_empty() {
+            return Some("maintenance.s3.bucket is empty".into());
+        }
+        if self.access_key_id.is_empty() || self.secret_access_key.is_empty() {
+            return Some(
+                "maintenance.s3.access_key_id and secret_access_key must both be set".into(),
+            );
+        }
+        if self.region.trim().is_empty() {
+            return Some("maintenance.s3.region is empty".into());
+        }
+        if !self.endpoint.is_empty() {
+            match url::Url::parse(&self.endpoint) {
+                Ok(url) if matches!(url.scheme(), "http" | "https") && url.host().is_some() => {}
+                _ => {
+                    return Some(format!(
+                        "maintenance.s3.endpoint {:?} is not an http(s) URL",
+                        self.endpoint
+                    ));
+                }
+            }
+        }
+        None
+    }
 }
 
 impl Default for MaintenanceConfig {
@@ -169,6 +282,7 @@ impl Default for MaintenanceConfig {
             backup_keep: 7,
             backup_max_age: Duration::ZERO,
             optimize_every: Duration::from_secs(24 * 3_600),
+            s3: S3Config::default(),
         }
     }
 }
@@ -1724,6 +1838,33 @@ impl Config {
                         self.maintenance.optimize_every = every;
                     }
                 }
+                "s3__enabled" => {
+                    self.maintenance.s3.enabled = parse_bool_setting(
+                        "maintenance.s3.enabled",
+                        value,
+                        self.maintenance.s3.enabled,
+                    )
+                }
+                "s3__path_style" => {
+                    self.maintenance.s3.path_style = parse_bool_setting(
+                        "maintenance.s3.path_style",
+                        value,
+                        self.maintenance.s3.path_style,
+                    )
+                }
+                "s3__keep" => {
+                    if let Ok(keep) = value.parse() {
+                        self.maintenance.s3.keep = keep;
+                    }
+                }
+                "s3__endpoint" => self.maintenance.s3.endpoint = value.to_string(),
+                "s3__region" => self.maintenance.s3.region = value.to_string(),
+                "s3__bucket" => self.maintenance.s3.bucket = value.to_string(),
+                "s3__prefix" => self.maintenance.s3.prefix = value.to_string(),
+                "s3__access_key_id" => self.maintenance.s3.access_key_id = value.to_string(),
+                "s3__secret_access_key" => {
+                    self.maintenance.s3.secret_access_key = value.to_string()
+                }
                 _ => {}
             },
             "refs" => match field {
@@ -2136,6 +2277,11 @@ impl Config {
                 "maintenance.backup_every must be at least one minute (or zero for none)".into(),
             ));
         }
+        if self.maintenance.s3.enabled
+            && let Some(problem) = self.maintenance.s3.problem()
+        {
+            return Err(ConfigError::Invalid(problem));
+        }
         if let Some(server) = self
             .mcp
             .servers
@@ -2234,6 +2380,9 @@ impl Config {
         }
         for key in &mut copy.auth.keys {
             key.key = "<redacted>".to_string();
+        }
+        if !copy.maintenance.s3.secret_access_key.is_empty() {
+            copy.maintenance.s3.secret_access_key = "<redacted>".to_string();
         }
         for upstream in &mut copy.proxy.upstreams {
             for value in upstream.headers.values_mut() {
@@ -3439,5 +3588,79 @@ mod tests {
         let mut config = Config::default();
         config.apply_env(&[("KOMPRESSOR__REFS__BROWSE".into(), "true".into())]);
         assert!(config.refs.browse);
+    }
+
+    #[test]
+    fn the_off_site_copy_is_off_by_default_and_set_from_a_file_or_the_environment() {
+        assert!(!Config::default().maintenance.s3.enabled);
+        let from_file: Config = toml::from_str(
+            "[maintenance.s3]\nenabled = true\nbucket = \"b\"\naccess_key_id = \"k\"\nsecret_access_key = \"s\"\nkeep = 3\n",
+        )
+        .expect("parses");
+        assert!(from_file.maintenance.s3.enabled);
+        assert_eq!(from_file.maintenance.s3.keep, 3);
+        assert_eq!(from_file.maintenance.s3.location(), "s3://b/kompressor/");
+        assert!(from_file.validate().is_ok());
+        assert!(toml::from_str::<Config>("[maintenance.s3]\nbuckets = \"x\"\n").is_err());
+
+        let mut config = Config::default();
+        config.apply_env(&[
+            ("KOMPRESSOR__MAINTENANCE__S3__ENABLED".into(), "true".into()),
+            (
+                "KOMPRESSOR__MAINTENANCE__S3__BUCKET".into(),
+                "env-bucket".into(),
+            ),
+            (
+                "KOMPRESSOR__MAINTENANCE__S3__ENDPOINT".into(),
+                "http://minio:9000".into(),
+            ),
+            (
+                "KOMPRESSOR__MAINTENANCE__S3__ACCESS_KEY_ID".into(),
+                "k".into(),
+            ),
+            (
+                "KOMPRESSOR__MAINTENANCE__S3__SECRET_ACCESS_KEY".into(),
+                "s".into(),
+            ),
+            ("KOMPRESSOR__MAINTENANCE__S3__KEEP".into(), "5".into()),
+            (
+                "KOMPRESSOR__MAINTENANCE__S3__PATH_STYLE".into(),
+                "false".into(),
+            ),
+        ]);
+        let s3 = &config.maintenance.s3;
+        assert!(s3.enabled && !s3.path_style);
+        assert_eq!(
+            (s3.bucket.as_str(), s3.endpoint.as_str(), s3.keep),
+            ("env-bucket", "http://minio:9000", 5)
+        );
+        assert!(config.validate().is_ok());
+        assert!(
+            config.env.iter().all(|o| o.effect == EnvEffect::Applied),
+            "every variable did something: {:?}",
+            config.env
+        );
+    }
+
+    #[test]
+    fn an_off_site_copy_that_cannot_work_stops_the_service_from_starting() {
+        let mut config = Config::default();
+        config.maintenance.s3.enabled = true;
+        let error = config.validate().expect_err("no bucket").to_string();
+        assert!(error.contains("maintenance.s3.bucket"), "{error}");
+        // Off, the same settings are nobody's business.
+        config.maintenance.s3.enabled = false;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn the_s3_secret_key_is_never_shown() {
+        let mut config = Config::default();
+        config.maintenance.s3.secret_access_key = "wJalrXUtnFEMI-secret".into();
+        config.maintenance.s3.access_key_id = "AKIAEXAMPLE".into();
+        let rendered = config.redacted_toml();
+        assert!(!rendered.contains("wJalrXUtnFEMI-secret"), "{rendered}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!format!("{config:?}").contains("wJalrXUtnFEMI-secret"));
     }
 }

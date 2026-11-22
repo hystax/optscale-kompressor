@@ -186,12 +186,19 @@ fn scheduled_backups(
         let mut ticks = tokio::time::interval(tick);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut failed_at: Option<std::time::Instant> = None;
+        // The off-site copy: the newest archive known to be in the bucket,
+        // and when an upload last failed.
+        let mut synced: Option<String> = None;
+        let mut upload_failed_at: Option<std::time::Instant> = None;
         loop {
             tokio::select! {
                 biased;
                 _ = shutdown.changed() => break,
                 _ = ticks.tick() => {
                     if failed_at.is_some_and(|at| at.elapsed() < retry) {
+                        // A backup that failed is not tried again yet; an
+                        // archive that is already written can still go up.
+                        upload_if_needed(&core, &mut synced, &mut upload_failed_at, retry).await;
                         continue;
                     }
                     let for_task = core.clone();
@@ -259,10 +266,85 @@ fn scheduled_backups(
                             tracing::warn!(%error, "scheduled backup task stopped");
                         }
                     }
+                    upload_if_needed(&core, &mut synced, &mut upload_failed_at, retry).await;
                 }
             }
         }
     }))
+}
+
+/// Copy the newest scheduled archive to the bucket (`maintenance.s3`), when
+/// that is on and the bucket does not have it yet.
+///
+/// Run after every scheduled backup, and on ticks between them: an upload
+/// that failed — the store down, a key revoked — is retried after `retry`
+/// without a new backup, and the archive left by a run before a restart, or
+/// from before the bucket was turned on, goes up too. What the bucket holds
+/// is asked once per new archive, not once a tick.
+async fn upload_if_needed(
+    core: &Arc<AppCore>,
+    synced: &mut Option<String>,
+    failed_at: &mut Option<std::time::Instant>,
+    retry: std::time::Duration,
+) {
+    let s3 = &core.config().maintenance.s3;
+    if !s3.enabled || failed_at.is_some_and(|at| at.elapsed() < retry) {
+        return;
+    }
+    let (for_task, known) = (core.clone(), synced.clone());
+    let attempt = tokio::task::spawn_blocking(move || {
+        let config = for_task.config();
+        let newest = kompressor_core::backup::list_archives(&config.maintenance.backup_dir)
+            .into_iter()
+            .next()
+            .map(|archive| archive.name);
+        if newest.is_none() || newest == known {
+            return Ok(None);
+        }
+        kompressor_core::s3::sync_newest(config)
+    })
+    .await;
+    let record = |destination: String, bytes: u64, error: Option<String>| {
+        core.stats().send(kompressor_stats::Event::Backup(
+            kompressor_stats::events::BackupEvent {
+                time_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|since| since.as_millis() as i64)
+                    .unwrap_or(0),
+                origin: "schedule".to_string(),
+                destination,
+                bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
+                databases: 0,
+                ok: error.is_none(),
+                error,
+            },
+        ));
+    };
+    match attempt {
+        Ok(Ok(Some((name, uploaded)))) => {
+            *failed_at = None;
+            *synced = Some(name);
+            if let Some(uploaded) = uploaded {
+                tracing::info!(
+                    destination = %uploaded.destination,
+                    bytes = uploaded.bytes,
+                    removed = uploaded.removed.len(),
+                    "scheduled backup uploaded"
+                );
+                record(uploaded.destination, uploaded.bytes, None);
+            }
+        }
+        Ok(Ok(None)) => {}
+        Ok(Err(error)) => {
+            *failed_at = Some(std::time::Instant::now());
+            tracing::warn!(%error, retry_in = ?retry, "uploading the scheduled backup failed");
+            record(s3.location(), 0, Some(error.to_string()));
+        }
+        Err(error) => {
+            *failed_at = Some(std::time::Instant::now());
+            tracing::warn!(%error, "backup upload task stopped");
+        }
+    }
 }
 
 /// Whether an optimize last done at `last_ms` (none on record: never) is due
@@ -1033,6 +1115,165 @@ mod tests {
         config.refs.backend = RefsBackend::Memory;
         config.stats.enabled = false;
         config
+    }
+
+    /// A bucket that keeps what is PUT to it, and refuses everything while
+    /// `down` is set. Returns its URL and what it holds.
+    #[allow(clippy::type_complexity)]
+    fn bucket(
+        down: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (
+        String,
+        Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>>,
+    ) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let held = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let shared = held.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let (held, down) = (shared.clone(), down.clone());
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut out = stream;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let mut words = line.split_whitespace();
+                        let method = words.next().unwrap_or("").to_string();
+                        let target = words.next().unwrap_or("").to_string();
+                        let mut length = 0usize;
+                        loop {
+                            let mut header = String::new();
+                            reader.read_line(&mut header).unwrap();
+                            let header = header.trim_end().to_ascii_lowercase();
+                            if header.is_empty() {
+                                break;
+                            }
+                            if let Some(v) = header.strip_prefix("content-length:") {
+                                length = v.trim().parse().unwrap();
+                            }
+                        }
+                        let mut body = vec![0u8; length];
+                        reader.read_exact(&mut body).unwrap();
+                        let path = target
+                            .split('?')
+                            .next()
+                            .unwrap()
+                            .trim_start_matches("/bucket/");
+                        let mut held = held.lock().unwrap();
+                        let (status, reply) = if down.load(Ordering::SeqCst) {
+                            (
+                                503,
+                                "<Error><Code>SlowDown</Code><Message>down</Message></Error>"
+                                    .to_string(),
+                            )
+                        } else if method == "PUT" {
+                            held.insert(path.to_string(), body);
+                            (200, String::new())
+                        } else if method == "DELETE" {
+                            held.remove(path);
+                            (204, String::new())
+                        } else {
+                            let items: String = held
+                                .iter()
+                                .map(|(k, v)| {
+                                    format!(
+                                        "<Contents><Key>{k}</Key><Size>{}</Size></Contents>",
+                                        v.len()
+                                    )
+                                })
+                                .collect();
+                            (
+                                200,
+                                format!(
+                                    "<ListBucketResult><IsTruncated>false</IsTruncated>{items}</ListBucketResult>"
+                                ),
+                            )
+                        };
+                        let _ = write!(
+                            out,
+                            "HTTP/1.1 {status} X\r\nContent-Length: {}\r\n\r\n{reply}",
+                            reply.len()
+                        );
+                    }
+                });
+            }
+        });
+        (url, held)
+    }
+
+    /// With `maintenance.s3` on, each scheduled archive goes to the bucket
+    /// with its checksum; while the bucket is down the backups keep being
+    /// taken, the failure is on record, and once it is back the archive goes
+    /// up without another backup being needed.
+    #[tokio::test]
+    async fn scheduled_archives_are_uploaded_and_a_failed_upload_is_retried() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let down = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (url, held) = bucket(down.clone());
+        let mut config = test_config();
+        config.refs.backend = RefsBackend::Sqlite;
+        config.refs.path = dir.path().join("refs.db");
+        let backups = dir.path().join("backups");
+        config.maintenance.backup_dir = backups.clone();
+        // Long enough that only one backup is taken during the test; short
+        // enough that the retry (capped at the interval) comes quickly.
+        config.maintenance.backup_every = std::time::Duration::from_secs(2);
+        config.maintenance.s3 = kompressor_core::config::S3Config {
+            enabled: true,
+            endpoint: url,
+            bucket: "bucket".into(),
+            prefix: "p".into(),
+            access_key_id: "k".into(),
+            secret_access_key: "s".into(),
+            ..Default::default()
+        };
+        let core = Arc::new(AppCore::new(
+            config.clone(),
+            kompressor_core::build_ref_store(&config).unwrap(),
+            kompressor_stats::null_sink(),
+        ));
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let task = scheduled_backups(core, rx).expect("a schedule");
+
+        // The backup is taken though the bucket refuses everything.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while kompressor_core::backup::list_archives(&backups).is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("a backup is taken with the bucket down");
+        assert!(held.lock().unwrap().is_empty());
+
+        down.store(false, Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while held.lock().unwrap().len() < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the archive and its checksum are uploaded once the bucket is back");
+        let name = kompressor_core::backup::list_archives(&backups)[0]
+            .name
+            .clone();
+        {
+            let held = held.lock().unwrap();
+            assert!(held.contains_key(&format!("p/{name}")), "{:?}", held.keys());
+            assert!(held.contains_key(&format!("p/{name}.sha256")));
+        }
+
+        stop.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("stops with the service")
+            .unwrap();
     }
 
     /// With a schedule, `serve` takes a backup without being asked — at once

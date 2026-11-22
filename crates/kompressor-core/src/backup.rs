@@ -88,6 +88,13 @@ pub struct Manifest {
 /// A name for an archive written now: `kompressor-backup-20261120-071530.tar.gz`,
 /// in UTC.
 pub fn archive_name(now_ms: i64) -> String {
+    let (year, month, day, hour, minute, second) = civil(now_ms);
+    format!("kompressor-backup-{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}.tar.gz")
+}
+
+/// UTC `(year, month, day, hour, minute, second)` of a time in milliseconds
+/// since the epoch.
+pub(crate) fn civil(now_ms: i64) -> (i64, i64, i64, i64, i64, i64) {
     let seconds = now_ms.div_euclid(1_000);
     let (days, of_day) = (seconds.div_euclid(86_400), seconds.rem_euclid(86_400));
     // Civil date from days since the epoch (Howard Hinnant's algorithm), so
@@ -101,11 +108,13 @@ pub fn archive_name(now_ms: i64) -> String {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "kompressor-backup-{year:04}{month:02}{day:02}-{:02}{:02}{:02}.tar.gz",
+    (
+        year,
+        month,
+        day,
         of_day / 3_600,
         of_day % 3_600 / 60,
-        of_day % 60
+        of_day % 60,
     )
 }
 

@@ -57,6 +57,11 @@ pub enum ApiError {
     /// A stats or config lookup that found nothing.
     #[error("{0}")]
     NotFound(String),
+    /// A store this server writes to off-host (S3-compatible object
+    /// storage) refused or could not be reached. The message is the store's
+    /// own reason and never carries a credential.
+    #[error("{0}")]
+    BadGateway(String),
 }
 
 impl ApiError {
@@ -71,6 +76,7 @@ impl ApiError {
             ApiError::Saturated => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
+            ApiError::BadGateway(_) => StatusCode::BAD_GATEWAY,
         }
     }
 
@@ -85,6 +91,7 @@ impl ApiError {
             ApiError::Saturated => "engine_saturated",
             ApiError::Internal(_) => "internal_error",
             ApiError::NotFound(_) => "not_found",
+            ApiError::BadGateway(_) => "storage_unavailable",
         }
     }
 
