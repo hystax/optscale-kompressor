@@ -232,6 +232,10 @@ struct Seen {
     /// writes; OpenAI does not, so this stays false there and its zero reads
     /// keep meaning what they did.
     rewritten: bool,
+    /// How much of the conversation's first request the provider held in its
+    /// cache once it had answered: what it read plus what it wrote. See
+    /// [`PrefixTracker::opened_with`]. `None` until that answer arrives.
+    opened_with: Option<u32>,
 }
 
 /// Which conversation, under which model, last sent one history.
@@ -579,6 +583,7 @@ impl PrefixTracker {
         // Like `known`: a usage-less finish says nothing about writes either.
         let rewritten =
             cache_read.is_none() && seen.get(&fingerprint).is_some_and(|prior| prior.rewritten);
+        let opened_with = seen.get(&fingerprint).and_then(|prior| prior.opened_with);
 
         // Within one conversation the prefix only grows, so the cache read the
         // provider reports should never fall. When it does, something outside
@@ -619,8 +624,38 @@ impl PrefixTracker {
                 idled_past_ttl,
                 most_messages,
                 rewritten,
+                opened_with,
             },
         );
+    }
+
+    /// Record how much of the conversation's first request the provider held
+    /// in its cache once it had answered it: `cached` is what it read plus
+    /// what it wrote. Called beside [`PrefixTracker::record`], and only for
+    /// the request that opened the conversation; the first figure filed
+    /// stands.
+    pub fn record_opening(&self, fingerprint: u64, cached: u32) {
+        if let Ok(mut seen) = self.seen.lock()
+            && let Some(entry) = seen.get_mut(&fingerprint)
+            && entry.opened_with.is_none()
+        {
+            entry.opened_with = Some(cached);
+        }
+    }
+
+    /// How many tokens of the conversation's first request the provider held
+    /// in its cache after answering it. `None` for a conversation not seen
+    /// before, or whose first answer has not arrived.
+    ///
+    /// That much is not this conversation's alone. Another conversation that
+    /// opens with the same bytes — a second run of the same task, with the
+    /// same instructions, tools and first message — reads and renews the
+    /// same entry, so the provider can go on serving it after everything
+    /// this conversation wrote later has lapsed. A read no longer than this
+    /// is therefore no sign that this conversation's cache was alive.
+    pub fn opened_with(&self, fingerprint: u64) -> Option<u32> {
+        let seen = self.seen.lock().ok()?;
+        seen.get(&fingerprint)?.opened_with
     }
 
     /// Record that the response just filed by [`PrefixTracker::record`] also
@@ -1247,6 +1282,7 @@ impl PrefixTracker {
                 idled_past_ttl: false,
                 most_messages: 0,
                 rewritten: false,
+                opened_with: None,
             },
         );
         observed
@@ -1748,6 +1784,34 @@ mod tests {
     /// A replay moves the tracker's clock, and everything that measures idle
     /// time moves with it: what is recorded, the adaptive TTL, a predicted
     /// lapse. A ping read during the pause starts the clock again.
+    #[test]
+    fn what_the_first_request_left_cached_is_filed_once_and_kept() {
+        let tracker = PrefixTracker::new(Duration::from_secs(0));
+        assert_eq!(tracker.opened_with(9), None, "never seen");
+        tracker.record_opening(9, 18_300);
+        assert_eq!(
+            tracker.opened_with(9),
+            None,
+            "nothing recorded to hang it on"
+        );
+
+        tracker.record(9, Some(14_482), Some(18_300), 0);
+        assert_eq!(tracker.opened_with(9), None, "not until it is filed");
+        tracker.record_opening(9, 18_300);
+        tracker.record_opening(9, 40_000);
+        assert_eq!(
+            tracker.opened_with(9),
+            Some(18_300),
+            "the first figure stands"
+        );
+
+        // Later responses, with usage or without, leave it as it was.
+        tracker.record(9, Some(30_000), Some(31_000), 0);
+        tracker.record(9, None, None, 0);
+        assert_eq!(tracker.opened_with(9), Some(18_300));
+        assert_eq!(tracker.opened_with(10), None, "another conversation");
+    }
+
     #[test]
     fn a_clock_moved_forward_is_idle_time_for_every_conversation() {
         let tracker = PrefixTracker::new(Duration::from_secs(0));

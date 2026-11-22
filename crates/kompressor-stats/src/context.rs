@@ -128,6 +128,14 @@ pub struct PrefixObservation {
     /// lapse of this one's. `None` on a row written before this was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continues: Option<bool>,
+    /// Tokens of the conversation's first request the provider held in its
+    /// cache after answering it: what it read plus what it wrote. Another
+    /// conversation opening with the same bytes keeps that much alive, so a
+    /// read no longer than this says nothing of this conversation's own
+    /// cache. Zero on the first request and on a row written before this was
+    /// recorded.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub shared_read: u32,
     /// The cache lifetime the previous request asked the provider for, in
     /// seconds, where the request says: Anthropic's five minutes or an hour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -253,8 +261,17 @@ impl PrefixObservation {
     /// three, came out below the real opening, and so called three correct
     /// predictions wrong and ended prediction for the run. Erring high costs
     /// only sight of a read that stops within the first few messages.
+    ///
+    /// Nor is the opening all that is shared. A second run of the same task
+    /// opens with the same first message too, and keeps the provider's entry
+    /// for it alive: three trials of one task under Harbor did, one of them
+    /// writing for an hour, and a conversation that had lost its own 1,161
+    /// tokens still read the 18,300 its first request had found there — a
+    /// correct prediction, counted as wrong. So the read also has to go past
+    /// what the conversation's first request left cached (`shared_read`).
     pub fn read_reaches_messages(&self, read: u32) -> bool {
-        u64::from(read) > self.opening_tokens() + 1_024
+        let shared = (self.opening_tokens() + 1_024).max(u64::from(self.shared_read));
+        u64::from(read) > shared
     }
 
     /// An upper estimate of the tokens the provider caches in front of the

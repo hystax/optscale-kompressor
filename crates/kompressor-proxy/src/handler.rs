@@ -953,6 +953,7 @@ fn prefix_identity(
             idle_ms: u64::try_from(idle.as_millis()).unwrap_or(u64::MAX),
             was_warm,
             continues,
+            opened_with: state.prefixes.opened_with(fingerprint),
         });
     let mut incoming = crate::drift::Segments::sized(
         &value,
@@ -3251,6 +3252,18 @@ impl Recorder {
             // wrote nothing" would have the next turn recompacted again.
             let cache_read = self.event.cache_read_tokens.filter(|_| !predates);
             self.prefixes.record(prefix, cache_read, prompt, rounds);
+            // The request that opened the conversation: what the provider
+            // holds of it now is what another conversation opening with the
+            // same bytes can keep alive, and so no evidence about this one.
+            let opens = self
+                .event
+                .prefix
+                .as_ref()
+                .is_some_and(|seen| seen.idle_ms.is_none());
+            if let (true, false, Some(read)) = (opens, predates, self.event.cache_read_tokens) {
+                self.prefixes
+                    .record_opening(prefix, read.saturating_add(written));
+            }
             if anthropic && written > 0 && !predates {
                 self.prefixes.record_rewritten(prefix);
             }

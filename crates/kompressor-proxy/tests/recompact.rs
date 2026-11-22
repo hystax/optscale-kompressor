@@ -261,8 +261,11 @@ async fn without_predicted_an_idle_conversation_is_left_alone() {
 #[tokio::test]
 async fn predictions_that_keep_reading_from_cache_end_prediction() {
     let harness = Harness::with(first_seen(ColdRecompact::Predicted)).await;
-    // Every turn after the first is served from cache, lapse predicted or not.
-    answering(&harness, &[(0, 30_000)]).await;
+    // Every turn after the first is served from cache, lapse predicted or not,
+    // and further than the first request reached: a read no longer than what
+    // that request left cached would be no evidence (see the test of a second
+    // run of the same task below).
+    answering(&harness, &[(0, 20_000)]).await;
     harness.post(MESSAGES, &conversation(0)).await;
     harness.post(MESSAGES, &conversation(1)).await;
     let conversation_id = conversation_of(&harness);
@@ -571,6 +574,60 @@ async fn a_lapse_that_still_reads_the_shared_opening_is_not_a_wrong_prediction()
     let recompact = harness.state.recompact();
     assert_eq!(recompact.wrong_predictions(), 0);
     assert!(recompact.predicting());
+}
+
+/// Nor is the opening all another conversation can keep cached. A second run
+/// of the same task opens with the same first message, so the provider goes
+/// on serving that much after everything this conversation wrote later has
+/// lapsed. Measured under Harbor, three trials a task: a conversation whose
+/// first request already read 18,300 tokens lost its own 1,161 and read the
+/// 18,300 again, and the correct prediction was counted as wrong.
+#[tokio::test]
+async fn a_lapse_that_still_reads_what_the_first_request_found_is_not_a_wrong_prediction() {
+    let harness = Harness::with(first_seen(ColdRecompact::Predicted)).await;
+    answering(
+        &harness,
+        &[
+            (18_300, 0),
+            (18_300, 1_161),
+            (18_300, 1_919),
+            (18_300, 1_919),
+            (18_300, 1_919),
+            // The cache alive after all: a read past what the first request
+            // found is still a prediction the provider contradicts.
+            (20_219, 554),
+        ],
+    )
+    .await;
+    harness.post(MESSAGES, &conversation(0)).await;
+    harness.post(MESSAGES, &conversation(1)).await;
+    let conversation_id = conversation_of(&harness);
+    let prefixes = harness.state.prefixes();
+    assert_eq!(prefixes.opened_with(conversation_id), Some(18_300));
+    let recompact = harness.state.recompact();
+    for lapse in 0..3 {
+        prefixes.age_for_test(conversation_id, Duration::from_secs(420));
+        harness.post(MESSAGES, &conversation(2 + lapse)).await;
+        let row = proxy_rows(&harness.events)
+            .pop()
+            .and_then(|row| row.prefix)
+            .expect("observed");
+        assert_eq!(
+            (row.recompacted.as_deref(), row.shared_read),
+            (Some("predicted"), 18_300),
+            "lapse {lapse}"
+        );
+        assert!(
+            !row.prediction_was_wrong(Some(18_300), 0),
+            "as the report counts it"
+        );
+    }
+    assert_eq!(recompact.wrong_predictions(), 0);
+    assert!(recompact.predicting());
+
+    prefixes.age_for_test(conversation_id, Duration::from_secs(420));
+    harness.post(MESSAGES, &conversation(5)).await;
+    assert_eq!(recompact.wrong_predictions(), 1);
 }
 
 /// A recompaction whose response carried no usage leaves the tracker holding

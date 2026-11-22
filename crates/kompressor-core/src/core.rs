@@ -655,7 +655,10 @@ impl AppCore {
             }
         }
         for (kind, group) in &by_kind {
-            let meta = PutMeta { kind: *kind, ..base.clone() };
+            let meta = PutMeta {
+                kind: *kind,
+                ..base.clone()
+            };
             if let Err(error) = self.refs.put_many(&identity.tenant, group, &meta) {
                 tracing::warn!(%error, "could not retain elided fragments");
                 return false;

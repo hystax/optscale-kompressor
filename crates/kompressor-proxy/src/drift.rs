@@ -915,6 +915,9 @@ pub(crate) struct Idle {
     pub(crate) was_warm: bool,
     /// Whether the request carries more messages than any before it.
     pub(crate) continues: bool,
+    /// Tokens of the conversation's first request the provider held in its
+    /// cache after answering it (`PrefixTracker::opened_with`).
+    pub(crate) opened_with: Option<u32>,
 }
 
 /// Put one request's observation together.
@@ -957,6 +960,7 @@ pub(crate) fn observation(
         idle_ms: idle.map(|idle| idle.idle_ms),
         was_warm: idle.is_some_and(|idle| idle.was_warm),
         continues: idle.map(|idle| idle.continues),
+        shared_read: idle.and_then(|idle| idle.opened_with).unwrap_or(0),
         lifetime_s: (family == ApiFamily::AnthropicMessages)
             .then_some(compared.previous_one_hour)
             .flatten()
@@ -1437,6 +1441,7 @@ mod tests {
                 idle_ms: 42,
                 was_warm: true,
                 continues: true,
+                opened_with: Some(18_300),
             }),
         );
         assert_eq!(later.volatile, None);
@@ -1445,6 +1450,7 @@ mod tests {
             (Some(42), true, Some(3_600))
         );
         assert_eq!((first.continues, later.continues), (None, Some(true)));
+        assert_eq!((first.shared_read, later.shared_read), (0, 18_300));
         assert_eq!(first.lifetime_s, None, "no earlier request to have asked");
     }
 

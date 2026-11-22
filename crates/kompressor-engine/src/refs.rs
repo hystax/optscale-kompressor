@@ -15,12 +15,12 @@
 //! re-emits byte-identical markers and re-storing a fragment is an idempotent
 //! overwrite that refreshes its TTL.
 
+use crate::types::Kind;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use blake2::Blake2b;
 use blake2::Digest;
 use blake2::digest::consts::U9;
-use crate::types::Kind;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 

@@ -702,6 +702,38 @@ fn a_read_of_a_tool_heavy_opening_is_not_a_read_of_the_conversation() {
     assert!(!json.contains("opening_bytes"), "{json}");
 }
 
+/// What the conversation's first request left cached is shared too: a second
+/// run of the same task opens with the same first message and keeps it there.
+#[test]
+fn a_read_of_what_the_first_request_left_cached_is_not_a_read_of_the_conversation() {
+    let seen = PrefixObservation {
+        compared: true,
+        opening_bytes: 40_705,
+        shared_read: 18_300,
+        ..PrefixObservation::default()
+    };
+    assert!(!seen.read_reaches_messages(18_300));
+    assert!(!seen.prediction_was_wrong(Some(18_300), 0));
+    assert!(seen.prediction_was_wrong(Some(18_301), 0));
+    use crate::context::LapseOutcome;
+    assert_eq!(seen.lapse_outcome(true, 18_300), LapseOutcome::Full);
+    assert_eq!(seen.lapse_outcome(true, 19_000), LapseOutcome::Partial);
+    // A first request that found less than the opening does not lower the bar.
+    let small = PrefixObservation {
+        shared_read: 2_000,
+        ..seen.clone()
+    };
+    assert!(!small.read_reaches_messages(14_482));
+    // Stored only where there is something to say, and read back as zero.
+    let json = serde_json::to_string(&PrefixObservation::default()).unwrap();
+    assert!(!json.contains("shared_read"), "{json}");
+    assert!(
+        serde_json::to_string(&seen)
+            .unwrap()
+            .contains("\"shared_read\":18300")
+    );
+}
+
 /// What a lost prefix is put down to, case by case.
 #[test]
 fn a_loss_is_classified_by_what_else_was_true_of_the_request() {
