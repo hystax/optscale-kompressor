@@ -185,6 +185,11 @@ jobs:
       - name: bench
         run: make bench
 
+      # The scripts that read a run and replay a capture, checked against
+      # themselves and — the replay — against the binary just built.
+      - name: script self-tests
+        run: make bench-selftest
+
       # The docs against the binary that ships: the config reference has to
       # parse, documented endpoints have to be served, and the § cross-links
       # have to resolve.

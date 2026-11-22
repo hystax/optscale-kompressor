@@ -104,9 +104,15 @@ sync-check: ## Org invariants: crates carry `repository`, CI uses only allowed a
 check: lint test bench bench-selftest docs-check ## Everything CI gates on (no docker; see `check-full`)
 
 .PHONY: bench-selftest
-bench-selftest: ## The benchmark reader's own checks. No build, no provider, no spend
+bench-selftest: ## The benchmark and replay scripts' own checks. No provider, no spend
 	python3 scripts/harbor/bench.py --self-test
 	python3 scripts/harbor/ab.py --self-test
+	# The scripts a run is read with. They decide whether a cache loss is
+	# called ours and whether a replay can reach a provider, and until they ran
+	# here a wrong answer from either was found by reading a report. The replay
+	# suite drives a built binary where there is one, and skips that where not.
+	python3 -m unittest discover -s scripts/harbor -p 'test_*.py'
+	python3 -m unittest discover -s scripts/bench -p 'test_*.py'
 
 .PHONY: check-full
 check-full: check e2e ## `check` plus the hermetic end-to-end suite. Needs docker
@@ -135,10 +141,10 @@ test-cache-replay: ## Price a captured run through the proxy: make test-cache-re
 	  -p kompressor-proxy --test cachesavings a_captured_run -- --nocapture
 
 .PHONY: replay-diff
-replay-diff: release ## Byte-compare upstream traffic of two binaries on a capture: make replay-diff BODIES=… BASE_BIN=…
+replay-diff: release ## Byte-compare upstream traffic of two binaries on a capture: make replay-diff BODIES=… BASE_BIN=… [CONFIG=…]
 	@[ -n "$(BODIES)" ] && [ -n "$(BASE_BIN)" ] || { echo "set BODIES (a kompressor-bodies.jsonl) and BASE_BIN (the binary to compare against)" >&2; exit 2; }
-	python3 scripts/bench/replay-bodies.py --bin "$(BASE_BIN)" --capture "$(BODIES)" --out target/replay/base
-	python3 scripts/bench/replay-bodies.py --bin ./$(RELEASE_BIN) --capture "$(BODIES)" --out target/replay/head
+	python3 scripts/bench/replay-bodies.py --bin "$(BASE_BIN)" --capture "$(BODIES)" --out target/replay/base $(if $(CONFIG),--config "$(CONFIG)")
+	python3 scripts/bench/replay-bodies.py --bin ./$(RELEASE_BIN) --capture "$(BODIES)" --out target/replay/head $(if $(CONFIG),--config "$(CONFIG)")
 	python3 scripts/bench/replay-bodies.py --compare target/replay/base target/replay/head
 
 .PHONY: bench

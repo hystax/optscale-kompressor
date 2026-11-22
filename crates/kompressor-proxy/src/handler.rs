@@ -356,6 +356,11 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
             request_id = %request_id,
             how = prepared.recompacted.map(|(kind, _)| kind.as_str()),
             reads_decided = held,
+            // Beside the claim, because the claim is only that the freeze was
+            // lifted and the whole conversation offered to the engine. On
+            // three runs of 2026-11-21/22 that line was read as a saving and
+            // the figure was nought: the conversation held nothing to remove.
+            saved_tokens = prepared.saved_tokens,
             "the provider's cache was gone; recompacted the whole conversation"
         );
     }

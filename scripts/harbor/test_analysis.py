@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Offline regressions: python3 -m unittest discover -s scripts/harbor -p 'test_*.py'."""
 import copy
+import contextlib
+import io
 from collections import defaultdict
 import importlib.util
 import json
+import sqlite3
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 spec = importlib.util.spec_from_file_location("cache_diff", Path(__file__).with_name("cache-loss-diff.py"))
 cache = importlib.util.module_from_spec(spec)
@@ -25,6 +29,87 @@ def classify(a, b, ia=None, ib=None):
 
 
 class AttributionTests(unittest.TestCase):
+    def test_keepwarm_body_identity_requires_a_ping_row(self):
+        row = dict(request_id="request.keepwarm3", keep_warm=1)
+        self.assertEqual(cache.captured_request_id(row), "request")
+        row["keep_warm"] = 0
+        self.assertEqual(cache.captured_request_id(row), "request.keepwarm3")
+
+    def run_with(self, rows, records, loss):
+        """`analyse` over a run directory holding just these rows and bodies."""
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            with contextlib.closing(sqlite3.connect(run / "kompressor-stats.db")) as db, db:
+                db.execute("CREATE TABLE proxy_requests (request_id TEXT, time_ms INT, keep_warm INT)")
+                db.execute("CREATE TABLE optimization_events (request_id TEXT, messages_total INT)")
+                db.executemany("INSERT INTO proxy_requests VALUES (?, ?, ?)", rows)
+            lines = [json.dumps(dict(request_id=rid, dir=direction, body=json.dumps(value)))
+                     for rid, direction, value in records]
+            # What a ping leaves in the capture: its outcome, and no body.
+            lines.append(json.dumps(dict(request_id="a.keepwarm1", dir="keep-warm",
+                                         status=200, read=1000)))
+            (run / "kompressor-bodies.jsonl").write_text("\n".join(lines))
+            module = SimpleNamespace(cache_losses=lambda _: [loss])
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = cache.analyse(run, module)
+            return code, output.getvalue()
+
+    LOSS_AFTER_PING = dict(before_request_id="a.keepwarm1", request_id="b", was=1000,
+                           now=0, lost=1000, gap_ms=400000)
+
+    def test_a_loss_after_a_ping_is_diffed_against_the_request_the_ping_repeated(self):
+        # The run of 2026-11-22 06:14: the last cache observation before the
+        # loss was a ping, and the tool said "no body pair captured" although
+        # the request the ping repeated was captured in full.
+        code, output = self.run_with(
+            [("a", 1, 0), ("a.keepwarm1", 2, 1), ("b", 3, 0)],
+            [("a", "client->proxy", body("unchanged")),
+             ("a", "proxy->upstream", body("unchanged")),
+             ("b", "client->proxy", body("unchanged")),
+             ("b", "proxy->upstream", body("unchanged"))],
+            self.LOSS_AFTER_PING)
+        self.assertEqual(code, 0)
+        self.assertNotIn("no body pair", output)
+        self.assertIn("PROVIDER_CANDIDATE", output)
+
+    def test_a_rewrite_between_a_ping_and_the_next_request_is_still_ours(self):
+        # The point of following the ping to its body: a prefix this proxy
+        # changed after the ping must not hide behind "cannot say".
+        code, output = self.run_with(
+            [("a", 1, 0), ("a.keepwarm1", 2, 1), ("b", 3, 0)],
+            [("a", "client->proxy", body("what the client sent")),
+             ("a", "proxy->upstream", body("what the client sent")),
+             ("b", "client->proxy", body("what the client sent")),
+             ("b", "proxy->upstream", body("what the proxy made of it"))],
+            self.LOSS_AFTER_PING)
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("no body pair", output)
+
+    def test_a_ping_is_read_from_the_body_prepare_produced(self):
+        # One `proxy->upstream` body per request is what the proxy captures,
+        # and it is the body a ping re-sends. Should a capture ever hold a
+        # second under the same id, the first is still the one.
+        code, output = self.run_with(
+            [("a", 1, 0), ("a.keepwarm1", 2, 1), ("b", 3, 0)],
+            [("a", "client->proxy", body("unchanged")),
+             ("a", "proxy->upstream", body("unchanged")),
+             ("a", "proxy->upstream", body("a later record under the same id")),
+             ("b", "client->proxy", body("unchanged")),
+             ("b", "proxy->upstream", body("unchanged"))],
+            self.LOSS_AFTER_PING)
+        self.assertEqual(code, 0, output)
+        self.assertIn("PROVIDER_CANDIDATE", output)
+
+    def test_a_ping_whose_request_was_not_captured_is_said_to_be_unknown(self):
+        code, output = self.run_with(
+            [("a", 1, 0), ("a.keepwarm1", 2, 1), ("b", 3, 0)],
+            [("b", "client->proxy", body("unchanged")),
+             ("b", "proxy->upstream", body("unchanged"))],
+            self.LOSS_AFTER_PING)
+        self.assertEqual(code, 0)
+        self.assertIn("no body pair", output)
+
     def test_moving_cache_marker_is_not_content_damage(self):
         a, b = body(), body()
         a["messages"][0]["content"] = [{"type": "text", "text": "original",

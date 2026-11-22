@@ -928,6 +928,20 @@ pub struct ProxyConfig {
     /// ended pinging for 50 minutes; [`Self::cache_keep_warm_max_pings`] also
     /// caps it.
     pub cache_keep_warm_background_pings: u32,
+    /// The most conversations kept warm at one moment, and `0` for no limit.
+    ///
+    /// Each one holds the request it re-sends — the whole prompt as this proxy
+    /// sent it — until its wait ends or its pings run out, and nothing else
+    /// bounded how many did: the per-wait caps above limit how long a timer
+    /// lives, not how many live together. Past the limit a new wait is not
+    /// armed and its cache is left to lapse; a conversation already being
+    /// kept warm is unaffected. Deployment-wide, like the interval and the
+    /// caps: it is one map for every provider.
+    ///
+    /// 1,024 is not a measurement: no deployment has been seen near it. It is
+    /// where a number has to be — at a megabyte a prompt, about a gigabyte
+    /// held — and it was set by review (2026-11-22), not after an incident.
+    pub cache_keep_warm_max_conversations: usize,
     /// How many retrieve rounds may be **answered** in one request.
     ///
     /// The metric counts one more than this. Reaching the cap does not end the
@@ -1316,6 +1330,7 @@ impl Default for ProxyConfig {
             cache_keep_warm_interval: Duration::from_secs(270),
             cache_keep_warm_max_pings: 11,
             cache_keep_warm_background_pings: 4,
+            cache_keep_warm_max_conversations: 1_024,
             retrieve_execution: RetrieveExecution::Server,
             retrieve_max_rounds: 3,
             retrieve_max_tokens_per_request: 16_384,
@@ -2029,6 +2044,11 @@ impl Config {
             "cache_keep_warm_background_pings" => {
                 if let Ok(v) = value.parse() {
                     self.proxy.cache_keep_warm_background_pings = v;
+                }
+            }
+            "cache_keep_warm_max_conversations" => {
+                if let Ok(v) = value.parse() {
+                    self.proxy.cache_keep_warm_max_conversations = v;
                 }
             }
             "enabled" => {
@@ -2868,6 +2888,12 @@ mod tests {
             "0".into(),
         )]);
         assert_eq!(config.proxy.cache_keep_warm_background_pings, 0);
+        assert_eq!(config.proxy.cache_keep_warm_max_conversations, 1_024);
+        config.apply_env(&[(
+            "KOMPRESSOR__PROXY__CACHE_KEEP_WARM_MAX_CONVERSATIONS".into(),
+            "2".into(),
+        )]);
+        assert_eq!(config.proxy.cache_keep_warm_max_conversations, 2);
         config.apply_env(&[(
             "KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__CACHE_KEEP_WARM".into(),
             "false".into(),

@@ -207,6 +207,10 @@ pub struct Mark {
 #[derive(Clone, Debug, Default)]
 pub struct Shelved {
     fragments: Vec<String>,
+    /// Every handle the candidate stashed, in order, repeats included: one an
+    /// earlier message already holds is not among `fragments`, and it is the
+    /// one `stashed_since` exists to report.
+    stashed: Vec<RefId>,
     /// Stashes refused for size while the candidate ran.
     oversized: usize,
 }
@@ -340,7 +344,9 @@ impl RefCollector {
     /// rejects a candidate compression, so the store never holds fragments no
     /// marker points at.
     pub fn rollback(&mut self, mark: Mark) {
-        for (id, _) in self.pairs.drain(mark.pairs..) {
+        // `min`: a mark taken before an earlier rollback can point past the
+        // end, and there is then nothing of its candidate left to discard.
+        for (id, _) in self.pairs.drain(mark.pairs.min(self.pairs.len())..) {
             self.seen.remove(&id);
         }
         self.stashed.truncate(mark.stashed);
@@ -368,6 +374,7 @@ impl RefCollector {
                 .map(|(_, fragment)| fragment.clone())
                 .collect(),
             oversized: self.oversized_attempts.saturating_sub(mark.oversized),
+            stashed: self.stashed[mark.stashed.min(self.stashed.len())..].to_vec(),
         };
         self.rollback(mark);
         shelved
@@ -379,6 +386,13 @@ impl RefCollector {
     pub fn reinstate(&mut self, mark: Mark, shelved: &Shelved) {
         self.rollback(mark);
         self.restash_all(&shelved.fragments);
+        // The fragments alone are not the whole candidate. One it elided
+        // under a handle an earlier message already holds is not in
+        // `fragments` — the collector kept it once — so re-stashing them
+        // forgets that this message stashed it too, and `stashed_since` is
+        // what tells `messages` the model read the same bytes again.
+        self.stashed.truncate(mark.stashed);
+        self.stashed.extend_from_slice(&shelved.stashed);
         self.oversized_attempts += shelved.oversized;
     }
 
@@ -611,6 +625,35 @@ mod tests {
         refs.reinstate(mark, &shelved);
         assert_eq!(refs.stashed_since(mark), vec![a, b]);
         assert_eq!(refs.oversized_attempts(), 0);
+    }
+
+    #[test]
+    fn reinstating_preserves_handles_already_held_by_earlier_messages() {
+        let mut refs = RefCollector::new(1024);
+        let earlier = refs.stash("earlier message's fragment").unwrap();
+        let mark = refs.mark();
+        let new = refs.stash("new fragment").unwrap();
+        refs.stash("earlier message's fragment");
+        let shelved = refs.shelve(mark);
+        refs.stash("losing candidate");
+        refs.reinstate(mark, &shelved);
+        assert_eq!(refs.stashed_since(mark), vec![new, earlier]);
+        assert_eq!(refs.pairs().len(), 2);
+    }
+
+    /// A mark can outlive what it points at: an arbitration is handed the
+    /// caller's mark, and a rollback in between leaves it past the end.
+    #[test]
+    fn shelving_from_a_mark_past_the_end_sets_nothing_aside() {
+        let mut refs = RefCollector::new(1024);
+        let start = refs.mark();
+        refs.stash("gone before the shelve");
+        let later = refs.mark();
+        refs.rollback(start);
+        let shelved = refs.shelve(later);
+        refs.reinstate(start, &shelved);
+        assert!(refs.is_empty());
+        assert!(refs.stashed_since(start).is_empty());
     }
 
     #[test]

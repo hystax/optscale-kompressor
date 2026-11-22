@@ -2181,7 +2181,7 @@ fn restore_refuses_while_the_service_is_running() {
         .assert()
         .success();
 
-    let mut service = std::process::Command::new(env!("CARGO_BIN_EXE_kompressor"))
+    let service = std::process::Command::new(env!("CARGO_BIN_EXE_kompressor"))
         .args([
             "serve",
             "--api",
@@ -2192,6 +2192,9 @@ fn restore_refuses_while_the_service_is_running() {
         ])
         .arg(&config)
         .env_remove("KOMPRESSOR_CONFIG")
+        // Readiness below is an INFO line. Under an inherited `RUST_LOG=warn`
+        // the service comes up and never says so, and this waited for ever.
+        .env("RUST_LOG", "info")
         .env("XDG_CONFIG_HOME", no_config_dir())
         .current_dir(&dir)
         .stdin(std::process::Stdio::piped())
@@ -2199,8 +2202,18 @@ fn restore_refuses_while_the_service_is_running() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("serve starts");
+    // An assertion that fails below must not leave a service holding the
+    // directory's databases open after the test has gone.
+    struct Reaped(std::process::Child);
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut service = Reaped(service);
     // Up, with its databases open, once it says it is listening.
-    let mut lines = BufReader::new(service.stdout.take().unwrap()).lines();
+    let mut lines = BufReader::new(service.0.stdout.take().unwrap()).lines();
     assert!(
         lines
             .by_ref()
@@ -2229,8 +2242,8 @@ fn restore_refuses_while_the_service_is_running() {
         "nothing was moved"
     );
 
-    writeln!(service.stdin.take().unwrap(), "stop").unwrap();
-    assert!(service.wait().unwrap().success());
+    writeln!(service.0.stdin.take().unwrap(), "stop").unwrap();
+    assert!(service.0.wait().unwrap().success());
     // Stopped, it goes through.
     run_in(&dir)
         .arg("restore")

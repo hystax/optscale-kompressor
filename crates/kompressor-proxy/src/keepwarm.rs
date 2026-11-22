@@ -58,6 +58,17 @@
 //! that reads nothing has just written the prefix at full price, which is the
 //! cost this exists to avoid, so the next one would only repeat it.
 //!
+//! # How many at once
+//!
+//! A timer holds the request it re-sends for as long as it runs, so the
+//! conversations kept warm at one moment are bounded by
+//! [`ProxyConfig::cache_keep_warm_max_conversations`]. Past it a new wait is
+//! not armed and its cache is left to lapse — the cost of not having the
+//! feature, for that wait only — while a conversation that already has a
+//! timer goes on replacing it as before.
+//!
+//! [`ProxyConfig::cache_keep_warm_max_conversations`]: kompressor_core::config::ProxyConfig::cache_keep_warm_max_conversations
+//!
 //! [`ProxyConfig::cache_keep_warm_interval`]: kompressor_core::config::ProxyConfig::cache_keep_warm_interval
 //! [`ProxyConfig::cache_keep_warm_max_pings`]: kompressor_core::config::ProxyConfig::cache_keep_warm_max_pings
 //! [`ProxyConfig::cache_keep_warm_background_pings`]: kompressor_core::config::ProxyConfig::cache_keep_warm_background_pings
@@ -89,6 +100,10 @@ const PING_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct KeepWarm {
     armed: Mutex<HashMap<u64, Armed>>,
     next_generation: Mutex<u64>,
+    /// Waits left to lapse because
+    /// [`cache_keep_warm_max_conversations`](kompressor_core::config::ProxyConfig::cache_keep_warm_max_conversations)
+    /// were already being kept warm.
+    refused: std::sync::atomic::AtomicU64,
 }
 
 struct Armed {
@@ -581,6 +596,12 @@ impl KeepWarm {
         }
     }
 
+    /// How many waits were not kept warm because the deployment was already
+    /// keeping as many conversations warm as it allows.
+    pub fn refused(&self) -> u64 {
+        self.refused.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// How many conversations have a timer running. For tests and `/metrics`.
     pub fn armed(&self) -> usize {
         self.armed.lock().map(|armed| armed.len()).unwrap_or(0)
@@ -622,17 +643,67 @@ impl KeepWarm {
         {
             return;
         }
+        // Every timer holds the body it re-sends — a whole prompt, megabytes
+        // late in a long conversation — until its wait ends, so what is armed
+        // at once is memory held and, an interval later, that many requests
+        // upstream. A conversation that already has a timer is replacing it,
+        // not adding one, and is never refused.
+        let limit = state
+            .core
+            .config_for(Some("anthropic"))
+            .proxy
+            .cache_keep_warm_max_conversations;
+        if limit > 0 && armed.len() >= limit && !armed.contains_key(&conversation) {
+            let refused = self
+                .refused
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Once, then quietly: a deployment at its limit is at it for
+            // every response until a wait ends.
+            if refused == 0 {
+                tracing::warn!(
+                    limit,
+                    "proxy.cache_keep_warm_max_conversations reached; a waiting \
+                     conversation is not being kept warm, and its cache will lapse \
+                     if the wait outlasts the provider's lifetime"
+                );
+            } else {
+                tracing::debug!(
+                    limit,
+                    refused = refused + 1,
+                    "keep-warm not armed: at the limit"
+                );
+            }
+            return;
+        }
         let messages = ping.messages;
         let keepwarm = state.keepwarm.clone();
         let task = tokio::spawn(async move {
             let mut due = cached_at + schedule.interval;
+            let mut stopped = false;
             for sent in 1..=schedule.max_pings {
                 tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
                 let began = Instant::now();
                 if send(&state, &ping, sent).await == Outcome::Stop {
+                    stopped = true;
                     break;
                 }
                 due = began + schedule.interval;
+            }
+            // Reached only while the client is still away: its next request
+            // aborts this task. So the wait has outlasted what it was given,
+            // and from here the cache lapses as if nothing had kept it — the
+            // one outcome a report of "keep-warm on" does not suggest. Said
+            // here because a run configured with one ping was read as a run
+            // with keep-warm, and lost its cache 473 s after that ping
+            // (2026-11-22 `06-14-11`).
+            if !stopped {
+                tracing::info!(
+                    request_id = %ping.request_id,
+                    pings = schedule.max_pings,
+                    interval_s = schedule.interval.as_secs_f32(),
+                    "keep-warm ran out of pings with the client still away; \
+                     the cache lapses if the wait outlasts its lifetime"
+                );
             }
             if let Ok(mut armed) = keepwarm.armed.lock()
                 && armed

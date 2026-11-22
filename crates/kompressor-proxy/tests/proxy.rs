@@ -180,6 +180,48 @@ async fn a_zstd_encoded_request_is_compressed_like_any_other() {
 }
 
 #[tokio::test]
+async fn a_gzip_request_sent_as_several_members_is_read_whole() {
+    // A gzip body may be several members end to end (RFC 1952), which is what
+    // a client compressing in chunks produces. The decoder used to stop at the
+    // end of the first: the JSON below was cut mid-document, did not parse,
+    // and the request went upstream uncompressed with nothing logged but a
+    // fail-open count.
+    use std::io::Write;
+    let member = |bytes: &[u8]| {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    };
+    let harness = Harness::new().await;
+    answering(&harness).await;
+
+    let payload = log_payload(400);
+    let body = chat_body(&payload).to_string();
+    let (head, tail) = body.as_bytes().split_at(body.len() / 2);
+    let mut encoded = member(head);
+    encoded.extend(member(tail));
+
+    let sent = harness
+        .post_encoded("/v1/chat/completions", "gzip", encoded)
+        .await;
+    assert_eq!(sent.status, 200);
+
+    let raw = &harness.upstream_raw_bodies().await[0];
+    let mut decoded = Vec::new();
+    std::io::Read::read_to_end(
+        &mut flate2::read::MultiGzDecoder::new(&raw[..]),
+        &mut decoded,
+    )
+    .expect("still gzip on the wire");
+    let upstream: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+    let compressed = upstream["messages"][3]["content"].as_str().unwrap();
+    assert!(
+        compressed.len() < payload.len() && compressed.contains("ref:k_"),
+        "both halves were read, so the request parsed and was compressed"
+    );
+}
+
+#[tokio::test]
 async fn an_encoded_request_the_engine_declines_reaches_the_upstream_byte_identical() {
     // The fail-open promise has to survive the detour through the decoder:
     // under the size gate nothing is rewritten, so the bytes that arrived are

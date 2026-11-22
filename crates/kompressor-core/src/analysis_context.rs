@@ -35,6 +35,7 @@ pub(crate) fn context(config: &Config) -> RunContext {
             "cache_keep_warm_interval_ms":p.cache_keep_warm_interval.as_millis(),
             "cache_keep_warm_max_pings":p.cache_keep_warm_max_pings,
             "cache_keep_warm_background_pings":p.cache_keep_warm_background_pings,
+            "cache_keep_warm_max_conversations":p.cache_keep_warm_max_conversations,
             "keep_inline_max_percent":p.keep_inline_max_percent,
             "stream_buffer_bytes":p.stream_buffer_bytes,
             "stream_buffer_timeout_ms":p.stream_buffer_timeout.as_millis(),
