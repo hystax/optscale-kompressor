@@ -24,6 +24,10 @@ pub enum CoreError {
     BadRequest(String),
     #[error("{0}")]
     Io(#[from] std::io::Error),
+    /// The S3-compatible store refused, or could not be reached. Never holds
+    /// a credential.
+    #[error("object storage: {0}")]
+    ObjectStore(String),
 }
 
 /// Why a request was refused before any work happened.

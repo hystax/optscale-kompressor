@@ -394,6 +394,29 @@ the archives off the host. The Maintenance page lists them and, with
 `backup = true`, downloads them. From a shell, `kompressor backup --out DIR
 --keep 7` does one round of the same.
 
+To have the service copy them off the host itself, point it at an
+S3-compatible bucket (AWS S3, MinIO, Cloudflare R2, Backblaze B2, Wasabi):
+
+```toml
+[maintenance.s3]
+enabled = true
+bucket = "my-kompressor-backups"
+access_key_id = "AKIA…"
+secret_access_key = "…"
+# anything but AWS S3:
+# endpoint = "https://minio.internal:9000"
+# region = "auto"
+```
+
+Each scheduled archive is then uploaded, with its `.sha256`, as soon as it is
+written; one that could not be (the store was down) is retried every 15
+minutes. The Maintenance page's *Off-site copy* section tests the connection,
+lists the bucket and uploads on demand (it needs `backup = true`, as a
+download does). The key is never shown, and `keep` (default 0, all) can prune
+the bucket — a lifecycle rule on the bucket is the safer way to expire
+archives. To restore, download an archive with any S3 client, check it with
+`sha256sum -c`, and run `kompressor restore` as usual.
+
 The same page describes each database — size, write-ahead log, schema version,
 the space a vacuum would reclaim — with nothing turned on, along with when
 retention last ran and what it removed, how much disk is left, and (*Space*)

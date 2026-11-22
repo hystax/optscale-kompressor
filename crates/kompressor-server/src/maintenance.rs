@@ -12,6 +12,17 @@
 //! schedule wrote (`maintenance.backup_dir`), under the same rule as taking
 //! one.
 //!
+//! # An off-site copy
+//!
+//! With `maintenance.s3.enabled` the schedule also copies each archive to an
+//! S3-compatible bucket ([`kompressor_core::s3`]), and three routes work on
+//! it, all under the grant a backup needs — the archive leaves the host:
+//! `GET /v1/maintenance/s3` lists what the bucket holds, `POST …/s3/test`
+//! checks it can be written to, and `POST …/s3/upload` copies one archive —
+//! `{"name": "<a scheduled archive>"}` — or, with no name, takes a fresh
+//! backup and uploads that. The credentials are in the configuration and
+//! never in a response.
+//!
 //! The status also describes each database as SQLite sees it — size, the
 //! write-ahead log, the schema it holds against the one this build expects,
 //! the space a vacuum would reclaim, the span of what it records — and two
@@ -328,6 +339,39 @@ struct BuildInfo {
     code_aware: bool,
 }
 
+/// Where the off-site copy goes, as the status says. No credential.
+#[derive(Debug, Serialize)]
+struct S3Status {
+    enabled: bool,
+    /// `s3://bucket/prefix/`; absent when no bucket is set.
+    destination: Option<String>,
+    endpoint: String,
+    region: String,
+    keep: u32,
+    /// Whether the scheduled backups are copied there. Not every off-site
+    /// copy is scheduled: with no `backup_dir` it is by hand only.
+    scheduled: bool,
+    /// What is wrong with the settings, when something is.
+    problem: Option<String>,
+}
+
+fn s3_status(config: &Config) -> S3Status {
+    let s3 = &config.maintenance.s3;
+    S3Status {
+        enabled: s3.enabled,
+        destination: (!s3.bucket.trim().is_empty()).then(|| s3.location()),
+        endpoint: if s3.endpoint.trim().is_empty() {
+            format!("AWS S3 ({})", s3.region)
+        } else {
+            s3.endpoint.clone()
+        },
+        region: s3.region.clone(),
+        keep: s3.keep,
+        scheduled: s3.enabled && config.maintenance.schedule().is_some(),
+        problem: s3.enabled.then(|| s3.problem()).flatten(),
+    }
+}
+
 /// The JSON body of `GET /v1/maintenance`.
 #[derive(Debug, Serialize)]
 struct MaintenanceStatus {
@@ -347,6 +391,7 @@ struct MaintenanceStatus {
     storage: Storage,
     /// Absent when `maintenance.backup_dir` is not set.
     schedule: Option<ScheduleStatus>,
+    s3: S3Status,
     databases: Vec<DatabaseStatus>,
     /// The newest maintenance work on record, newest first.
     history: Vec<MaintenanceEvent>,
@@ -360,6 +405,9 @@ pub(crate) fn maintenance_routes() -> Router<Arc<ServerState>> {
         .route("/maintenance/backup", post(take_backup))
         .route("/maintenance/backups/{name}", get(stored_backup))
         .route("/maintenance/backups/{name}/verify", post(verify))
+        .route("/maintenance/s3", get(s3_list))
+        .route("/maintenance/s3/test", post(s3_test))
+        .route("/maintenance/s3/upload", post(s3_upload))
         .route("/maintenance/config", get(effective_config))
         .route("/maintenance/databases/{name}/check", post(check))
         .route("/maintenance/databases/{name}/checkpoint", post(checkpoint))
@@ -667,6 +715,7 @@ async fn status(
             retention: retention(&core, &databases, now_ms),
             storage: storage(config, &databases),
             schedule: schedule(config, now_ms),
+            s3: s3_status(config),
             databases,
             history: Vec::new(),
         }
@@ -1698,6 +1747,173 @@ async fn take_backup(
         now_ms()
     });
     Ok(attachment(name, Some(spooled), file, bytes))
+}
+
+/// Whether the off-site copy is on and sound: 404 with how to turn it on
+/// when it is off, 422 naming what is wrong with its settings.
+fn s3_ready(config: &Config) -> Result<(), ApiError> {
+    if !config.maintenance.s3.enabled {
+        return Err(ApiError::NotFound(
+            "the off-site copy is off; set maintenance.s3.enabled = true and name a bucket \
+             under [maintenance.s3]"
+                .to_string(),
+        ));
+    }
+    match config.maintenance.s3.problem() {
+        Some(problem) => Err(ApiError::Invalid(problem)),
+        None => Ok(()),
+    }
+}
+
+/// A failure of the bucket, as a caller is told it: the store's own reason.
+fn s3_failure(error: kompressor_core::CoreError) -> ApiError {
+    match error {
+        kompressor_core::CoreError::ObjectStore(reason) => ApiError::BadGateway(reason),
+        other => ApiError::Internal(format!("object storage: {other}")),
+    }
+}
+
+/// `GET /v1/maintenance/s3`: the archives in the bucket, newest first.
+async fn s3_list(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    permit(&state, &headers, Wanted::Backup)?;
+    s3_ready(state.core.config())?;
+    let core = state.core.clone();
+    let started = std::time::Instant::now();
+    let archives = tokio::task::spawn_blocking(move || {
+        kompressor_core::s3::S3::new(&core.config().maintenance.s3)?.list()
+    })
+    .await
+    .map_err(|error| ApiError::Internal(format!("s3 list: {error}")))?
+    .map_err(s3_failure)?;
+    Ok(json_response(&serde_json::json!({
+        "destination": s3_status(state.core.config()).destination,
+        "took_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "archives": archives,
+    })))
+}
+
+/// `POST /v1/maintenance/s3/test`: list the bucket and write a small object
+/// to it, to say now whether a backup would reach it.
+async fn s3_test(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    permit(&state, &headers, Wanted::Backup)?;
+    s3_ready(state.core.config())?;
+    let core = state.core.clone();
+    let took = tokio::task::spawn_blocking(move || {
+        kompressor_core::s3::S3::new(&core.config().maintenance.s3)?.probe()
+    })
+    .await
+    .map_err(|error| ApiError::Internal(format!("s3 test: {error}")))?
+    .map_err(s3_failure)?;
+    Ok(json_response(&serde_json::json!({
+        "ok": true,
+        "destination": s3_status(state.core.config()).destination,
+        "took_ms": u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
+    })))
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UploadRequest {
+    /// A scheduled archive to copy. Absent: take a backup now.
+    name: Option<String>,
+}
+
+/// `POST /v1/maintenance/s3/upload`: copy a scheduled archive to the bucket,
+/// or take a backup and copy that.
+async fn s3_upload(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    permit(&state, &headers, Wanted::Backup)?;
+    s3_ready(state.core.config())?;
+    let request = if body.iter().all(u8::is_ascii_whitespace) {
+        UploadRequest::default()
+    } else {
+        serde_json::from_slice::<UploadRequest>(&body)
+            .map_err(|error| ApiError::BadJson(format!("body: {error}")))?
+    };
+    // A stored archive is only read; a fresh one reads every database.
+    let (slot, stored) = match &request.name {
+        Some(name) => (
+            None,
+            Some((name.clone(), stored_archive(state.core.config(), name)?)),
+        ),
+        None => match Slot::take(&state) {
+            Some(slot) => (Some(slot), None),
+            None => return Ok(busy()),
+        },
+    };
+    let core = state.core.clone();
+    let done = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        let config = core.config();
+        match stored {
+            Some((name, path)) => kompressor_core::s3::upload_archive(config, &path, &name),
+            None => {
+                static NEXT: AtomicU64 = AtomicU64::new(0);
+                let dir = spool_dir(config);
+                backup::remove_stale_scratch(&dir);
+                let _ = core.stats().flush();
+                let spooled = Spooled(dir.join(format!(
+                    ".kompressor-backup-{}-s3{}.tar.gz",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                )));
+                let manifest = backup::write_archive(config, &spooled.0)?;
+                let name = backup::archive_name(if manifest.created_at_ms > 0 {
+                    manifest.created_at_ms
+                } else {
+                    now_ms()
+                });
+                kompressor_core::s3::upload_archive(config, &spooled.0, &name)
+            }
+        }
+    })
+    .await
+    .map_err(|error| ApiError::Internal(format!("s3 upload: {error}")))?;
+    let destination = s3_status(state.core.config())
+        .destination
+        .unwrap_or_default();
+    // On record either way, like every backup: the page's history and the
+    // Health page's "last backup" are read from these.
+    let record = |destination: String, bytes: u64, error: Option<String>| {
+        state.core.stats().send(kompressor_stats::Event::Backup(
+            kompressor_stats::events::BackupEvent {
+                time_ms: now_ms(),
+                origin: "http".to_string(),
+                destination,
+                bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
+                databases: 0,
+                ok: error.is_none(),
+                error,
+            },
+        ));
+    };
+    match done {
+        Ok(uploaded) => {
+            record(uploaded.destination.clone(), uploaded.bytes, None);
+            tracing::info!(
+                destination = %uploaded.destination,
+                bytes = uploaded.bytes,
+                removed = uploaded.removed.len(),
+                "archive uploaded"
+            );
+            Ok(json_response(&serde_json::json!({ "uploaded": uploaded })))
+        }
+        Err(kompressor_core::CoreError::BadRequest(reason)) => Err(ApiError::NotFound(reason)),
+        Err(error) => {
+            record(destination, 0, Some(error.to_string()));
+            tracing::warn!(%error, "archive upload failed");
+            Err(s3_failure(error))
+        }
+    }
 }
 
 /// An archive as a streamed attachment called `name`. `spooled` is the file

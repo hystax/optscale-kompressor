@@ -1688,3 +1688,294 @@ async fn a_scheduled_archive_is_verified_and_the_verdict_kept() {
         "verifying is an action"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The off-site copy on S3-compatible storage.
+// ---------------------------------------------------------------------------
+
+/// A bucket that keeps what is PUT to it and lists it back — enough S3 for
+/// the routes under test. Returns its URL and what it holds, by key.
+type Held = std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>>;
+
+fn bucket() -> (String, Held) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let held = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let shared = held.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let held = shared.clone();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut out = stream;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let mut words = line.split_whitespace();
+                    let method = words.next().unwrap_or("").to_string();
+                    let target = words.next().unwrap_or("").to_string();
+                    let mut length = 0usize;
+                    let mut signed = false;
+                    loop {
+                        let mut header = String::new();
+                        reader.read_line(&mut header).unwrap();
+                        let header = header.trim_end().to_ascii_lowercase();
+                        if header.is_empty() {
+                            break;
+                        }
+                        if let Some(value) = header.strip_prefix("content-length:") {
+                            length = value.trim().parse().unwrap();
+                        }
+                        signed |= header
+                            .starts_with("authorization: aws4-hmac-sha256 credential=testkey/");
+                    }
+                    let mut body = vec![0u8; length];
+                    reader.read_exact(&mut body).unwrap();
+                    let path = target
+                        .split('?')
+                        .next()
+                        .unwrap()
+                        .trim_start_matches("/bucket/");
+                    let mut held = held.lock().unwrap();
+                    let (status, reply) = match (signed, method.as_str()) {
+                        (false, _) => (
+                            403,
+                            "<Error><Code>AccessDenied</Code><Message>unsigned</Message></Error>"
+                                .to_string(),
+                        ),
+                        (_, "PUT") => {
+                            held.insert(path.to_string(), body);
+                            (200, String::new())
+                        }
+                        (_, "DELETE") => {
+                            held.remove(path);
+                            (204, String::new())
+                        }
+                        _ => {
+                            let items: String = held
+                                .iter()
+                                .map(|(k, v)| {
+                                    format!(
+                                        "<Contents><Key>{k}</Key><Size>{}</Size></Contents>",
+                                        v.len()
+                                    )
+                                })
+                                .collect();
+                            (
+                                200,
+                                format!(
+                                    "<ListBucketResult><IsTruncated>false</IsTruncated>{items}</ListBucketResult>"
+                                ),
+                            )
+                        }
+                    };
+                    let _ = write!(
+                        out,
+                        "HTTP/1.1 {status} X\r\nContent-Length: {}\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                }
+            });
+        }
+    });
+    (url, held)
+}
+
+fn offsite(endpoint: String) -> impl FnOnce(&mut Config) {
+    move |config| {
+        backing_up(config);
+        config.maintenance.s3 = kompressor_core::config::S3Config {
+            enabled: true,
+            endpoint,
+            bucket: "bucket".into(),
+            prefix: "kept".into(),
+            access_key_id: "testkey".into(),
+            secret_access_key: "hunter2-secret".into(),
+            ..Default::default()
+        };
+    }
+}
+
+#[tokio::test]
+async fn the_off_site_copy_is_off_until_it_is_set_up() {
+    let deployment = deployment(backing_up, kompressor_server::router);
+    let status = send(&deployment, "GET", "/v1/maintenance?format=json", &[])
+        .await
+        .json();
+    assert_eq!(status["s3"]["enabled"], false);
+    assert_eq!(status["s3"]["problem"], Value::Null);
+    for (method, path) in [
+        ("GET", "/v1/maintenance/s3"),
+        ("POST", "/v1/maintenance/s3/test"),
+        ("POST", "/v1/maintenance/s3/upload"),
+    ] {
+        let answer = send(&deployment, method, path, &[]).await;
+        assert_eq!(answer.status, StatusCode::NOT_FOUND, "{path}");
+        assert!(
+            String::from_utf8_lossy(&answer.body).contains("maintenance.s3.enabled"),
+            "it says how to turn it on"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_backup_is_uploaded_to_the_bucket_and_listed_from_it() {
+    let (url, held) = bucket();
+    let deployment = deployment(offsite(url), kompressor_server::router);
+
+    let status = send(&deployment, "GET", "/v1/maintenance?format=json", &[])
+        .await
+        .json();
+    assert_eq!(status["s3"]["enabled"], true);
+    assert_eq!(status["s3"]["destination"], "s3://bucket/kept/");
+    assert!(
+        !status.to_string().contains("hunter2"),
+        "no key in the status"
+    );
+
+    let tested = send(&deployment, "POST", "/v1/maintenance/s3/test", &[]).await;
+    assert_eq!(
+        tested.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&tested.body)
+    );
+    assert_eq!(tested.json()["ok"], true);
+
+    // A fresh backup, taken and sent.
+    let uploaded = send(&deployment, "POST", "/v1/maintenance/s3/upload", &[]).await;
+    assert_eq!(
+        uploaded.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&uploaded.body)
+    );
+    let name = uploaded.json()["uploaded"]["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (archive, checksum) = {
+        let held = held.lock().unwrap();
+        (
+            held.get(&format!("kept/{name}"))
+                .cloned()
+                .expect("the archive is in the bucket"),
+            held.get(&format!("kept/{name}.sha256"))
+                .cloned()
+                .expect("and its checksum"),
+        )
+    };
+    let entries = unpack(&archive);
+    assert!(
+        entries.iter().any(|(entry, _)| entry == "stats.db"),
+        "an archive that restores"
+    );
+    assert!(
+        String::from_utf8(checksum)
+            .unwrap()
+            .ends_with(&format!("  {name}\n"))
+    );
+    assert_eq!(
+        uploaded.json()["uploaded"]["destination"],
+        format!("s3://bucket/kept/{name}")
+    );
+
+    let listed = send(&deployment, "GET", "/v1/maintenance/s3", &[])
+        .await
+        .json();
+    assert_eq!(listed["archives"][0]["name"], name.as_str());
+    assert_eq!(
+        listed["archives"][0]["bytes"].as_u64(),
+        Some(archive.len() as u64)
+    );
+
+    // Nothing of the spool is left behind, and the key is nowhere on offer.
+    assert!(strays(&deployment).is_empty(), "{:?}", strays(&deployment));
+    let config = send(&deployment, "GET", "/v1/maintenance/config", &[]).await;
+    let text = String::from_utf8_lossy(&config.body).into_owned();
+    assert!(!text.contains("hunter2"), "{text}");
+    assert!(text.contains("<redacted>"));
+
+    // And it is on record, for the history and for Health.
+    let _ = deployment.sink.flush();
+    let status = send(&deployment, "GET", "/v1/maintenance?format=json", &[])
+        .await
+        .json();
+    let entry = &status["last_backup"]["history"][0];
+    assert_eq!(entry["destination"], format!("s3://bucket/kept/{name}"));
+    assert_eq!(entry["ok"], true);
+}
+
+#[tokio::test]
+async fn a_bucket_that_cannot_be_reached_is_a_failure_on_record_not_a_crash() {
+    // A port nothing listens on.
+    let closed = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    let deployment = deployment(offsite(closed), kompressor_server::router);
+    let answer = send(&deployment, "POST", "/v1/maintenance/s3/upload", &[]).await;
+    assert_eq!(answer.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(answer.json()["error"]["code"], "storage_unavailable");
+    assert!(!String::from_utf8_lossy(&answer.body).contains("hunter2"));
+    assert!(
+        strays(&deployment).is_empty(),
+        "the spooled archive is removed"
+    );
+    let _ = deployment.sink.flush();
+    let status = send(&deployment, "GET", "/v1/maintenance?format=json", &[])
+        .await
+        .json();
+    assert_eq!(status["last_backup"]["history"][0]["ok"], false);
+    assert!(status["last_backup"]["failed_ms"].is_i64());
+}
+
+#[tokio::test]
+async fn a_scheduled_archive_is_uploaded_by_name_and_only_by_its_name() {
+    let (url, held) = bucket();
+    let backups = tempfile::tempdir().unwrap();
+    let dir = backups.path().to_path_buf();
+    let name = kompressor_core::backup::archive_name(1_700_000_000_000);
+    std::fs::write(dir.join(&name), b"an archive").unwrap();
+    let inner = offsite(url);
+    let deployment = deployment(
+        move |config| {
+            inner(config);
+            config.maintenance.backup_dir = dir;
+        },
+        kompressor_server::router,
+    );
+    let sent = post_json(
+        &deployment,
+        "/v1/maintenance/s3/upload",
+        json!({"name": name}),
+    )
+    .await;
+    assert_eq!(
+        sent.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&sent.body)
+    );
+    assert_eq!(
+        held.lock().unwrap().get(&format!("kept/{name}")).unwrap(),
+        b"an archive"
+    );
+
+    for refused in [
+        "../../etc/passwd",
+        "notes.txt",
+        "kompressor-backup-20990101-000000.tar.gz",
+    ] {
+        let answer = post_json(
+            &deployment,
+            "/v1/maintenance/s3/upload",
+            json!({"name": refused}),
+        )
+        .await;
+        assert_eq!(answer.status, StatusCode::NOT_FOUND, "{refused}");
+    }
+}
