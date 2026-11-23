@@ -30,6 +30,10 @@ pub struct QualityRuntime {
     pub retention_days: u32,
 }
 
+/// How long after its last engine run a proxied request id with no
+/// `proxy_requests` row is still taken for one that has not finished.
+const UNFINISHED_MS: i64 = 3_600_000;
+
 /// One table's rows in the window.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TableRows {
@@ -284,15 +288,57 @@ impl StatsReader {
         c.optional("shadow", "requests", "Uncompressed prompt measured", (u(shadow), answered), "answered model calls", "this build does not measure the uncompressed prompt, so savings are the engine's estimate", "trends");
 
         // ---- engine runs
-        let (runs, outcome, skips, duplicates): (i64, i64, i64, i64) = self.conn.query_row(
+        let (runs, outcome, skips): (i64, i64, i64) = self.conn.query_row(
             "SELECT COUNT(*), COALESCE(SUM(outcome IS NOT NULL), 0),
-                    COALESCE(SUM(skipped_tokens_by_reason IS NOT NULL), 0),
-                    COUNT(*) - COUNT(DISTINCT request_id)
+                    COALESCE(SUM(skipped_tokens_by_reason IS NOT NULL), 0)
                FROM optimization_events WHERE tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3",
             window,
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         let runs = u(runs);
+        // Runs per request id, sorted by what the id is. One run a request is
+        // the rule on HTTP, and more than one there means a per-request join
+        // silently keeps one of them. A relayed WebSocket session is the
+        // exception by design: the connection is the unit, every frame on it
+        // is compressed under the connection's id, and its one
+        // `proxy_requests` row carries status 101. Counted as duplicates,
+        // those frames turned this check red on any deployment a Codex
+        // session went through — 38 of 211 runs in a day, every one a frame.
+        //
+        // A proxied id with no row at all, still running within the last
+        // hour, is unfinished: the row is written when the request or the
+        // session ends, so until then it cannot be told which of the two it
+        // is, and it is not judged. One that has been quiet for longer has
+        // lost its row and is judged like any other.
+        let (judged, duplicates, session_runs, sessions, unfinished): (i64, i64, i64, i64, i64) =
+            self.conn.query_row(
+                "WITH g AS (
+                     SELECT request_id, COUNT(*) n, MAX(surface = 'proxy') proxied,
+                            MAX(time_ms) last_ms
+                       FROM optimization_events
+                      WHERE tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3
+                      GROUP BY request_id),
+                 k AS (
+                     SELECT n,
+                            CASE WHEN EXISTS (SELECT 1 FROM proxy_requests p
+                                               WHERE p.request_id = g.request_id
+                                                 AND p.tenant = ?1 AND p.status = 101) THEN 1
+                                 WHEN proxied AND n > 1 AND last_ms >= ?4
+                                      AND NOT EXISTS (SELECT 1 FROM proxy_requests p
+                                                       WHERE p.request_id = g.request_id
+                                                         AND p.tenant = ?1) THEN 2
+                                 ELSE 0 END kind
+                       FROM g)
+                 SELECT COALESCE(SUM(CASE WHEN kind = 0 THEN n END), 0),
+                        COALESCE(SUM(CASE WHEN kind = 0 THEN n - 1 END), 0),
+                        COALESCE(SUM(CASE WHEN kind = 1 THEN n END), 0),
+                        COALESCE(SUM(kind = 1), 0),
+                        COALESCE(SUM(CASE WHEN kind = 2 THEN n END), 0)
+                   FROM k",
+                (tenant, from_ms, to_ms, runtime.now_ms - UNFINISHED_MS),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )?;
+        let judged = u(judged);
         c.coverage(
             "outcome",
             "engine",
@@ -313,18 +359,40 @@ impl StatsReader {
             Some(0.90),
             "yield",
         );
-        let dup_share = (runs > 0).then(|| u(duplicates) as f64 / runs as f64);
+        let dup_share = (judged > 0).then(|| u(duplicates) as f64 / judged as f64);
+        let mut dup_detail = format!(
+            "{} extra runs under a request id already seen, of {judged} runs; per-request joins keep one",
+            u(duplicates)
+        );
+        if session_runs > 0 {
+            dup_detail.push_str(&format!(
+                "; {} more runs are frames of {} WebSocket sessions, one id a session, and are not counted",
+                u(session_runs),
+                u(sessions)
+            ));
+        }
+        if unfinished > 0 {
+            dup_detail.push_str(&format!(
+                "; {} under ids with no request row yet are not judged",
+                u(unfinished)
+            ));
+        }
         c.add(
-            "duplicate_runs", "engine", "Requests with more than one run",
+            "duplicate_runs",
+            "engine",
+            "Requests with more than one run",
             match dup_share {
-                Some(v) if runs >= MIN_SAMPLES && v >= 0.10 => Level::Bad,
-                Some(v) if runs >= MIN_SAMPLES && v >= 0.02 => Level::Warn,
-                Some(_) if runs >= MIN_SAMPLES => Level::Ok,
+                Some(v) if judged >= MIN_SAMPLES && v >= 0.10 => Level::Bad,
+                Some(v) if judged >= MIN_SAMPLES && v >= 0.02 => Level::Warn,
+                Some(_) if judged >= MIN_SAMPLES => Level::Ok,
                 _ => Level::Info,
             },
-            dup_share, Unit::Share,
-            format!("{} extra runs under a request id already seen, of {runs} runs; per-request joins keep one", u(duplicates)),
-            (Some(0.02), Some(0.10)), false, "engine",
+            dup_share,
+            Unit::Share,
+            dup_detail,
+            (Some(0.02), Some(0.10)),
+            false,
+            "engine",
         );
 
         // ---- retrievals
