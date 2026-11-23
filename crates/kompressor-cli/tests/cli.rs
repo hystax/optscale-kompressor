@@ -1588,32 +1588,53 @@ fn a_supervised_proxy_stops_on_the_stop_line() {
 /// later session owns it, and on Windows it has no window to close.
 #[test]
 fn an_orphaned_proxy_stops_once_no_session_uses_it() {
+    // An assertion failure must not leave a proxy running after the test.
+    struct ReapOnDrop(std::process::Child);
+    impl Drop for ReapOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     let clients = tempfile::tempdir().unwrap();
-    let live = clients.path().join("4242.held");
+    let live = clients.path().join(format!("{}.held", std::process::id()));
     let marker = std::fs::File::create(&live).unwrap();
     marker.lock().unwrap();
     // A dead session's marker: nobody holds its lock, so it must not count.
-    std::fs::File::create(clients.path().join("4343.held")).unwrap();
+    // Zero cannot be the proxy's own pid, which the sweep skips.
+    let dead = clients.path().join("0.held");
+    std::fs::File::create(&dead).unwrap();
 
-    let mut child =
-        supervised_serve_with(&["--stop-when-unused".as_ref(), clients.path().as_os_str()]);
+    let mut child = ReapOnDrop(supervised_serve_with(&[
+        "--stop-when-unused".as_ref(),
+        clients.path().as_os_str(),
+    ]));
+    let child = &mut child.0;
     drop(child.stdin.take());
-    let exited_while_used = exited_within(&mut child, std::time::Duration::from_secs(6));
-    if exited_while_used {
-        let _ = child.wait();
+
+    // Startup and the first sweep can take more than six seconds on a busy
+    // runner. Observe a sweep before starting the keep-alive window; merely
+    // seeing a process that has not exited says nothing about its readiness.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while dead.exists() {
+        let status = child.try_wait().expect("the child can be polled");
+        assert!(
+            status.is_none(),
+            "proxy exited before its first sweep: {status:?}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dead session's marker was not reaped"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
+    let exited_while_used = exited_within(child, std::time::Duration::from_secs(6));
     assert!(!exited_while_used, "stopped while a live session used it");
-    assert!(
-        !clients.path().join("4343.held").exists(),
-        "the dead session's marker was not reaped"
-    );
 
     marker.unlock().unwrap();
     drop(marker);
-    let stopped = exited_within(&mut child, std::time::Duration::from_secs(20));
-    if !stopped {
-        let _ = child.kill();
-    }
+    let stopped = exited_within(child, std::time::Duration::from_secs(20));
     assert!(stopped, "an unused orphaned proxy kept running");
     assert!(
         child.wait().unwrap().success(),
