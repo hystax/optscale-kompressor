@@ -1,0 +1,1276 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kompressor · Maintenance</title>
+<script>
+// Apply the shared preference before rendering to avoid a theme flash.
+(() => {
+  const key = "kompressor-theme";
+  let theme = "dark";
+  try { if (localStorage.getItem(key) === "light") theme = "light"; } catch (_) {}
+  const apply = (value) => {
+    theme = value === "light" ? "light" : "dark";
+    document.documentElement.dataset.theme = theme;
+    const button = document.getElementById("theme-toggle");
+    if (button) {
+      button.textContent = theme === "dark" ? "Light theme" : "Dark theme";
+      button.setAttribute("aria-label", "Switch to " + (theme === "dark" ? "light" : "dark") + " theme");
+    }
+  };
+  apply(theme);
+  document.addEventListener("DOMContentLoaded", () => {
+    apply(theme);
+    document.getElementById("theme-toggle").addEventListener("click", () => {
+      apply(theme === "dark" ? "light" : "dark");
+      try { localStorage.setItem(key, theme); } catch (_) {}
+    });
+  });
+  window.addEventListener("storage", (event) => {
+    if (event.key === key || event.key === null) apply(event.newValue);
+  });
+})();
+</script>
+<style>
+:root {
+  color-scheme: dark;
+  --ink: #e3eaf2; --bg: #101419; --panel: #191f27; --muted: #9caaba;
+  --line: #303a46; --accent: #70d8b6; --good: #70d8b6; --warn: #f2c66d; --bad: #ffa096; --soft: #262e39;
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+  --ink: #172033; --bg: #f7f8fa; --panel: #ffffff; --muted: #5b6475;
+  --line: #d5dce5; --accent: #13745b; --good: #13745b; --warn: #946000; --bad: #b83228; --soft: #eef1f5;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px system-ui, sans-serif; }
+main { max-width: 1100px; margin: auto; padding: 24px 16px; }
+header, .filters { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+h1 { font-size: 24px; margin: 0 auto 0 0; }
+h2 { font-size: 17px; margin: 0 0 10px; }
+a { color: var(--accent); }
+button, input {
+  font: inherit; color: inherit; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 5px; padding: 7px 9px;
+}
+button { cursor: pointer; }
+button:disabled { cursor: default; opacity: .55; }
+button.primary { border-color: var(--accent); background: var(--soft); font-weight: 600; }
+.filters { margin: 18px 0 6px; }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 16px; margin-top: 16px; }
+table { border-collapse: collapse; width: 100%; margin: 6px 0 14px; }
+th, td { text-align: left; padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; }
+td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+td.actions { white-space: nowrap; }
+/* A path under the name it belongs to: whole when there is room, broken only
+   at a slash when there is not, never a letter to a line. */
+code.path { display: block; margin-top: 2px; color: var(--muted); font-size: 12px;
+  overflow-wrap: normal; word-break: normal; max-width: 44ch; }
+/* Five buttons in a row push the table past the page; let them take two. */
+#databases td.actions { white-space: normal; min-width: 200px; }
+#databases td.actions button { margin-bottom: 4px; }
+code.slashes { overflow-wrap: normal; word-break: normal; }
+td.actions button { padding: 3px 8px; margin-right: 4px; }
+.good { color: var(--good); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+h3 { font-size: 14px; margin: 18px 0 6px; color: var(--muted); font-weight: 600; }
+.scroll { overflow-x: auto; }
+#restore-steps { padding-left: 20px; }
+#restore-steps li { margin: 6px 0; }
+#restore-steps code { display: inline-block; padding: 2px 6px; background: var(--soft); border-radius: 4px; }
+#last-backup { margin: 0 0 12px; }
+td.index { padding-left: 18px; color: var(--muted); }
+section.danger { border-color: var(--bad); }
+section.danger h2 { color: var(--bad); }
+button.danger { border-color: var(--bad); color: var(--bad); font-weight: 600; }
+#nuke-confirm { margin-top: 12px; padding: 12px; border: 1px solid var(--bad); border-radius: 5px; max-width: 80ch; }
+#nuke-confirm p { margin: 0 0 10px; line-height: 1.45; }
+#nuke-confirm button { margin-right: 6px; }
+#nuke-losing { font-weight: 600; }
+code { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+.muted { color: var(--muted); }
+.note { color: var(--muted); margin: 8px 0 0; max-width: 80ch; line-height: 1.45; }
+#error { color: var(--bad); }
+#status, #progress { color: var(--muted); margin: 8px 0 0; }
+#done { color: var(--good); margin: 8px 0 0; }
+[hidden] { display: none !important; }
+dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 0; }
+dl.facts dt { color: var(--muted); }
+dl.facts dd { margin: 0; overflow-wrap: anywhere; }
+#config-text { max-height: 420px; overflow: auto; background: var(--soft); padding: 10px; border-radius: 5px;
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre; }
+.banner { border: 1px solid var(--warn); color: var(--warn); border-radius: 5px; padding: 8px 10px; margin: 10px 0 0; }
+form.purge { display: flex; gap: 10px 14px; flex-wrap: wrap; align-items: end; margin: 8px 0; }
+form.purge label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); }
+form.purge fieldset { border: 0; padding: 0; margin: 0; display: flex; gap: 12px; }
+form.purge fieldset label { flex-direction: row; align-items: center; color: var(--ink); }
+#purge-confirm { margin-top: 10px; padding: 12px; border: 1px solid var(--warn); border-radius: 5px; max-width: 80ch; }
+#purge-confirm p { margin: 0 0 10px; line-height: 1.45; }
+#purge-confirm button { margin-right: 6px; }
+td.last { font-size: 13px; }
+#theme-toggle:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+</style>
+</head>
+<body>
+<main>
+<header>
+  <h1>Kompressor maintenance</h1>
+  <a id="live-link" href="#">Live</a>
+  <a id="cache-link" href="#">Cache</a>
+  <a id="analysis-link" href="#">Analysis</a>
+  <a id="dashboards-link" href="#">Dashboards</a>
+  <a id="refs-link" href="#">Ref store</a>
+  <button id="theme-toggle" type="button" aria-label="Switch to light theme">Light theme</button>
+</header>
+<form class="filters" id="filters">
+  <label>Key <input id="key" type="password" size="16" autocomplete="off" placeholder="x-kompressor-key"/></label>
+  <label>Secret <input id="secret" type="password" size="16" autocomplete="off" placeholder="x-kompressor-secret"/></label>
+  <button type="submit">Load</button>
+</form>
+<p id="status" role="status">Loading…</p>
+<p id="error" role="alert"></p>
+
+<section aria-labelledby="build-title">
+  <h2 id="build-title">What is running</h2>
+  <dl class="facts" id="build"></dl>
+  <p id="restart-pending" class="banner" hidden>
+    The binary on disk has been replaced since this process started: an upgrade was installed and the service
+    not restarted, so what runs here is not what is installed. Restart the service to run it.
+  </p>
+  <p><button id="show-config" type="button">Show effective configuration</button></p>
+  <pre id="config-text" hidden></pre>
+  <p class="note">The configuration as this process reads it — file, then environment — with every key and
+    secret replaced. From a shell: <code>kompressor check-config</code>.</p>
+</section>
+
+<section aria-labelledby="databases-title">
+  <h2 id="databases-title">Databases</h2>
+  <div class="scroll">
+  <div class="scroll"><table id="databases" hidden>
+    <thead><tr><th>Database</th><th>Size</th><th>Write-ahead log</th><th>Schema</th>
+      <th>Reclaimable</th><th>Records</th><th>Planner</th><th>Integrity</th><th>Last done</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table></div>
+  </div>
+  <p id="action-result" role="status" hidden></p>
+  <p class="note" id="actions-why" hidden></p>
+  <p class="note">
+    <b>Write-ahead log</b> is what has been written and not yet folded into the file; SQLite folds it in
+    by itself, and <i>Checkpoint</i> does it now. <b>Schema</b> is the version the file holds against the
+    one this build expects. <b>Reclaimable</b> is space a vacuum would return to the disk, and
+    <i>Vacuum</i> returns it: the file is rewritten, which needs about twice its size free and holds
+    writes to it until it is done. <b>Planner</b> says whether SQLite has statistics to choose indexes
+    by; <i>Optimize</i> gathers them, and again whenever the data has changed shape.
+    <i>Check</i> reads every page and every index and can take a while on a large file. <i>Space</i> reads
+    every page too. <b>Last done</b> is the newest of each on record, by the page or the schedule, across
+    restarts. A vacuum of <code>refs.db</code> also switches it to incremental auto-vacuum, after which the
+    fragment sweep hands freed pages back by itself. From a shell:
+    <code>kompressor db status</code>, <code>kompressor db check</code>,
+    <code>kompressor db checkpoint</code>.
+  </p>
+  <div id="space" hidden>
+    <h3 id="space-title">Where the space is</h3>
+    <div class="scroll">
+    <table id="space-table">
+      <thead><tr><th>Table or index</th><th>Rows</th><th>Size</th><th>Share</th><th>Unused inside</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    </div>
+    <p class="note">
+      <b>Unused inside</b> is slack within the pages a table holds, as distinct from
+      <b>Reclaimable</b> above, which is whole pages holding nothing. A vacuum returns all of the
+      second and only some of the first: rows that nearly fill a page leave the rest of it empty.
+    </p>
+  </div>
+</section>
+
+<section aria-labelledby="retention-title">
+  <h2 id="retention-title">Retention</h2>
+  <div class="scroll">
+  <table id="retention" hidden>
+    <thead><tr><th>What</th><th>Rule</th><th>Runs</th><th>Last run</th><th>It removed</th><th>Now</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  </div>
+  <p class="note">
+    What keeps the databases from growing without bound. Requests older than
+    <code>stats.retention_days</code> are archived into daily rollups, which are kept, and then
+    removed; expired fragments are swept out of the ref store every <code>refs.purge_interval</code>, and the
+    pages they held handed back to the disk. With <code>stats.context_retention_days</code> set, requests older
+    than that keep their row and lose their copy of the settings, most of a busy <code>stats.db</code>; the
+    analysis history is archived first, so no breakdown loses a request. The planner's statistics are
+    refreshed every <code>maintenance.optimize_every</code>. <b>Last run</b> is since the service started.
+  </p>
+</section>
+
+<section aria-labelledby="disk-title">
+  <h2 id="disk-title">Disk</h2>
+  <div class="scroll">
+  <table id="volumes" hidden>
+    <thead><tr><th>Holds</th><th>Directory</th><th>Free</th><th>Of</th><th>Used</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  </div>
+  <p id="growth" class="muted"></p>
+  <p id="shared-disk" class="warn" hidden>
+    The backups are kept on the disk they back up: they survive a bad upgrade, not a dead disk.
+    Copy the archives off this host.
+  </p>
+</section>
+
+<section aria-labelledby="backup-title">
+  <h2 id="backup-title">Backup</h2>
+  <p id="last-backup" class="muted">Loading…</p>
+  <button id="backup" class="primary" type="button" disabled>Download backup (.tar.gz)</button>
+  <p id="progress" role="status" hidden></p>
+  <p id="done" role="status" hidden></p>
+  <p class="note" id="why" hidden></p>
+  <p class="note">
+    One gzipped tar with a consistent snapshot of every database above and a
+    <code>manifest.json</code>. The snapshots are taken through SQLite while the service keeps running;
+    nothing is paused. The configuration and the interception CA are not included: they hold keys.
+    The same archive from a shell, for a scheduled job: <code>kompressor backup --out DIR</code>.
+  </p>
+  <h3>Scheduled backups</h3>
+  <p id="schedule" class="muted">Loading…</p>
+  <table id="archives" hidden>
+    <thead><tr><th>Archive</th><th>Taken</th><th>Size</th><th>Verified</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <p class="note">
+    <i>Verify</i> checks an archive as a restore would — the checksum written beside it when it was taken, its
+    manifest, and a full integrity check of every database in it — without stopping or touching anything. It
+    unpacks into the backup directory for as long as it runs. Each archive has a <code>.sha256</code> beside it:
+    a copy taken off this host is checked with <code>sha256sum -c</code>.
+  </p>
+  <h3>Off-site copy (S3-compatible storage)</h3>
+  <p id="s3-state" class="muted">Loading…</p>
+  <p id="s3-buttons" hidden>
+    <button id="s3-test" type="button" title="List the bucket and write a small object to it">Test connection</button>
+    <button id="s3-upload" type="button" title="Take a backup now and upload it to the bucket">Back up to S3 now</button>
+    <button id="s3-list" type="button" title="List the archives in the bucket">List bucket</button>
+  </p>
+  <p id="s3-result" role="status" hidden></p>
+  <p class="note" id="s3-why" hidden></p>
+  <table id="s3-archives" hidden>
+    <thead><tr><th>Archive in the bucket</th><th>Taken</th><th>Size</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <p class="note">
+    Copies each scheduled archive, and its <code>.sha256</code>, to a bucket on AWS S3, MinIO, Cloudflare R2,
+    Backblaze B2, Wasabi or any other S3-compatible store, so a dead disk does not take the backups with it.
+    It is off until <code>[maintenance.s3]</code> is set (<code>enabled</code>, <code>bucket</code>,
+    <code>access_key_id</code>, <code>secret_access_key</code>, and <code>endpoint</code> for anything but AWS);
+    the key is never shown here. To restore, fetch an archive with any S3 client, check it with
+    <code>sha256sum -c</code>, and follow Restore below. The bucket should be private: an archive holds every
+    tenant's data.
+  </p>
+  <h3>History</h3>
+  <p id="history-none" class="muted">Loading…</p>
+  <table id="history" hidden>
+    <thead><tr><th>When</th><th>By</th><th>Result</th><th>Size</th><th>Went to</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<section aria-labelledby="restore-title">
+  <h2 id="restore-title">Restore</h2>
+  <p class="note">
+    Restoring replaces the databases, so it is done from a shell on this host with the service
+    <b>stopped</b> — not from this page. The command refuses a database that is still open, checks the
+    archive in full before touching anything, and moves the files it replaces aside
+    (<code>…before-restore-&lt;time&gt;</code>) instead of deleting them.
+  </p>
+  <ol id="restore-steps" class="note"></ol>
+</section>
+
+<section aria-labelledby="purge-title">
+  <h2 id="purge-title">Trim or delete statistics</h2>
+  <form class="purge" id="purge-form">
+    <fieldset>
+      <label><input type="radio" name="purge-kind" value="context" checked/> Trim the settings each request carries</label>
+      <label><input type="radio" name="purge-kind" value="rows"/> Delete the requests</label>
+    </fieldset>
+  </form>
+  <form class="purge" id="purge-scope">
+    <label>Before (UTC day) <input id="purge-before" type="date"/></label>
+    <label>Tenant <input id="purge-tenant" type="text" size="14" autocomplete="off" spellcheck="false"/></label>
+    <label>Run <input id="purge-run" type="text" size="18" autocomplete="off" spellcheck="false"/></label>
+    <label>Experiment <input id="purge-experiment" type="text" size="14" autocomplete="off" spellcheck="false"/></label>
+    <button id="purge-preview" type="submit">Preview</button>
+  </form>
+  <p class="note" id="purge-why" hidden></p>
+  <p id="purge-result" role="status" hidden></p>
+  <div class="scroll"><table id="purge-tables" hidden>
+    <thead><tr><th>Table</th><th>Rows</th></tr></thead><tbody></tbody>
+  </table></div>
+  <div id="purge-confirm" hidden>
+    <p id="purge-confirm-text"></p>
+    <p id="purge-phrase-row" hidden><label for="purge-phrase">To confirm, type <code>delete statistics</code> below.</label><br/>
+      <input id="purge-phrase" type="text" size="24" autocomplete="off" spellcheck="false"/></p>
+    <button id="purge-go" class="primary" type="button">Go ahead</button>
+    <button id="purge-cancel" type="button">Cancel</button>
+  </div>
+  <p class="note">
+    Every field given narrows it: requests from before a day, of a tenant, recorded under a run or an experiment
+    label (<code>stats.run_id</code>, <code>stats.experiment_id</code>). <b>Trimming</b> keeps every request and
+    empties only its copy of the effective settings; the analysis history is archived first, so nothing it
+    reports changes. <b>Deleting</b> by a day alone is retention brought forward — each day is rolled up first,
+    as the hourly pass would — while deleting a tenant's, a run's or an experiment's requests makes them not to
+    have happened, and keeps only aggregates already archived. <i>Preview</i> does the work and undoes it, so
+    what it reports is exact. Freed space is reused by what is written next; <i>Vacuum</i> above hands it back to
+    the disk. Trimming is an action (<code>maintenance.actions</code>); deleting is the danger zone's
+    (<code>maintenance.erase</code>).
+  </p>
+</section>
+
+<section aria-labelledby="work-title">
+  <h2 id="work-title">Maintenance history</h2>
+  <p id="work-none" class="muted">Loading…</p>
+  <div class="scroll"><table id="work" hidden>
+    <thead><tr><th>When</th><th>What</th><th>On</th><th>By</th><th>Result</th><th>Size</th><th>Took</th></tr></thead>
+    <tbody></tbody>
+  </table></div>
+  <p class="note">Every check, checkpoint, vacuum, optimize, trim, delete, erase and verification, from this page
+    and the schedule, newest first. Kept through an erase.</p>
+</section>
+
+<section class="danger" aria-labelledby="danger-title">
+  <h2 id="danger-title">Danger zone</h2>
+  <button id="nuke" class="danger" type="button" disabled>Nuke all stats…</button>
+  <p class="note" id="nuke-why" hidden></p>
+  <p id="nuke-done" role="status" hidden></p>
+  <div id="nuke-confirm" hidden>
+    <div id="nuke-first">
+      <p>This deletes <b>every statistic</b> this deployment has recorded, for every tenant: every
+        request, compression and retrieval, and the daily rollups that outlive retention. Every
+        dashboard starts again from empty. It cannot be undone from here — only by restoring a backup.</p>
+      <p id="nuke-losing"></p>
+      <p id="nuke-backup"></p>
+      <button id="nuke-continue" class="danger" type="button">I understand, continue</button>
+      <button class="nuke-cancel" type="button">Cancel</button>
+    </div>
+    <div id="nuke-second" hidden>
+      <p><label for="nuke-phrase">To confirm, type <code>nuke all stats</code> below.</label></p>
+      <p><input id="nuke-phrase" type="text" size="24" autocomplete="off" spellcheck="false"/></p>
+      <button id="nuke-go" class="danger" type="button" disabled>Nuke all stats</button>
+      <button class="nuke-cancel" type="button">Cancel</button>
+    </div>
+  </div>
+  <p class="note">
+    Stored fragments (<code>refs.db</code>), the record of backups, the configuration and the backup
+    archives are left alone. The service keeps running and goes on recording into the emptied
+    database. Off unless <code>maintenance.erase = true</code>.
+  </p>
+</section>
+</main>
+<script>
+"use strict";
+const SETTINGS = /*SETTINGS*/{};
+const $ = id => document.getElementById(id);
+
+// On the statistics listener the pages sit at /refs, /cache and so on and the
+// data under /v1; on the API this page is the data route itself.
+const prefix = SETTINGS.listener ? "/v1/" : location.pathname.replace(/maintenance\/?$/, "");
+$("live-link").href = SETTINGS.listener ? "/" : prefix + "stats/live";
+$("cache-link").href = SETTINGS.listener ? "/cache" : prefix + "stats/cache";
+$("analysis-link").href = SETTINGS.listener ? "/analysis" : prefix + "stats/analysis";
+$("dashboards-link").href = SETTINGS.listener ? "/health" : prefix + "stats/health";
+$("refs-link").href = SETTINGS.listener ? "/refs" : prefix + "refs";
+
+const credentials = () => {
+  const headers = {};
+  const key = $("key").value.trim(), secret = $("secret").value.trim();
+  if (key) headers["x-kompressor-key"] = key;
+  if (secret) headers["x-kompressor-secret"] = secret;
+  return headers;
+};
+const size = bytes => {
+  if (bytes == null) return "–";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes, unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
+  return (unit ? value.toFixed(value < 10 ? 1 : 0) : value) + " " + units[unit];
+};
+// Everything drawn from a response is inserted as text, never as markup.
+const cell = (text, className) => {
+  const td = document.createElement("td");
+  if (className) td.className = className;
+  td.textContent = text;
+  return td;
+};
+const explain = async response => {
+  try {
+    const body = await response.json();
+    return (body.error && body.error.message) || body.message || response.statusText;
+  } catch (_) { return response.statusText; }
+};
+
+const when = ms => ms == null ? "–" : new Date(ms).toLocaleString();
+const span = (from, to) => {
+  const seconds = Math.max(0, Math.round((to - from) / 1000));
+  if (seconds < 90) return seconds + " s";
+  if (seconds < 5400) return Math.round(seconds / 60) + " min";
+  if (seconds < 129600) return Math.round(seconds / 3600) + " h";
+  return Math.round(seconds / 86400) + " d";
+};
+const every = seconds => seconds % 86400 === 0 ? seconds / 86400 + " d"
+  : seconds % 3600 === 0 ? seconds / 3600 + " h" : Math.round(seconds / 60) + " min";
+const tagged = (text, className) => {
+  const element = document.createElement("span");
+  if (className) element.className = className;
+  element.textContent = text;
+  return element;
+};
+const button = (label, title, run) => {
+  const element = document.createElement("button");
+  element.type = "button";
+  element.textContent = label;
+  element.title = title;
+  element.addEventListener("click", run);
+  return element;
+};
+
+// POST one action and say what came of it.
+async function act(path, describe, body) {
+  $("error").textContent = "";
+  $("action-result").hidden = false;
+  $("action-result").className = "muted";
+  $("action-result").textContent = "Working…";
+  try {
+    const headers = credentials();
+    const request = { method: "POST", headers, cache: "no-store" };
+    if (body !== undefined) {
+      headers["content-type"] = "application/json";
+      request.body = JSON.stringify(body);
+    }
+    const response = await fetch(prefix + path, request);
+    if (!response.ok) throw new Error(response.status + " " + await explain(response));
+    const [text, className] = describe(await response.json());
+    $("action-result").textContent = text;
+    $("action-result").className = className;
+  } catch (error) {
+    $("action-result").hidden = true;
+    $("error").textContent = "Failed: " + (error.message || error);
+  }
+  load();
+}
+
+async function download(path, fallback) {
+  const response = await fetch(prefix + path, { headers: credentials(), cache: "no-store" });
+  if (!response.ok) throw new Error(response.status + " " + await explain(response));
+  const blob = await response.blob();
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = fallback;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  return blob.size;
+}
+
+// A path that may break after a slash and nowhere else.
+function pathCode(path) {
+  const code = document.createElement("code");
+  code.className = "path";
+  path.split("/").forEach((part, index) => {
+    if (index) code.append("/", document.createElement("wbr"));
+    code.append(part);
+  });
+  return code;
+}
+
+function databaseRow(database, status) {
+  const row = document.createElement("tr");
+  const named = cell(database.name, "named");
+  if (database.path) named.append(pathCode(database.path));
+
+  const schema = cell("", "num");
+  if (database.schema_version == null) {
+    schema.textContent = "–";
+  } else if (database.schema_version === database.expected_schema_version) {
+    schema.textContent = "v" + database.schema_version;
+  } else {
+    // Older is migrated at the next start; newer is a file from a later build.
+    schema.append(tagged("v" + database.schema_version + " (this build: v" + database.expected_schema_version + ")",
+      database.schema_version > database.expected_schema_version ? "bad" : "warn"));
+  }
+
+  const records = cell(database.oldest_ms == null ? "–"
+    : new Date(database.oldest_ms).toLocaleDateString() + " → " + new Date(database.newest_ms).toLocaleDateString());
+
+  const integrity = cell("");
+  if (database.error) {
+    integrity.append(tagged("unreadable: " + database.error, "bad"));
+  } else if (!database.checked) {
+    integrity.append(tagged(database.included ? "never checked" : "–", "muted"));
+  } else if (database.checked.ok) {
+    integrity.append(tagged("ok, " + span(database.checked.at_ms, status.now_ms) + " ago", "good"));
+  } else {
+    integrity.append(tagged("FAILED: " + database.checked.problems.slice(0, 3).join("; "), "bad"));
+  }
+
+  const actions = cell("", "actions");
+  if (database.included) {
+    const check = button("Check", "Run a full integrity check",
+      () => act("maintenance/databases/" + database.name + "/check", result => result.checked.ok
+        ? [database.name + ": integrity check passed in " + (result.checked.took_ms / 1000).toFixed(1) + " s.", "good"]
+        : [database.name + ": integrity check FAILED — " + result.checked.problems.join("; "), "bad"]));
+    const checkpoint = button("Checkpoint", "Fold the write-ahead log into the file",
+      () => act("maintenance/databases/" + database.name + "/checkpoint", result => result.complete
+        ? [database.name + ": log folded in, " + size(result.wal_bytes_before) + " → " + size(result.wal_bytes_after) + ".", "good"]
+        : [database.name + ": a reader was in the way; part of the log is still to fold in. Nothing is lost — try again.", "warn"]));
+    const seconds = result => (result.took_ms / 1000).toFixed(1) + " s";
+    const vacuum = button("Vacuum", "Rewrite the file without its free pages", () => {
+      if (!confirm("Vacuum " + database.name + "?\n\nThe file (" + size(database.bytes) + ") is rewritten. That needs about "
+        + size(2 * database.bytes) + " free beside it, and writes to it wait until it is done.")) return;
+      act("maintenance/databases/" + database.name + "/vacuum", result =>
+        [database.name + ": vacuumed in " + seconds(result) + ", " + size(result.bytes_before) + " → " + size(result.bytes_after)
+          + (result.folded ? "." : ". A reader was in the way: the file itself shrinks at the next checkpoint."),
+          result.folded ? "good" : "warn"]);
+    });
+    const optimize = button("Optimize", "Gather the statistics the query planner chooses indexes by",
+      () => act("maintenance/databases/" + database.name + "/optimize", result =>
+        [database.name + ": planner statistics gathered for " + result.described + " tables and indexes in " + seconds(result) + ".", "good"]));
+    const where = button("Space", "Show where this database's bytes are", () => drawSpace(database.name));
+    check.disabled = checkpoint.disabled = vacuum.disabled = optimize.disabled = !status.actions.allowed;
+    where.disabled = !status.space.allowed;
+    actions.append(check, checkpoint, vacuum, optimize, where);
+  }
+
+  const planner = cell("");
+  if (database.analyzed != null) {
+    planner.append(tagged(database.analyzed ? "has statistics" : "no statistics", database.analyzed ? "" : "muted"));
+  } else {
+    planner.textContent = "–";
+  }
+
+  const reclaimable = cell(size(database.reclaimable_bytes), "num");
+  if (database.auto_vacuum === 2) {
+    reclaimable.append(document.createElement("br"), tagged("handed back by itself", "muted"));
+  }
+  row.append(named,
+    cell(database.included ? size(database.bytes) : "– " + (database.reason || ""), "num"),
+    cell(size(database.wal_bytes), "num"), schema, reclaimable,
+    records, planner, integrity, lastDone(database, status), actions);
+  return row;
+}
+
+const count = number => number == null ? "–" : Number(number).toLocaleString();
+const ago = (ms, now) => span(ms, now) + " ago";
+const BY = { schedule: "schedule", http: "this page", cli: "a shell" };
+const by = work => (BY[work.origin] || work.origin) + (work.actor ? " (" + work.actor + ")" : "");
+
+// The newest of each kind of work on record for one database.
+function lastDone(database, status) {
+  const td = cell("", "last");
+  const done = database.last || {};
+  const lines = ["vacuum", "optimize", "checkpoint", "trim", "delete", "erase"]
+    .filter(action => done[action])
+    .map(action => {
+      const work = done[action];
+      return tagged(action + " " + ago(work.time_ms, status.now_ms) + (work.ok ? "" : ", FAILED"),
+        work.ok ? "" : "bad");
+    });
+  if (!lines.length) { td.append(tagged("–", "muted")); return td; }
+  lines.forEach((line, index) => { if (index) td.append(document.createElement("br")); td.append(line); });
+  return td;
+}
+
+// Where one database's bytes are. Asked for, not loaded with the page: it
+// reads the whole file.
+async function drawSpace(name) {
+  $("error").textContent = "";
+  $("space").hidden = false;
+  $("space-title").textContent = "Where the space is — " + name + " (reading…)";
+  $("space-table").tBodies[0].replaceChildren();
+  try {
+    const response = await fetch(prefix + "maintenance/databases/" + name + "/space", { headers: credentials(), cache: "no-store" });
+    if (!response.ok) throw new Error(response.status + " " + await explain(response));
+    const found = await response.json();
+    $("space-title").textContent = "Where the space is — " + name + ", " + size(found.bytes)
+      + " in " + found.objects.length + " tables and indexes";
+    $("space-table").tBodies[0].replaceChildren(...found.objects.map(object => {
+      const row = document.createElement("tr");
+      const index = object.kind === "index";
+      row.append(cell(index ? object.name + " (index on " + object.table + ")" : object.name, index ? "index" : ""),
+        cell(count(object.rows), "num"), cell(size(object.bytes), "num"),
+        cell(found.bytes ? (100 * object.bytes / found.bytes).toFixed(1) + " %" : "–", "num"),
+        cell(size(object.unused_bytes), "num"));
+      return row;
+    }));
+  } catch (error) {
+    $("space").hidden = true;
+    $("error").textContent = "Could not read the space breakdown: " + (error.message || error);
+  }
+}
+
+function drawRetention(status) {
+  const now = status.now_ms, rows = [];
+  const lastRun = last => {
+    const td = cell("");
+    if (!last) td.append(tagged("not since the service started", "muted"));
+    else if (last.error) td.append(tagged(ago(last.at_ms, now) + ", FAILED: " + last.error, "bad"));
+    else td.append(tagged(ago(last.at_ms, now) + ", took " + last.took_ms + " ms", "good"));
+    return td;
+  };
+  const stats = status.retention.stats;
+  if (stats) {
+    const row = document.createElement("tr");
+    const rule = cell("");
+    if (stats.retention_days) {
+      rule.textContent = "kept " + stats.retention_days + " d, then rolled up by day; now removing before "
+        + new Date(stats.cutoff_ms).toLocaleDateString();
+    } else {
+      rule.append(tagged("off (stats.retention_days = 0): nothing is ever removed", "warn"));
+    }
+    const removed = stats.last && stats.last.removed;
+    const total = removed ? Object.values(removed).reduce((sum, n) => sum + n, 0) : null;
+    const backlog = cell("");
+    if (stats.backlog_days) backlog.append(tagged(stats.backlog_days + " d of requests past the cutoff, still to remove", "warn"));
+    else backlog.textContent = stats.retention_days ? "nothing past the cutoff" : "–";
+    row.append(cell("Statistics (stats.db)"), rule, cell(stats.retention_days ? "every " + every(stats.every_s) : "–"),
+      stats.retention_days ? lastRun(stats.last) : cell("–"),
+      cell(total == null ? "–" : count(total) + " rows" + (total ? " (" + count(removed.proxy_requests) + " requests)" : "")),
+      backlog);
+    rows.push(row);
+
+    const settings = document.createElement("tr");
+    const settingsRule = cell("");
+    if (stats.context_cutoff_ms != null) {
+      settingsRule.textContent = "emptied after " + stats.context_retention_days + " d, the request kept; now before "
+        + new Date(stats.context_cutoff_ms).toLocaleDateString();
+    } else if (stats.context_retention_days) {
+      settingsRule.append(tagged("stats.context_retention_days = " + stats.context_retention_days
+        + " is no shorter than the requests' own window: nothing to do", "muted"));
+    } else {
+      settingsRule.append(tagged("kept as long as the request (stats.context_retention_days = 0)", "muted"));
+    }
+    const trimmed = stats.last && stats.last.contexts_trimmed;
+    settings.append(cell("Request settings (request_context)"), settingsRule,
+      cell(stats.context_cutoff_ms != null ? "every " + every(stats.every_s) : "–"),
+      stats.context_cutoff_ms != null ? lastRun(stats.last) : cell("–"),
+      cell(trimmed == null ? "–" : count(trimmed) + " requests trimmed"), cell("–"));
+    rows.push(settings);
+
+    const planner = document.createElement("tr");
+    const optimized = status.databases.map(database => database.last && database.last.optimize).filter(Boolean)
+      .sort((a, b) => b.time_ms - a.time_ms)[0];
+    const plannerLast = cell("");
+    if (!optimized) plannerLast.append(tagged("none on record", "muted"));
+    else plannerLast.append(tagged(ago(optimized.time_ms, now) + " by " + by(optimized) + (optimized.ok ? "" : ", FAILED"),
+      optimized.ok ? "good" : "bad"));
+    planner.append(cell("Planner statistics (both)"),
+      cell(stats.optimize_every_s ? "refreshed on a schedule" : "by hand only (maintenance.optimize_every = 0)"),
+      cell(stats.optimize_every_s ? "every " + every(stats.optimize_every_s) : "–"), plannerLast, cell("–"), cell("–"));
+    rows.push(planner);
+  }
+  const refs = status.retention.refs;
+  const row = document.createElement("tr");
+  const held = refs.live_bytes == null ? "–"
+    : count(refs.live_refs) + " fragments, " + size(refs.live_bytes) + (refs.max_bytes ? " of a " + size(refs.max_bytes) + " cap" : "");
+  const full = refs.max_bytes && refs.live_bytes != null && refs.live_bytes > 0.9 * refs.max_bytes;
+  const holding = cell("");
+  holding.append(tagged(held, full ? "warn" : ""));
+  row.append(cell("Fragments (ref store)"), cell("each until its own time-to-live runs out"),
+    cell("every " + every(refs.every_s)), lastRun(refs.last),
+    cell(refs.last && refs.last.removed != null ? count(refs.last.removed) + " fragments"
+      + (refs.last.reclaimed_bytes ? ", " + size(refs.last.reclaimed_bytes) + " handed back" : "") : "–"), holding);
+  rows.push(row);
+  $("retention").tBodies[0].replaceChildren(...rows);
+  $("retention").hidden = false;
+}
+
+function drawStorage(status) {
+  const storage = status.storage;
+  const holds = { data: "the databases", backups: "the scheduled backups" };
+  $("volumes").tBodies[0].replaceChildren(...storage.volumes.map(volume => {
+    const row = document.createElement("tr");
+    const path = cell("");
+    path.append(pathCode(volume.path));
+    path.firstChild.className = "slashes";
+    const used = volume.total_bytes && volume.free_bytes != null ? 100 * (1 - volume.free_bytes / volume.total_bytes) : null;
+    const share = cell("", "num");
+    if (used == null) share.textContent = "–";
+    else share.append(tagged(used.toFixed(0) + " %", used >= 95 ? "bad" : used >= 85 ? "warn" : ""));
+    const what = holds[volume.role] + (volume.role === "data" && storage.backups_share_disk ? " and the scheduled backups" : "");
+    row.append(cell(what), path, cell(size(volume.free_bytes), "num"), cell(size(volume.total_bytes), "num"), share);
+    return row;
+  }));
+  $("volumes").hidden = !storage.volumes.length;
+  $("shared-disk").hidden = storage.backups_share_disk !== true;
+  const parts = [];
+  if (!storage.volumes.length) {
+    parts.push("No database is kept on disk.");
+  } else if (storage.growth_bytes_per_day == null) {
+    parts.push("No growth estimate yet: it needs a day of requests on record.");
+  } else {
+    parts.push("stats.db has grown about " + size(storage.growth_bytes_per_day) + " a day over what it records");
+    if (storage.projected_bytes != null) parts.push("a full retention window would be about " + size(storage.projected_bytes));
+    else parts.push("with retention off it does not level off");
+    if (storage.days_left != null) parts.push("at that rate the disk has room for about " + count(storage.days_left) + " d");
+  }
+  $("growth").textContent = parts.join(" · ") + (parts.length > 1 ? ". An estimate." : "");
+}
+
+// The danger zone: two steps before anything is sent, and the phrase the
+// server asks for typed by hand.
+const NUKE_PHRASE = "nuke all stats";
+function closeNuke() {
+  $("nuke-confirm").hidden = true;
+  $("nuke-first").hidden = false;
+  $("nuke-second").hidden = true;
+  $("nuke-phrase").value = "";
+  $("nuke-go").disabled = true;
+}
+function drawDanger(status) {
+  $("nuke").disabled = !status.erase.allowed;
+  $("nuke-why").textContent = status.erase.allowed ? "" : status.erase.reason;
+  $("nuke-why").hidden = status.erase.allowed;
+  if (!status.erase.allowed) closeNuke();
+  const stats = status.databases.find(database => database.name === "stats.db");
+  $("nuke-losing").textContent = !stats || stats.bytes == null ? ""
+    : "On the line: " + size(stats.bytes) + " in " + stats.path + (stats.oldest_ms == null ? "."
+      : ", requests from " + new Date(stats.oldest_ms).toLocaleDateString() + " to " + new Date(stats.newest_ms).toLocaleDateString() + ".");
+  const last = status.last_backup.ok_ms;
+  $("nuke-backup").replaceChildren(last == null
+    ? tagged("There is no backup on record. Take one first — the Backup section above.", "bad")
+    : tagged("The last backup was taken " + ago(last, status.now_ms) + "; anything recorded since is not in it.",
+      status.now_ms - last > 3600000 ? "warn" : ""));
+}
+
+function drawSchedule(status) {
+  const schedule = status.schedule;
+  $("archives").hidden = true;
+  if (!schedule) {
+    $("schedule").textContent = "None. Set maintenance.backup_dir (and backup_every, backup_keep) to have the service take them.";
+    return;
+  }
+  const parts = [schedule.every_s ? "Every " + every(schedule.every_s) : "No schedule (backup_every = 0)",
+    "into " + schedule.dir,
+    schedule.keep ? "keeping the newest " + schedule.keep : "keeping all"];
+  if (schedule.next_due_ms != null) {
+    parts.push(schedule.next_due_ms <= status.now_ms ? "next: due now" : "next in " + span(status.now_ms, schedule.next_due_ms));
+  }
+  $("schedule").textContent = parts.join(" · ") + (schedule.archives.length ? "" : " · none taken yet");
+  if (!schedule.archives.length) return;
+  $("archives").tBodies[0].replaceChildren(...schedule.archives.map(archive => {
+    const row = document.createElement("tr");
+    const actions = cell("", "actions");
+    const get = button("Download", "Download this archive", async () => {
+      $("error").textContent = "";
+      get.disabled = true;
+      try { await download("maintenance/backups/" + encodeURIComponent(archive.name), archive.name); }
+      catch (error) { $("error").textContent = "Download failed: " + (error.message || error); }
+      get.disabled = !status.backup.allowed;
+    });
+    get.disabled = !status.backup.allowed;
+    const check = button("Verify", "Check this archive as a restore would, without restoring it",
+      () => act("maintenance/backups/" + encodeURIComponent(archive.name) + "/verify", result => {
+        const verified = result.verified;
+        const sum = { matches: "checksum matches", differs: "checksum DIFFERS", absent: "no checksum to compare" }[verified.checksum];
+        return verified.ok
+          ? [archive.name + ": sound — " + verified.databases.length + " databases pass a full check, " + sum
+              + ", in " + (result.took_ms / 1000).toFixed(1) + " s.", "good"]
+          : [archive.name + ": FAILED — " + verified.problems.join("; "), "bad"];
+      }));
+    check.disabled = !status.actions.allowed;
+    actions.append(get, check);
+    if (status.s3.enabled && !status.s3.problem) {
+      const up = button("Upload to S3", "Copy this archive to the bucket", () => s3Upload(archive.name));
+      up.disabled = !status.backup.allowed;
+      actions.append(up);
+    }
+    const name = cell("");
+    const code = document.createElement("code");
+    code.textContent = archive.name;
+    if (archive.sha256) code.title = "sha256 " + archive.sha256;
+    name.append(code);
+    const verdict = cell("");
+    const verified = (schedule.verified || {})[archive.name];
+    if (!verified) verdict.append(tagged("not yet", "muted"));
+    else verdict.append(tagged((verified.ok ? "sound, " : "FAILED, ") + ago(verified.time_ms, status.now_ms),
+      verified.ok ? "good" : "bad"));
+    row.append(name, cell(when(archive.created_at_ms) + " (" + span(archive.created_at_ms, status.now_ms) + " ago)"),
+      cell(size(archive.bytes), "num"), verdict, actions);
+    return row;
+  }));
+  $("archives").hidden = false;
+}
+
+// The off-site copy: where it goes, and what may be done to it.
+function drawS3(status) {
+  const s3 = status.s3;
+  const allowed = status.backup.allowed;
+  if (!s3.enabled) $("s3-archives").hidden = true;
+  $("s3-buttons").hidden = !s3.enabled || !!s3.problem;
+  ["s3-test", "s3-upload", "s3-list"].forEach(id => { $(id).disabled = !allowed; });
+  $("s3-why").hidden = !s3.enabled || allowed;
+  $("s3-why").textContent = allowed ? "" : status.backup.reason;
+  const state = $("s3-state");
+  state.replaceChildren();
+  if (!s3.enabled) {
+    state.append(tagged("Off. Set maintenance.s3.enabled = true and name a bucket to copy backups off this host.", "muted"));
+  } else if (s3.problem) {
+    state.append(tagged("Misconfigured: " + s3.problem, "bad"));
+  } else {
+    const kept = s3.keep ? "keeping the newest " + s3.keep : "keeping all";
+    state.append(tagged("On — " + (s3.scheduled ? "each scheduled backup is copied to " : "no backup schedule; copies are made by hand to ")
+      + s3.destination + " (" + s3.endpoint + "), " + kept, s3.scheduled ? "good" : "warn"));
+  }
+}
+
+// One call to the bucket, and what came of it.
+async function s3call(method, path, body, describe) {
+  $("error").textContent = "";
+  $("s3-result").hidden = false;
+  $("s3-result").className = "muted";
+  $("s3-result").textContent = "Working…";
+  ["s3-test", "s3-upload", "s3-list"].forEach(id => { $(id).disabled = true; });
+  try {
+    const headers = credentials();
+    const request = { method, headers, cache: "no-store" };
+    if (body !== undefined) {
+      headers["content-type"] = "application/json";
+      request.body = JSON.stringify(body);
+    }
+    const response = await fetch(prefix + path, request);
+    if (!response.ok) throw new Error(response.status + " " + await explain(response));
+    const [text, className] = describe(await response.json());
+    $("s3-result").textContent = text;
+    $("s3-result").className = className;
+  } catch (error) {
+    $("s3-result").className = "bad";
+    $("s3-result").textContent = "Failed: " + (error.message || error);
+  }
+  load();
+}
+
+function s3Upload(name) {
+  return s3call("POST", "maintenance/s3/upload", name ? { name } : undefined, result => {
+    const uploaded = result.uploaded;
+    return ["Uploaded " + uploaded.name + " (" + size(uploaded.bytes) + ") to " + uploaded.destination
+      + (uploaded.removed.length ? "; removed " + uploaded.removed.length + " older from the bucket" : "") + ".", "good"];
+  });
+}
+
+$("s3-test").addEventListener("click", () => s3call("POST", "maintenance/s3/test", undefined,
+  result => ["Connected to " + result.destination + " — listed and wrote in " + result.took_ms + " ms.", "good"]));
+$("s3-upload").addEventListener("click", () => s3Upload());
+$("s3-list").addEventListener("click", () => s3call("GET", "maintenance/s3", undefined, result => {
+  $("s3-archives").tBodies[0].replaceChildren(...result.archives.map(archive => {
+    const row = document.createElement("tr");
+    const name = cell("");
+    const code = document.createElement("code");
+    code.textContent = archive.name;
+    name.append(code);
+    row.append(name, cell(when(archive.created_at_ms)), cell(size(archive.bytes), "num"));
+    return row;
+  }));
+  $("s3-archives").hidden = !result.archives.length;
+  return [result.archives.length ? result.archives.length + " archive(s) in " + result.destination + "."
+    : "No archives in " + result.destination + " yet.", result.archives.length ? "good" : "muted"];
+}));
+
+function drawLastBackup(status) {
+  const last = status.last_backup;
+  const line = $("last-backup");
+  line.replaceChildren();
+  const limit = last.max_age_s ? " (expected at least every " + every(last.max_age_s) + ")" : "";
+  if (last.ok_ms == null) {
+    line.append(tagged("No backup on record" + (last.max_age_s ? ", and one is expected" + limit : ""), last.stale ? "warn" : "muted"));
+  } else {
+    line.append(tagged("Last backup " + span(last.ok_ms, status.now_ms) + " ago — " + when(last.ok_ms) + limit,
+      last.stale ? "warn" : "good"));
+  }
+  if (last.failed_ms != null) {
+    line.append(document.createTextNode(" · "), tagged("the last attempt, " + span(last.failed_ms, status.now_ms) + " ago, failed", "bad"));
+  }
+
+  $("history").hidden = !last.history.length;
+  $("history-none").hidden = !!last.history.length;
+  $("history-none").textContent = "None on record yet.";
+  $("history").tBodies[0].replaceChildren(...last.history.map(backup => {
+    const row = document.createElement("tr");
+    const result = cell("");
+    result.append(tagged(backup.ok ? "ok" : "failed: " + (backup.error || ""), backup.ok ? "good" : "bad"));
+    const where = cell("");
+    const code = document.createElement("code");
+    code.textContent = backup.destination;
+    where.append(code);
+    const by = { schedule: "schedule", http: "this page", cli: "kompressor backup" }[backup.origin] || backup.origin;
+    row.append(cell(when(backup.time_ms)), cell(by), result, cell(backup.ok ? size(backup.bytes) : "–", "num"), where);
+    return row;
+  }));
+}
+
+// The commands for this deployment: its own paths, its own configuration.
+function drawRestore(status) {
+  const config = status.restore.config ? " --config " + status.restore.config : "";
+  const step = (text, command) => {
+    const item = document.createElement("li");
+    item.append(document.createTextNode(text));
+    if (command) {
+      item.append(document.createElement("br"));
+      const code = document.createElement("code");
+      code.textContent = command;
+      item.append(code);
+    }
+    return item;
+  };
+  const files = status.databases.filter(database => database.path).map(database => database.path);
+  $("restore-steps").replaceChildren(
+    step("Stop the service.", status.restore.systemd ? "sudo systemctl stop kompressor" : ""),
+    step("Rehearse: the archive is checked and what would happen is printed. Nothing changes.",
+      "kompressor restore ARCHIVE.tar.gz" + config),
+    step("Restore" + (files.length ? " to " + files.join(" and ") : "") + ". Add --only stats.db or --only refs.db for one of them.",
+      "kompressor restore ARCHIVE.tar.gz" + config + " --yes"),
+    step("Start the service. A database older than this build is migrated as it starts.",
+      status.restore.systemd ? "sudo systemctl start kompressor" : ""),
+    step("When all is well, remove the files that were moved aside.", ""));
+}
+
+// Where it listens, how it is set, the process, and what it is doing now.
+function runningFacts(running) {
+  if (!running) return [];
+  const plural = (n, one, many) => count(n) + " " + (n === 1 ? one : many);
+  const auth = running.auth.mode === "none" ? "none (one anonymous tenant)"
+    : "API keys (" + plural(running.auth.keys, "key", "keys") + ")";
+  const scopes = {};
+  running.features.forEach(feature => {
+    (scopes[feature.scope] = scopes[feature.scope] || []).push(feature.setting + " = " + feature.value);
+  });
+  const process = running.process, load = running.load;
+  const about = ["pid " + process.pid];
+  if (process.user) about.push("user " + process.user);
+  if (process.memory_bytes != null) about.push(size(process.memory_bytes) + " in memory");
+  if (process.open_files != null) {
+    about.push(count(process.open_files) + (process.open_files_limit ? " of " + count(process.open_files_limit) : "") + " files open");
+  }
+  const busy = load.requests || load.engine_busy || load.backup_running;
+  const now = [
+    load.requests ? plural(load.requests, "request", "requests") + " under way through the proxy, "
+        + (load.streams ? count(load.streams) + " streaming" : "none streaming")
+      : "no request under way through the proxy",
+    "engine: " + load.engine_busy + " of " + load.engine_limit + " slots busy"
+      + (load.backup_running ? "; a backup is being written" : ""),
+    tagged(busy ? "a restart now would interrupt this" : "idle: a restart now interrupts no one", busy ? "warn" : "muted"),
+  ];
+  const env = running.env || [];
+  const named = effect => env.filter(one => one.effect === effect).map(one => one.name);
+  const variables = [];
+  if (named("applied").length) variables.push("changed a setting: " + named("applied").join(", "));
+  if (named("no_effect").length) {
+    const line = document.createElement("span");
+    line.append(tagged("changed nothing", "warn"), " " + named("no_effect").join(", ")
+      + " — an unknown name, a value that could not be read, or the value already in force");
+    variables.push(line);
+  }
+  if (named("elsewhere").length) variables.push("not settings: " + named("elsewhere").join(", "));
+  const took = ms => ms < 1000 ? ms + " ms" : (ms / 1000).toFixed(1) + " s";
+  const opened = (running.opened || []).map(one => one.database + ": "
+    + (one.from == null ? "created at v" + one.to
+      : one.from === one.to ? "v" + one.to + ", no migration"
+      : "migrated v" + one.from + " → v" + one.to)
+    + " (opened in " + took(one.took_ms) + ")");
+  const memory = running.memory;
+  const held = !memory ? "nothing: the proxy is not running in this process" : [
+    plural(memory.conversations, "conversation", "conversations") + " remembered, "
+      + count(memory.frozen) + " with a frozen prefix, " + count(memory.one_hour) + " on one-hour cache entries",
+    plural(memory.keep_warm, "keep-warm timer", "keep-warm timers") + " running, "
+      + plural(memory.recompacted, "conversation", "conversations") + " recompacted after a lapse",
+    memory.prediction === "unused" ? "lapse prediction: not in use"
+      : memory.prediction === "on"
+        ? "lapse prediction: on, " + plural(memory.wrong_predictions, "wrong prediction", "wrong predictions") + " since start"
+        : tagged("lapse prediction: switched off until restart, after "
+            + plural(memory.wrong_predictions, "wrong prediction", "wrong predictions"), "warn"),
+    tagged("a restart forgets all of this", "muted"),
+  ];
+  return [
+    ["Listening on", running.listeners.length
+      ? running.listeners.map(listener => listener.address + " — " + listener.serves.join(", "))
+      : "not on record"],
+    ["Mode", running.mode + "; authentication: " + auth + (running.auth.secret ? ", shared secret set" : "")],
+    ["Upstreams", !running.proxy_enabled ? "the proxy is off"
+      : running.upstreams.length
+        ? running.upstreams.map(upstream => upstream.name + ": " + upstream.path_prefix + " → " + upstream.base_url + " (" + upstream.api_family + ")")
+        : "none configured"],
+    ["Opt-in settings", Object.keys(scopes).length
+      ? Object.entries(scopes).map(([scope, set]) => (scope === "all" ? "every provider" : scope) + ": " + set.join(", "))
+      : "all as shipped"],
+    ["Environment", variables.length ? variables : "no KOMPRESSOR_ variable set"],
+    ["Schema at start", opened.length ? opened : "not on record"],
+    ["Process", about.join(", ")],
+    ["Right now", now],
+    ["Held in memory", held],
+  ];
+}
+
+function drawBuild(status) {
+  const build = status.build, running = status.running;
+  const facts = [
+    ["Version", "kompressor " + build.version + (build.commit ? " (" + build.commit + ")" : " (commit unknown)")],
+    ["Build", build.profile + " build for " + build.target
+      + (build.built_at_ms ? ", built " + when(build.built_at_ms) : "")
+      + "; code-aware grammars " + (build.code_aware ? "compiled in" : "not compiled in")],
+    ["Running since", when(build.started_at_ms) + " — up " + span(0, build.uptime_s * 1000)],
+    ["Binary", build.binary || "–"],
+    ["Configuration", build.config || "none: defaults and the environment"],
+    ["Supervised by", build.systemd ? "systemd" : "not systemd"],
+    ...runningFacts(running),
+  ];
+  $("build").replaceChildren(...facts.flatMap(([term, value]) => {
+    const dt = document.createElement("dt"), dd = document.createElement("dd");
+    dt.textContent = term;
+    [].concat(value).forEach((line, index) => {
+      if (index) dd.append(document.createElement("br"));
+      dd.append(line);
+    });
+    return [dt, dd];
+  }));
+  $("restart-pending").hidden = !build.restart_pending;
+  $("show-config").disabled = !status.space.allowed;
+  $("show-config").title = status.space.allowed ? "" : status.space.reason;
+}
+
+function drawWork(status) {
+  const history = status.history || [];
+  $("work").hidden = !history.length;
+  $("work-none").hidden = !!history.length;
+  $("work-none").textContent = "None on record yet.";
+  $("work").tBodies[0].replaceChildren(...history.map(work => {
+    const row = document.createElement("tr");
+    const result = cell("");
+    result.append(tagged(work.ok ? "ok" : "failed: " + (work.error || ""), work.ok ? "good" : "bad"));
+    const target = cell("");
+    const code = document.createElement("code");
+    code.textContent = work.target;
+    target.append(code);
+    const sized = work.bytes_before == null ? "–"
+      : work.bytes_after == null ? size(work.bytes_before) : size(work.bytes_before) + " → " + size(work.bytes_after);
+    row.append(cell(when(work.time_ms)), cell(work.action), target, cell(by(work)), result, cell(sized, "num"),
+      cell(work.took_ms < 1000 ? work.took_ms + " ms" : (work.took_ms / 1000).toFixed(1) + " s", "num"));
+    return row;
+  }));
+}
+
+// Trim or delete: always previewed first, and a delete asks for its phrase.
+const DELETE_PHRASE = "delete statistics";
+let lastStatus = null;
+const purgeKind = () => document.querySelector("input[name=purge-kind]:checked").value;
+const purgeScope = () => {
+  const scope = {};
+  const day = $("purge-before").value;
+  if (day) scope.before_ms = Date.parse(day + "T00:00:00Z");
+  if ($("purge-tenant").value.trim()) scope.tenant = $("purge-tenant").value.trim();
+  if ($("purge-run").value.trim()) scope.run_id = $("purge-run").value.trim();
+  if ($("purge-experiment").value.trim()) scope.experiment_id = $("purge-experiment").value.trim();
+  return scope;
+};
+function drawPurgeGrant() {
+  if (!lastStatus) return;
+  const grant = purgeKind() === "rows" ? lastStatus.erase : lastStatus.actions;
+  $("purge-preview").disabled = !grant.allowed;
+  $("purge-why").textContent = grant.allowed ? "" : grant.reason;
+  $("purge-why").hidden = grant.allowed;
+  $("purge-go").textContent = purgeKind() === "rows" ? "Delete these requests" : "Trim these requests";
+  $("purge-go").className = purgeKind() === "rows" ? "danger" : "primary";
+}
+function closePurge() {
+  $("purge-confirm").hidden = true;
+  $("purge-phrase").value = "";
+}
+async function purge(dryRun) {
+  $("error").textContent = "";
+  const kind = purgeKind(), scope = purgeScope();
+  const body = { kind, scope, dry_run: dryRun };
+  if (!dryRun && kind === "rows") body.confirm = $("purge-phrase").value.trim();
+  $("purge-result").hidden = false;
+  $("purge-result").className = "muted";
+  $("purge-result").textContent = dryRun ? "Rehearsing…" : "Working…";
+  const headers = credentials();
+  headers["content-type"] = "application/json";
+  const response = await fetch(prefix + "maintenance/statistics/delete",
+    { method: "POST", headers, cache: "no-store", body: JSON.stringify(body) });
+  if (!response.ok) throw new Error(response.status + " " + await explain(response));
+  const purged = (await response.json()).purged;
+  const entries = Object.entries(purged.tables);
+  $("purge-tables").tBodies[0].replaceChildren(...entries.map(([table, rows]) => {
+    const row = document.createElement("tr");
+    row.append(cell(table), cell(count(rows), "num"));
+    return row;
+  }));
+  $("purge-tables").hidden = !entries.length;
+  const what = kind === "rows" ? "deletes " + count(purged.rows) + " rows" : "empties the settings of " + count(purged.rows) + " requests";
+  const space = (purged.content_bytes != null ? size(purged.content_bytes) + " of settings" : "")
+    + (purged.freed_bytes ? (purged.content_bytes != null ? ", " : "") + size(purged.freed_bytes) + " of whole pages freed" : "");
+  $("purge-result").className = dryRun ? "" : "good";
+  $("purge-result").textContent = (dryRun ? "This " + what : "Done: it " + what.replace(/^deletes/, "deleted").replace(/^empties/, "emptied"))
+    + (space ? " — " + space : "") + (purged.rolled_up ? "; the days were rolled up first" : "") + ".";
+  return purged;
+}
+$("purge-scope").addEventListener("submit", async event => {
+  event.preventDefault();
+  closePurge();
+  try {
+    const purged = await purge(true);
+    if (!purged.rows) return;
+    $("purge-confirm-text").textContent = purgeKind() === "rows"
+      ? "Delete these " + count(purged.rows) + " rows? This cannot be undone from here — only by restoring a backup"
+        + (lastStatus && lastStatus.last_backup.ok_ms != null ? " (the last was taken " + ago(lastStatus.last_backup.ok_ms, lastStatus.now_ms) + ")." : "; there is none on record.")
+      : "Empty the settings of these " + count(purged.rows) + " requests? Every request stays, and the analysis history keeps what it reports.";
+    $("purge-phrase-row").hidden = purgeKind() !== "rows";
+    $("purge-go").disabled = purgeKind() === "rows";
+    $("purge-confirm").hidden = false;
+  } catch (error) {
+    $("purge-result").hidden = true;
+    $("error").textContent = "Preview failed: " + (error.message || error);
+  }
+});
+$("purge-phrase").addEventListener("input", () => {
+  $("purge-go").disabled = $("purge-phrase").value.trim() !== DELETE_PHRASE;
+});
+$("purge-go").addEventListener("click", async () => {
+  try {
+    await purge(false);
+  } catch (error) {
+    $("purge-result").hidden = true;
+    $("error").textContent = "Failed: " + (error.message || error);
+  }
+  closePurge();
+  load();
+});
+$("purge-cancel").addEventListener("click", closePurge);
+document.querySelectorAll("input[name=purge-kind]").forEach(input => input.addEventListener("change", () => {
+  closePurge();
+  $("purge-result").hidden = true;
+  $("purge-tables").hidden = true;
+  drawPurgeGrant();
+}));
+["purge-before", "purge-tenant", "purge-run", "purge-experiment"].forEach(id => $(id).addEventListener("input", closePurge));
+
+$("show-config").addEventListener("click", async () => {
+  $("error").textContent = "";
+  if (!$("config-text").hidden) { $("config-text").hidden = true; $("show-config").textContent = "Show effective configuration"; return; }
+  try {
+    const response = await fetch(prefix + "maintenance/config", { headers: credentials(), cache: "no-store" });
+    if (!response.ok) throw new Error(response.status + " " + await explain(response));
+    $("config-text").textContent = await response.text();
+    $("config-text").hidden = false;
+    $("show-config").textContent = "Hide effective configuration";
+  } catch (error) {
+    $("error").textContent = "Could not read the configuration: " + (error.message || error);
+  }
+});
+
+async function load() {
+  $("error").textContent = "";
+  try {
+    const response = await fetch(prefix + "maintenance?format=json", { headers: credentials(), cache: "no-store" });
+    if (!response.ok) throw new Error(response.status + " " + await explain(response));
+    const status = await response.json();
+    $("databases").tBodies[0].replaceChildren(...status.databases.map(database => databaseRow(database, status)));
+    $("databases").hidden = false;
+    $("actions-why").textContent = status.actions.allowed ? "" : status.actions.reason;
+    $("actions-why").hidden = status.actions.allowed;
+    drawSchedule(status);
+    drawLastBackup(status);
+    drawS3(status);
+    drawRestore(status);
+    drawRetention(status);
+    drawStorage(status);
+    drawDanger(status);
+    drawBuild(status);
+    drawWork(status);
+    lastStatus = status;
+    drawPurgeGrant();
+    $("backup").disabled = !status.backup.allowed;
+    $("why").textContent = status.backup.allowed ? "" : status.backup.reason;
+    $("why").hidden = status.backup.allowed;
+    $("status").textContent = "kompressor " + status.version + (status.build.commit ? " (" + status.build.commit + ")" : "") + " · " +
+      (status.backup.allowed ? "backup available" : "backup not available here") + " · " +
+      (status.actions.allowed ? "actions available" : "actions not available here");
+  } catch (error) {
+    $("status").textContent = "";
+    $("error").textContent = "Could not load: " + (error.message || error);
+  }
+}
+
+$("filters").addEventListener("submit", event => { event.preventDefault(); load(); });
+
+$("nuke").addEventListener("click", () => {
+  closeNuke();
+  $("nuke-done").hidden = true;
+  $("nuke-confirm").hidden = false;
+  $("nuke-continue").focus();
+});
+document.querySelectorAll(".nuke-cancel").forEach(element => element.addEventListener("click", closeNuke));
+$("nuke-continue").addEventListener("click", () => {
+  $("nuke-first").hidden = true;
+  $("nuke-second").hidden = false;
+  $("nuke-phrase").focus();
+});
+$("nuke-phrase").addEventListener("input", () => {
+  $("nuke-go").disabled = $("nuke-phrase").value.trim() !== NUKE_PHRASE;
+});
+$("nuke-go").addEventListener("click", async () => {
+  if ($("nuke-phrase").value.trim() !== NUKE_PHRASE) return;
+  closeNuke();
+  $("error").textContent = "";
+  $("nuke").disabled = true;
+  $("nuke-done").hidden = false;
+  $("nuke-done").className = "muted";
+  $("nuke-done").textContent = "Erasing…";
+  try {
+    const headers = credentials();
+    headers["content-type"] = "application/json";
+    const response = await fetch(prefix + "maintenance/statistics/erase",
+      { method: "POST", headers, cache: "no-store", body: JSON.stringify({ confirm: NUKE_PHRASE }) });
+    if (!response.ok) throw new Error(response.status + " " + await explain(response));
+    const erased = (await response.json()).erased;
+    $("nuke-done").className = "warn";
+    $("nuke-done").textContent = "Erased " + count(erased.rows) + " rows from " + erased.tables + " tables; stats.db went from "
+      + size(erased.bytes_before) + " to " + size(erased.bytes_after) + ".";
+  } catch (error) {
+    $("nuke-done").hidden = true;
+    $("error").textContent = "Erase failed: " + (error.message || error);
+  }
+  load();
+});
+
+$("backup").addEventListener("click", async () => {
+  $("error").textContent = "";
+  $("done").hidden = true;
+  $("backup").disabled = true;
+  $("progress").hidden = false;
+  $("progress").textContent = "Taking snapshots and compressing — this can take a minute for a large database…";
+  try {
+    const response = await fetch(prefix + "maintenance/backup", { method: "POST", headers: credentials(), cache: "no-store" });
+    if (!response.ok) throw new Error(response.status + " " + await explain(response));
+    $("progress").textContent = "Downloading…";
+    const blob = await response.blob();
+    const match = /filename="?([^";]+)"?/.exec(response.headers.get("content-disposition") || "");
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = match ? match[1] : "kompressor-backup.tar.gz";
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+    $("done").textContent = "Saved " + link.download + " (" + size(blob.size) + ").";
+    $("done").hidden = false;
+  } catch (error) {
+    $("error").textContent = "Backup failed: " + (error.message || error);
+  } finally {
+    $("progress").hidden = true;
+    $("backup").disabled = false;
+  }
+});
+
+load();
+</script>
+</body>
+</html>

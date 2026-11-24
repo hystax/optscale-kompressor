@@ -12,6 +12,7 @@ default = ["code-aware"]
 code-aware = ["kompressor-engine/code-aware"]
 
 [dependencies]
+blake2 = { workspace = true }
 kompressor-engine = { path = "../kompressor-engine", default-features = false }
 kompressor-store = { path = "../kompressor-store" }
 kompressor-stats = { path = "../kompressor-stats" }
@@ -25,6 +26,12 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+# The backup archive: database snapshots, tarred and gzipped.
+tar = { workspace = true }
+flate2 = { workspace = true }
+# SHA-256 of each scheduled archive, written beside it (`sha256sum -c`).
+ring = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
 
 [dev-dependencies]
 tempfile = "3"

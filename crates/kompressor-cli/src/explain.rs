@@ -447,134 +447,213 @@ fn forced_name(forced: ForcedType) -> &'static str {
 }
 
 impl Explanation {
-    /// The explanation as lines a human reads top to bottom.
+    /// The explanation as lines a human reads top to bottom, with colour
+    /// wrapped around the parts worth finding at a glance. Written through
+    /// [`crate::highlight::write_stderr`], the colour is stripped whenever it is
+    /// off, and what is left is the same text, byte for byte, as before colour
+    /// existed.
     pub fn render(&self) -> String {
+        use crate::highlight::{BAD, GOOD, HANDLE, LABEL, MARKER, VALUE, WARN, paint, sanitize};
         use std::fmt::Write as _;
+        let label = |name: &str| paint(LABEL, name);
         let mut out = String::new();
 
         let _ = writeln!(
             out,
-            "input        {} chars, role {}{}",
+            "{}{} chars, role {}{}",
+            label("input        "),
             self.chars_in,
-            self.role,
+            paint(VALUE, &self.role),
             if self.role_protected {
-                " (PROTECTED: this role is never compressed)"
+                paint(BAD, " (PROTECTED: this role is never compressed)")
             } else {
-                ""
+                String::new()
             }
         );
         let _ = writeln!(
             out,
-            "size gate    {} (min_compress_chars {})",
+            "{}{} (min_compress_chars {})",
+            label("size gate    "),
             if self.size_gate_passed {
-                "passed"
+                paint(GOOD, "passed")
             } else {
-                "BELOW THE GATE: the payload was left alone without being classified"
+                paint(
+                    WARN,
+                    "BELOW THE GATE: the payload was left alone without being classified",
+                )
             },
             self.min_compress_chars
         );
 
         match &self.forced_type {
             Some(forced) => {
-                let _ = writeln!(out, "forced type  {forced} (detection bypassed)");
+                let _ = writeln!(
+                    out,
+                    "{}{} (detection bypassed)",
+                    label("forced type  "),
+                    paint(VALUE, forced)
+                );
             }
             None => {
                 let _ = writeln!(
                     out,
-                    "detected     {} (confidence {:.2}){}{}",
-                    self.detection.content_type,
+                    "{}{} (confidence {:.2}){}{}",
+                    label("detected     "),
+                    paint(VALUE, &self.detection.content_type),
                     self.detection.confidence,
                     self.detection
                         .language
                         .as_ref()
-                        .map(|l| format!(", language {l}"))
+                        .map(|l| format!(", language {}", paint(VALUE, l)))
                         .unwrap_or_default(),
                     self.detection
                         .config_flavor
                         .as_ref()
-                        .map(|f| format!(", flavor {f}"))
+                        .map(|f| format!(", flavor {}", paint(VALUE, f)))
                         .unwrap_or_default(),
                 );
             }
         }
-        let _ = writeln!(out, "strategy     {}", self.strategy);
         let _ = writeln!(
             out,
-            "route        {} — {}",
-            self.route.winner, self.route.reason
+            "{}{}",
+            label("strategy     "),
+            paint(VALUE, &self.strategy)
         );
         let _ = writeln!(
             out,
-            "             segmenter offered: {}",
+            "{}{} — {}",
+            label("route        "),
+            paint(VALUE, &self.route.winner),
+            self.route.reason
+        );
+        let _ = writeln!(
+            out,
+            "{}segmenter offered: {}",
+            label("             "),
             self.route.segmenter_offered
         );
 
         if self.redraw.candidate {
             let _ = writeln!(
                 out,
-                "redraw       {} lines resolve to {} fewer chars; arbitrated: {}; {}",
+                "{}{} lines resolve to {} fewer chars; arbitrated: {}; {}",
+                label("redraw       "),
                 self.redraw.lines,
                 self.redraw.chars_resolved,
                 self.redraw.arbitrated,
                 if self.redraw.won {
-                    "the folded reading won"
+                    paint(VALUE, "the folded reading won")
                 } else {
-                    "the plain reading won"
+                    "the plain reading won".to_string()
                 }
             );
         } else {
-            let _ = writeln!(out, "redraw       no overwritten lines in this payload");
+            let _ = writeln!(
+                out,
+                "{}no overwritten lines in this payload",
+                label("redraw       ")
+            );
         }
 
+        let removed = format!("{:.2}% removed", self.saved_pct);
         let _ = writeln!(
             out,
-            "result       {} chars ({:.2}% removed), reported as {}",
+            "{}{} chars ({}), reported as {}",
+            label("result       "),
             self.chars_out,
-            self.saved_pct,
-            self.kind.as_deref().unwrap_or("untouched")
+            if self.saved_pct > 0.0 {
+                paint(GOOD, &removed)
+            } else {
+                removed
+            },
+            paint(VALUE, self.kind.as_deref().unwrap_or("untouched"))
         );
         if !self.applied.is_empty() {
-            let _ = writeln!(out, "applied      {}", self.applied.join(", "));
+            let _ = writeln!(
+                out,
+                "{}{}",
+                label("applied      "),
+                paint(VALUE, &self.applied.join(", "))
+            );
         }
 
-        let _ = writeln!(out, "accounted    {}", self.accounted.decision);
+        let decision = &self.accounted.decision;
+        let (verdict, rest) = decision
+            .split_once(':')
+            .map_or((decision.as_str(), ""), |(head, _)| {
+                (head, &decision[head.len()..])
+            });
+        let verdict_style = match verdict {
+            "accepted" => GOOD,
+            "inconsistent" => BAD,
+            _ => WARN,
+        };
+        let _ = writeln!(
+            out,
+            "{}{}{}",
+            label("accounted    "),
+            paint(verdict_style, verdict),
+            rest
+        );
 
         if self.markers.is_empty() {
-            let _ = writeln!(out, "markers      none");
+            let _ = writeln!(out, "{}none", label("markers      "));
         } else {
-            let _ = writeln!(out, "markers      {}", self.markers.len());
+            let _ = writeln!(out, "{}{}", label("markers      "), self.markers.len());
             for marker in &self.markers {
                 let _ = writeln!(
                     out,
                     "  {} {}",
-                    marker.handle.as_deref().unwrap_or("(no handle)"),
-                    marker.text
+                    match &marker.handle {
+                        Some(handle) => paint(HANDLE, handle),
+                        None => paint(WARN, "(no handle)"),
+                    },
+                    paint(MARKER, &sanitize(&marker.text))
                 );
             }
         }
         if let Some(reason) = &self.handleless_marker_reason {
-            let _ = writeln!(out, "             {reason}");
+            let _ = writeln!(out, "{}{}", label("             "), paint(WARN, reason));
         }
 
         if self.refs.is_empty() {
-            let _ = writeln!(out, "refs         none retained");
+            let _ = writeln!(out, "{}none retained", label("refs         "));
         } else {
-            let _ = writeln!(out, "refs         {} retained", self.refs.len());
+            let _ = writeln!(
+                out,
+                "{}{} retained",
+                label("refs         "),
+                self.refs.len()
+            );
             for reference in &self.refs {
                 let _ = writeln!(
                     out,
                     "  {} {} bytes{}",
-                    reference.handle,
+                    paint(HANDLE, &reference.handle),
                     reference.bytes,
                     if reference.named_by_output {
-                        ""
+                        String::new()
                     } else {
-                        "  ORPHANED: the output never names this handle"
+                        paint(BAD, "  ORPHANED: the output never names this handle")
                     }
                 );
             }
         }
 
         out
+    }
+
+    /// How `--show-output` should read the compressed payload: by the
+    /// detector's verdict, or by the type the caller forced.
+    pub fn hint(&self) -> crate::highlight::Hint {
+        match &self.forced_type {
+            Some(forced) => crate::highlight::Hint::from_names(forced, None, None),
+            None => crate::highlight::Hint::from_names(
+                &self.detection.content_type,
+                self.detection.language.as_deref(),
+                self.detection.config_flavor.as_deref(),
+            ),
+        }
     }
 }

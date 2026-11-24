@@ -15,7 +15,7 @@ use kompressor_stats::events::Surface;
 use kompressor_stats::reader::StatsReader;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 
@@ -121,7 +121,10 @@ impl KompressorTools {
     ///
     /// Read from the connection, never from the call's arguments. A `tenant`
     /// field in a tool's arguments reaches no code at all.
-    fn identity(&self, context: &RequestContext<RoleServer>) -> Result<Identity, ErrorData> {
+    pub(crate) fn identity(
+        &self,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<Identity, ErrorData> {
         match &self.identity {
             IdentitySource::Fixed(identity) => Ok((**identity).clone()),
             IdentitySource::Connection => context
@@ -145,10 +148,15 @@ impl KompressorTools {
 
     /// The request identifier recorded against everything this call does.
     ///
-    /// The JSON-RPC id is reused so a row in the statistics database can be
-    /// matched back to the exact tool call that produced it.
-    fn request_id(context: &RequestContext<RoleServer>) -> String {
-        format!("mcp-{}", context.id)
+    /// The JSON-RPC id ends it, so a row in the statistics database can still
+    /// be matched back to the tool call that produced it — but it cannot *be*
+    /// the id. It is chosen by the client, and over stateless streamable HTTP
+    /// it restarts at 1 with every POST, so every call a tenant made was
+    /// recorded as `mcp-1`: unrelated compressions summed as one request,
+    /// retrievals attributed to whichever of them came first, and each call's
+    /// run context overwriting the last.
+    pub(crate) fn request_id(context: &RequestContext<RoleServer>) -> String {
+        unique_request_id(&context.id.to_string())
     }
 }
 
@@ -220,6 +228,8 @@ impl KompressorTools {
         let for_store = identity.clone();
         let request_id = request.request_id.to_string();
         let reference = normalize_handle(&input.reference).to_string();
+        // Kept for the note after the move into the blocking closure.
+        let handle = reference.clone();
         let range = input.range.map(Into::into);
         let retrieved = blocking(move || {
             core.retrieve(
@@ -264,6 +274,21 @@ impl KompressorTools {
         let mut result =
             CallToolResult::structured(serde_json::to_value(&output).map_err(internal)?);
         result.content = vec![ContentBlock::text(text)];
+        // ...and a second block for what the envelope says, when it says
+        // something the model should act on.
+        //
+        // Not every client surfaces `structuredContent`. Claude Desktop's chat
+        // shows the text blocks alone, and a model there reported `found` and
+        // `total_lines` as simply absent — so the one field that carries an
+        // instruction, `truncated`, was invisible precisely where the tool
+        // description tells the model to narrow the range and ask again.
+        //
+        // Kept out of the first block so a fragment stays quotable verbatim,
+        // and omitted entirely when the whole fragment came back, which is the
+        // case that needs no commentary.
+        if let Some(note) = envelope_note(&output, &handle) {
+            result.content.push(ContentBlock::text(note));
+        }
         Ok(result)
     }
 
@@ -423,7 +448,10 @@ impl KompressorTools {
         }
 
         let to = input.to.unwrap_or_else(now_ms);
-        let from = input.from.unwrap_or(to - DEFAULT_STATS_WINDOW_MS);
+        // `to` is the caller's: near `i64::MIN` a plain subtraction overflows.
+        let from = input
+            .from
+            .unwrap_or_else(|| to.saturating_sub(DEFAULT_STATS_WINDOW_MS));
         // Opened per call rather than held: the writer owns the connection that
         // matters, and a reader kept open across a retention sweep would serve
         // a stale page cache.
@@ -452,8 +480,8 @@ impl KompressorTools {
 // `tools/call`.
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for KompressorTools {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(SERVER_INSTRUCTIONS)
             // The default here is the transport library's own name and version,
             // which is what a user sees in an agent's server list. Naming the
@@ -467,11 +495,55 @@ impl ServerHandler for KompressorTools {
     }
 }
 
+/// `mcp-<unique>-<json-rpc id>`: unique in this process by a counter, and
+/// across processes and restarts by the millisecond it was issued in.
+fn unique_request_id(rpc_id: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let ms = now_ms().max(0) as u64;
+    // Whatever the client put in its id is not carried into a log line or a
+    // stats key verbatim: only what could not forge either.
+    let tail: String = rpc_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .take(32)
+        .collect();
+    format!("mcp-{ms:x}{:04x}-{tail}", counter & 0xFFFF_FFFF)
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// What the envelope says, for clients that never show the envelope.
+///
+/// `None` when the whole fragment came back intact: the content speaks for
+/// itself and a note would be noise on every retrieval. Something is returned
+/// only when the model is holding part of a fragment, because then "how much is
+/// there" and "was this cut" change what it should do next.
+fn envelope_note(output: &RetrieveOutput, reference: &str) -> Option<String> {
+    if !output.found {
+        // The miss already explains itself in the first block.
+        return None;
+    }
+    if output.truncated {
+        return Some(format!(
+            "[kompressor: TRUNCATED at the size cap. ref:{reference} holds {} lines / {} chars. \
+             Ask again with a narrower range rather than assuming this is all of it.]",
+            output.total_lines, output.total_chars
+        ));
+    }
+    if output.ranged {
+        return Some(format!(
+            "[kompressor: a range of ref:{reference}, which holds {} lines / {} chars in full.]",
+            output.total_lines, output.total_chars
+        ));
+    }
+    None
 }
 
 fn internal(error: serde_json::Error) -> ErrorData {
@@ -480,4 +552,81 @@ fn internal(error: serde_json::Error) -> ErrorData {
 
 fn tool_failure(what: &str, error: impl std::fmt::Display) -> ErrorData {
     ErrorData::internal_error(format!("could not {what}: {error}"), None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn output(found: bool, ranged: bool, truncated: bool) -> RetrieveOutput {
+        RetrieveOutput {
+            content: found.then(|| "fragment".to_string()),
+            found,
+            expired: false,
+            ranged,
+            total_lines: 200,
+            total_chars: 4_800,
+            truncated,
+            hint: None,
+        }
+    }
+
+    #[test]
+    fn a_whole_fragment_gets_no_note() {
+        assert_eq!(envelope_note(&output(true, false, false), "k_x"), None);
+    }
+
+    #[test]
+    fn a_miss_gets_no_note() {
+        // The first block already says why; a second would repeat it.
+        assert_eq!(envelope_note(&output(false, true, true), "k_x"), None);
+    }
+
+    #[test]
+    fn a_range_names_the_handle_and_the_whole_size() {
+        let note = envelope_note(&output(true, true, false), "k_abc").expect("a note");
+        assert_eq!(
+            note,
+            "[kompressor: a range of ref:k_abc, which holds 200 lines / 4800 chars in full.]"
+        );
+    }
+
+    #[test]
+    fn a_truncation_says_so_and_wins_over_a_range() {
+        // Truncated is the field that asks the model to act, so it is the one
+        // reported when both hold.
+        let note = envelope_note(&output(true, true, true), "k_abc").expect("a note");
+        assert_eq!(
+            note,
+            "[kompressor: TRUNCATED at the size cap. ref:k_abc holds 200 lines / 4800 chars. \
+             Ask again with a narrower range rather than assuming this is all of it.]"
+        );
+        assert!(
+            !note.contains("  "),
+            "no run of spaces in the text: {note:?}"
+        );
+    }
+
+    /// A JSON-RPC id is the client's and repeats; the recorded id must not.
+    #[test]
+    fn two_calls_with_the_same_json_rpc_id_get_different_request_ids() {
+        let ids: Vec<String> = (0..500).map(|_| unique_request_id("1")).collect();
+        let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(distinct.len(), ids.len());
+        assert!(
+            ids.iter()
+                .all(|id| id.starts_with("mcp-") && id.ends_with("-1"))
+        );
+    }
+
+    /// The client's id is carried as a suffix, stripped of anything that could
+    /// break a log line or pass for a different key.
+    #[test]
+    fn the_json_rpc_id_is_carried_but_never_verbatim_when_it_is_hostile() {
+        let id = unique_request_id("\"abc\ninjected: 1\"");
+        assert!(id.ends_with("-abcinjected1"), "{id}");
+        assert!(!id.contains('\n') && !id.contains('"') && !id.contains(' '));
+        let long = unique_request_id(&"x".repeat(10_000));
+        assert!(long.len() < 80, "{}", long.len());
+    }
 }

@@ -3,7 +3,7 @@
 # target/dist with checksums.
 #
 # "This machine" is the load-bearing part. A full release matrix needs a C
-# toolchain per target — the tree-sitter grammars, bundled SQLite and aws-lc-rs
+# toolchain per target — the tree-sitter grammars, bundled SQLite and ring
 # are all C — and no single host has them all. So each leg is probed before it
 # is attempted and skipped with the command that would enable it, rather than
 # run and left to fail three layers down in a linker. What is skipped is

@@ -28,6 +28,10 @@ pub struct CompressArgs {
     pub forced: Option<ForcedType>,
     pub json: bool,
     pub explain: bool,
+    /// Also show the compressed payload on standard error, highlighted.
+    pub show_output: bool,
+    /// When standard error gets colour. Standard output never does.
+    pub color: crate::highlight::ColorWhen,
 }
 
 /// What a compression produced, for `--json`.
@@ -127,7 +131,9 @@ pub fn compress(args: CompressArgs) -> CliResult {
 
     let chars_in = content.chars().count();
     let chars_out = output.chars().count();
-    let explanation = args.explain.then(|| {
+    // `--show-output` reads the payload by the detector's verdict, so it needs
+    // the explanation even when the report itself was not asked for.
+    let explanation = (args.explain || args.show_output).then(|| {
         explain(
             &content,
             &args.role,
@@ -141,6 +147,18 @@ pub fn compress(args: CompressArgs) -> CliResult {
             },
         )
     });
+
+    // `--show-output` is rendered from the same explanation, then the
+    // explanation is kept only if the report itself was asked for.
+    let view = args.show_output.then(|| {
+        crate::highlight::output_view(
+            &output,
+            explanation
+                .as_ref()
+                .map_or(crate::highlight::Hint::Plain, Explanation::hint),
+        )
+    });
+    let explanation = explanation.filter(|_| args.explain);
 
     if args.json {
         let payload = CompressJson {
@@ -163,10 +181,23 @@ pub fn compress(args: CompressArgs) -> CliResult {
             explain: explanation,
         };
         print_json(&payload)?;
+        // The JSON already carries the explanation; only the view is extra,
+        // and it goes to standard error like every other human-facing part.
+        if let Some(view) = &view {
+            crate::highlight::write_stderr(args.color, view);
+        }
     } else {
         print!("{output}");
-        if let Some(explanation) = explanation {
-            eprint!("{}", explanation.render());
+        let mut report = explanation.map(|e| e.render()).unwrap_or_default();
+        if let Some(view) = &view {
+            report.push_str(view);
+        }
+        if !report.is_empty() {
+            // Standard output first, and flushed, so a terminal shows the
+            // payload and then the report. Each stream's bytes are unchanged.
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            crate::highlight::write_stderr(args.color, &report);
         }
     }
     Ok(())

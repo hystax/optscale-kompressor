@@ -43,12 +43,17 @@
 
 #![forbid(unsafe_code)]
 
+pub mod browse;
 pub mod cache;
 pub mod clock;
 pub mod memory;
 pub mod sqlite;
 pub mod types;
 
+pub use browse::{
+    BrowseOrder, BrowsePage, BrowseQuery, MAX_CENSUS_ENTRIES, RefBrowse, RefCensus, RefCensusEntry,
+    RefDetail, RefSummary,
+};
 pub use cache::CachedRefStore;
 pub use clock::{Clock, ManualClock};
 pub use memory::MemoryRefStore;
@@ -146,12 +151,23 @@ mod tests {
         an_entry_past_its_idle_window_reports_expired_rather_than_missing,
         an_expired_entry_is_dropped_by_the_read_that_reported_it,
         an_entry_that_keeps_being_read_still_dies_at_the_lifetime_cap,
+        re_storing_a_dead_unswept_handle_mints_a_live_one,
+        re_storing_a_live_handle_near_its_cap_does_not_extend_the_cap,
         touch_many_extends_several_at_once_and_reports_how_many_it_found,
         touching_does_not_resurrect_an_expired_entry,
         purge_expired_removes_exactly_the_dead_rows_and_returns_the_count,
         the_byte_cap_evicts_the_least_recently_accessed_first,
         stats_reports_live_rows_and_bytes,
         an_empty_batch_is_accepted_and_changes_nothing,
+        browsing_lists_only_the_callers_tenant_newest_first,
+        browsing_hides_expired_rows_unless_asked_and_never_touches,
+        browsing_filters_by_search_kind_request_and_handle,
+        browsing_pages_and_orders_deterministically,
+        a_browse_preview_is_cut_on_a_character_boundary,
+        a_search_preview_is_a_window_around_the_first_match,
+        inspecting_an_expired_row_neither_deletes_nor_touches_it,
+        removing_deletes_only_the_named_tenants_rows,
+        a_census_lists_the_tenants_bookkeeping_newest_first_without_touching,
     );
 
     fn meta() -> PutMeta {
@@ -362,6 +378,54 @@ mod tests {
         );
     }
 
+    /// A row past its absolute lifetime that the sweep has not reached yet is
+    /// the same thing as no row. Before the fix the re-store kept the dead
+    /// `created_at`, so the handle just minted read back `Expired` — and the
+    /// request that stored it was reverted to its original bytes.
+    fn re_storing_a_dead_unswept_handle_mints_a_live_one(make: Make) {
+        let f = make(1_000, None);
+        let fragment = "crossed its cap between two turns";
+        let id = put(f.store(), &a(), fragment, &meta_with(100, 250));
+
+        // Past both deadlines (idle 1_100, absolute 1_250); no purge runs.
+        f.clock.advance(300);
+        let again = put(f.store(), &a(), fragment, &meta_with(100, 250));
+        assert_eq!(again, id);
+
+        match f.store().get(&a(), &id, false).unwrap() {
+            Lookup::Hit(record) => {
+                assert_eq!(record.created_at, 1_300, "a dead row is a fresh insert");
+                assert_eq!(record.fragment, fragment);
+            }
+            other => panic!("a handle stored a moment ago must resolve, got {other:?}"),
+        }
+        // And its new life is a full one, not the remainder of the old.
+        f.clock.advance(90);
+        assert!(f.store().get(&a(), &id, true).unwrap().is_hit());
+    }
+
+    /// The other side of the same rule: a row that is still alive keeps its
+    /// `created_at`, so re-storing it every turn cannot outrun the cap.
+    fn re_storing_a_live_handle_near_its_cap_does_not_extend_the_cap(make: Make) {
+        let f = make(1_000, None);
+        let fragment = "re-stored every turn";
+        let id = put(f.store(), &a(), fragment, &meta_with(100, 250));
+        for _ in 0..4 {
+            f.clock.advance(60);
+            put(f.store(), &a(), fragment, &meta_with(100, 250));
+        }
+        // 1_240: alive, with the original birth.
+        match f.store().get(&a(), &id, false).unwrap() {
+            Lookup::Hit(record) => assert_eq!(record.created_at, 1_000),
+            other => panic!("expected a hit, got {other:?}"),
+        }
+        f.clock.advance(11);
+        assert_eq!(
+            f.store().get(&a(), &id, false).unwrap(),
+            Lookup::Expired { expired_at: 1_250 }
+        );
+    }
+
     fn touch_many_extends_several_at_once_and_reports_how_many_it_found(make: Make) {
         let f = make(1_000, None);
         let policy = meta_with(100, 10_000);
@@ -467,6 +531,340 @@ mod tests {
         f.store().put_many(&a(), &[], &meta()).unwrap();
         assert_eq!(f.store().touch_many(&a(), &[]).unwrap(), 0);
         assert_eq!(f.store().stats().unwrap(), StoreStats::default());
+    }
+
+    fn browser(f: &Fixture) -> &dyn RefBrowse {
+        f.store().browser().expect("every backend can be browsed")
+    }
+
+    fn handles(page: &BrowsePage) -> Vec<RefId> {
+        page.entries.iter().map(|entry| entry.id).collect()
+    }
+
+    fn browsing_lists_only_the_callers_tenant_newest_first(make: Make) {
+        let f = make(1_000, None);
+        let first = put(f.store(), &a(), "first", &meta());
+        f.clock.advance(10);
+        let second = put(f.store(), &a(), "second", &meta());
+        put(f.store(), &b(), "someone else's", &meta());
+
+        let page = browser(&f).browse(&a(), &BrowseQuery::default()).unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(handles(&page), vec![second, first]);
+        assert_eq!(page.kinds, vec![("log".to_owned(), 2)]);
+        let entry = &page.entries[1];
+        assert_eq!(entry.preview, "first");
+        assert!(!entry.truncated);
+        assert_eq!(entry.bytes, 5);
+        assert_eq!(entry.created_at, 1_000);
+        assert_eq!(entry.expires_at, 1_000 + DEFAULT_TTL_SECONDS);
+        assert!(!entry.expired);
+    }
+
+    fn browsing_hides_expired_rows_unless_asked_and_never_touches(make: Make) {
+        let f = make(1_000, None);
+        let short = put(f.store(), &a(), "short", &meta_with(100, 10_000));
+        let long = put(f.store(), &a(), "long", &meta_with(10_000, 10_000));
+
+        f.clock.advance(90);
+        browser(&f).browse(&a(), &BrowseQuery::default()).unwrap();
+        browser(&f).inspect(&a(), &short).unwrap();
+        f.clock.advance(20);
+
+        // Had the browse or the inspect touched `short`, it would be live at
+        // 1_110; it is not, because looking is not using.
+        let live = browser(&f).browse(&a(), &BrowseQuery::default()).unwrap();
+        assert_eq!(handles(&live), vec![long]);
+        let all = browser(&f)
+            .browse(
+                &a(),
+                &BrowseQuery {
+                    include_expired: true,
+                    order: BrowseOrder::ExpiringSoon,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(handles(&all), vec![short, long]);
+        assert!(all.entries[0].expired);
+        assert_eq!(all.entries[0].expires_at, 1_100);
+    }
+
+    fn browsing_filters_by_search_kind_request_and_handle(make: Make) {
+        let f = make(1_000, None);
+        let secret = put(
+            f.store(),
+            &a(),
+            "export AWS_SECRET=abc",
+            &meta().with_request_id("req-7"),
+        );
+        let json = put(
+            f.store(),
+            &a(),
+            "{\"rows\": []}",
+            &PutMeta::new(Kind::Json).with_request_id("req-8"),
+        );
+        let search = |text: &str| {
+            browser(&f)
+                .browse(
+                    &a(),
+                    &BrowseQuery {
+                        search: Some(text.to_owned()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+
+        assert_eq!(handles(&search("aws_secret")), vec![secret], "case folds");
+        assert_eq!(handles(&search("REQ-8")), vec![json], "request ids match");
+        assert_eq!(handles(&search(&secret.to_string())), vec![secret]);
+        assert_eq!(handles(&search(&format!("ref:{secret}"))), vec![secret]);
+        let partial = format!("k_{}", &json.body()[..6]);
+        assert!(
+            handles(&search(&partial)).contains(&json),
+            "a partial handle"
+        );
+        assert_eq!(search("nothing like this").total, 0);
+        assert_eq!(search("   ").total, 2, "blank is no filter");
+
+        let by_kind = browser(&f)
+            .browse(
+                &a(),
+                &BrowseQuery {
+                    kind: Some("json".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(handles(&by_kind), vec![json]);
+        assert_eq!(by_kind.kinds.len(), 2, "kinds ignore the other filters");
+
+        let by_request = browser(&f)
+            .browse(
+                &a(),
+                &BrowseQuery {
+                    request_id: Some("req-7".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(handles(&by_request), vec![secret]);
+
+        // Tenant b holds the same bytes under the same handle and still sees
+        // only its own copy.
+        put(f.store(), &b(), "export AWS_SECRET=abc", &meta());
+        let other = browser(&f)
+            .browse(
+                &b(),
+                &BrowseQuery {
+                    request_id: Some("req-7".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(other.total, 0);
+    }
+
+    fn browsing_pages_and_orders_deterministically(make: Make) {
+        let f = make(1_000, None);
+        // One batch, one second: only the handle can break the tie.
+        let mut ids: Vec<RefId> = (0..5)
+            .map(|n| put(f.store(), &a(), &"x".repeat(n + 1), &meta()))
+            .collect();
+
+        let largest = browser(&f)
+            .browse(
+                &a(),
+                &BrowseQuery {
+                    order: BrowseOrder::Largest,
+                    limit: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(largest.total, 5);
+        assert_eq!(handles(&largest), vec![ids[4], ids[3]]);
+
+        ids.sort_by(|x, y| x.body().cmp(y.body()));
+        let page = |offset| {
+            handles(
+                &browser(&f)
+                    .browse(
+                        &a(),
+                        &BrowseQuery {
+                            order: BrowseOrder::Oldest,
+                            offset,
+                            limit: 2,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap(),
+            )
+        };
+        assert_eq!(page(0), ids[..2]);
+        assert_eq!(page(2), ids[2..4]);
+        assert_eq!(page(4), ids[4..]);
+        assert!(page(10).is_empty());
+
+        let capped = browser(&f)
+            .browse(
+                &a(),
+                &BrowseQuery {
+                    limit: usize::MAX,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(capped.entries.len(), 5);
+    }
+
+    fn a_browse_preview_is_cut_on_a_character_boundary(make: Make) {
+        let f = make(1_000, None);
+        let fragment = "ёжик в тумане ".repeat(50);
+        put(f.store(), &a(), &fragment, &meta());
+        let page = browser(&f)
+            .browse(
+                &a(),
+                &BrowseQuery {
+                    preview_chars: 7,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(page.entries[0].preview, "ёжик в ");
+        assert!(page.entries[0].truncated);
+        assert_eq!(page.entries[0].bytes, fragment.len() as u64);
+    }
+
+    fn a_search_preview_is_a_window_around_the_first_match(make: Make) {
+        let f = make(1_000, None);
+        let fragment = format!("{}AWS_SECRET=x{}", "ё".repeat(300), "b".repeat(300));
+        let deep = put(f.store(), &a(), &fragment, &meta().with_request_id("req-ё"));
+        let browse = |search: &str| {
+            browser(&f)
+                .browse(
+                    &a(),
+                    &BrowseQuery {
+                        search: Some(search.to_owned()),
+                        preview_chars: 40,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+
+        let page = browse("aws_secret");
+        let entry = &page.entries[0];
+        assert_eq!(entry.id, deep);
+        assert_eq!(entry.preview_start, 290, "ten characters of lead-in");
+        assert_eq!(
+            entry.preview,
+            format!("{}AWS_SECRET=x{}", "ё".repeat(10), "b".repeat(18))
+        );
+        assert!(entry.truncated);
+
+        // A hit on the request id, not the text: the preview is the start.
+        let page = browse("req-ё");
+        assert_eq!(page.entries[0].preview_start, 0);
+        assert_eq!(page.entries[0].preview, "ё".repeat(40));
+
+        // A window that reaches the end of the fragment is not a cut.
+        put(
+            f.store(),
+            &a(),
+            &format!("{}THE END", "z".repeat(100)),
+            &meta(),
+        );
+        let tail = browse("the end");
+        assert_eq!(
+            tail.entries[0].preview,
+            format!("{}THE END", "z".repeat(10))
+        );
+        assert_eq!(tail.entries[0].preview_start, 90);
+        assert!(!tail.entries[0].truncated);
+    }
+
+    fn inspecting_an_expired_row_neither_deletes_nor_touches_it(make: Make) {
+        let f = make(1_000, None);
+        let id = put(f.store(), &a(), "aged out", &meta_with(100, 10_000));
+        f.clock.advance(150);
+
+        let detail = browser(&f)
+            .inspect(&a(), &id)
+            .unwrap()
+            .expect("still on disk");
+        assert!(detail.expired);
+        assert_eq!(detail.expires_at, 1_100);
+        assert_eq!(detail.record.fragment, "aged out");
+        assert_eq!(detail.max_lifetime_seconds, 10_000);
+        assert!(
+            browser(&f).inspect(&a(), &id).unwrap().is_some(),
+            "not deleted"
+        );
+        assert!(browser(&f).inspect(&b(), &id).unwrap().is_none(), "scoped");
+    }
+
+    fn a_census_lists_the_tenants_bookkeeping_newest_first_without_touching(make: Make) {
+        let f = make(1_000, None);
+        let old = put(f.store(), &a(), "aged out", &meta_with(100, 10_000));
+        f.clock.advance(150);
+        let new = put(
+            f.store(),
+            &a(),
+            "fresh",
+            &PutMeta::new(Kind::Json)
+                .with_ttl(600)
+                .with_max_lifetime(400),
+        );
+        put(f.store(), &b(), "someone else's", &meta());
+
+        let census = browser(&f).census(&a()).unwrap();
+        assert!(!census.truncated);
+        let ids: Vec<&str> = census.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec![new.body(), old.body()]);
+        let (fresh, aged) = (&census.entries[0], &census.entries[1]);
+        assert_eq!((fresh.kind.as_str(), fresh.bytes), ("json", 5));
+        assert_eq!(fresh.created_at, 1_150);
+        assert_eq!(fresh.expires_at, 1_550, "the lifetime cap comes first");
+        assert!(!fresh.expired);
+        assert_eq!((aged.kind.as_str(), aged.expires_at), ("log", 1_100));
+        assert!(aged.expired);
+        assert!(
+            browser(&f).inspect(&a(), &old).unwrap().is_some(),
+            "a census deletes nothing"
+        );
+        assert_eq!(
+            browser(&f)
+                .inspect(&a(), &old)
+                .unwrap()
+                .unwrap()
+                .record
+                .last_accessed,
+            1_000,
+            "and touches nothing"
+        );
+        assert!(
+            browser(&f)
+                .census(&Tenant::new("nobody"))
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+    }
+
+    fn removing_deletes_only_the_named_tenants_rows(make: Make) {
+        let f = make(1_000, None);
+        let fragment = "held by both tenants";
+        let id = put(f.store(), &a(), fragment, &meta());
+        put(f.store(), &b(), fragment, &meta());
+        let never = ref_for("never stored");
+
+        assert_eq!(browser(&f).remove(&a(), &[id, never]).unwrap(), 1);
+        assert_eq!(f.store().get(&a(), &id, false).unwrap(), Lookup::Miss);
+        assert!(f.store().get(&b(), &id, false).unwrap().is_hit());
+        assert_eq!(browser(&f).remove(&a(), &[id]).unwrap(), 0, "idempotent");
+        assert_eq!(browser(&f).remove(&a(), &[]).unwrap(), 0);
     }
 
     #[test]

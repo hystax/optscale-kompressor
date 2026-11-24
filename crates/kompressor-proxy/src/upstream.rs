@@ -6,8 +6,9 @@
 //! rounds, and a base prompt that drifts is a provider cache prefix that
 //! misses — which costs more than the whole compression saved.
 
-use std::sync::Arc;
+use kompressor_stats::context::ProxyTiming;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -42,8 +43,11 @@ pub(crate) struct Outbound {
     /// understate the wait by exactly the part the loop added. Accumulating at
     /// the one place every path goes through is what stops the two disagreeing.
     waited_us: Arc<AtomicU64>,
-    /// Set when the proxy added `prompt_cache_retention`, so a refusal of it
-    /// can be answered by sending without it. See [`crate::retention`].
+    timing: Arc<Mutex<ProxyTiming>>,
+    started: Instant,
+    /// Set when the proxy added `prompt_cache_retention` or `prompt_cache_key`,
+    /// so a refusal of either can be answered by sending without it. See
+    /// [`crate::retention`].
     retention: Option<retention::Guard>,
 }
 
@@ -75,8 +79,18 @@ impl Outbound {
             timeout: None,
             encoding,
             waited_us: Arc::new(AtomicU64::new(0)),
+            timing: Arc::new(Mutex::new(ProxyTiming::default())),
+            started: Instant::now(),
             retention: None,
         }
+    }
+
+    pub(crate) fn with_started(mut self, started: Instant) -> Self {
+        self.started = started;
+        self
+    }
+    pub(crate) fn timing(&self) -> Arc<Mutex<ProxyTiming>> {
+        self.timing.clone()
     }
 
     /// The body carries a `prompt_cache_retention` the proxy added.
@@ -156,26 +170,38 @@ impl Outbound {
                 .unwrap_or_else(|| self.body.clone());
             return self.send_body(body).await;
         }
-        let response = self.send_body(self.body.clone()).await?;
-        if response.status() != StatusCode::BAD_REQUEST {
-            return Ok(response);
+        // Once per field this request was given: an upstream that reports one
+        // unknown parameter at a time refuses the second only after the first
+        // is gone, and the client sent neither.
+        let mut body = self.body.clone();
+        for _ in 0..=guard.fields() {
+            let response = self.send_body(body.clone()).await?;
+            if response.status() != StatusCode::BAD_REQUEST {
+                return Ok(response);
+            }
+            // An error is small; reading it is the only way to know whose it is.
+            let status = response.status();
+            let version = response.version();
+            let headers = response.headers().clone();
+            let bytes = response.bytes().await?;
+            // Stripped from the original each time: every field refused so
+            // far comes out, and a refusal that names nothing new ends it.
+            match guard
+                .refuse_named(&bytes)
+                .then(|| guard.strip(&self.body, self.encoding))
+                .flatten()
+            {
+                Some(stripped) if stripped != body => body = stripped,
+                _ => {
+                    let mut rebuilt = http::Response::new(bytes);
+                    *rebuilt.status_mut() = status;
+                    *rebuilt.version_mut() = version;
+                    *rebuilt.headers_mut() = headers;
+                    return Ok(reqwest::Response::from(rebuilt));
+                }
+            }
         }
-        // An error is small; reading it is the only way to know whose it is.
-        let status = response.status();
-        let version = response.version();
-        let headers = response.headers().clone();
-        let bytes = response.bytes().await?;
-        if retention::names_field(&bytes)
-            && let Some(stripped) = guard.strip(&self.body, self.encoding)
-        {
-            guard.refuse();
-            return self.send_body(stripped).await;
-        }
-        let mut rebuilt = http::Response::new(bytes);
-        *rebuilt.status_mut() = status;
-        *rebuilt.version_mut() = version;
-        *rebuilt.headers_mut() = headers;
-        Ok(reqwest::Response::from(rebuilt))
+        self.send_body(body).await
     }
 
     async fn send_body(&self, body: Bytes) -> reqwest::Result<reqwest::Response> {
@@ -205,6 +231,15 @@ impl Outbound {
             began.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
             Ordering::Relaxed,
         );
+        self.timing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record_attempt(
+                began.elapsed().as_secs_f64() * 1000.0,
+                self.started.elapsed().as_secs_f64() * 1000.0,
+                result.as_ref().ok().map(|r| r.status().as_u16()),
+                result.is_err(),
+            );
         result
     }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared by `codex.sh` and `claude.sh`.
+# Shared by `codex.sh`, `claude.sh` and `opencode.sh`.
 #
 # What lives here is what is genuinely the same question for both agents:
 # where the helper scripts are, and whether a paid run proved anything. The

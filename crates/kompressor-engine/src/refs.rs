@@ -15,12 +15,13 @@
 //! re-emits byte-identical markers and re-storing a fragment is an idempotent
 //! overwrite that refreshes its TTL.
 
+use crate::types::Kind;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use blake2::Blake2b;
 use blake2::Digest;
 use blake2::digest::consts::U9;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 /// Every handle reads `k_` + [`HANDLE_WIDTH`] url-safe characters.
@@ -46,7 +47,14 @@ impl RefId {
 
     /// Parse `k_XXXXXXXXXXXX` or the bare 12-character body.
     pub fn parse(s: &str) -> Option<RefId> {
-        let body = s.strip_prefix(REF_PREFIX).unwrap_or(s);
+        // A bare body is tried first: `k` and `_` are both handle bytes, so
+        // about one body in 4096 itself begins with `k_`, and stripping the
+        // prefix unconditionally cut such a body to ten characters.
+        let body = if s.len() == HANDLE_WIDTH {
+            s
+        } else {
+            s.strip_prefix(REF_PREFIX)?
+        };
         if body.len() != HANDLE_WIDTH || !body.bytes().all(is_handle_byte) {
             return None;
         }
@@ -160,6 +168,16 @@ pub struct RefCollector {
     max_ref_bytes: usize,
     pairs: Vec<(RefId, String)>,
     seen: HashSet<RefId>,
+    /// The kind of payload being compressed, as the route that is running
+    /// reported it. Stamped on each fragment `stash` retains.
+    kind: Kind,
+    /// The kind each retained fragment came out of, for the store's `kind`
+    /// column. Absent for a fragment stashed before any route set a kind.
+    kinds: HashMap<RefId, Kind>,
+    /// Every handle `stash` answered, repeats included, in order. `pairs`
+    /// holds a fragment once, so a later message eliding the same bytes left
+    /// no trace of it; this is how a caller sees what one message elided.
+    stashed: Vec<RefId>,
     oversized_attempts: usize,
     /// Every fragment refused for size, for reporting rather than for control.
     ///
@@ -189,6 +207,19 @@ pub struct Mark {
     /// sliced from to read what a candidate added.
     pub pairs: usize,
     oversized: usize,
+    stashed: usize,
+}
+
+/// A candidate set aside by [`RefCollector::shelve`].
+#[derive(Clone, Debug, Default)]
+pub struct Shelved {
+    fragments: Vec<String>,
+    /// Every handle the candidate stashed, in order, repeats included: one an
+    /// earlier message already holds is not among `fragments`, and it is the
+    /// one `stashed_since` exists to report.
+    stashed: Vec<RefId>,
+    /// Stashes refused for size while the candidate ran.
+    oversized: usize,
 }
 
 impl RefCollector {
@@ -200,6 +231,9 @@ impl RefCollector {
             max_ref_bytes,
             pairs: Vec::new(),
             seen: HashSet::new(),
+            kind: Kind::Text,
+            kinds: HashMap::new(),
+            stashed: Vec::new(),
             oversized_attempts: 0,
             oversized_refusals: 0,
             gated: 0,
@@ -214,6 +248,9 @@ impl RefCollector {
             max_ref_bytes: 0,
             pairs: Vec::new(),
             seen: HashSet::new(),
+            kind: Kind::Text,
+            kinds: HashMap::new(),
+            stashed: Vec::new(),
             oversized_attempts: 0,
             oversized_refusals: 0,
             gated: 0,
@@ -259,7 +296,9 @@ impl RefCollector {
         let id = ref_for(fragment);
         if self.seen.insert(id) {
             self.pairs.push((id, fragment.to_owned()));
+            self.kinds.insert(id, self.kind);
         }
+        self.stashed.push(id);
         Some(id)
     }
 
@@ -268,6 +307,7 @@ impl RefCollector {
         Mark {
             pairs: self.pairs.len(),
             oversized: self.oversized_attempts,
+            stashed: self.stashed.len(),
         }
     }
 
@@ -316,14 +356,57 @@ impl RefCollector {
     /// rejects a candidate compression, so the store never holds fragments no
     /// marker points at.
     pub fn rollback(&mut self, mark: Mark) {
-        for (id, _) in self.pairs.drain(mark.pairs..) {
+        // `min`: a mark taken before an earlier rollback can point past the
+        // end, and there is then nothing of its candidate left to discard.
+        for (id, _) in self.pairs.drain(mark.pairs.min(self.pairs.len())..) {
             self.seen.remove(&id);
+            self.kinds.remove(&id);
         }
+        self.stashed.truncate(mark.stashed);
         // The refusals go back too. A candidate that was discarded did not
         // ship, so neither did anything it could not store — and leaving the
         // count raised lets a losing reading veto a winning one whose
         // fragments were all within the cap.
         self.oversized_attempts = mark.oversized;
+    }
+
+    /// Set a candidate aside: remember what it stashed and what it was refused
+    /// since `mark`, then roll the collector back so the next candidate starts
+    /// clean. [`RefCollector::reinstate`] brings it back if it wins after all.
+    ///
+    /// The refusal count has to travel with the fragments. `rollback` clears
+    /// it — rightly, for a candidate that is gone — but a candidate that is
+    /// rolled back and then *re-adopted* ships its text, elisions included. If
+    /// one of those elisions was refused for being over `max_ref_bytes`, its
+    /// marker has no handle, and with the count cleared nothing downstream
+    /// knows: the payload goes out with content removed and no way back to it.
+    pub fn shelve(&mut self, mark: Mark) -> Shelved {
+        let shelved = Shelved {
+            fragments: self.pairs[mark.pairs.min(self.pairs.len())..]
+                .iter()
+                .map(|(_, fragment)| fragment.clone())
+                .collect(),
+            oversized: self.oversized_attempts.saturating_sub(mark.oversized),
+            stashed: self.stashed[mark.stashed.min(self.stashed.len())..].to_vec(),
+        };
+        self.rollback(mark);
+        shelved
+    }
+
+    /// Roll back to `mark` and put a shelved candidate back: its fragments
+    /// (content addressing reproduces the handles its markers carry) and its
+    /// refusals, so the oversized veto still sees them.
+    pub fn reinstate(&mut self, mark: Mark, shelved: &Shelved) {
+        self.rollback(mark);
+        self.restash_all(&shelved.fragments);
+        // The fragments alone are not the whole candidate. One it elided
+        // under a handle an earlier message already holds is not in
+        // `fragments` — the collector kept it once — so re-stashing them
+        // forgets that this message stashed it too, and `stashed_since` is
+        // what tells `messages` the model read the same bytes again.
+        self.stashed.truncate(mark.stashed);
+        self.stashed.extend_from_slice(&shelved.stashed);
+        self.oversized_attempts += shelved.oversized;
     }
 
     /// An empty collector with the same capacity rules, for one candidate of an
@@ -336,6 +419,9 @@ impl RefCollector {
             max_ref_bytes: self.max_ref_bytes,
             pairs: Vec::new(),
             seen: HashSet::new(),
+            kind: self.kind,
+            kinds: HashMap::new(),
+            stashed: Vec::new(),
             oversized_attempts: 0,
             oversized_refusals: 0,
             gated: 0,
@@ -350,9 +436,13 @@ impl RefCollector {
         self.oversized_attempts += other.oversized_attempts;
         self.oversized_refusals += other.oversized_refusals;
         self.gated += other.gated;
-        for (_, fragment) in other.pairs {
+        let outer = self.kind;
+        for (id, fragment) in other.pairs {
+            // each fragment keeps the kind its own route stamped on it
+            self.kind = other.kinds.get(&id).copied().unwrap_or(outer);
             self.stash(&fragment);
         }
+        self.kind = outer;
     }
 
     /// Replay fragments taken from a previous `pairs()` snapshot.
@@ -360,6 +450,37 @@ impl RefCollector {
         for fragment in fragments {
             self.stash(fragment.as_ref());
         }
+    }
+
+    /// Each handle stashed since `mark`, once, in first-stashed order —
+    /// including fragments an earlier stash already holds, which
+    /// `pairs()[mark.pairs..]` does not show.
+    pub fn stashed_since(&self, mark: Mark) -> Vec<RefId> {
+        let mut seen = HashSet::new();
+        self.stashed[mark.stashed.min(self.stashed.len())..]
+            .iter()
+            .copied()
+            .filter(|id| seen.insert(*id))
+            .collect()
+    }
+
+    /// The fragment held under `id`.
+    pub fn fragment(&self, id: RefId) -> Option<&str> {
+        self.pairs
+            .iter()
+            .find(|(other, _)| *other == id)
+            .map(|(_, fragment)| fragment.as_str())
+    }
+
+    /// Record what kind of payload the fragments stashed from here on come
+    /// out of. Kept for statistics and the store browser; nothing routes on it.
+    pub fn set_kind(&mut self, kind: Kind) {
+        self.kind = kind;
+    }
+
+    /// The kind of payload `id` was elided from; `Text` if none was recorded.
+    pub fn kind_of(&self, id: &RefId) -> Kind {
+        self.kinds.get(id).copied().unwrap_or(Kind::Text)
     }
 
     pub fn pairs(&self) -> &[(RefId, String)] {
@@ -386,6 +507,23 @@ impl RefCollector {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_fragment_remembers_the_kind_it_was_stashed_under() {
+        let mut refs = RefCollector::new(1024);
+        let text = refs.stash("plain").unwrap();
+        refs.set_kind(Kind::Json);
+        let json = refs.stash("{\"a\":1}").unwrap();
+        assert_eq!(refs.kind_of(&text), Kind::Text);
+        assert_eq!(refs.kind_of(&json), Kind::Json);
+
+        let mut scratch = refs.scratch();
+        scratch.set_kind(Kind::SourceCode);
+        let code = scratch.stash("fn main() {}").unwrap();
+        refs.set_kind(Kind::Log);
+        refs.adopt(scratch);
+        assert_eq!(refs.kind_of(&code), Kind::SourceCode);
+    }
+
     use super::*;
 
     #[test]
@@ -459,6 +597,110 @@ mod tests {
         let mut refs = RefCollector::disabled();
         assert_eq!(refs.stash("anything"), None);
         assert!(refs.is_empty());
+    }
+
+    /// `parse` takes "`k_XXXXXXXXXXXX` or the bare 12-character body". A body
+    /// that itself begins with `k_` is still a body: stripping the prefix
+    /// first cut it to ten characters and refused a legal handle.
+    #[test]
+    fn a_bare_body_that_begins_with_the_prefix_parses_as_a_body() {
+        let id = RefId::parse("k_k_b306r9LLlg").expect("rendered");
+        assert_eq!(id.body(), "k_b306r9LLlg");
+        assert_eq!(RefId::parse(id.body()), Some(id), "the bare body");
+        // Every handle round-trips through both spellings.
+        for fragment in ["a", "b", "some fragment", "k_"] {
+            let id = ref_for(fragment);
+            assert_eq!(RefId::parse(&id.to_string()), Some(id));
+            assert_eq!(RefId::parse(id.body()), Some(id));
+        }
+        // Still refused: wrong widths, and a prefix with nothing legal behind it.
+        assert_eq!(RefId::parse("k_short"), None);
+        assert_eq!(RefId::parse("k_k_k_b306r9LLlg"), None);
+        assert_eq!(RefId::parse("x_k_b306r9LLlg"), None);
+        assert_eq!(RefId::parse("k_b306r9LL!g"), None);
+        assert_eq!(RefId::parse(""), None);
+    }
+
+    /// A candidate that is set aside and then wins after all ships its text,
+    /// so the refusals it collected must come back with its fragments. With
+    /// only `rollback` + `restash_all`, the count stayed at zero and an
+    /// elision with no handle passed the oversized veto.
+    #[test]
+    fn a_reinstated_candidate_brings_its_refusals_back() {
+        let mut refs = RefCollector::new(16);
+        refs.stash("before");
+        let mark = refs.mark();
+        let kept = refs.stash("fits").expect("under the cap");
+        assert_eq!(
+            refs.stash("this one is well over the sixteen byte cap"),
+            None
+        );
+        assert_eq!(refs.oversized_attempts(), 1);
+
+        let shelved = refs.shelve(mark);
+        assert_eq!(
+            refs.oversized_attempts(),
+            0,
+            "a shelved candidate vetoes nothing"
+        );
+        assert_eq!(refs.pairs().len(), 1, "and holds nothing");
+
+        // The rival runs, is refused something of its own, and loses.
+        assert_eq!(refs.stash("the rival is also far beyond the cap"), None);
+        refs.stash("rival");
+
+        refs.reinstate(mark, &shelved);
+        assert_eq!(
+            refs.oversized_attempts(),
+            1,
+            "its own refusal, not the rival's"
+        );
+        let held: Vec<RefId> = refs.pairs().iter().map(|(id, _)| *id).collect();
+        assert_eq!(held, vec![ref_for("before"), kept]);
+        assert_eq!(refs.stashed_since(mark), vec![kept]);
+    }
+
+    /// Shelving a candidate that was refused nothing changes nothing.
+    #[test]
+    fn shelving_and_reinstating_a_clean_candidate_is_exact() {
+        let mut refs = RefCollector::new(1024);
+        let mark = refs.mark();
+        let a = refs.stash("alpha").unwrap();
+        let b = refs.stash("beta").unwrap();
+        let shelved = refs.shelve(mark);
+        assert!(refs.is_empty());
+        refs.reinstate(mark, &shelved);
+        assert_eq!(refs.stashed_since(mark), vec![a, b]);
+        assert_eq!(refs.oversized_attempts(), 0);
+    }
+
+    #[test]
+    fn reinstating_preserves_handles_already_held_by_earlier_messages() {
+        let mut refs = RefCollector::new(1024);
+        let earlier = refs.stash("earlier message's fragment").unwrap();
+        let mark = refs.mark();
+        let new = refs.stash("new fragment").unwrap();
+        refs.stash("earlier message's fragment");
+        let shelved = refs.shelve(mark);
+        refs.stash("losing candidate");
+        refs.reinstate(mark, &shelved);
+        assert_eq!(refs.stashed_since(mark), vec![new, earlier]);
+        assert_eq!(refs.pairs().len(), 2);
+    }
+
+    /// A mark can outlive what it points at: an arbitration is handed the
+    /// caller's mark, and a rollback in between leaves it past the end.
+    #[test]
+    fn shelving_from_a_mark_past_the_end_sets_nothing_aside() {
+        let mut refs = RefCollector::new(1024);
+        let start = refs.mark();
+        refs.stash("gone before the shelve");
+        let later = refs.mark();
+        refs.rollback(start);
+        let shelved = refs.shelve(later);
+        refs.reinstate(start, &shelved);
+        assert!(refs.is_empty());
+        assert!(refs.stashed_since(start).is_empty());
     }
 
     #[test]

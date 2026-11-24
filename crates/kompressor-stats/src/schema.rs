@@ -381,6 +381,63 @@ const V12: &str = r#"
 ALTER TABLE proxy_requests ADD COLUMN keep_warm INTEGER NOT NULL DEFAULT 0;
 "#;
 
+// v13: request provenance, phase timing, and daily experiment aggregates.
+const V13: &str = r#"
+CREATE TABLE request_context (
+ tenant TEXT NOT NULL, request_id TEXT NOT NULL, time_ms INTEGER NOT NULL,
+ context TEXT, model TEXT, mode TEXT, PRIMARY KEY(tenant,request_id));
+CREATE INDEX request_context_time ON request_context(time_ms);
+ALTER TABLE proxy_requests ADD COLUMN timing_json TEXT;
+ALTER TABLE proxy_requests ADD COLUMN analysis_archived INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE optimization_events ADD COLUMN analysis_archived INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE retrieval_events ADD COLUMN analysis_archived INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE retrieval_events ADD COLUMN context_json TEXT;
+CREATE TABLE daily_analysis (
+ day_ms INTEGER NOT NULL, tenant TEXT NOT NULL, dimension TEXT NOT NULL,
+ metrics TEXT NOT NULL, PRIMARY KEY(day_ms,tenant,dimension));
+CREATE TABLE daily_analysis_conversations (
+ day_ms INTEGER NOT NULL, tenant TEXT NOT NULL, dimension TEXT NOT NULL,
+ conversation TEXT NOT NULL, PRIMARY KEY(day_ms,tenant,dimension,conversation));
+"#;
+
+// v14: whether a retrieval's range was read as asked, normalized, salvaged, or
+// unusable (the whole fragment went back). NULL when no range was asked for.
+const V14: &str = r#"
+ALTER TABLE retrieval_events ADD COLUMN range_status TEXT;
+"#;
+
+// v15: what the proxy observed about the request's cacheable prefix
+// (`context::PrefixObservation`): segment drift, composition, volatile values
+// and idle time. NULL on rows from before, which reports read as "unknown".
+const V15: &str = r#"
+ALTER TABLE proxy_requests ADD COLUMN prefix_json TEXT;
+"#;
+
+// v16: every backup taken — by the schedule, from the Maintenance page or by
+// `kompressor backup` — and whether it worked. What "when was the last
+// backup" is answered from. No tenant: an archive is every tenant's.
+const V16: &str = r#"
+CREATE TABLE backups (
+ id INTEGER PRIMARY KEY, time_ms INTEGER NOT NULL, origin TEXT NOT NULL,
+ destination TEXT NOT NULL, bytes INTEGER NOT NULL, databases INTEGER NOT NULL,
+ ok INTEGER NOT NULL, error TEXT);
+CREATE INDEX backups_time ON backups (time_ms);
+"#;
+
+// v17: every piece of maintenance work — a check, checkpoint, vacuum,
+// optimize, erase, delete, trim or archive verification — who asked for it
+// and what came of it. What the Maintenance page's history and each
+// database's "last vacuumed" are read from, across restarts. No tenant: the
+// work is on every tenant's file.
+const V17: &str = r#"
+CREATE TABLE maintenance_events (
+ id INTEGER PRIMARY KEY, time_ms INTEGER NOT NULL, action TEXT NOT NULL,
+ target TEXT NOT NULL, origin TEXT NOT NULL, actor TEXT, took_ms INTEGER NOT NULL,
+ ok INTEGER NOT NULL, bytes_before INTEGER, bytes_after INTEGER, detail TEXT, error TEXT);
+CREATE INDEX maintenance_events_time ON maintenance_events (time_ms);
+CREATE INDEX maintenance_events_target ON maintenance_events (target, action, time_ms);
+"#;
+
 pub const MIGRATIONS: &[(u32, &str)] = &[
     (1, V1),
     (2, V2),
@@ -394,6 +451,11 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (10, V10),
     (11, V11),
     (12, V12),
+    (13, V13),
+    (14, V14),
+    (15, V15),
+    (16, V16),
+    (17, V17),
 ];
 
 /// The version a freshly migrated database reports in `PRAGMA user_version`.
@@ -406,12 +468,23 @@ pub fn latest_version() -> u32 {
 /// Idempotent: a database already at the latest version is untouched, and each
 /// step runs inside its own transaction so a failure leaves the file at the
 /// last version that fully applied rather than half-way through one.
+///
+/// Safe for several processes at once. `serve`, `mcp serve` and every `wrap`
+/// session open the same file, and after an upgrade the first two to start
+/// both find it behind. Each step therefore takes the write lock *before*
+/// asking what version the file holds (`BEGIN IMMEDIATE`, which waits out the
+/// other process under the connection's busy timeout) and skips a step that
+/// was applied while it waited. Reading the version first and locking
+/// afterwards had the second process run a step the first had just committed:
+/// it failed on "table already exists" and did not start. Measured with two
+/// `serve` processes on one v12 file, 15 rounds of 15.
 pub fn apply(conn: &Connection) -> Result<u32, StatsError> {
-    let mut current: u32 = {
+    let version_of = |conn: &Connection| -> Result<u32, StatsError> {
         let raw: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         // a negative or absurd user_version is not ours; treat it as unversioned
-        u32::try_from(raw).unwrap_or(0)
+        Ok(u32::try_from(raw).unwrap_or(0))
     };
+    let mut current = version_of(conn)?;
 
     let mut ladder: Vec<&(u32, &str)> = MIGRATIONS.iter().collect();
     ladder.sort_by_key(|(version, _)| *version);
@@ -420,15 +493,28 @@ pub fn apply(conn: &Connection) -> Result<u32, StatsError> {
         if *version <= current {
             continue;
         }
-        conn.execute_batch("BEGIN")?;
-        match conn.execute_batch(sql) {
-            Ok(()) => {
-                // user_version takes no parameter binding, and the value is a
-                // crate constant rather than anything a caller supplies
-                conn.execute_batch(&format!("PRAGMA user_version = {version}"))?;
-                conn.execute_batch("COMMIT")?;
-                current = *version;
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        // Asked again now that nobody else can be writing: another process
+        // may have applied this step, and later ones, while this one waited.
+        current = match version_of(conn) {
+            Ok(held) => held,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
             }
+        };
+        if *version <= current {
+            conn.execute_batch("ROLLBACK")?;
+            continue;
+        }
+        // user_version takes no parameter binding, and the value is a crate
+        // constant rather than anything a caller supplies
+        let applied = conn
+            .execute_batch(sql)
+            .and_then(|()| conn.execute_batch(&format!("PRAGMA user_version = {version}")))
+            .and_then(|()| conn.execute_batch("COMMIT"));
+        match applied {
+            Ok(()) => current = *version,
             Err(e) => {
                 let _ = conn.execute_batch("ROLLBACK");
                 return Err(StatsError::Sqlite(e));
@@ -439,6 +525,162 @@ pub fn apply(conn: &Connection) -> Result<u32, StatsError> {
     Ok(current)
 }
 
+/// Whether the database `conn` is open on has a table called `name`: what a
+/// reader or a one-row writer asks before touching a table a file from an
+/// older build does not have yet.
+pub fn has_table(conn: &Connection, name: &str) -> Result<bool, StatsError> {
+    let found: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |row| row.get(0),
+    )?;
+    Ok(found > 0)
+}
+
+/// Write a consistent copy of the database at `source` to `destination`,
+/// which must not exist, and return the schema version the copy holds.
+///
+/// `VACUUM INTO` on a read-only connection: it reads one snapshot of the
+/// file, whatever the writer commits meanwhile, and writes a complete,
+/// defragmented database — the WAL folded in, so the copy is one file that
+/// needs nothing beside it. Copying `stats.db` with `cp` gets neither: the
+/// newest rows are still in `stats.db-wal`, and a page the writer changes
+/// mid-copy leaves a file SQLite refuses to open.
+///
+/// The copy is checked before it is returned (`PRAGMA quick_check`): a backup
+/// nobody can restore is worse than an error now.
+pub fn snapshot(source: &Path, destination: &Path) -> Result<u32, StatsError> {
+    let conn = Connection::open_with_flags(
+        source,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+    conn.execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])?;
+    drop(conn);
+    let copy = Connection::open_with_flags(
+        destination,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let verdict: String = copy.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if verdict != "ok" {
+        return Err(StatsError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            Some(format!("the copy failed its check: {verdict}")),
+        )));
+    }
+    let version: i64 = copy.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    Ok(u32::try_from(version).unwrap_or(0))
+}
+
+/// The times of the oldest and newest request the database at `path` holds,
+/// in milliseconds, or `None` when it holds none.
+///
+/// Two primary-key lookups — the first and last row — not a scan: rows are
+/// written in the order they happen.
+pub fn time_span(path: &Path) -> Result<Option<(i64, i64)>, StatsError> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+    let end = |order: &str| -> Result<Option<i64>, StatsError> {
+        let mut statement = conn.prepare(&format!(
+            "SELECT time_ms FROM proxy_requests ORDER BY id {order} LIMIT 1"
+        ))?;
+        let mut rows = statement.query([])?;
+        Ok(match rows.next()? {
+            Some(row) => Some(row.get(0)?),
+            None => None,
+        })
+    };
+    Ok(end("ASC")?.zip(end("DESC")?))
+}
+
+/// What [`erase`] removed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Erased {
+    /// Rows deleted, across `tables` tables.
+    pub rows: u64,
+    pub tables: usize,
+    /// The database's size on disk before and after, write-ahead log
+    /// included.
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+}
+
+/// The one table [`erase`] leaves: the record of backups taken is about the
+/// deployment, not about traffic, and "when was the last backup" matters
+/// most right after everything else has been deleted. So is the record of
+/// maintenance, which is where the erase itself is put on record.
+const KEPT_BY_ERASE: [&str; 2] = ["backups", "maintenance_events"];
+
+/// Delete every statistic in the database at `path` — every request, event
+/// and sample, and the daily rollups that outlive retention — and hand the
+/// space back to the filesystem. The schema stays, so the service carries on
+/// writing into the same file.
+///
+/// One transaction: a reader sees all of it or none of it. There is no
+/// undoing it short of restoring a backup. Whoever owns the file should hold
+/// its own writes meanwhile ([`crate::StatsSink::exclusive`]).
+pub fn erase(path: &Path) -> Result<Erased, StatsError> {
+    let size = || {
+        let len = |path: &Path| std::fs::metadata(path).map_or(0, |meta| meta.len());
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        len(path) + len(Path::new(&wal))
+    };
+    let bytes_before = size();
+    let mut conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+    let tables = {
+        let mut statement = conn.prepare(
+            "SELECT name FROM sqlite_schema
+             WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
+               AND name <> ?1 AND name <> ?2
+             ORDER BY name",
+        )?;
+        statement
+            .query_map(KEPT_BY_ERASE, |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<String>, _>>()?
+    };
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut rows = 0u64;
+    for table in &tables {
+        // Names from the schema itself, quoted as identifiers.
+        let quoted = table.replace('"', "\"\"");
+        rows += tx.execute(&format!("DELETE FROM \"{quoted}\""), [])? as u64;
+    }
+    tx.commit()?;
+    // The rows are gone whatever happens next; giving the pages back is the
+    // part that can wait for a quieter moment.
+    if let Err(error) = conn
+        .execute_batch("VACUUM;")
+        .and_then(|()| conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())))
+    {
+        tracing::warn!(%error, "statistics erased, but the file was not shrunk");
+    }
+    drop(conn);
+    Ok(Erased {
+        rows,
+        tables: tables.len(),
+        bytes_before,
+        bytes_after: size(),
+    })
+}
+
+/// How long a writer keeps trying to put a new file into WAL mode while
+/// another process is doing the same. The connection's busy timeout, in the
+/// one place that timeout is not consulted.
+const WAL_SWITCH_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The size a write-ahead log is cut back to after a checkpoint
+/// (`PRAGMA journal_size_limit`): a few checkpoints' worth at the default
+/// 1,000-page interval.
+pub const JOURNAL_SIZE_LIMIT: u64 = 16 * 1024 * 1024;
+
 /// Pragmas every connection to `stats.db` sets, read-only ones included.
 ///
 /// `WAL` is what lets the reader and the CLI query the file while the writer
@@ -448,14 +690,58 @@ pub fn apply(conn: &Connection) -> Result<u32, StatsError> {
 /// stops a concurrent `prune` from turning into an immediate `SQLITE_BUSY` in
 /// the writer.
 fn set_pragmas(conn: &Connection, read_only: bool) -> Result<(), StatsError> {
+    // First, because the next statement needs it: switching a new file to WAL
+    // takes the file's lock, and a second process creating the same file at
+    // the same moment would otherwise be refused at once with "database is
+    // locked" instead of waiting its turn.
+    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
     if !read_only {
         // journal_mode returns a row, and it cannot be changed from a read-only
         // connection: the mode is a property of the file, already set by the
         // writer that created it.
-        let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
-        conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
+        //
+        // Retried, because this is the one statement the busy timeout does
+        // not cover. Switching a new file to WAL needs it exclusively, and
+        // when two processes create the file together each holds a read lock
+        // the other is waiting on: SQLite sees the deadlock and refuses one at
+        // once rather than calling the busy handler. Letting go and asking
+        // again is what resolves it, and once the file is in WAL — which the
+        // other process is about to make it — the statement changes nothing.
+        let started = std::time::Instant::now();
+        loop {
+            match conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0)) {
+                Ok(_mode) => break,
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if matches!(
+                        error.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    ) && started.elapsed() < WAL_SWITCH_PATIENCE =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        // SQLite reuses the write-ahead log rather than shrinking it, so one
+        // burst — a vacuum, a large delete — leaves a log the size of that
+        // burst on disk for good. This truncates it back after the
+        // checkpoint that follows.
+        conn.execute_batch(&format!(
+            "PRAGMA synchronous=NORMAL; PRAGMA journal_size_limit={JOURNAL_SIZE_LIMIT};"
+        ))?;
     }
-    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+    if read_only {
+        // Report queries sort and group whole windows (percentiles, per-request
+        // joins): keep those temporary B-trees in memory, give the page cache
+        // room for a day of rows, and map the file rather than copying pages
+        // through read(2). All three are per-connection settings and change
+        // nothing about the file.
+        conn.execute_batch(
+            "PRAGMA temp_store=MEMORY;
+             PRAGMA cache_size=-16384;
+             PRAGMA mmap_size=268435456;",
+        )?;
+    }
     Ok(())
 }
 

@@ -6,7 +6,7 @@
 //! caller shown only gross is being shown a number this workspace knows to be
 //! wrong, so the table form never prints one without the other.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use kompressor_core::Config;
 use kompressor_stats::{Bucket, BucketRow, RetrievalSummary, StatsReader, Summary, TypeCoverage};
@@ -28,6 +28,12 @@ pub enum Report {
         id: String,
     },
     Store,
+    Cache,
+    Skips,
+    Conversations {
+        limit: usize,
+        order: kompressor_stats::breakdown::ConversationOrder,
+    },
     /// One self-contained HTML page, to stdout.
     Html {
         bucket: Bucket,
@@ -80,6 +86,78 @@ fn unreadable(path: &std::path::Path, because: &str) -> CliError {
     ))
 }
 
+/// The configuration `stats` took its database from.
+struct Chosen {
+    config: Config,
+    /// The file it was read from; `None` is the built-in defaults.
+    from: Option<PathBuf>,
+    /// Set when this is not the configuration the search path found first.
+    note: Option<String>,
+}
+
+/// Pick the configuration whose stats path to read.
+///
+/// `--config` is taken literally. Otherwise the search path wins, and
+/// `/etc/kompressor/config.toml` is read only when it found nothing — except
+/// when what it found names a database that does not exist while the system
+/// file names one that does. That is a per-user config left over from running
+/// the service by hand, after it moved to the package: it shadowed the live
+/// database with a missing one, and the failure surfaced as a permission
+/// problem on a file nobody had asked about.
+fn choose_config(
+    explicit: Option<PathBuf>,
+    discovered: Option<PathBuf>,
+    system: Option<PathBuf>,
+) -> Result<Chosen, CliError> {
+    let load = |path: Option<&Path>| Config::load(path).map_err(|e| CliError::Usage(e.to_string()));
+    let chosen = |config, from| Chosen {
+        config,
+        from,
+        note: None,
+    };
+    if let Some(path) = explicit {
+        return Ok(chosen(load(Some(&path))?, Some(path)));
+    }
+    let Some(found) = discovered else {
+        return Ok(chosen(load(system.as_deref())?, system));
+    };
+    let config = load(Some(&found))?;
+    if config.stats.path.exists() {
+        return Ok(chosen(config, Some(found)));
+    }
+    // A system file that does not parse is not this command's problem to
+    // report: the search path's answer stands, and so does its error.
+    if let Some(system) = system.filter(|system| *system != found)
+        && let Ok(fallback) = load(Some(&system))
+        && fallback.stats.path.exists()
+    {
+        let note = format!(
+            "{} names {}, which does not exist; reading {} from {} instead. \
+             Remove the stale file, or pass --config to choose.",
+            found.display(),
+            config.stats.path.display(),
+            fallback.stats.path.display(),
+            system.display(),
+        );
+        return Ok(Chosen {
+            config: fallback,
+            from: Some(system),
+            note: Some(note),
+        });
+    }
+    Ok(chosen(config, Some(found)))
+}
+
+/// Say which configuration named the path, so a stale one can be found.
+fn named_by(error: CliError, config: Option<&Path>) -> CliError {
+    match (error, config) {
+        (CliError::Runtime(message), Some(config)) => {
+            CliError::Runtime(format!("{message} (stats.path from {})", config.display()))
+        }
+        (error, _) => error,
+    }
+}
+
 /// Where the running service answers, if this configuration starts one.
 ///
 /// The API is nested under `/v1`, which is worth knowing: a request to
@@ -110,7 +188,13 @@ struct Types {
 /// owns it when it cannot.
 enum Source {
     Local(StatsReader),
-    Remote(String),
+    /// The service's API base, and why the file was not read. The reason is
+    /// kept because a report the service does not serve has nothing else to
+    /// say: guessing at it sent a missing file off to be chowned.
+    Remote {
+        base: String,
+        local: CliError,
+    },
 }
 
 impl Source {
@@ -165,7 +249,9 @@ impl Source {
             Source::Local(r) => r
                 .summary(tenant, from, to)
                 .map_err(|e| CliError::runtime("reading the summary", e)),
-            Source::Remote(base) => Self::fetch(base, "summary", &Self::window(tenant, from, to)),
+            Source::Remote { base, .. } => {
+                Self::fetch(base, "summary", &Self::window(tenant, from, to))
+            }
         }
     }
 
@@ -180,7 +266,7 @@ impl Source {
             Source::Local(r) => r
                 .histogram(tenant, from, to, bucket)
                 .map_err(|e| CliError::runtime("reading the histogram", e)),
-            Source::Remote(base) => {
+            Source::Remote { base, .. } => {
                 let mut q = Self::window(tenant, from, to);
                 q.push((
                     "bucket",
@@ -204,7 +290,7 @@ impl Source {
                 .map_err(|e| CliError::runtime("reading type coverage", e)),
             // The endpoint wraps its rows in `{"types": [...]}`; the reader
             // returns the rows. Unwrap so both hand the printing the same thing.
-            Source::Remote(base) => {
+            Source::Remote { base, .. } => {
                 Self::fetch::<Types>(base, "by_type", &Self::window(tenant, from, to))
                     .map(|t| t.types)
             }
@@ -216,7 +302,7 @@ impl Source {
             Source::Local(r) => r
                 .retrievals(tenant, from, to)
                 .map_err(|e| CliError::runtime("reading retrievals", e)),
-            Source::Remote(base) => {
+            Source::Remote { base, .. } => {
                 Self::fetch(base, "retrievals", &Self::window(tenant, from, to))
             }
         }
@@ -230,10 +316,10 @@ impl Source {
     fn only_local(&self, report: &str) -> Result<&StatsReader, CliError> {
         match self {
             Source::Local(r) => Ok(r),
-            Source::Remote(base) => Err(CliError::Runtime(format!(
+            Source::Remote { base, local } => Err(CliError::Runtime(format!(
                 "{report} is not served over HTTP, and the local database could not be \
-                 read. Run it as the user that owns the file, or use a report the \
-                 service does expose: summary, histogram, by-type, retrievals ({base})."
+                 read: {local}\nThe reports the service does expose are summary, \
+                 histogram, by-type and retrievals ({base})."
             ))),
         }
     }
@@ -263,6 +349,7 @@ pub fn stats(args: StatsArgs) -> CliResult {
     // The configuration is kept, not just its stats path: when the file cannot
     // be read, `server.listen` is what makes the running service reachable
     // instead.
+    let mut origin = None;
     let (path, listen) = match args.stats_path {
         // An explicitly named file is taken literally. Falling back to a
         // service for a path the caller chose would answer a different question
@@ -279,20 +366,22 @@ pub fn stats(args: StatsArgs) -> CliResult {
             // Only this command looks there, and only when nothing nearer was
             // found. Putting it in `Config::discover` instead made six hermetic
             // CLI tests change their output the moment that file existed.
-            let explicit = args.config.clone().or_else(|| {
-                Config::discover()
-                    .is_none()
-                    .then(Config::system_path)
-                    .flatten()
-            });
-            let config =
-                Config::load(explicit.as_deref()).map_err(|e| CliError::Usage(e.to_string()))?;
-            let listen = api_base(&config);
-            (config.stats.path, listen)
+            let chosen = choose_config(
+                args.config.clone(),
+                Config::discover(),
+                Config::system_path(),
+            )?;
+            if let Some(note) = &chosen.note {
+                eprintln!("kompressor: {note}");
+            }
+            let listen = api_base(&chosen.config);
+            let path = chosen.config.stats.path;
+            origin = chosen.from;
+            (path, listen)
         }
     };
 
-    let source = match open_local(&path) {
+    let source = match open_local(&path).map_err(|e| named_by(e, origin.as_deref())) {
         Ok(reader) => Source::Local(reader),
         Err(local) => match listen {
             // A packaged install puts the database under the service's state
@@ -301,7 +390,7 @@ pub fn stats(args: StatsArgs) -> CliResult {
             // refused with "attempt to write a readonly database" even when the
             // file itself is world-readable. The process that owns it serves the
             // same reports over HTTP; ask that instead of explaining chmod.
-            Some(base) => Source::Remote(base),
+            Some(base) => Source::Remote { base, local },
             None => return Err(local),
         },
     };
@@ -530,6 +619,39 @@ pub fn stats(args: StatsArgs) -> CliResult {
             .map_err(|e| CliError::runtime("building the report", e))?;
             print!("{}", crate::report::render(&data));
         }
+        Report::Cache => {
+            let report = source
+                .only_local("cache")?
+                .cache_billing(tenant, from, to)
+                .map_err(|e| CliError::runtime("reading cache usage", e))?;
+            if args.json {
+                print_json(&report)?;
+            } else {
+                print_cache(&report);
+            }
+        }
+        Report::Skips => {
+            let report = source
+                .only_local("skips")?
+                .skips(tenant, from, to)
+                .map_err(|e| CliError::runtime("reading skip reasons", e))?;
+            if args.json {
+                print_json(&report)?;
+            } else {
+                print_skips(&report);
+            }
+        }
+        Report::Conversations { limit, order } => {
+            let report = source
+                .only_local("conversations")?
+                .conversations(tenant, from, to, order, limit)
+                .map_err(|e| CliError::runtime("reading conversations", e))?;
+            if args.json {
+                print_json(&report)?;
+            } else {
+                print_conversations(&report);
+            }
+        }
         Report::Store => {
             let sample = source
                 .only_local("store")?
@@ -562,6 +684,176 @@ pub fn stats(args: StatsArgs) -> CliResult {
     Ok(())
 }
 
+/// `stats cache` as a table. Cost is in input-equivalent tokens: what the
+/// input would have cost had every token been billed at the fresh price is the
+/// baseline, and "saved" is the cache's discount on it, writes included.
+fn print_cache(report: &kompressor_stats::breakdown::CacheBilling) {
+    use kompressor_stats::breakdown::Billed;
+    let header = || {
+        println!(
+            "{:<28} {:>7} {:>6} {:>13} {:>13} {:>11} {:>11} {:>11} {:>6} {:>14} {:>7}",
+            "model",
+            "reqs",
+            "pings",
+            "uncached",
+            "cache read",
+            "write 5m",
+            "write 1h",
+            "output",
+            "read%",
+            "cost (in-eq)",
+            "saved%"
+        );
+    };
+    let line = |name: &str, reqs: u64, pings: u64, b: &Billed| {
+        println!(
+            "{:<28} {:>7} {:>6} {:>13} {:>13} {:>11} {:>11} {:>11} {:>5.1}% {:>14.0} {:>6.1}%",
+            truncate(name, 28),
+            reqs,
+            pings,
+            b.uncached,
+            b.read,
+            b.write_5m,
+            b.write_1h,
+            b.output,
+            b.read_share * 100.0,
+            b.cost,
+            b.saved_share * 100.0
+        );
+    };
+    if report.models.is_empty() {
+        println!("no proxy requests in this window");
+        return;
+    }
+    header();
+    for model in &report.models {
+        let unnamed;
+        let name = if model.model.is_empty() {
+            unnamed = format!("(no model: {})", model.api_family);
+            unnamed.as_str()
+        } else {
+            model.model.as_str()
+        };
+        line(name, model.client_requests, 0, &model.clients);
+        if model.pings > 0 {
+            line("  keep-warm pings", 0, model.pings, &model.ping_usage);
+        }
+    }
+    let requests: u64 = report.models.iter().map(|m| m.client_requests).sum();
+    let pings: u64 = report.models.iter().map(|m| m.pings).sum();
+    line("total", requests, pings, &report.total);
+    println!(
+        "\nuncached baseline {:.0} input-equivalent tokens; the cache billed {:.0} ({:.1}% saved). \
+         Pings cost {:.0}.",
+        report.total.baseline,
+        report.total.cost,
+        report.total.saved_share * 100.0,
+        report.pings.cost
+    );
+}
+
+/// `stats skips` as a table.
+fn print_skips(report: &kompressor_stats::breakdown::SkipReport) {
+    println!("compressions        {}", report.compressions);
+    println!(
+        "messages            {} total, {} compressed, {} skipped ({} in the frozen prefix)",
+        report.messages_total,
+        report.messages_compressed,
+        report.messages_skipped,
+        report.frozen_messages
+    );
+    println!("skipped tokens      {}", report.skipped_tokens);
+    if !report.reasons.is_empty() {
+        println!(
+            "\n{:<28} {:>10} {:>14} {:>7}",
+            "reason", "messages", "tokens", "share"
+        );
+        for reason in &report.reasons {
+            println!(
+                "{:<28} {:>10} {:>14} {:>6.1}%",
+                truncate(&reason.reason, 28),
+                reason.messages,
+                reason.tokens,
+                reason.token_share * 100.0
+            );
+        }
+    }
+    if !report.outcomes.is_empty() {
+        println!(
+            "\n{:<28} {:>10} {:>14} {:>14}",
+            "outcome", "requests", "tokens in", "removed"
+        );
+        for outcome in &report.outcomes {
+            println!(
+                "{:<28} {:>10} {:>14} {:>14}",
+                truncate(&outcome.outcome, 28),
+                outcome.requests,
+                outcome.tokens_in,
+                outcome.saved
+            );
+        }
+    }
+}
+
+/// `stats conversations` as a table.
+fn print_conversations(report: &kompressor_stats::breakdown::ConversationReport) {
+    if report.conversations.is_empty() {
+        println!("no conversations in this window");
+        return;
+    }
+    println!(
+        "{:<16} {:<18} {:>8} {:>6} {:>5} {:>6} {:>14} {:>6} {:>7} {:>12} {:>10} {:>12}  model",
+        "conversation",
+        "started",
+        "minutes",
+        "turns",
+        "pings",
+        "errors",
+        "cost (in-eq)",
+        "read%",
+        "saved%",
+        "removed",
+        "retrieved",
+        "net"
+    );
+    for c in &report.conversations {
+        println!(
+            "{:<16} {:<18} {:>8.1} {:>6} {:>5} {:>6} {:>14.0} {:>5.1}% {:>6.1}% {:>12} {:>10} {:>12}  {}",
+            c.conversation,
+            crate::report::stamp(c.first_ms),
+            (c.last_ms - c.first_ms) as f64 / 60_000.0,
+            c.client_turns,
+            c.pings,
+            c.errors,
+            c.billed.cost,
+            c.billed.read_share * 100.0,
+            c.billed.saved_share * 100.0,
+            c.saved_gross,
+            c.retrieved_tokens,
+            c.saved_net,
+            c.models.join(", ")
+        );
+    }
+    if report.total > report.conversations.len() {
+        println!(
+            "... {} of {} conversations shown; --limit to see more",
+            report.conversations.len(),
+            report.total
+        );
+    }
+}
+
+/// `value` cut to `width` characters, marked when cut.
+fn truncate(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        value.to_string()
+    } else {
+        let mut cut: String = value.chars().take(width.saturating_sub(1)).collect();
+        cut.push('…');
+        cut
+    }
+}
+
 /// Parse a window bound.
 ///
 /// Three spellings, because the three questions asked of this are different:
@@ -588,8 +880,16 @@ fn parse_instant(value: Option<&str>, default: i64) -> Result<i64, CliError> {
 
 /// `30s`, `15m`, `24h`, `7d` as milliseconds.
 fn parse_relative(value: &str) -> Option<i64> {
-    let (digits, unit) = value.split_at(value.len().checked_sub(1)?);
+    // The unit is the last *character*. Cutting one byte off the end is not
+    // the same thing: `7д` ends in a two-byte character, the cut lands inside
+    // it, and `split_at` panics — on a command-line argument.
+    let (at, _) = value.char_indices().next_back()?;
+    let (digits, unit) = value.split_at(at);
     let amount: i64 = digits.parse().ok()?;
+    // A span is how long ago. `-5d` would otherwise be five days from now.
+    if amount < 0 {
+        return None;
+    }
     let scale = match unit {
         "s" => 1_000,
         "m" => 60_000,
@@ -638,6 +938,99 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
 
+    /// A config file naming `db` as its stats path, and whether `db` exists.
+    fn config_naming(dir: &Path, name: &str, db: &str, exists: bool) -> PathBuf {
+        let db = dir.join(db);
+        if exists {
+            std::fs::write(&db, b"").unwrap();
+        }
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!("[stats]\npath = {:?}\n", db.to_str().unwrap()),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn a_found_config_naming_a_missing_database_gives_way_to_the_system_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = config_naming(dir.path(), "user.toml", "gone.db", false);
+        let system = config_naming(dir.path(), "system.toml", "live.db", true);
+        let chosen = choose_config(None, Some(user.clone()), Some(system.clone())).unwrap();
+        assert_eq!(chosen.config.stats.path, dir.path().join("live.db"));
+        assert_eq!(chosen.from.as_deref(), Some(system.as_path()));
+        let note = chosen.note.expect("the switch is announced");
+        assert!(note.contains(user.to_str().unwrap()), "{note}");
+        assert!(note.contains("gone.db"), "{note}");
+    }
+
+    #[test]
+    fn a_found_config_naming_a_live_database_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = config_naming(dir.path(), "user.toml", "mine.db", true);
+        let system = config_naming(dir.path(), "system.toml", "live.db", true);
+        let chosen = choose_config(None, Some(user.clone()), Some(system)).unwrap();
+        assert_eq!(chosen.config.stats.path, dir.path().join("mine.db"));
+        assert_eq!(chosen.from.as_deref(), Some(user.as_path()));
+        assert!(chosen.note.is_none());
+    }
+
+    #[test]
+    fn an_explicit_config_is_taken_literally_even_when_its_database_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let named = config_naming(dir.path(), "named.toml", "gone.db", false);
+        let system = config_naming(dir.path(), "system.toml", "live.db", true);
+        let chosen = choose_config(Some(named), None, Some(system)).unwrap();
+        assert_eq!(chosen.config.stats.path, dir.path().join("gone.db"));
+        assert!(chosen.note.is_none());
+    }
+
+    #[test]
+    fn with_no_live_database_anywhere_the_found_config_stands() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = config_naming(dir.path(), "user.toml", "gone.db", false);
+        let system = config_naming(dir.path(), "system.toml", "also-gone.db", false);
+        let chosen = choose_config(None, Some(user.clone()), Some(system)).unwrap();
+        assert_eq!(chosen.from.as_deref(), Some(user.as_path()));
+        assert!(chosen.note.is_none());
+    }
+
+    #[test]
+    fn nothing_found_reads_the_system_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let system = config_naming(dir.path(), "system.toml", "live.db", true);
+        let chosen = choose_config(None, None, Some(system.clone())).unwrap();
+        assert_eq!(chosen.from.as_deref(), Some(system.as_path()));
+        assert!(chosen.note.is_none());
+    }
+
+    #[test]
+    fn a_report_only_the_file_has_says_why_the_file_was_not_read() {
+        let local = named_by(
+            open_local(Path::new("/nonexistent/stats.db"))
+                .err()
+                .unwrap(),
+            Some(Path::new("/home/someone/.config/kompressor/config.toml")),
+        );
+        let source = Source::Remote {
+            base: "http://127.0.0.1:8817/v1".into(),
+            local,
+        };
+        let message = source
+            .only_local("the HTML report")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(message.contains("no statistics database"), "{message}");
+        assert!(
+            message.contains("/home/someone/.config/kompressor/config.toml"),
+            "{message}"
+        );
+        assert!(!message.contains("user that owns the file"), "{message}");
+    }
+
     #[test]
     fn an_absent_window_bound_takes_its_default() {
         assert_eq!(parse_instant(None, 0).unwrap(), 0);
@@ -669,6 +1062,39 @@ mod tests {
         let day_ago = parse_instant(Some("1d"), 0).unwrap();
         let delta = now_ms() - day_ago;
         assert!((86_400_000..86_400_000 + 5_000).contains(&delta), "{delta}");
+    }
+
+    /// The bound comes straight from the command line, in whatever script the
+    /// user types. A unit that is not ASCII is not a unit — and must be refused
+    /// as bad usage, not by panicking on a byte offset inside the character.
+    #[test]
+    fn a_bound_ending_in_a_multi_byte_character_is_a_usage_error_not_a_panic() {
+        for bound in ["7д", "7日", "12час", "5\u{00e9}", "\u{1f600}", "д"] {
+            assert_eq!(
+                parse_instant(Some(bound), 0).unwrap_err().code(),
+                2,
+                "{bound}"
+            );
+        }
+        assert_eq!(parse_relative("7д"), None);
+        assert_eq!(parse_relative(""), None);
+        assert_eq!(parse_relative("d"), None);
+    }
+
+    #[test]
+    fn a_span_is_a_whole_non_negative_number_and_a_known_unit() {
+        assert_eq!(parse_relative("30s"), Some(30_000));
+        assert_eq!(parse_relative("15m"), Some(900_000));
+        assert_eq!(parse_relative("24h"), Some(86_400_000));
+        assert_eq!(parse_relative("7d"), Some(604_800_000));
+        assert_eq!(parse_relative("0d"), Some(0));
+        // A negative span would name a time in the future.
+        assert_eq!(parse_relative("-5d"), None);
+        assert_eq!(parse_instant(Some("-5d"), 0).unwrap_err().code(), 2);
+        assert_eq!(parse_relative("7w"), None);
+        assert_eq!(parse_relative("1.5h"), None);
+        // Overflow is refused rather than wrapped.
+        assert_eq!(parse_relative("9223372036854775807d"), None);
     }
 
     #[test]

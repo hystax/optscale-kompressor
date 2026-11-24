@@ -83,6 +83,7 @@ pub struct Retriever {
     /// carries no identity, in which case a hit is served and not remembered:
     /// there is nothing to remember it against.
     conversation: Option<u64>,
+    timing: Option<Arc<std::sync::Mutex<kompressor_stats::context::ProxyTiming>>>,
 }
 
 impl Retriever {
@@ -103,15 +104,33 @@ impl Retriever {
             model,
             prefixes,
             conversation,
+            timing: None,
+        }
+    }
+
+    pub(crate) fn with_timing(
+        mut self,
+        timing: Arc<std::sync::Mutex<kompressor_stats::context::ProxyTiming>>,
+    ) -> Self {
+        self.timing = Some(timing);
+        self
+    }
+    fn measured(&self, began: std::time::Instant) {
+        if let Some(t) = &self.timing {
+            t.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record_retrieval(began.elapsed().as_secs_f64() * 1000.0);
         }
     }
 
     /// Answer one call, returning the tool-result payload and what it costs the
     /// next round in tokens.
     pub fn answer(&self, call: &ModelToolCall) -> (String, u32) {
+        let began = std::time::Instant::now();
         let payload = self.result_for(call);
         let text = payload.to_string();
         let tokens = estimate_tokens(&text, "tool");
+        self.measured(began);
         (text, tokens)
     }
 
@@ -132,6 +151,7 @@ impl Retriever {
     /// something unreadable and was refused for an unrelated reason, and
     /// dropping the row would lose the refusal to keep a field tidy.
     pub fn refuse(&self, call: &ModelToolCall) -> (String, u32) {
+        let began = std::time::Instant::now();
         let handle = arguments_object(&call.arguments)
             .and_then(|arguments| {
                 arguments
@@ -160,6 +180,7 @@ impl Retriever {
         });
         let text = payload.to_string();
         let tokens = estimate_tokens(&text, "tool");
+        self.measured(began);
         (text, tokens)
     }
 

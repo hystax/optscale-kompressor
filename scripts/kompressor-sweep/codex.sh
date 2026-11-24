@@ -809,6 +809,10 @@ PY
 You are exercising a compression proxy. Run each command below, exactly once, in this order.
 Show the complete output of every command. Do not pipe to head/tail/wc, do not summarise, do
 not skip any, do not stop early, and do not combine them into one command.
+Use a separate tool call for each command. If you run a command through the `exec` tool,
+start that cell's source with exactly this first line:
+// @exec: {"max_output_tokens": 200000}
+and pass max_output_tokens: 200000 to tools.exec_command, so the output is not truncated.
 After the last one, reply with exactly: SWEEP DONE
 
 1. cat logs/service.log
@@ -832,8 +836,10 @@ EOF
 
   # What is about to be tested, and how compressible each payload is on its own.
   # Measured by the engine directly, so it is the ceiling: through codex these
-  # same files arrive wrapped in tool-output framing, truncated at ~40 KB, and
-  # mixed with conversation the proxy must leave alone.
+  # same files arrive wrapped in tool-output framing and mixed with conversation
+  # the proxy must leave alone. They used to arrive truncated at ~40 KB too:
+  # codex 0.166 runs commands only through code mode, whose cells default to a
+  # 10000-token output budget. The `// @exec:` pragma in the prompt raises it.
   say "what the sweep will send"
   local list; list=$(sed -n 's/^[0-9]*\. cat //p' "$PROMPT" | tr '\n' ' ')
   # shellcheck disable=SC2086
@@ -926,13 +932,36 @@ sweep() {
     echo "           If that fails too, sign in again: codex login"
     return 1
   fi
+  # Truncation is checked before bytes, because it explains them: a run that
+  # read every file can still land under the threshold when codex cut the
+  # output first. Codex 0.166 runs commands only through code mode's `exec`,
+  # and caps each cell's output at 10000 tokens (about 40 KB) before the
+  # request reaches the proxy. `tool_output_token_limit` does not move that
+  # cap and disabling `code_mode_host` leaves `exec` offered but failing every
+  # call; only the cell's first-line `// @exec: {"max_output_tokens": N}`
+  # pragma does, which is why the prompt asks for it. Measured 2026-11-05. The
+  # plugin flag above no longer turns code mode off; it stays for older codex.
+  if [ "${4:-0}" -gt 0 ]; then
+    echo "  code-mode cells: ${3:-0}, results truncated by codex: $4"
+    echo
+    echo "  WARNING: codex cut the command output before it reached the proxy."
+    echo "           $4 of $1 tool results carry codex's 'truncated output' marker,"
+    echo "           so kompressor only saw what was left of each payload and the"
+    echo "           numbers from 'report' are not comparable with a full run."
+    echo "           This is codex's code-mode output cap (10000 tokens per cell by"
+    echo "           default), not kompressor: the model skipped the prompt's"
+    echo "           '// @exec: {\"max_output_tokens\": 200000}' pragma. Re-run."
+    echo "           codex: $(codex --version 2>/dev/null || echo unknown)."
+    echo "           Session: $sess"
+    return 1
+  fi
   if [ "${2:-0}" -lt 100000 ]; then
     echo
     echo "  WARNING: the agent did not run the sweep. It answered without reading the"
-    echo "           files, so the numbers from 'report' would measure nothing. Codex"
-    echo "           can take a code-mode path and execute an empty cell. Re-run, and"
-    echo "           if it persists disable the code-mode plugin for the run:"
-    echo "             -c 'plugins.\"codex-app-tools@openai-bundled\".enabled=false'"
+    echo "           files (${3:-0} code-mode cells, $2 chars of tool output), so the"
+    echo "           numbers from 'report' would measure nothing. Re-run; if it"
+    echo "           persists, inspect the session for empty or failing exec cells:"
+    echo "             $sess"
     return 1
   fi
   say "what the proxy did with it"

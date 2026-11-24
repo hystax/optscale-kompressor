@@ -620,6 +620,18 @@ Check the exit code without a pipe. `python3 cache-loss-diff.py <dir> | tail`
 reports `tail`'s status, not the tool's, which is how three runs were recorded
 as clean when one of them was not.
 
+A loss measured from a keep-warm ping is diffed against the request the ping
+repeated. The last cache observation before a loss is often a ping — it is the
+last thing to read the entry before a long wait — and a ping has a row of its
+own (`<request id>.keepwarm<N>`, `keep_warm = 1`) but no body in the capture,
+because it re-sends the body its request sent with only `max_tokens` and
+`stream` changed. Before 2026-11-22 the tool looked for a body under the ping's
+own id, found none and printed "no body pair captured", on exactly the losses
+keep-warm was meant to prevent: on that day's `06-14-11` run the one loss, 473 s
+after a single ping, could not be attributed until the ping was followed back.
+The mapping is made only for a row filed as a ping, since a client may choose
+an id that happens to end the same way.
+
 It decides promotion from demotion by **counting `ref:k_` markers**, not by
 looking for marker wording. The obvious phrase to match on,
 `[... N body lines omitted from NAME; ...]`, is only the *code* compressor's;
@@ -802,3 +814,38 @@ sees its first byte at +0.0s. Through the proxy it sees one at +10.0s — the
 keep-alive interval — because the relay holds frames back while it decides
 whose turn the stream is. Before that keep-alive existed the client saw nothing
 for the full 25s, and a real agent gave up after five minutes of it.
+
+### Replaying a run's bodies through a binary
+
+`scripts/bench/replay-bodies.py` posts every request a run captured
+(`kompressor-bodies.jsonl`) through a binary, in front of a local upstream that
+records what arrives and answers with a minimal reply. It answers one question
+— *what does this binary send upstream for these requests* — and
+`make replay-diff` asks it of two binaries and compares them byte for byte:
+
+```bash
+make replay-diff BODIES=<run>/kompressor-bodies.jsonl BASE_BIN=<older binary> CONFIG=<run>/kompressor-effective-config.toml
+```
+
+`CONFIG` (the script's `--config`) is the configuration to replay under; left
+out, it is the packaged one, which is not what a bench run used — a run's
+provider overlay, frozen prefix and engine switches are in its
+`kompressor-effective-config.toml`. Either way the file is rewritten before the
+binary reads it: listeners move to a free local port, the databases into the
+output directory, every `base_url` to the local upstream, the interception
+listener and any scheduled backup are removed, and keep-warm is switched off
+both under `[proxy]` and in each provider's overlay, which would otherwise win.
+The child is started without any `KOMPRESSOR_*` variable from the calling
+shell, since those override the file key by key. The rewritten file is then
+parsed and checked, and a configuration that would still listen elsewhere, open
+another database or name another upstream is refused rather than replayed. The
+script exits non-zero when any replayed request failed.
+
+What it is not: a cache simulator. Requests go out back to back, so nothing
+idles, no entry lapses, no ping fires and `cold_recompact = "predicted"` never
+predicts; the upstream's replies carry no usage and never ask for a fragment.
+It shows what compression does to the bytes, and says nothing about what a run
+would have cost. The two unit suites beside the scripts
+(`scripts/bench/test_replay_bodies.py`, `scripts/harbor/test_analysis.py`) run
+under `make bench-selftest`, and so under `make check`.
+

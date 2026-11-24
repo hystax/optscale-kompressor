@@ -32,6 +32,8 @@ login (`oauth-2025-04-20`), model `claude-opus-5[1m]`, OptScale Kompressor in
 - [Why the default freezes everything](#why-the-default-freezes-everything)
 - [Do not disable prompt caching](#do-not-disable-prompt-caching)
 - [Verify it for yourself](#verify-it-for-yourself)
+  - [Do not ask the model](#do-not-ask-the-model)
+  - [What the session says on exit](#what-the-session-says-on-exit)
 - [Reading the outcome field](#reading-the-outcome-field)
 - [What the proxy changes about your request](#what-the-proxy-changes-about-your-request)
 - [What compression costs, measured](#what-compression-costs-measured)
@@ -338,6 +340,34 @@ payloads a compression proxy exists for are exactly the ones this client
 disposes of first. What reaches the engine is the traffic already small enough
 that Claude Code did not consider it worth persisting.
 
+#### Where the line is
+
+**30,720 bytes — 30 KiB.** Measured against 2.1.299 by reading files of known
+size in one session and checking which came back wrapped:
+
+| output | result |
+|---|---|
+| 8K, 12K, 16K, 20K, 24K, 28K, 29K, 30,000 bytes | arrives inline |
+| 30,720 bytes (30 KiB), 31K, 32K | `<persisted-output>`, ~2 KB preview |
+
+So the band in which compression can do anything at all through a Bash tool is
+between `min_compress_chars` and that ceiling:
+
+| size | what happens |
+|---|---|
+| under 512 characters | below `min_compress_chars`; nothing to do |
+| **512 characters – 30 KiB** | **the engine sees it and can compress it** |
+| 30 KiB and over | withheld by the client; the proxy never sees it |
+
+`BASH_MAX_OUTPUT_LENGTH` appears in the binary beside this logic, so the ceiling
+may be raisable, but that is untested here.
+
+The practical consequence is for anyone building a fixture to exercise this: a
+test file of 36 KB produces no compression and no markers, and the session will
+report — accurately — that every line arrived intact. That is the client
+withholding it, not the engine declining it. The sweep's own code fixture takes
+`--compact` for this reason, which brings it to roughly 21 KB.
+
 ## Do not disable prompt caching
 
 `DISABLE_PROMPT_CACHING=1` removes the breakpoints, and compression does start
@@ -363,8 +393,71 @@ trade that pays.
 
 ## Verify it for yourself
 
-Run a task that reads something sizeable — a long log, a large file, a test
-run — and then:
+### Do not ask the model
+
+The obvious test is to ask the session what it sees: whether bodies arrived as
+markers, which handles it was given, to quote a marker line. Every one of those
+questions returns "no compression happened", in sessions where the engine
+removed fifteen thousand tokens from a single request.
+
+The model is not wrong, and it is not a reliable witness. With
+`retrieve_execution = "server"` — the default — the proxy elides on the way out,
+resolves the handles itself, and the model is handed resolved content. It
+reports what it was given. Measured on one run:
+
+```text
+tokens_in   tokens_out   removed   refs_emitted
+   22,875        7,576    15,299            20
+
+retrieval_events: 3, 8,476 chars returned
+tools the model called: Bash, Bash, Bash, Bash
+```
+
+Twenty bodies elided, three retrievals executed, and from inside the
+conversation nothing visibly happened. A report of "every line is present as
+literal source" is compatible with all of that.
+
+Ask the ledger instead:
+
+```bash
+sqlite3 ~/.local/share/kompressor/stats.db \
+  'select tokens_in, tokens_out, tokens_in - tokens_out as removed, refs_emitted
+   from optimization_events where outcome = "compressed" order by id desc limit 5;'
+```
+
+A model only becomes a witness worth questioning when the handles reach it
+unresolved — `retrieve_execution` set so the client answers, or the MCP surface
+where the model calls `optscale_kompressor_retrieve` itself. Those are the
+configurations the retrieval fixtures are built for, and they are not the
+default.
+
+### What the session says on exit
+
+A wrapped session tells you as it exits. With the packaged profile
+(`frozen_prefix = "first_seen"`) the line to expect is the last one — messages
+compressed and tokens saved:
+
+```console
+kompressor: <N> request(s), <M> message(s) compressed, ~<T> tokens saved (<U> net of retrieval)
+```
+
+On the deployment default (`frozen_prefix = "marker"`) Claude Code's trailing
+`cache_control` breakpoint freezes everything, and the line says so:
+
+```console
+kompressor: <N> request(s), no message compressed — every message was withheld.
+           Either there was nothing worth rewriting, or proxy.frozen_prefix is "marker"
+           and the client pins its whole prompt with cache_control (Claude Code does);
+           set it to "first_seen" — see docs/CLAUDE-CODE.md.
+```
+
+That is the proxy working and the profile missing — see
+[Settings that make it compress](#settings-that-make-it-compress).
+`no requests reached the proxy` would be the real failure, and it is not what
+Claude Code does: it honours `ANTHROPIC_BASE_URL` correctly.
+
+For the detail behind that line, run a task that reads something sizeable — a
+long log, a large file, a test run — and then:
 
 ```bash
 kompressor stats summary
@@ -527,7 +620,8 @@ seconds until Claude Code's next request arrives, at most 11 times; after an
 `end_turn` while a background task or `Monitor` watch Claude Code started is
 still running (its end neither reported nor caused by `TaskStop`; a `Monitor` watch runs until it expires, whatever events it sends, and a wait on watches alone stops at the longest one's stated expiry, three pings for the usual ten minutes), at most 4 times (`proxy.cache_keep_warm_background_pings`,
 0 to turn that off), or while a `ScheduleWakeup` wake is still to come, until
-it is due.
+it is due: a wake whose delay the tool stated bounds the wait even with a task
+still running, and is held to the 11-ping limit only, not the background one.
 Each ping costs the conversation at the cache-read price plus one output token,
 and is recorded as its own `proxy_requests` row with `keep_warm = 1`. Simulated
 over the request logs of seven 89-task runs, it would have saved $1.84–$3.00 a

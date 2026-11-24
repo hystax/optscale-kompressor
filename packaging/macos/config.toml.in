@@ -17,6 +17,11 @@
 
 [server]
 listen = "127.0.0.1:8817"
+# Live statistics — a dashboard at http://<address>/, the prompt-cache
+# analysis at /cache, and JSON at /v1/stats/live and /v1/stats/cache — on a
+# port of their own, whatever surfaces are served.
+# Off unless an address is named; /v1/stats/live is on the API listener either way.
+# stats_listen = "127.0.0.1:8818"
 
 # Deployment defaults: what Codex traffic runs under. Code elision on, the
 # client's own cache markers, the provider's default cache lifetime.
@@ -29,6 +34,35 @@ max_ref_bytes = 1048576
 [refs]
 backend = "sqlite"
 path = "@STATE@/refs.db"
+# The ref browser — /v1/refs, and /refs on server.stats_listen — lists, shows
+# and deletes stored fragments. Fragments are tool output and can hold secrets,
+# so it is off unless turned on here.
+# browse = true
+
+# The Maintenance page — /maintenance on server.stats_listen — can download a
+# backup: one .tar.gz with a snapshot of every database. It holds every
+# tenant's statistics and fragments, so it is off unless turned on here.
+# `kompressor backup --out DIR` on this host needs no setting.
+[maintenance]
+# backup = true
+# The housekeeping buttons on the same page — integrity check, checkpoint,
+# vacuum, optimize:
+# actions = true
+# The page's danger zone: delete every statistic recorded, for every tenant.
+# It asks twice, and there is no undoing it short of `kompressor restore`.
+# erase = true
+# Have the service take a backup itself, and keep the newest few. The
+# directory must be writable by the service: under systemd, inside the state
+# directory. Copy the archives off this host — a backup on the disk it backs
+# up does not survive that disk.
+# backup_dir = "/var/lib/kompressor/backups"
+# backup_every = "1day"
+# backup_keep = 7
+# The Health page warns when the last backup is older than twice
+# backup_every. To be held to an age whoever takes them:
+# backup_max_age = "7days"
+# `serve` refreshes the query planner's statistics this often ("0s" = never):
+# optimize_every = "1day"
 
 [stats]
 enabled = true
@@ -161,4 +195,18 @@ name = "anthropic-api"
 path_prefix = "/api"
 base_url = "https://api.anthropic.com"
 api_family = "passthrough"
+forward_auth = true
+
+# --- opencode: OpenCode Zen and OpenCode Go ------------------------------
+# `kompressor wrap opencode` points opencode's built-in `opencode` and
+# `opencode-go` providers at /zen/v1 and /zen/go/v1 here. One host serves both
+# tiers and every wire shape (Chat Completions, Responses, Messages); the family
+# is read off the path, so one mount covers them. The client's
+# x-opencode-session header is forwarded with the rest — the relay 400s without
+# it. opencode's `openai` and `anthropic` providers use the mounts above.
+[[proxy.upstreams]]
+name = "opencode-zen"
+path_prefix = "/zen"
+base_url = "https://opencode.ai"
+api_family = "auto"
 forward_auth = true

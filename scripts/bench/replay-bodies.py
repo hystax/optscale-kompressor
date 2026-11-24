@@ -10,6 +10,12 @@ configuration, in front of a local upstream that records what arrives and
 answers each call with a minimal, tool-free reply. Nothing reaches a provider
 and nothing is billed.
 
+Use `--config <run>/kompressor-effective-config.toml` to preserve a run's
+compression settings. Listeners, database paths and upstream URLs are redirected
+locally; keep-warm is disabled, including provider overrides. Environment
+configuration overrides are removed. This replays compression, not elapsed
+cache lifetimes or the provider's original usage and tool decisions.
+
 What it writes to `--out`:
 
 * `upstream.jsonl` -- one line per upstream call: the request's index, the
@@ -177,41 +183,124 @@ class Upstream:
 
     def close(self):
         self.server.shutdown()
+        self.server.server_close()
         self.out.close()
 
 
-def write_config(out: Path, upstream_port: int, proxy_port: int) -> Path:
+def write_config(out: Path, upstream_port: int, proxy_port: int, source: Path = PACKAGED) -> Path:
+    """`source`, pointed at this replay and at nothing else.
+
+    What is replayed is the compression settings. Everything that says where
+    the service listens, what it writes and whom it calls is replaced: a run's
+    effective configuration names the bench host's bridge address, that run's
+    own databases and the provider, and the packaged one names the paths a
+    live service on this machine is using.
+    """
     # Forward slashes: a Windows path in a TOML basic string would read
     # `\U` and friends as escapes. Windows accepts either separator.
     out = out.resolve()
-    text = PACKAGED.read_text(encoding="utf-8")
-    text = re.sub(
-        r'base_url = "https://[^"]+"', f'base_url = "http://127.0.0.1:{upstream_port}"', text
-    )
-    text = text.replace("/var/lib/kompressor/refs.db", (out / "refs.db").as_posix())
-    text = text.replace("/var/lib/kompressor/stats.db", (out / "stats.db").as_posix())
-    text = text.replace("/var/lib/kompressor/ca", (out / "ca").as_posix())
-    text = text.replace('listen = "127.0.0.1:8817"', f'listen = "127.0.0.1:{proxy_port}"')
-    # No intercept listener: nothing here speaks CONNECT, and a fixed port
-    # would collide between replays run side by side.
-    kept, skipping = [], False
+    upstream = f"http://127.0.0.1:{upstream_port}"
+    text = source.read_text(encoding="utf-8")
+    # `[ \t]`, not `\s`: that also matches the newline before the key, and
+    # would join it to whatever line came before.
+    text = re.sub(r'(?m)^([ \t]*)base_url[ \t]*=.*$', rf'\1base_url = "{upstream}"', text)
+    overrides = {
+        "server": dict(listen=f"127.0.0.1:{proxy_port}", api_listen="", proxy_listen="",
+                       mcp_listen="", stats_listen="", queue_timeout="600s"),
+        "refs": dict(path=(out / "refs.db").as_posix()),
+        "stats": dict(path=(out / "stats.db").as_posix()),
+        "proxy": dict(compress_timeout="600s", cache_keep_warm=False),
+        # A scheduled backup would be written wherever the source said.
+        "maintenance": dict(backup_dir=""),
+    }
+    assign = lambda table: [f"{key} = {json.dumps(value)}\n" for key, value in table.items()]
+    kept, skipping, section, seen = [], False, "", set()
     for line in text.splitlines(keepends=True):
-        if re.match(r"\[\[?[A-Za-z_]", line):
-            skipping = line.startswith("[proxy.intercept]")
-        if not skipping:
+        header = re.match(r"\s*\[([A-Za-z_][\w.]*)\]\s*(?:#.*)?$", line)
+        if header or re.match(r"\s*\[\[", line):
+            section = header.group(1) if header else ""
+            # No intercept listener: nothing here speaks CONNECT, and a fixed
+            # port would collide between replays run side by side.
+            skipping = section == "proxy.intercept" or section.startswith("proxy.intercept.")
+            if skipping:
+                continue
+            # A provider's own switch wins over `[proxy]`'s, so turning
+            # keep-warm off there alone leaves it on for that provider.
+            if section.startswith("proxy.providers.") and section.count(".") == 2:
+                overrides[section] = dict(cache_keep_warm=False)
+            seen.add(section)
             kept.append(line)
+            kept.extend(assign(overrides.get(section, {})))
+            continue
+        key = re.match(r"\s*(\w+)\s*=", line)
+        if not skipping and not (key and key.group(1) in overrides.get(section, {})):
+            kept.append(line)
+    if kept and not kept[-1].endswith("\n"):
+        kept.append("\n")
+    # A section the source leaves to its defaults still has to be redirected:
+    # the default listener is the one a live service on this machine holds.
+    for section in ("server", "refs", "stats", "proxy", "maintenance"):
+        if section not in seen:
+            kept.append(f"[{section}]\n")
+            kept.extend(assign(overrides[section]))
     text = "".join(kept)
-    text = text.replace(
-        "[server]\n", '[server]\nqueue_timeout = "600s"\n', 1
-    )
-    text = text.replace(
-        "[proxy]\n",
-        '[proxy]\ncompress_timeout = "600s"\ncache_keep_warm = false\n',
-        1,
-    )
+    isolated(text, out, upstream, proxy_port)
     path = out / "kompressor.toml"
     path.write_text(text, encoding="utf-8", newline="\n")
     return path
+
+
+def isolated(text: str, out: Path, upstream: str, proxy_port: int) -> None:
+    """Refuse a configuration that still reaches outside the replay.
+
+    The rewrite above edits text, line by line, and reads the spelling the
+    packaged file and `kompressor config` produce. A hand-written file can say
+    the same things another way -- `providers.anthropic.cache_keep_warm = true`
+    under `[proxy]`, an inline table -- and would pass through untouched. So the
+    result is parsed and checked, and a replay that would ping a provider or
+    open someone else's database does not start.
+    """
+    try:
+        import tomllib
+    except ImportError:  # before Python 3.11: nothing to parse it with
+        return
+    try:
+        config = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        sys.exit(f"replay: the rewritten configuration does not parse: {error}")
+    server, proxy = config.get("server", {}), config.get("proxy", {})
+    wrong = []
+    if server.get("listen") != f"127.0.0.1:{proxy_port}":
+        wrong.append("server.listen is not the replay's port")
+    wrong += [f"server.{key} is set" for key in
+              ("api_listen", "proxy_listen", "mcp_listen", "stats_listen") if server.get(key)]
+    for name in ("refs", "stats"):
+        if Path(config.get(name, {}).get("path", "")).parent != out:
+            wrong.append(f"{name}.path is outside the replay directory")
+    if config.get("maintenance", {}).get("backup_dir"):
+        wrong.append("maintenance.backup_dir is set")
+    if "intercept" in proxy:
+        wrong.append("proxy.intercept is present")
+    if proxy.get("cache_keep_warm") is not False:
+        wrong.append("proxy.cache_keep_warm is not off")
+    wrong += [f"proxy.providers.{name}.cache_keep_warm is on"
+              for name, provider in proxy.get("providers", {}).items()
+              if isinstance(provider, dict) and provider.get("cache_keep_warm")]
+
+    def urls(node, where):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "base_url" and value != upstream:
+                    wrong.append(f"{where}.base_url is {value!r}, not the local upstream")
+                urls(value, f"{where}.{key}")
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                urls(value, f"{where}[{index}]")
+
+    urls(config, "config")
+    if wrong:
+        sys.exit("replay: the configuration would reach outside this replay:\n  "
+                 + "\n  ".join(wrong))
 
 
 def wait_ready(port: int, proc: subprocess.Popen, log: Path):
@@ -246,18 +335,23 @@ def replay(args) -> dict:
             p.unlink()
     upstream = Upstream(out / "upstream.jsonl")
     proxy_port = free_port()
-    config = write_config(out, upstream.port, proxy_port)
+    config = write_config(out, upstream.port, proxy_port,
+                          Path(args.config) if args.config else PACKAGED)
     log = out / "proxy.log"
-    env = dict(os.environ)
-    env.pop("KOMPRESSOR_BODY_CAPTURE", None)
-    env.pop("KOMPRESSOR_CONFIG", None)
-    proc = subprocess.Popen(
-        [args.bin, "serve", "--proxy", "--api", "--config", str(config)],
-        stdout=log.open("w"),
-        stderr=subprocess.STDOUT,
-        env=env,
-        cwd=out,
-    )
+    # Every one of them, not the two that were known about when this was
+    # written: `KOMPRESSOR__PROXY__…` overrides the file key by key, so a shell
+    # left set up for a bench run would replay that run's settings instead of
+    # the file's, and could point the child back at a provider.
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith("KOMPRESSOR_")}
+    with log.open("w") as sink:
+        proc = subprocess.Popen(
+            [args.bin, "serve", "--proxy", "--api", "--config", str(config)],
+            stdout=sink,
+            stderr=subprocess.STDOUT,
+            env=env,
+            cwd=out,
+        )
     try:
         wait_ready(proxy_port, proc, log)
         sent = client_bytes = errors = 0
@@ -274,6 +368,10 @@ def replay(args) -> dict:
                     orig_out += len(raw.encode())
                 continue
             if direction != "client->proxy":
+                continue
+            if args.limit and sent >= args.limit:
+                # Still consume outbound records to account for the last
+                # selected request's original body pair.
                 continue
             try:
                 body = json.loads(raw)
@@ -309,8 +407,6 @@ def replay(args) -> dict:
             sent += 1
             client_bytes += len(data)
             by_path[path] = by_path.get(path, 0) + 1
-            if args.limit and sent >= args.limit:
-                break
     finally:
         proc.terminate()
         try:
@@ -361,6 +457,7 @@ def main():
     parser.add_argument("--bin")
     parser.add_argument("--capture")
     parser.add_argument("--out")
+    parser.add_argument("--config", help="configuration to replay (default: packaged)")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--compare", nargs=2, metavar=("A", "B"))
     args = parser.parse_args()
@@ -368,7 +465,9 @@ def main():
         sys.exit(compare(Path(args.compare[0]), Path(args.compare[1])))
     if not (args.bin and args.capture and args.out):
         parser.error("--bin, --capture and --out are required")
-    print(json.dumps(replay(args), indent=2))
+    summary = replay(args)
+    print(json.dumps(summary, indent=2))
+    sys.exit(1 if summary["errors"] else 0)
 
 
 if __name__ == "__main__":

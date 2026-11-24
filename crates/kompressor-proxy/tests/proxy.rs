@@ -76,6 +76,27 @@ async fn an_upstream_using_the_default_family_detects_known_endpoints() {
     assert!(sent["messages"][3]["content"].as_str().unwrap().len() < input.len());
 }
 
+/// A request is among those under way while the provider is answering and
+/// not after, so "nothing under way" can be trusted before a restart.
+#[tokio::test]
+async fn a_request_is_counted_under_way_only_while_it_is() {
+    let harness = Harness::new().await;
+    Mock::given(any())
+        .respond_with(answered().set_delay(Duration::from_millis(600)))
+        .mount(&harness.server)
+        .await;
+    assert_eq!(harness.state.under_way().requests, 0);
+    let body = chat_body(&log_payload(400));
+    let sending = harness.post("/v1/chat/completions", &body);
+    let watching = async {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        harness.state.under_way()
+    };
+    let (_, during) = tokio::join!(sending, watching);
+    assert_eq!((during.requests, during.streams), (1, 0));
+    assert_eq!(harness.state.under_way().requests, 0);
+}
+
 #[tokio::test]
 async fn an_ordinary_request_is_untouched_by_the_websocket_relay() {
     // The relay ships on, and "on" has to mean *as well as*, not instead.
@@ -156,6 +177,48 @@ async fn a_zstd_encoded_request_is_compressed_like_any_other() {
         "an encoded body is compressed like any other, or the client gets nothing"
     );
     assert!(compressed.contains("ref:k_"));
+}
+
+#[tokio::test]
+async fn a_gzip_request_sent_as_several_members_is_read_whole() {
+    // A gzip body may be several members end to end (RFC 1952), which is what
+    // a client compressing in chunks produces. The decoder used to stop at the
+    // end of the first: the JSON below was cut mid-document, did not parse,
+    // and the request went upstream uncompressed with nothing logged but a
+    // fail-open count.
+    use std::io::Write;
+    let member = |bytes: &[u8]| {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    };
+    let harness = Harness::new().await;
+    answering(&harness).await;
+
+    let payload = log_payload(400);
+    let body = chat_body(&payload).to_string();
+    let (head, tail) = body.as_bytes().split_at(body.len() / 2);
+    let mut encoded = member(head);
+    encoded.extend(member(tail));
+
+    let sent = harness
+        .post_encoded("/v1/chat/completions", "gzip", encoded)
+        .await;
+    assert_eq!(sent.status, 200);
+
+    let raw = &harness.upstream_raw_bodies().await[0];
+    let mut decoded = Vec::new();
+    std::io::Read::read_to_end(
+        &mut flate2::read::MultiGzDecoder::new(&raw[..]),
+        &mut decoded,
+    )
+    .expect("still gzip on the wire");
+    let upstream: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+    let compressed = upstream["messages"][3]["content"].as_str().unwrap();
+    assert!(
+        compressed.len() < payload.len() && compressed.contains("ref:k_"),
+        "both halves were read, so the request parsed and was compressed"
+    );
 }
 
 #[tokio::test]
@@ -1053,7 +1116,20 @@ async fn the_provider_wait_is_recorded_and_is_not_the_whole_request() {
         .drain()
         .into_iter()
         .filter_map(|event| match event {
-            kompressor_stats::events::Event::ProxyRequest(e) => e.upstream_ms,
+            kompressor_stats::events::Event::ProxyRequest(e) => {
+                let timing = e.timing.as_ref().expect("HTTP proxy records phase timing");
+                assert_eq!(timing.attempts_total, 1);
+                assert_eq!(timing.attempts.len(), 1);
+                assert_eq!(timing.attempts[0].status, Some(200));
+                assert!(!timing.attempts[0].failed);
+                assert!(timing.first_head_ms.unwrap() >= timing.attempts[0].duration_ms);
+                assert!(
+                    e.context
+                        .as_ref()
+                        .is_some_and(|c| c.build_version == env!("CARGO_PKG_VERSION"))
+                );
+                e.upstream_ms
+            }
             _ => None,
         })
         .collect();
@@ -2338,4 +2414,79 @@ async fn a_turn_about_something_else_leaves_the_elision_alone() {
         second.matches("heartbeat seq=").count() < 100,
         "and so does not ship the log whole"
     );
+}
+
+/// A recoverable elision is only recoverable if the model may call the tool.
+/// `tool_choice` can forbid that — `"none"`, or a different tool forced — and
+/// a request that cannot fetch anything back is forwarded whole rather than
+/// answered from a marker the model is not allowed to resolve.
+#[tokio::test]
+async fn a_tool_choice_that_forbids_retrieval_leaves_the_content_whole() {
+    let harness = Harness::new().await;
+    answering(&harness).await;
+    let payload = log_payload(400);
+
+    let mut chat_none = chat_body(&payload);
+    chat_none["tool_choice"] = json!("none");
+    let mut chat_forced = chat_body(&payload);
+    chat_forced["tools"] = json!([{"type": "function",
+        "function": {"name": "summarize", "parameters": {"type": "object"}}}]);
+    chat_forced["tool_choice"] = json!({"type": "function", "function": {"name": "summarize"}});
+    harness.post("/v1/chat/completions", &chat_none).await;
+    harness.post("/v1/chat/completions", &chat_forced).await;
+
+    let mut anthropic_none = anthropic_body(&payload);
+    anthropic_none["tool_choice"] = json!({"type": "none"});
+    let mut anthropic_forced = anthropic_body(&payload);
+    anthropic_forced["tool_choice"] = json!({"type": "tool", "name": "summarize"});
+    harness.post("/v1/messages", &anthropic_none).await;
+    harness.post("/v1/messages", &anthropic_forced).await;
+
+    let mut responses_none = responses_body(&payload);
+    responses_none["tool_choice"] = json!("none");
+    harness.post("/v1/responses", &responses_none).await;
+
+    let sent = harness.upstream_json().await;
+    assert_eq!(sent[0]["messages"][3]["content"], payload, "chat, none");
+    assert_eq!(sent[1]["messages"][3]["content"], payload, "chat, forced");
+    assert_eq!(
+        sent[2]["messages"][2]["content"][0]["content"], payload,
+        "anthropic, none"
+    );
+    assert_eq!(
+        sent[3]["messages"][2]["content"][0]["content"], payload,
+        "anthropic, forced"
+    );
+    assert_eq!(sent[4]["input"][2]["output"], payload, "responses, none");
+    for body in &sent {
+        assert!(!without_our_tool(&body.to_string()).contains("ref:k_"));
+    }
+}
+
+/// The choices that leave the retrieve tool callable are compressed as before.
+#[tokio::test]
+async fn a_tool_choice_that_allows_retrieval_is_compressed() {
+    let harness = Harness::new().await;
+    answering(&harness).await;
+    let payload = log_payload(400);
+    for choice in [
+        json!("auto"),
+        json!("required"),
+        json!({"type": "function", "function": {"name": "optscale_kompressor_retrieve"}}),
+    ] {
+        let mut body = chat_body(&payload);
+        body["tool_choice"] = choice;
+        harness.post("/v1/chat/completions", &body).await;
+    }
+    let mut anthropic_any = anthropic_body(&payload);
+    anthropic_any["tool_choice"] = json!({"type": "any"});
+    harness.post("/v1/messages", &anthropic_any).await;
+
+    for body in harness.upstream_json().await {
+        assert!(
+            without_our_tool(&body.to_string()).contains("ref:k_"),
+            "{}",
+            body["tool_choice"]
+        );
+    }
 }

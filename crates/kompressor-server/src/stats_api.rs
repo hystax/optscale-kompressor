@@ -69,6 +69,7 @@ pub(crate) fn stats_routes() -> Router<Arc<ServerState>> {
         .route("/stats/retrievals", get(retrievals))
         .route("/stats/requests", get(requests))
         .route("/stats/store", get(store))
+        .merge(crate::live::live_routes())
 }
 
 /// Unpack the query, refusing a parameter we do not serve rather than ignoring

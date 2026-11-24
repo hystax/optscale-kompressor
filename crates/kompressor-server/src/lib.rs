@@ -37,12 +37,21 @@ pub mod middleware;
 pub mod state;
 pub mod wire;
 
+pub mod analysis;
 mod api;
+pub mod cache;
+pub mod dashboards;
+pub mod export;
+pub mod live;
+pub mod maintenance;
 mod ops;
+pub mod refs;
+mod running;
 mod stats_api;
 
 pub use api::api_router;
 pub use error::ApiError;
+pub use live::stats_listener_router;
 pub use middleware::{RequestId, extract_credentials, with_request_middleware};
 pub use ops::ops_router;
 pub use state::{ServerState, run_engine};

@@ -10,13 +10,18 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod backup;
 pub mod config;
 pub mod core;
 pub mod error;
 pub mod retrieve;
+pub mod runtime;
+pub mod s3;
 
 pub use auth::{Authenticator, Credentials, Identity};
 pub use config::Config;
-pub use core::{AppCore, CompressOutcome, RequestInfo, build_ref_store};
+pub use core::{AppCore, CompressOutcome, RefsSweep, RequestInfo, build_ref_store};
 pub use error::{AuthError, ConfigError, CoreError};
 pub use retrieve::{RetrieveRange, Retrieved};
+
+mod analysis_context;

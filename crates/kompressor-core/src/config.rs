@@ -35,6 +35,274 @@ pub struct Config {
     pub mcp: McpConfig,
     pub proxy: ProxyConfig,
     pub log: LogConfig,
+    pub maintenance: MaintenanceConfig,
+    /// Environment overrides that named a value this build does not know, for
+    /// the settings where carrying on regardless is not safe. Reported by
+    /// [`Config::validate`]; never read from or written to a file.
+    #[serde(skip)]
+    pub refused_env: Vec<String>,
+    /// Every `KOMPRESSOR_*` variable [`Config::apply_env`] was given, and
+    /// whether it changed anything. Names only: a value can be a secret.
+    /// Never read from or written to a file.
+    #[serde(skip)]
+    pub env: Vec<EnvOverride>,
+    /// The file this configuration was read from, made absolute; `None` for
+    /// the built-in defaults. So the Maintenance page can name it in the
+    /// commands it shows. Never read from or written to a file.
+    #[serde(skip)]
+    pub source: Option<PathBuf>,
+}
+
+/// One `KOMPRESSOR_*` variable the process was started with.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct EnvOverride {
+    /// The variable's name, as it was spelt.
+    pub name: String,
+    pub effect: EnvEffect,
+}
+
+/// What a `KOMPRESSOR_*` variable did to the configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvEffect {
+    /// It changed a setting from what the file and the defaults gave.
+    Applied,
+    /// It changed nothing: the name is not a setting, the value could not be
+    /// read, or the value is the one already in force. The three cannot be
+    /// told apart here, and the first two are the ones worth a look.
+    NoEffect,
+    /// Not a setting: read somewhere else, for something else.
+    Elsewhere,
+}
+
+/// `KOMPRESSOR_*` variables that are not settings and are read where they are
+/// used: the file to load, `wrap`'s home, the capture files, the build's
+/// commit, and the credentials `mcp serve` takes its tenant from.
+const ENV_READ_ELSEWHERE: [&str; 8] = [
+    "CONFIG",
+    "HOME",
+    "BODY_CAPTURE",
+    "WS_CAPTURE",
+    "GIT_COMMIT",
+    "API_KEY",
+    "SECRET",
+    "TENANT",
+];
+
+/// Backups on a schedule, and what the Maintenance page may do over HTTP.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MaintenanceConfig {
+    /// Serve `POST /v1/maintenance/backup`: a gzipped tar of every database
+    /// this process keeps, whole.
+    ///
+    /// Off by default, for the reason `refs.browse` is and more: the archive
+    /// holds every tenant's statistics and every stored fragment — tool
+    /// output, which can be a `.env` read. Even when on, it is served only to
+    /// a caller that may act for every tenant: anyone under
+    /// `auth.mode = "none"`, where there is one tenant, and otherwise only a
+    /// caller presenting `auth.secret`.
+    ///
+    /// `kompressor backup` on the host needs none of this: it reads the files
+    /// directly, as whoever runs it.
+    pub backup: bool,
+    /// Serve the housekeeping actions: `POST
+    /// /v1/maintenance/databases/{name}/check` (a full integrity check) and
+    /// `…/checkpoint` (fold the write-ahead log into the database).
+    ///
+    /// Apart from `backup` because the grant is a different one: these read
+    /// nothing out, but they are work on every tenant's database, so they are
+    /// off by default and limited to the same callers. What the page *shows*
+    /// about each database needs neither setting.
+    pub actions: bool,
+    /// Serve `POST /v1/maintenance/statistics/erase`: delete every statistic
+    /// this deployment has recorded, for every tenant, rollups included. The
+    /// Maintenance page's danger zone.
+    ///
+    /// Apart from `actions` because nothing those do loses anything, and this
+    /// loses all of it: off by default, limited to the same callers, and the
+    /// request must spell out what it is asking for. There is no undoing it
+    /// short of `kompressor restore`.
+    pub erase: bool,
+    /// Where `serve` writes a backup on a schedule. Empty, the default, takes
+    /// none. The directory is created if it is missing, readable by its
+    /// owner alone.
+    ///
+    /// Under the shipped systemd unit only the state directory is writable:
+    /// use a directory inside it (`/var/lib/kompressor/backups`), or add the
+    /// path to the unit's `ReadWritePaths`. A backup on the disk it backs up
+    /// survives a bad migration, not a dead disk — copy it off the host.
+    pub backup_dir: PathBuf,
+    /// How often. A backup is taken when the newest archive in `backup_dir`
+    /// is older than this, so the schedule holds across restarts and a
+    /// service that was down takes one when it comes back. Zero takes none.
+    #[serde(with = "humantime_serde")]
+    pub backup_every: Duration,
+    /// How many archives to keep in `backup_dir`; older ones are removed
+    /// after each scheduled backup. Zero keeps them all. Only files this
+    /// names itself (`kompressor-backup-<UTC>.tar.gz`) are ever removed.
+    pub backup_keep: u32,
+    /// How old the last backup may be before the Health page warns
+    /// (`last_backup`), and three times that before it is `bad`. Zero, the
+    /// default, follows the schedule — twice `backup_every`, so one missed
+    /// backup is a warning — and with no schedule says nothing: a deployment
+    /// that has not asked for backups is not nagged about them. Set it to be
+    /// held to an age whoever takes them.
+    #[serde(with = "humantime_serde")]
+    pub backup_max_age: Duration,
+    /// How often `serve` gathers the query planner's statistics on each
+    /// database (`ANALYZE`, sampled: quick on a large file) — what the page's
+    /// Optimize does by hand. Due when the last optimize on record is older
+    /// than this, so it holds across restarts. Zero takes none.
+    #[serde(with = "humantime_serde")]
+    pub optimize_every: Duration,
+    /// An off-site copy of every archive, on S3-compatible object storage.
+    pub s3: S3Config,
+}
+
+/// Where backup archives are copied to, off this host: any S3-compatible
+/// object store (AWS S3, MinIO, Cloudflare R2, Backblaze B2, Wasabi, Ceph…).
+///
+/// Off by default. When on, `serve` uploads each scheduled archive (with its
+/// `.sha256`) after writing it, and the Maintenance page can upload one on
+/// demand. Nothing is ever downloaded or restored from here by the service:
+/// fetch an archive with any S3 client and give it to `kompressor restore`.
+///
+/// The archive holds every tenant's statistics and fragments, so the bucket
+/// should be private, and the credentials should be able to write (and, with
+/// `keep`, delete) under `prefix` and nothing else.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct S3Config {
+    /// Copy archives to the bucket below.
+    pub enabled: bool,
+    /// The service's URL, `https://minio.internal:9000`. Empty is AWS S3 in
+    /// `region`.
+    pub endpoint: String,
+    /// The region requests are signed for. Most S3-compatible stores accept
+    /// any value; some (R2) want `auto`.
+    pub region: String,
+    pub bucket: String,
+    /// A key prefix ("folder") the archives are kept under.
+    pub prefix: String,
+    pub access_key_id: String,
+    /// Replaced by `<redacted>` wherever the configuration is shown.
+    pub secret_access_key: String,
+    /// Address the bucket as `endpoint/bucket/key` rather than
+    /// `bucket.endpoint/key`. What a store at your own address needs; AWS
+    /// takes either.
+    pub path_style: bool,
+    /// How many archives to keep in the bucket; older ones (and their
+    /// `.sha256`) are removed after each upload. Zero keeps them all, and is
+    /// the default: a bucket's own lifecycle rules are the safer place to
+    /// expire objects. Only names this writes itself are ever removed.
+    pub keep: u32,
+}
+
+impl Default for S3Config {
+    fn default() -> Self {
+        S3Config {
+            enabled: false,
+            endpoint: String::new(),
+            region: "us-east-1".to_string(),
+            bucket: String::new(),
+            prefix: "kompressor/".to_string(),
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
+            path_style: true,
+            keep: 0,
+        }
+    }
+}
+
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("enabled", &self.enabled)
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field("path_style", &self.path_style)
+            .field("keep", &self.keep)
+            .finish()
+    }
+}
+
+impl S3Config {
+    /// Where the archives go, for people: `s3://bucket/prefix/`.
+    pub fn location(&self) -> String {
+        let prefix = self.prefix.trim().trim_matches('/');
+        if prefix.is_empty() {
+            format!("s3://{}/", self.bucket.trim())
+        } else {
+            format!("s3://{}/{prefix}/", self.bucket.trim())
+        }
+    }
+
+    /// What is wrong with the settings, when something is. Only checked when
+    /// `enabled`.
+    pub fn problem(&self) -> Option<String> {
+        if self.bucket.trim().is_empty() {
+            return Some("maintenance.s3.bucket is empty".into());
+        }
+        if self.access_key_id.is_empty() || self.secret_access_key.is_empty() {
+            return Some(
+                "maintenance.s3.access_key_id and secret_access_key must both be set".into(),
+            );
+        }
+        if self.region.trim().is_empty() {
+            return Some("maintenance.s3.region is empty".into());
+        }
+        if !self.endpoint.is_empty() {
+            match url::Url::parse(&self.endpoint) {
+                Ok(url) if matches!(url.scheme(), "http" | "https") && url.host().is_some() => {}
+                _ => {
+                    return Some(format!(
+                        "maintenance.s3.endpoint {:?} is not an http(s) URL",
+                        self.endpoint
+                    ));
+                }
+            }
+        }
+        None
+    }
+}
+
+impl Default for MaintenanceConfig {
+    fn default() -> Self {
+        MaintenanceConfig {
+            backup: false,
+            actions: false,
+            erase: false,
+            backup_dir: PathBuf::new(),
+            backup_every: Duration::from_secs(24 * 3_600),
+            backup_keep: 7,
+            backup_max_age: Duration::ZERO,
+            optimize_every: Duration::from_secs(24 * 3_600),
+            s3: S3Config::default(),
+        }
+    }
+}
+
+impl MaintenanceConfig {
+    /// How old the last backup may be before it is a warning, when the
+    /// deployment expects backups at all: `backup_max_age`, or failing that
+    /// twice the scheduled interval.
+    pub fn max_age(&self) -> Option<Duration> {
+        if !self.backup_max_age.is_zero() {
+            return Some(self.backup_max_age);
+        }
+        self.schedule().map(|(_, every)| every.saturating_mul(2))
+    }
+
+    /// The schedule, when there is one: a directory and an interval.
+    pub fn schedule(&self) -> Option<(&std::path::Path, Duration)> {
+        (!self.backup_dir.as_os_str().is_empty() && !self.backup_every.is_zero())
+            .then_some((self.backup_dir.as_path(), self.backup_every))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -45,6 +313,12 @@ pub struct ServerConfig {
     pub api_listen: String,
     pub mcp_listen: String,
     pub proxy_listen: String,
+    /// A listener of its own for the live statistics and cache analysis pages
+    /// and their JSON, e.g.
+    /// `127.0.0.1:8818`. Empty serves them only on the API listener, at
+    /// `/v1/stats/live`; set, they are served here too, whatever surfaces the
+    /// process runs, so a proxy-only deployment still has a dashboard.
+    pub stats_listen: String,
     pub max_body_bytes: usize,
     /// 0 means twice the detected parallelism.
     ///
@@ -75,6 +349,7 @@ impl Default for ServerConfig {
             api_listen: String::new(),
             mcp_listen: String::new(),
             proxy_listen: String::new(),
+            stats_listen: String::new(),
             max_body_bytes: 64 * 1024 * 1024,
             max_inflight_compressions: 0,
             queue_timeout: Duration::from_secs(2),
@@ -167,6 +442,15 @@ pub struct RefsConfig {
     #[serde(with = "humantime_serde")]
     pub purge_interval: Duration,
     pub max_bytes: u64,
+    /// Serve the ref browser: `/v1/refs`, which lists, shows and deletes
+    /// stored fragments for the caller's tenant.
+    ///
+    /// Off by default. Fragments are tool output — a `.env` read, a cloud
+    /// API response — and until this is on, reading one back needs its
+    /// unguessable handle. With it on, any credential for a tenant can list
+    /// that tenant's fragments, and with `auth.mode = "none"` anyone who can
+    /// reach the listener can.
+    pub browse: bool,
 }
 
 impl Default for RefsConfig {
@@ -178,6 +462,62 @@ impl Default for RefsConfig {
             recent_cache_bytes: 64 * 1024 * 1024,
             purge_interval: Duration::from_secs(60),
             max_bytes: 1024 * 1024 * 1024,
+            browse: false,
+        }
+    }
+}
+
+/// An MCP server this one fronts.
+///
+/// Proxy mode exists for clients that cannot be pointed at the HTTP proxy at
+/// all — Claude Desktop's Chat tab among them. Their inference requests carry
+/// no bulk worth eliding, because the conversation lives on the server; the
+/// bulk they carry is **tool results**, which are machine-facing in exactly the
+/// way tool output in a coding agent is. Fronting the servers that produce
+/// those results compresses them without touching anything a person reads.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpServerConfig {
+    /// Prefixes this server's tool names, so two servers exporting `read_file`
+    /// do not shadow each other.
+    pub name: String,
+    /// Spawned, speaking JSON-RPC on its pipe. Exclusive with [`Self::url`].
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    /// Extra environment for a spawned server. The parent's is inherited,
+    /// except `KOMPRESSOR_API_KEY`, `KOMPRESSOR_SECRET` and
+    /// `KOMPRESSOR_TENANT`: this process's own credential reaches a fronted
+    /// server only when named here.
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Connected to over streamable HTTP. Exclusive with [`Self::command`].
+    pub url: Option<String>,
+    /// Whether results from this server are compressed at all.
+    ///
+    /// False forwards them untouched, which is right for a server whose results
+    /// are already small or structurally fragile: excluding one is better than
+    /// tuning the engine around it.
+    pub compress: bool,
+    /// How long the server has to answer `initialize` before it is killed and
+    /// skipped.
+    ///
+    /// Servers are connected before the client is served, so one that starts
+    /// and never answers would otherwise hold the whole session, our own tools
+    /// included. Generous by default because `npx -y` downloads the package on
+    /// its first run.
+    #[serde(with = "humantime_serde")]
+    pub startup_timeout: Duration,
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        McpServerConfig {
+            name: String::new(),
+            command: None,
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            url: None,
+            compress: true,
+            startup_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -242,22 +582,34 @@ impl Default for InterceptConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StatsFileConfig {
+    /// Optional experiment and run labels for historical analysis.
+    pub experiment_id: Option<String>,
+    pub run_id: Option<String>,
     pub enabled: bool,
     pub path: PathBuf,
     pub queue_size: usize,
     #[serde(with = "humantime_serde")]
     pub flush_interval: Duration,
     pub retention_days: u32,
+    /// Days a request keeps its copy of the effective settings
+    /// (`request_context.context`, most of a busy `stats.db`) before it is
+    /// emptied, the request kept. The analysis history is archived first, so
+    /// no breakdown loses a request. Zero, the default, keeps it as long as
+    /// the request; a value no shorter than `retention_days` changes nothing.
+    pub context_retention_days: u32,
 }
 
 impl Default for StatsFileConfig {
     fn default() -> Self {
         StatsFileConfig {
+            experiment_id: None,
+            run_id: None,
             enabled: true,
             path: PathBuf::from("./data/stats.db"),
             queue_size: 16_384,
             flush_interval: Duration::from_millis(100),
             retention_days: 90,
+            context_retention_days: 0,
         }
     }
 }
@@ -287,6 +639,8 @@ impl Default for RetrieveConfig {
 pub struct McpConfig {
     pub enabled: bool,
     pub path: String,
+    /// Servers this one fronts. Empty, the default, serves only our own tools.
+    pub servers: Vec<McpServerConfig>,
     /// Empty means any host is accepted, which is right for an internal service.
     pub allowed_hosts: Vec<String>,
     pub max_retrievals_per_minute: u32,
@@ -297,6 +651,7 @@ impl Default for McpConfig {
         McpConfig {
             enabled: true,
             path: "/mcp".to_string(),
+            servers: Vec::new(),
             allowed_hosts: Vec::new(),
             max_retrievals_per_minute: 120,
         }
@@ -366,6 +721,75 @@ pub enum PromptCacheRetention {
     /// OpenAI documents it for. Free to write on those models.
     #[serde(rename = "24h")]
     Extended,
+}
+
+/// What to do on the turn that finds a conversation's provider cache gone.
+///
+/// A request that arrives after the cache has lapsed is written to the cache
+/// again at the write price whatever it contains, so it is the one turn on
+/// which rewriting the whole conversation costs nothing: the frozen prefix can
+/// be compressed, and a file read a later edit invalidated can be replaced.
+/// What that turn decides is recorded per conversation and replayed on every
+/// later turn, so the bytes it wrote are the bytes sent from then on.
+///
+/// Acts only under `frozen_prefix = "first_seen"`, which is what lets a
+/// conversation's freeze be lowered for good; under `marker` it does nothing.
+/// With it on, `first_seen` no longer withholds the stale-read replacement:
+/// that is decided on these turns and on no other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ColdRecompact {
+    /// A lapse is handled as it always was. The shipped default.
+    #[default]
+    Off,
+    /// Recompact when the provider's last answer showed the cache gone: it
+    /// read nothing and wrote nothing.
+    Observed,
+    /// Also when this request arrives longer after the conversation's last one
+    /// than the cache lifetime that one asked for, plus
+    /// `cold_recompact_margin`. Anthropic Messages only, where the lifetime is
+    /// in the request. Three wrong predictions in an hour turn it off for the
+    /// life of the process.
+    Predicted,
+}
+
+/// The order tool definitions go upstream in.
+///
+/// A provider renders the tool list ahead of the conversation, so a client
+/// that sends the same tools in another order on a later turn loses the cache
+/// from the first tool that moved. `pinned` keeps each conversation's tools in
+/// the order its first request sent them; a tool that appears later is added
+/// after those. Nothing is sorted, so the first request of every conversation
+/// goes out exactly as written, and a client that never reorders is never
+/// touched. Built on the evidence of the `/prefix` dashboard's `tool_order`
+/// row, and off until that row says it is worth having.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolsOrder {
+    /// The client's order, as written. The shipped default.
+    #[default]
+    Client,
+    /// The order the conversation's first request used.
+    Pinned,
+}
+
+/// Whether OpenAI requests that name no `prompt_cache_key` are given one.
+///
+/// OpenAI routes a request to a cache by a hash of its opening, and combines
+/// that with `prompt_cache_key` when the request carries one. A client that
+/// sends none leaves two conversations with the same instructions and tools
+/// competing for one route. `conversation` names the conversation by its
+/// opening messages, so every turn of it is routed alike. Codex sets its own
+/// key and is never overridden.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheKey {
+    /// The client's request goes out as written. The shipped default.
+    #[default]
+    Client,
+    /// Add a key derived from the conversation's opening where the client
+    /// named none.
+    Conversation,
 }
 
 /// Where the frozen prefix ends: what the client says, or what the provider
@@ -460,6 +884,95 @@ pub struct ProxyConfig {
     /// that names the field is answered by sending the request again without
     /// it, and the field is not added again for that upstream and model.
     pub prompt_cache_retention: PromptCacheRetention,
+    /// Whether an OpenAI request that names no `prompt_cache_key` is given
+    /// one. See [`PromptCacheKey`]. Applied where
+    /// [`Self::prompt_cache_retention`] is: Chat Completions and Responses
+    /// through the `openai` upstream or one on `api.openai.com`, never on the
+    /// ChatGPT-subscription route, and a 400 naming the field is answered by
+    /// sending again without it.
+    pub prompt_cache_key: PromptCacheKey,
+    /// The order tool definitions go upstream in. See [`ToolsOrder`].
+    pub tools_order: ToolsOrder,
+    /// The models whose earlier-turn reasoning is left out of the requests
+    /// that re-send it. **Empty by default**, and nothing is elided for a model
+    /// that is not named.
+    ///
+    /// Some providers return reasoning as plain text (`reasoning_content`, or
+    /// a `<think>` span) and bill it as input when the client sends it back.
+    /// For a model named here, an OpenAI Chat Completions request has the
+    /// reasoning of every assistant message *before its last user message*
+    /// replaced by a marker, with a handle in `recoverable` mode. A tool round
+    /// in progress keeps all of its reasoning, which is when a provider needs
+    /// it back.
+    ///
+    /// The step from one user turn to the next rewrites the turn just
+    /// finished, and so costs its cached prefix once per user turn. Name a
+    /// model only where its provider documents that earlier reasoning need not
+    /// be sent, and where conversations run long enough to repay that. An
+    /// entry ending in `*` matches by prefix.
+    pub reasoning_elide_models: Vec<String>,
+    /// Take out of each tool's schema what says nothing to a model: the
+    /// dialect, comments, an unreferenced identifier, a `title` that only
+    /// restates a property's name. **Off by default.**
+    ///
+    /// Nothing a model might act on is touched — descriptions, examples,
+    /// defaults, enums and constraints stay as written. Decided per
+    /// conversation when it is first seen, and never for one that was already
+    /// under way: the tool block sits at the front of the cached prefix and
+    /// must not change part-way. On Claude Code's own tools it removes about
+    /// 2% of the tool block; it exists for clients whose tools come from a
+    /// schema generator.
+    pub tools_compact: bool,
+    /// Keep sending the `anthropic-beta` tokens a conversation has already
+    /// sent. **Off by default.**
+    ///
+    /// A beta token can change how the provider renders the prompt, so a
+    /// client that sends one on some turns of a conversation and not on others
+    /// can lose its cache each time the set changes. With this on, a request
+    /// carrying fewer tokens than the conversation has sent before goes out
+    /// with all of them, in the order they were first seen. A token the client
+    /// never sent in this conversation is never added. Anthropic Messages
+    /// only.
+    pub sticky_beta: bool,
+    /// What to do on the turn that finds the provider's cache gone. See
+    /// [`ColdRecompact`].
+    pub cold_recompact: ColdRecompact,
+    /// How far past the cache lifetime a request must arrive before
+    /// `cold_recompact = "predicted"` calls the cache gone. A wrong call
+    /// rewrites a live prefix, so the margin is what keeps a slow clock or a
+    /// late response from being read as a lapse.
+    #[serde(with = "humantime_serde")]
+    pub cold_recompact_margin: Duration,
+    /// On a recompacted turn, also replace a file read that a later read of
+    /// the same file contains. **Off by default**, and does nothing unless
+    /// [`Self::cold_recompact`] is on.
+    ///
+    /// An agent that reads lines 40 to 60 of a file and later reads the whole
+    /// of it carries the twenty lines twice for the rest of the session. The
+    /// earlier read is replaced by a marker that says the file was read again
+    /// and keeps a handle to what it held. Decided only where the walker can
+    /// tell which lines each read asked for — Anthropic Messages, for a read
+    /// tool taking a path, an `offset` and a `limit`.
+    pub superseded_reads: bool,
+    /// On a recompacted turn, also compress as source a file read nothing has
+    /// touched for [`Self::matured_quiesce_turns`] assistant turns. **Off by
+    /// default**, and does nothing unless [`Self::cold_recompact`] is on.
+    ///
+    /// Function bodies go behind handles and signatures stay, whatever
+    /// `enable_code_aware` says for the provider: a profile turns that off
+    /// because a body elided from a file in use is fetched straight back, and
+    /// a file the conversation has finished with is where it is not.
+    pub matured_reads: bool,
+    /// Assistant turns a file must go unread and unwritten before a read of it
+    /// is matured. Five is where Headroom's audit of its own traffic put it
+    /// (the next touch of a file came a median of four turns later); it has
+    /// not been measured here.
+    pub matured_quiesce_turns: u32,
+    /// Assistant turns after which a read is matured however recently its file
+    /// was touched again.
+    pub matured_max_hold_turns: u32,
+    /// The smallest read worth maturing, in bytes.
+    pub matured_min_bytes: usize,
     /// Keep an Anthropic conversation's cached prefix alive while the client
     /// is busy running a tool. **On by default**; only Anthropic Messages
     /// traffic is ever pinged, so this is in effect Anthropic's default, and
@@ -529,6 +1042,20 @@ pub struct ProxyConfig {
     /// ended pinging for 50 minutes; [`Self::cache_keep_warm_max_pings`] also
     /// caps it.
     pub cache_keep_warm_background_pings: u32,
+    /// The most conversations kept warm at one moment, and `0` for no limit.
+    ///
+    /// Each one holds the request it re-sends — the whole prompt as this proxy
+    /// sent it — until its wait ends or its pings run out, and nothing else
+    /// bounded how many did: the per-wait caps above limit how long a timer
+    /// lives, not how many live together. Past the limit a new wait is not
+    /// armed and its cache is left to lapse; a conversation already being
+    /// kept warm is unaffected. Deployment-wide, like the interval and the
+    /// caps: it is one map for every provider.
+    ///
+    /// 1,024 is not a measurement: no deployment has been seen near it. It is
+    /// where a number has to be — at a megabyte a prompt, about a gigabyte
+    /// held — and it was set by review (2026-11-22), not after an incident.
+    pub cache_keep_warm_max_conversations: usize,
     /// How many retrieve rounds may be **answered** in one request.
     ///
     /// The metric counts one more than this. Reaching the cap does not end the
@@ -785,6 +1312,20 @@ pub struct ProviderOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_retention: Option<PromptCacheRetention>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<PromptCacheKey>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools_order: Option<ToolsOrder>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sticky_beta: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools_compact: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cold_recompact: Option<ColdRecompact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_reads: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matured_reads: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_keep_warm: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_read: Option<bool>,
@@ -815,6 +1356,13 @@ impl ProviderOverrides {
             frozen_prefix,
             cache_ttl,
             prompt_cache_retention,
+            prompt_cache_key,
+            tools_order,
+            sticky_beta,
+            tools_compact,
+            cold_recompact,
+            superseded_reads,
+            matured_reads,
             cache_keep_warm,
             stale_read
         );
@@ -880,10 +1428,23 @@ impl Default for ProxyConfig {
             frozen_prefix: FrozenPrefix::Marker,
             cache_ttl: CacheTtl::Default,
             prompt_cache_retention: PromptCacheRetention::Default,
+            prompt_cache_key: PromptCacheKey::Client,
+            tools_order: ToolsOrder::Client,
+            sticky_beta: false,
+            reasoning_elide_models: Vec::new(),
+            tools_compact: false,
+            cold_recompact: ColdRecompact::Off,
+            cold_recompact_margin: Duration::from_secs(60),
+            superseded_reads: false,
+            matured_reads: false,
+            matured_quiesce_turns: 5,
+            matured_max_hold_turns: 25,
+            matured_min_bytes: 2_048,
             cache_keep_warm: true,
             cache_keep_warm_interval: Duration::from_secs(270),
             cache_keep_warm_max_pings: 11,
             cache_keep_warm_background_pings: 4,
+            cache_keep_warm_max_conversations: 1_024,
             retrieve_execution: RetrieveExecution::Server,
             retrieve_max_rounds: 3,
             retrieve_max_tokens_per_request: 16_384,
@@ -1109,6 +1670,7 @@ impl Config {
             }
             None => Config::default(),
         };
+        config.source = path.map(|path| std::path::absolute(path).unwrap_or(path.to_path_buf()));
         config.apply_env(&std::env::vars().collect::<Vec<_>>());
         config.validate()?;
         Ok(config)
@@ -1149,17 +1711,53 @@ impl Config {
     pub fn apply_env(&mut self, vars: &[(String, String)]) {
         let named = || {
             vars.iter()
-                .filter(|(_, value)| !value.is_empty())
-                .filter_map(|(key, value)| Some((key.strip_prefix("KOMPRESSOR_")?, value)))
+                .filter_map(|(key, value)| Some((key, key.strip_prefix("KOMPRESSOR_")?, value)))
         };
-        for (rest, value) in named().filter(|(rest, _)| !rest.starts_with('_')) {
-            self.apply_flat(rest, value);
-        }
-        for (rest, value) in named() {
-            if let Some(rest) = rest.strip_prefix('_') {
-                self.apply_structured(rest, value);
+        // What each variable did is read off the configuration itself, before
+        // and after: the parsers below ignore what they cannot read in a dozen
+        // different ways, and this sees all of them.
+        let mut before = self.settings();
+        let mut apply = |config: &mut Config, name: &String, apply: &dyn Fn(&mut Config)| {
+            let refused = config.refused_env.len();
+            apply(config);
+            let after = config.settings();
+            let changed = after != before || config.refused_env.len() != refused;
+            before = after;
+            config.env.push(EnvOverride {
+                name: name.clone(),
+                effect: if changed {
+                    EnvEffect::Applied
+                } else {
+                    EnvEffect::NoEffect
+                },
+            });
+        };
+        for (name, rest, value) in named().filter(|(_, rest, _)| !rest.starts_with('_')) {
+            if ENV_READ_ELSEWHERE.contains(&rest) {
+                self.env.push(EnvOverride {
+                    name: name.clone(),
+                    effect: EnvEffect::Elsewhere,
+                });
+            } else if value.is_empty() {
+                apply(self, name, &|_| {});
+            } else {
+                apply(self, name, &|config| config.apply_flat(rest, value));
             }
         }
+        for (name, rest, value) in named() {
+            if let Some(rest) = rest.strip_prefix('_') {
+                if value.is_empty() {
+                    apply(self, name, &|_| {});
+                } else {
+                    apply(self, name, &|config| config.apply_structured(rest, value));
+                }
+            }
+        }
+    }
+
+    /// Every setting as one value, for telling whether something changed any.
+    fn settings(&self) -> Option<String> {
+        serde_json::to_string(self).ok()
     }
 
     fn apply_structured(&mut self, key: &str, value: &str) {
@@ -1174,6 +1772,7 @@ impl Config {
                 "api_listen" => self.server.api_listen = value.to_string(),
                 "mcp_listen" => self.server.mcp_listen = value.to_string(),
                 "proxy_listen" => self.server.proxy_listen = value.to_string(),
+                "stats_listen" => self.server.stats_listen = value.to_string(),
                 // The engine permit every surface shares, proxy included, so
                 // it is worth setting per deployment without a file.
                 "max_inflight_compressions" => {
@@ -1189,18 +1788,100 @@ impl Config {
                 _ => {}
             },
             "auth" => match field {
-                "mode" => {
-                    if value.eq_ignore_ascii_case("api_keys") {
-                        self.auth.mode = AuthMode::ApiKeys;
+                // Not "leave the setting standing", which is the rule for the
+                // tuning knobs. The setting left standing here is usually
+                // `none`: an operator who wrote `api-keys` or `apikeys` got a
+                // server that started, validated, and served every caller as
+                // the anonymous tenant. An unreadable auth mode stops the
+                // server instead (see `validate`).
+                "mode" => match value.to_ascii_lowercase().replace('-', "_").as_str() {
+                    "api_keys" | "apikeys" => self.auth.mode = AuthMode::ApiKeys,
+                    "none" => self.auth.mode = AuthMode::None,
+                    _ => self.refused_env.push(format!(
+                        "auth.mode cannot be {value:?}: expected none or api_keys"
+                    )),
+                },
+                "secret" => self.auth.secret = value.to_string(),
+                _ => {}
+            },
+            "maintenance" => match field {
+                "backup" => {
+                    self.maintenance.backup =
+                        parse_bool_setting("maintenance.backup", value, self.maintenance.backup)
+                }
+                "actions" => {
+                    self.maintenance.actions =
+                        parse_bool_setting("maintenance.actions", value, self.maintenance.actions)
+                }
+                "erase" => {
+                    self.maintenance.erase =
+                        parse_bool_setting("maintenance.erase", value, self.maintenance.erase)
+                }
+                "backup_dir" => self.maintenance.backup_dir = PathBuf::from(value),
+                "backup_every" => {
+                    if let Some(every) = parse_duration(value) {
+                        self.maintenance.backup_every = every;
                     }
                 }
-                "secret" => self.auth.secret = value.to_string(),
+                "backup_keep" => {
+                    if let Ok(keep) = value.parse() {
+                        self.maintenance.backup_keep = keep;
+                    }
+                }
+                "backup_max_age" => {
+                    if let Some(age) = parse_duration(value) {
+                        self.maintenance.backup_max_age = age;
+                    }
+                }
+                "optimize_every" => {
+                    if let Some(every) = parse_duration(value) {
+                        self.maintenance.optimize_every = every;
+                    }
+                }
+                "s3__enabled" => {
+                    self.maintenance.s3.enabled = parse_bool_setting(
+                        "maintenance.s3.enabled",
+                        value,
+                        self.maintenance.s3.enabled,
+                    )
+                }
+                "s3__path_style" => {
+                    self.maintenance.s3.path_style = parse_bool_setting(
+                        "maintenance.s3.path_style",
+                        value,
+                        self.maintenance.s3.path_style,
+                    )
+                }
+                "s3__keep" => {
+                    if let Ok(keep) = value.parse() {
+                        self.maintenance.s3.keep = keep;
+                    }
+                }
+                "s3__endpoint" => self.maintenance.s3.endpoint = value.to_string(),
+                "s3__region" => self.maintenance.s3.region = value.to_string(),
+                "s3__bucket" => self.maintenance.s3.bucket = value.to_string(),
+                "s3__prefix" => self.maintenance.s3.prefix = value.to_string(),
+                "s3__access_key_id" => self.maintenance.s3.access_key_id = value.to_string(),
+                "s3__secret_access_key" => {
+                    self.maintenance.s3.secret_access_key = value.to_string()
+                }
                 _ => {}
             },
             "refs" => match field {
                 "path" => self.refs.path = PathBuf::from(value),
-                "backend" if value.eq_ignore_ascii_case("memory") => {
-                    self.refs.backend = RefsBackend::Memory;
+                // Refused when unreadable, for the same reason as `auth.mode`:
+                // the backend left standing is SQLite, so asking for an
+                // in-memory store with a misspelt name wrote every fragment
+                // to disk.
+                "backend" => match value.to_ascii_lowercase().as_str() {
+                    "memory" => self.refs.backend = RefsBackend::Memory,
+                    "sqlite" => self.refs.backend = RefsBackend::Sqlite,
+                    _ => self.refused_env.push(format!(
+                        "refs.backend cannot be {value:?}: expected sqlite or memory"
+                    )),
+                },
+                "browse" => {
+                    self.refs.browse = parse_bool_setting("refs.browse", value, self.refs.browse)
                 }
                 "recent_cache_bytes" => {
                     if let Ok(bytes) = value.parse() {
@@ -1211,6 +1892,16 @@ impl Config {
             },
             "stats" => match field {
                 "path" => self.stats.path = PathBuf::from(value),
+                "retention_days" => {
+                    if let Ok(days) = value.parse() {
+                        self.stats.retention_days = days;
+                    }
+                }
+                "context_retention_days" => {
+                    if let Ok(days) = value.parse() {
+                        self.stats.context_retention_days = days;
+                    }
+                }
                 "enabled" => {
                     self.stats.enabled =
                         parse_bool_setting("stats.enabled", value, self.stats.enabled)
@@ -1403,6 +2094,78 @@ impl Config {
                     _ => self.proxy.prompt_cache_retention,
                 };
             }
+            "prompt_cache_key" => {
+                self.proxy.prompt_cache_key = match value.to_ascii_lowercase().as_str() {
+                    "client" => PromptCacheKey::Client,
+                    "conversation" => PromptCacheKey::Conversation,
+                    _ => self.proxy.prompt_cache_key,
+                };
+            }
+            "tools_order" => {
+                self.proxy.tools_order = match value.to_ascii_lowercase().as_str() {
+                    "client" => ToolsOrder::Client,
+                    "pinned" => ToolsOrder::Pinned,
+                    _ => self.proxy.tools_order,
+                };
+            }
+            "cold_recompact" => {
+                // A typo leaves the setting alone: it changes what is rewritten.
+                self.proxy.cold_recompact = match value.to_ascii_lowercase().as_str() {
+                    "off" => ColdRecompact::Off,
+                    "observed" => ColdRecompact::Observed,
+                    "predicted" => ColdRecompact::Predicted,
+                    _ => self.proxy.cold_recompact,
+                };
+            }
+            "cold_recompact_margin" => match parse_duration(value) {
+                Some(margin) => self.proxy.cold_recompact_margin = margin,
+                None => tracing::warn!(
+                    value,
+                    "KOMPRESSOR__PROXY__COLD_RECOMPACT_MARGIN is not a duration; ignored"
+                ),
+            },
+            "superseded_reads" => {
+                self.proxy.superseded_reads = parse_bool_setting(
+                    "proxy.superseded_reads",
+                    value,
+                    self.proxy.superseded_reads,
+                );
+            }
+            "matured_reads" => {
+                self.proxy.matured_reads =
+                    parse_bool_setting("proxy.matured_reads", value, self.proxy.matured_reads);
+            }
+            "matured_quiesce_turns" => {
+                if let Ok(turns) = value.parse() {
+                    self.proxy.matured_quiesce_turns = turns;
+                }
+            }
+            "matured_max_hold_turns" => {
+                if let Ok(turns) = value.parse() {
+                    self.proxy.matured_max_hold_turns = turns;
+                }
+            }
+            "matured_min_bytes" => {
+                if let Ok(bytes) = value.parse() {
+                    self.proxy.matured_min_bytes = bytes;
+                }
+            }
+            "reasoning_elide_models" => {
+                self.proxy.reasoning_elide_models = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                    .map(str::to_string)
+                    .collect();
+            }
+            "tools_compact" => {
+                self.proxy.tools_compact =
+                    parse_bool_setting("proxy.tools_compact", value, self.proxy.tools_compact);
+            }
+            "sticky_beta" => {
+                self.proxy.sticky_beta =
+                    parse_bool_setting("proxy.sticky_beta", value, self.proxy.sticky_beta);
+            }
             "cache_keep_warm" => {
                 self.proxy.cache_keep_warm =
                     parse_bool_setting("proxy.cache_keep_warm", value, self.proxy.cache_keep_warm);
@@ -1422,6 +2185,11 @@ impl Config {
             "cache_keep_warm_background_pings" => {
                 if let Ok(v) = value.parse() {
                     self.proxy.cache_keep_warm_background_pings = v;
+                }
+            }
+            "cache_keep_warm_max_conversations" => {
+                if let Ok(v) = value.parse() {
+                    self.proxy.cache_keep_warm_max_conversations = v;
                 }
             }
             "enabled" => {
@@ -1484,10 +2252,46 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(refused) = self.refused_env.first() {
+            return Err(ConfigError::Invalid(format!(
+                "environment override refused: {refused}"
+            )));
+        }
+        // Zero would mature a read on the turn after it was made, which is
+        // the case the setting exists to wait out.
+        if self.proxy.matured_quiesce_turns == 0 || self.proxy.matured_max_hold_turns == 0 {
+            return Err(ConfigError::Invalid(
+                "proxy.matured_quiesce_turns and proxy.matured_max_hold_turns must be at least 1"
+                    .into(),
+            ));
+        }
         if self.refs.purge_interval.is_zero() {
             return Err(ConfigError::Invalid(
                 "refs.purge_interval must be greater than zero".into(),
             ));
+        }
+        if let Some((_, every)) = self.maintenance.schedule()
+            && every < Duration::from_secs(60)
+        {
+            return Err(ConfigError::Invalid(
+                "maintenance.backup_every must be at least one minute (or zero for none)".into(),
+            ));
+        }
+        if self.maintenance.s3.enabled
+            && let Some(problem) = self.maintenance.s3.problem()
+        {
+            return Err(ConfigError::Invalid(problem));
+        }
+        if let Some(server) = self
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.startup_timeout.is_zero())
+        {
+            return Err(ConfigError::Invalid(format!(
+                "mcp.servers {:?}: startup_timeout must be greater than zero",
+                server.name
+            )));
         }
         self.engine
             .validate()
@@ -1577,6 +2381,9 @@ impl Config {
         for key in &mut copy.auth.keys {
             key.key = "<redacted>".to_string();
         }
+        if !copy.maintenance.s3.secret_access_key.is_empty() {
+            copy.maintenance.s3.secret_access_key = "<redacted>".to_string();
+        }
         for upstream in &mut copy.proxy.upstreams {
             for value in upstream.headers.values_mut() {
                 *value = "<redacted>".to_string();
@@ -1658,6 +2465,66 @@ fn parse_duration(value: &str) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_servers_are_none_by_default() {
+        assert!(Config::default().mcp.servers.is_empty());
+    }
+
+    #[test]
+    fn an_mcp_server_entry_takes_defaults_for_what_it_does_not_name() {
+        let config: Config = toml::from_str(
+            "[[mcp.servers]]\nname = \"fs\"\ncommand = \"npx\"\n\
+             args = [\"-y\", \"@modelcontextprotocol/server-filesystem\"]\n\
+             [mcp.servers.env]\nFS_ROOT = \"/srv\"\n\
+             [[mcp.servers]]\nname = \"wiki\"\ncommand = \"wiki-mcp\"\ncompress = false\n",
+        )
+        .expect("parses");
+        config.validate().expect("valid");
+        let [fs, wiki] = config.mcp.servers.as_slice() else {
+            panic!("two servers: {:?}", config.mcp.servers);
+        };
+        assert_eq!(fs.name, "fs");
+        assert_eq!(fs.command.as_deref(), Some("npx"));
+        assert_eq!(fs.args, ["-y", "@modelcontextprotocol/server-filesystem"]);
+        assert_eq!(fs.env.get("FS_ROOT").map(String::as_str), Some("/srv"));
+        assert_eq!(fs.url, None);
+        assert!(fs.compress, "compressing is the default");
+        assert!(!wiki.compress);
+        assert!(wiki.args.is_empty() && wiki.env.is_empty());
+        assert_eq!(fs.startup_timeout, Duration::from_secs(60));
+        // The rest of `[mcp]` is untouched by naming servers.
+        assert_eq!(config.mcp.path, "/mcp");
+    }
+
+    #[test]
+    fn an_mcp_server_startup_timeout_is_a_duration_above_zero() {
+        let config: Config = toml::from_str(
+            "[[mcp.servers]]\nname = \"fs\"\ncommand = \"npx\"\nstartup_timeout = \"5s\"\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            config.mcp.servers[0].startup_timeout,
+            Duration::from_secs(5)
+        );
+        config.validate().expect("valid");
+
+        let zero: Config = toml::from_str(
+            "[[mcp.servers]]\nname = \"fs\"\ncommand = \"npx\"\nstartup_timeout = \"0s\"\n",
+        )
+        .expect("parses");
+        let error = zero
+            .validate()
+            .expect_err("a zero timeout fails every server");
+        assert!(error.to_string().contains("startup_timeout"), "{error}");
+    }
+
+    #[test]
+    fn a_misspelt_mcp_server_key_is_refused() {
+        assert!(
+            toml::from_str::<Config>("[[mcp.servers]]\nname = \"fs\"\ncomand = \"npx\"\n").is_err()
+        );
+    }
 
     #[test]
     fn a_zero_purge_interval_is_rejected() {
@@ -1922,6 +2789,163 @@ mod tests {
     }
 
     #[test]
+    fn the_prefix_stabilisers_are_off_by_default_and_set_per_provider_or_from_the_environment() {
+        let mut config = Config::default();
+        assert_eq!(config.proxy.prompt_cache_key, PromptCacheKey::Client);
+        assert_eq!(config.proxy.tools_order, ToolsOrder::Client);
+        assert!(!config.proxy.sticky_beta);
+        assert!(config.proxy.reasoning_elide_models.is_empty());
+        config.apply_env(&[(
+            "KOMPRESSOR__PROXY__REASONING_ELIDE_MODELS".into(),
+            "deepseek-reasoner, kimi-k2*,".into(),
+        )]);
+        assert_eq!(
+            config.proxy.reasoning_elide_models,
+            ["deepseek-reasoner", "kimi-k2*"]
+        );
+        let listed: Config =
+            toml::from_str("[proxy]\nreasoning_elide_models = [\"glm-4.6\"]\n").unwrap();
+        assert_eq!(listed.proxy.reasoning_elide_models, ["glm-4.6"]);
+        assert!(!config.proxy.tools_compact);
+        config.apply_env(&[("KOMPRESSOR__PROXY__TOOLS_COMPACT".into(), "true".into())]);
+        assert!(config.proxy.tools_compact);
+        let per_provider: Config =
+            toml::from_str("[proxy.providers.openai]\ntools_compact = true\n").unwrap();
+        assert!(!per_provider.proxy.tools_compact);
+        assert!(
+            per_provider
+                .for_provider("openai")
+                .expect("openai has overrides")
+                .proxy
+                .tools_compact
+        );
+
+        config.apply_env(&[
+            (
+                "KOMPRESSOR__PROXY__PROMPT_CACHE_KEY".into(),
+                "conversation".into(),
+            ),
+            ("KOMPRESSOR__PROXY__TOOLS_ORDER".into(), "pinned".into()),
+            ("KOMPRESSOR__PROXY__STICKY_BETA".into(), "true".into()),
+        ]);
+        assert_eq!(config.proxy.prompt_cache_key, PromptCacheKey::Conversation);
+        assert_eq!(config.proxy.tools_order, ToolsOrder::Pinned);
+        assert!(config.proxy.sticky_beta);
+        // A typo leaves the setting alone.
+        config.apply_env(&[("KOMPRESSOR__PROXY__TOOLS_ORDER".into(), "sorted".into())]);
+        assert_eq!(config.proxy.tools_order, ToolsOrder::Pinned);
+
+        let parsed: Config = toml::from_str(
+            "[proxy.providers.anthropic]\nsticky_beta = true\ntools_order = \"pinned\"\n\
+             [proxy.providers.openai]\nprompt_cache_key = \"conversation\"\n",
+        )
+        .unwrap();
+        assert!(
+            !parsed.proxy.sticky_beta,
+            "the deployment default is untouched"
+        );
+        let anthropic = parsed
+            .for_provider("anthropic")
+            .expect("anthropic has overrides");
+        assert!(anthropic.proxy.sticky_beta);
+        assert_eq!(anthropic.proxy.tools_order, ToolsOrder::Pinned);
+        assert_eq!(anthropic.proxy.prompt_cache_key, PromptCacheKey::Client);
+        let openai = parsed.for_provider("openai").expect("openai has overrides");
+        assert_eq!(openai.proxy.prompt_cache_key, PromptCacheKey::Conversation);
+        assert!(!openai.proxy.sticky_beta);
+
+        assert!(toml::from_str::<Config>("[proxy]\ntools_order = \"sorted\"\n").is_err());
+    }
+
+    #[test]
+    fn the_read_decisions_are_off_by_default_and_set_per_provider_or_from_the_environment() {
+        let mut config = Config::default();
+        assert!(!config.proxy.superseded_reads && !config.proxy.matured_reads);
+        assert_eq!(
+            (
+                config.proxy.matured_quiesce_turns,
+                config.proxy.matured_max_hold_turns,
+                config.proxy.matured_min_bytes
+            ),
+            (5, 25, 2_048)
+        );
+        config.apply_env(&[
+            ("KOMPRESSOR__PROXY__SUPERSEDED_READS".into(), "true".into()),
+            ("KOMPRESSOR__PROXY__MATURED_READS".into(), "true".into()),
+            (
+                "KOMPRESSOR__PROXY__MATURED_QUIESCE_TURNS".into(),
+                "8".into(),
+            ),
+            (
+                "KOMPRESSOR__PROXY__MATURED_MAX_HOLD_TURNS".into(),
+                "40".into(),
+            ),
+            ("KOMPRESSOR__PROXY__MATURED_MIN_BYTES".into(), "4096".into()),
+        ]);
+        assert!(config.proxy.superseded_reads && config.proxy.matured_reads);
+        assert_eq!(
+            (
+                config.proxy.matured_quiesce_turns,
+                config.proxy.matured_max_hold_turns,
+                config.proxy.matured_min_bytes
+            ),
+            (8, 40, 4_096)
+        );
+        // Not a number: left alone.
+        config.apply_env(&[(
+            "KOMPRESSOR__PROXY__MATURED_QUIESCE_TURNS".into(),
+            "soon".into(),
+        )]);
+        assert_eq!(config.proxy.matured_quiesce_turns, 8);
+        assert!(config.validate().is_ok());
+        // Zero turns is no wait at all, and is refused.
+        config.proxy.matured_quiesce_turns = 0;
+        assert!(config.validate().is_err());
+
+        let parsed: Config = toml::from_str(
+            "[proxy.providers.anthropic]\nsuperseded_reads = true\nmatured_reads = true\n",
+        )
+        .unwrap();
+        assert!(!parsed.proxy.matured_reads);
+        let anthropic = parsed
+            .for_provider("anthropic")
+            .expect("anthropic has overrides");
+        assert!(anthropic.proxy.superseded_reads && anthropic.proxy.matured_reads);
+    }
+
+    #[test]
+    fn cold_recompaction_is_off_by_default_and_set_per_provider_or_from_the_environment() {
+        let mut config = Config::default();
+        assert_eq!(config.proxy.cold_recompact, ColdRecompact::Off);
+        assert_eq!(config.proxy.cold_recompact_margin, Duration::from_secs(60));
+
+        config.apply_env(&[
+            (
+                "KOMPRESSOR__PROXY__COLD_RECOMPACT".into(),
+                "predicted".into(),
+            ),
+            (
+                "KOMPRESSOR__PROXY__COLD_RECOMPACT_MARGIN".into(),
+                "2m".into(),
+            ),
+        ]);
+        assert_eq!(config.proxy.cold_recompact, ColdRecompact::Predicted);
+        assert_eq!(config.proxy.cold_recompact_margin, Duration::from_secs(120));
+        // A typo leaves the setting alone.
+        config.apply_env(&[("KOMPRESSOR__PROXY__COLD_RECOMPACT".into(), "always".into())]);
+        assert_eq!(config.proxy.cold_recompact, ColdRecompact::Predicted);
+
+        let parsed: Config =
+            toml::from_str("[proxy.providers.anthropic]\ncold_recompact = \"observed\"\n").unwrap();
+        assert_eq!(parsed.proxy.cold_recompact, ColdRecompact::Off);
+        let anthropic = parsed
+            .for_provider("anthropic")
+            .expect("anthropic has overrides");
+        assert_eq!(anthropic.proxy.cold_recompact, ColdRecompact::Observed);
+        assert!(toml::from_str::<Config>("[proxy]\ncold_recompact = \"always\"\n").is_err());
+    }
+
+    #[test]
     fn prompt_cache_retention_is_off_by_default_and_set_per_provider_or_from_the_environment() {
         let mut config = Config::default();
         assert_eq!(
@@ -2013,6 +3037,12 @@ mod tests {
             "0".into(),
         )]);
         assert_eq!(config.proxy.cache_keep_warm_background_pings, 0);
+        assert_eq!(config.proxy.cache_keep_warm_max_conversations, 1_024);
+        config.apply_env(&[(
+            "KOMPRESSOR__PROXY__CACHE_KEEP_WARM_MAX_CONVERSATIONS".into(),
+            "2".into(),
+        )]);
+        assert_eq!(config.proxy.cache_keep_warm_max_conversations, 2);
         config.apply_env(&[(
             "KOMPRESSOR__PROXY__PROVIDERS__ANTHROPIC__CACHE_KEEP_WARM".into(),
             "false".into(),
@@ -2200,6 +3230,62 @@ mod tests {
         assert_eq!(config.engine.max_array_items, before);
     }
 
+    /// A mistyped value used to be ignored without a trace; the record says
+    /// which variables changed a setting and which did not, by name alone.
+    #[test]
+    fn what_each_environment_variable_did_is_on_record() {
+        let mut config = Config::default();
+        config.apply_env(&[
+            ("PATH".into(), "/usr/bin".into()),
+            (
+                "KOMPRESSOR__PROXY__COLD_RECOMPACT".into(),
+                "predicted".into(),
+            ),
+            ("KOMPRESSOR__PROXY__CACHE_KEEP_WARM".into(), "treu".into()),
+            ("KOMPRESSOR__PROXY__RETRIEVE_TOOOL".into(), "always".into()),
+            ("KOMPRESSOR__ENGINE__MAX_ARRAY_ITEMS".into(), String::new()),
+            ("KOMPRESSOR_MAX_ARRAY_ITEMS".into(), "7".into()),
+            (
+                "KOMPRESSOR_CONFIG".into(),
+                "/etc/kompressor/config.toml".into(),
+            ),
+            ("KOMPRESSOR__AUTH__MODE".into(), "apikeys?".into()),
+        ]);
+        let effect = |name: &str| {
+            let found: Vec<EnvEffect> = config
+                .env
+                .iter()
+                .filter(|one| one.name == name)
+                .map(|one| one.effect)
+                .collect();
+            assert_eq!(found.len(), 1, "{name}: {:?}", config.env);
+            found[0]
+        };
+        assert_eq!(config.env.len(), 7, "only this service's variables");
+        assert_eq!(
+            effect("KOMPRESSOR__PROXY__COLD_RECOMPACT"),
+            EnvEffect::Applied
+        );
+        assert_eq!(effect("KOMPRESSOR_MAX_ARRAY_ITEMS"), EnvEffect::Applied);
+        assert_eq!(
+            effect("KOMPRESSOR__PROXY__CACHE_KEEP_WARM"),
+            EnvEffect::NoEffect
+        );
+        assert_eq!(
+            effect("KOMPRESSOR__PROXY__RETRIEVE_TOOOL"),
+            EnvEffect::NoEffect
+        );
+        assert_eq!(
+            effect("KOMPRESSOR__ENGINE__MAX_ARRAY_ITEMS"),
+            EnvEffect::NoEffect
+        );
+        assert_eq!(effect("KOMPRESSOR_CONFIG"), EnvEffect::Elsewhere);
+        // Refused, which stops the server: it did something.
+        assert_eq!(effect("KOMPRESSOR__AUTH__MODE"), EnvEffect::Applied);
+        let text = toml::to_string(&config).expect("toml");
+        assert!(!text.contains("KOMPRESSOR"), "the record is not a setting");
+    }
+
     #[test]
     fn api_key_auth_with_no_keys_is_refused() {
         let config = Config {
@@ -2271,9 +3357,310 @@ mod tests {
         );
     }
 
+    /// `KOMPRESSOR__AUTH__MODE=api-keys` used to be ignored without a word,
+    /// leaving `none` in force: the server came up serving everyone as the
+    /// anonymous tenant. An auth mode that cannot be read is now an error at
+    /// validation, and the common spellings are understood.
+    #[test]
+    fn an_unreadable_auth_mode_in_the_environment_stops_the_server() {
+        let env = |value: &str| {
+            let mut config = Config::default();
+            config.apply_env(&[("KOMPRESSOR__AUTH__MODE".into(), value.into())]);
+            config
+        };
+        for spelling in ["api_keys", "API_KEYS", "api-keys", "ApiKeys"] {
+            assert_eq!(env(spelling).auth.mode, AuthMode::ApiKeys, "{spelling}");
+        }
+        assert_eq!(env("none").auth.mode, AuthMode::None);
+        assert!(env("none").validate().is_ok());
+
+        for typo in ["api_key", "keys", "on", "true", "nonee"] {
+            let config = env(typo);
+            let error = config.validate().expect_err(typo).to_string();
+            assert!(
+                error.contains("auth.mode") && error.contains(typo),
+                "{error}"
+            );
+        }
+
+        // The environment can also turn a file's `api_keys` off, explicitly.
+        let mut config = Config::default();
+        config.auth.mode = AuthMode::ApiKeys;
+        config.apply_env(&[("KOMPRESSOR__AUTH__MODE".into(), "none".into())]);
+        assert_eq!(config.auth.mode, AuthMode::None);
+    }
+
+    /// The same for the fragment store: a misspelt `memory` kept SQLite, and
+    /// fragments the operator wanted held in memory were written to disk.
+    #[test]
+    fn an_unreadable_refs_backend_in_the_environment_stops_the_server() {
+        let env = |value: &str| {
+            let mut config = Config::default();
+            config.apply_env(&[("KOMPRESSOR__REFS__BACKEND".into(), value.into())]);
+            config
+        };
+        assert_eq!(env("memory").refs.backend, RefsBackend::Memory);
+        assert_eq!(env("Memory").refs.backend, RefsBackend::Memory);
+        assert_eq!(env("sqlite").refs.backend, RefsBackend::Sqlite);
+        assert!(env("sqlite").validate().is_ok());
+        let error = env("ephemeral").validate().unwrap_err().to_string();
+        assert!(
+            error.contains("refs.backend") && error.contains("ephemeral"),
+            "{error}"
+        );
+    }
+
+    /// The refusals never reach a file or the fingerprint of a configuration.
+    #[test]
+    fn refused_overrides_are_not_part_of_the_serialised_configuration() {
+        let mut config = Config::default();
+        config.apply_env(&[("KOMPRESSOR__AUTH__MODE".into(), "bogus".into())]);
+        let text = toml::to_string(&config).unwrap();
+        assert!(
+            !text.contains("refused_env") && !text.contains("bogus"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn an_unknown_key_in_a_config_file_is_an_error_not_a_silent_typo() {
         let text = "[engine]\nmax_array_itemz = 5\n";
         assert!(toml::from_str::<Config>(text).is_err());
+    }
+    #[test]
+    fn the_statistics_listener_is_off_until_a_file_or_the_environment_names_it() {
+        assert!(Config::default().server.stats_listen.is_empty());
+        let from_file: Config =
+            toml::from_str("[server]\nstats_listen = \"127.0.0.1:8818\"\n").expect("parses");
+        assert_eq!(from_file.server.stats_listen, "127.0.0.1:8818");
+        let mut config = Config::default();
+        config.apply_env(&[(
+            "KOMPRESSOR__SERVER__STATS_LISTEN".into(),
+            "0.0.0.0:9000".into(),
+        )]);
+        assert_eq!(config.server.stats_listen, "0.0.0.0:9000");
+    }
+
+    #[test]
+    fn backup_over_http_is_off_until_a_file_or_the_environment_turns_it_on() {
+        assert!(!Config::default().maintenance.backup);
+        let from_file: Config = toml::from_str("[maintenance]\nbackup = true\n").expect("parses");
+        assert!(from_file.maintenance.backup);
+        let mut config = Config::default();
+        config.apply_env(&[("KOMPRESSOR__MAINTENANCE__BACKUP".into(), "true".into())]);
+        assert!(config.maintenance.backup);
+        assert!(toml::from_str::<Config>("[maintenance]\nbackups = true\n").is_err());
+    }
+
+    #[test]
+    fn scheduled_backups_need_a_directory_and_are_off_without_one() {
+        use std::path::Path;
+        let config = Config::default();
+        assert_eq!(
+            config.maintenance.schedule(),
+            None,
+            "no directory, no schedule"
+        );
+        assert!(!config.maintenance.actions);
+        assert!(!config.maintenance.erase, "nothing is erased by default");
+        assert_eq!(
+            config.maintenance.optimize_every,
+            Duration::from_secs(24 * 3_600),
+            "the planner's figures are refreshed daily"
+        );
+        assert_eq!(
+            config.stats.context_retention_days, 0,
+            "kept with the request"
+        );
+        assert_eq!(config.maintenance.backup_keep, 7);
+
+        let config: Config = toml::from_str(
+            "[maintenance]\nbackup_dir = \"/var/lib/kompressor/backups\"\nbackup_every = \"6h\"\nbackup_keep = 3\nactions = true\n",
+        )
+        .expect("parses");
+        config.validate().expect("valid");
+        assert_eq!(
+            config.maintenance.schedule(),
+            Some((
+                Path::new("/var/lib/kompressor/backups"),
+                Duration::from_secs(6 * 3_600)
+            ))
+        );
+        assert_eq!(config.maintenance.backup_keep, 3);
+        assert!(config.maintenance.actions);
+
+        // A directory with the interval set to zero is a place for manual
+        // backups, not a schedule.
+        let mut manual = config.clone();
+        manual.maintenance.backup_every = Duration::ZERO;
+        assert_eq!(manual.maintenance.schedule(), None);
+        manual.validate().expect("valid");
+        // Faster than a backup can be taken is a mistake, not a schedule.
+        let mut hasty = config.clone();
+        hasty.maintenance.backup_every = Duration::from_secs(5);
+        let error = hasty.validate().expect_err("refused").to_string();
+        assert!(error.contains("maintenance.backup_every"), "{error}");
+
+        let mut env = Config::default();
+        env.apply_env(&[
+            (
+                "KOMPRESSOR__MAINTENANCE__BACKUP_DIR".into(),
+                "/srv/b".into(),
+            ),
+            ("KOMPRESSOR__MAINTENANCE__BACKUP_EVERY".into(), "12h".into()),
+            ("KOMPRESSOR__MAINTENANCE__BACKUP_KEEP".into(), "0".into()),
+            ("KOMPRESSOR__MAINTENANCE__ACTIONS".into(), "true".into()),
+            ("KOMPRESSOR__MAINTENANCE__ERASE".into(), "true".into()),
+            (
+                "KOMPRESSOR__MAINTENANCE__OPTIMIZE_EVERY".into(),
+                "6h".into(),
+            ),
+            ("KOMPRESSOR__STATS__RETENTION_DAYS".into(), "30".into()),
+            (
+                "KOMPRESSOR__STATS__CONTEXT_RETENTION_DAYS".into(),
+                "7".into(),
+            ),
+        ]);
+        assert_eq!(
+            env.maintenance.optimize_every,
+            Duration::from_secs(6 * 3_600)
+        );
+        assert_eq!(env.stats.retention_days, 30);
+        assert_eq!(env.stats.context_retention_days, 7);
+        assert_eq!(
+            env.maintenance.schedule(),
+            Some((Path::new("/srv/b"), Duration::from_secs(12 * 3_600)))
+        );
+        assert_eq!(env.maintenance.backup_keep, 0);
+        assert!(env.maintenance.actions);
+        assert!(env.maintenance.erase);
+    }
+
+    #[test]
+    fn the_age_a_backup_may_reach_follows_the_schedule_unless_it_is_set() {
+        let mut config = Config::default();
+        assert_eq!(config.maintenance.max_age(), None, "no backups asked for");
+        config.maintenance.backup_dir = PathBuf::from("/srv/b");
+        assert_eq!(
+            config.maintenance.max_age(),
+            Some(Duration::from_secs(2 * 24 * 3_600)),
+            "one missed daily backup"
+        );
+        config.maintenance.backup_max_age = Duration::from_secs(3_600);
+        assert_eq!(
+            config.maintenance.max_age(),
+            Some(Duration::from_secs(3_600))
+        );
+        // Held to an age with no schedule: someone else takes them.
+        let alone: Config = toml::from_str("[maintenance]\nbackup_max_age = \"7days\"\n").unwrap();
+        assert_eq!(alone.maintenance.schedule(), None);
+        assert_eq!(
+            alone.maintenance.max_age(),
+            Some(Duration::from_secs(7 * 86_400))
+        );
+        let mut env = Config::default();
+        env.apply_env(&[(
+            "KOMPRESSOR__MAINTENANCE__BACKUP_MAX_AGE".into(),
+            "36h".into(),
+        )]);
+        assert_eq!(
+            env.maintenance.max_age(),
+            Some(Duration::from_secs(36 * 3_600))
+        );
+    }
+
+    #[test]
+    fn a_loaded_configuration_remembers_its_file() {
+        assert_eq!(Config::default().source, None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k.toml");
+        std::fs::write(&path, "[stats]\nenabled = false\n").unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+        assert_eq!(config.source.as_deref(), Some(path.as_path()));
+        assert!(!toml::to_string(&config).unwrap().contains("source"));
+    }
+
+    #[test]
+    fn the_ref_browser_is_off_until_a_file_or_the_environment_turns_it_on() {
+        assert!(!Config::default().refs.browse);
+        let from_file: Config = toml::from_str("[refs]\nbrowse = true\n").expect("parses");
+        assert!(from_file.refs.browse);
+        let mut config = Config::default();
+        config.apply_env(&[("KOMPRESSOR__REFS__BROWSE".into(), "true".into())]);
+        assert!(config.refs.browse);
+    }
+
+    #[test]
+    fn the_off_site_copy_is_off_by_default_and_set_from_a_file_or_the_environment() {
+        assert!(!Config::default().maintenance.s3.enabled);
+        let from_file: Config = toml::from_str(
+            "[maintenance.s3]\nenabled = true\nbucket = \"b\"\naccess_key_id = \"k\"\nsecret_access_key = \"s\"\nkeep = 3\n",
+        )
+        .expect("parses");
+        assert!(from_file.maintenance.s3.enabled);
+        assert_eq!(from_file.maintenance.s3.keep, 3);
+        assert_eq!(from_file.maintenance.s3.location(), "s3://b/kompressor/");
+        assert!(from_file.validate().is_ok());
+        assert!(toml::from_str::<Config>("[maintenance.s3]\nbuckets = \"x\"\n").is_err());
+
+        let mut config = Config::default();
+        config.apply_env(&[
+            ("KOMPRESSOR__MAINTENANCE__S3__ENABLED".into(), "true".into()),
+            (
+                "KOMPRESSOR__MAINTENANCE__S3__BUCKET".into(),
+                "env-bucket".into(),
+            ),
+            (
+                "KOMPRESSOR__MAINTENANCE__S3__ENDPOINT".into(),
+                "http://minio:9000".into(),
+            ),
+            (
+                "KOMPRESSOR__MAINTENANCE__S3__ACCESS_KEY_ID".into(),
+                "k".into(),
+            ),
+            (
+                "KOMPRESSOR__MAINTENANCE__S3__SECRET_ACCESS_KEY".into(),
+                "s".into(),
+            ),
+            ("KOMPRESSOR__MAINTENANCE__S3__KEEP".into(), "5".into()),
+            (
+                "KOMPRESSOR__MAINTENANCE__S3__PATH_STYLE".into(),
+                "false".into(),
+            ),
+        ]);
+        let s3 = &config.maintenance.s3;
+        assert!(s3.enabled && !s3.path_style);
+        assert_eq!(
+            (s3.bucket.as_str(), s3.endpoint.as_str(), s3.keep),
+            ("env-bucket", "http://minio:9000", 5)
+        );
+        assert!(config.validate().is_ok());
+        assert!(
+            config.env.iter().all(|o| o.effect == EnvEffect::Applied),
+            "every variable did something: {:?}",
+            config.env
+        );
+    }
+
+    #[test]
+    fn an_off_site_copy_that_cannot_work_stops_the_service_from_starting() {
+        let mut config = Config::default();
+        config.maintenance.s3.enabled = true;
+        let error = config.validate().expect_err("no bucket").to_string();
+        assert!(error.contains("maintenance.s3.bucket"), "{error}");
+        // Off, the same settings are nobody's business.
+        config.maintenance.s3.enabled = false;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn the_s3_secret_key_is_never_shown() {
+        let mut config = Config::default();
+        config.maintenance.s3.secret_access_key = "wJalrXUtnFEMI-secret".into();
+        config.maintenance.s3.access_key_id = "AKIAEXAMPLE".into();
+        let rendered = config.redacted_toml();
+        assert!(!rendered.contains("wJalrXUtnFEMI-secret"), "{rendered}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!format!("{config:?}").contains("wJalrXUtnFEMI-secret"));
     }
 }

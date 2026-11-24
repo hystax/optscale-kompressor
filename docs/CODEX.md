@@ -110,9 +110,15 @@ Five things about that are deliberate:
 - **Both `model_provider` and `openai_base_url`.** `model_provider` selects
   our mount; `openai_base_url` points the *built-in* provider here too, so
   nothing in the session reaches OpenAI past the proxy.
-- **A key you already set is a refusal, not an overwrite.** TOML rejects
-  duplicate keys, so appending ours would not win the argument; it would stop
-  codex reading the file at all. The wrap declines and names the key.
+- **What you already define is commented out for the session.** TOML rejects
+  a duplicate key or table, so appending ours would not win the argument; it
+  would stop codex reading the file at all. Your own `model_provider`,
+  `openai_base_url` (bare, `"quoted"` or `'quoted'`, multi-line values
+  included) and `[model_providers.kompressor]` table are prefixed with
+  `# kompressor wrap disabled this line:` while the wrap runs, the wrap says
+  which, and cleanup puts them back. A file that would still not parse after
+  that — a dotted `model_providers.kompressor.name = …` key, say — is refused
+  and left untouched, with the parse error named.
 - **`env_key` or `requires_openai_auth`.** For a key stored by
   `codex login --with-api-key` the wrap writes `requires_openai_auth = true`
   instead of `env_key`: each finds only its own kind of key (codex 0.164.0).

@@ -25,6 +25,13 @@ uses when it cannot be.
 
 ## Why Desktop needs intercepting
 
+![Claude Desktop without kompressor](charts/desktop-baseline.drawio.png)
+
+The two tabs reach different providers over different protocols with different
+credentials, which is why neither is wrapped the way a CLI is. The chart is a
+`.drawio.png`: picture and source in one file, re-exported with `-e`.
+
+
 The CLI can use `kompressor wrap claude` or `ANTHROPIC_BASE_URL`. Signed-in
 Desktop overrides that base URL, including values supplied through settings.
 Desktop's third-party inference configuration instead uses separate gateway
@@ -252,6 +259,23 @@ statistics; join `optimization_events` and `proxy_requests` by `request_id`.
 | Claude works but old tool results stay full | Check `CLAUDE_CODE_TETHER_LIVE=0`, restart Desktop, and use a fresh session. |
 | Requests still bypass the listener | Check other environment/settings overrides, lowercase proxy variables, and `NO_PROXY` bypasses. |
 
+**Two things decide whether such a test can show you anything.**
+
+A tool result of **30 KiB or more never reaches the proxy**: Claude Code writes
+it to `~/.claude/projects/…/tool-results/` and sends a ~2 KB preview. Measured
+against 2.1.299 — 30,000 bytes arrives inline, 30,720 does not. A 36 KB fixture
+therefore produces no compression and no markers, and the session will report,
+accurately, that every line arrived whole. Keep fixtures under 30 KiB; the
+sweep's code fixture takes `--compact` for this reason.
+
+And **the model cannot see the compression**. With the default
+`retrieve_execution = "server"` the proxy elides on the way out and resolves the
+handles itself, so the model is handed resolved content and will say no
+compression happened — on a request the engine took 15,299 tokens out of. Verify
+against `optimization_events`, not against the session's own account of its
+context. [CLAUDE-CODE.md](CLAUDE-CODE.md#do-not-ask-the-model) has the measured
+numbers.
+
 For retrieval validation, prepare fresh fixture files before starting the
 session, attach no files, and read `warmup_1.py`, `warmup_2.py`, then `ledger.py`
 in separate tool calls. Follow with `wc -l warmup_1.py` before asking for the
@@ -318,3 +342,6 @@ This integration covers the Code tab's Anthropic Messages calls. Hosted Claude
 Chat uses different endpoints, which this listener does not intercept. An MCP
 registration can expose retrieval tools to Chat, but does not intercept its
 inference requests or automatically compress server-held conversation history.
+What Chat does carry in bulk is MCP tool results, and those can be compressed by
+putting `kompressor mcp serve` in front of the servers that produce them: see
+[MCP-PROXY.md](MCP-PROXY.md).

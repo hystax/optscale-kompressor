@@ -1,0 +1,586 @@
+<!doctype html>
+<html lang="en">
+<head>
+
+
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kompressor cache</title>
+<script>
+// Apply the shared preference before rendering to avoid a theme flash.
+(() => {
+  const key = "kompressor-theme";
+  let theme = "dark";
+  try { if (localStorage.getItem(key) === "light") theme = "light"; } catch (_) {}
+  const apply = (value) => {
+    theme = value === "light" ? "light" : "dark";
+    document.documentElement.dataset.theme = theme;
+    const button = document.getElementById("theme-toggle");
+    if (button) {
+      button.textContent = theme === "dark" ? "Light theme" : "Dark theme";
+      button.setAttribute("aria-label", "Switch to " + (theme === "dark" ? "light" : "dark") + " theme");
+    }
+  };
+  apply(theme);
+  document.addEventListener("DOMContentLoaded", () => {
+    apply(theme);
+    document.getElementById("theme-toggle").addEventListener("click", () => {
+      apply(theme === "dark" ? "light" : "dark");
+      try { localStorage.setItem(key, theme); } catch (_) {}
+    });
+  });
+  window.addEventListener("storage", (event) => {
+    if (event.key === key || event.key === null) apply(event.newValue);
+  });
+})();
+</script>
+<style>
+:root {
+  --bg: #f7f8fa; --panel: #ffffff; --ink: #172033; --muted: #5b6475; --line: #e3e6ec;
+  --accent: #3b6fd8; --kept: #c9d3e6; --good: #1f8a4c; --warn: #b26a00; --bad: #c0392b;
+  --read: #1f8a4c; --write: #d08a1e; --fresh: #3b6fd8;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #11151c; --panel: #171c25; --ink: #e6e9ef; --muted: #98a2b3; --line: #2a3140;
+    --accent: #6d9bff; --kept: #3a4459; --good: #4cc27f; --warn: #e0a440; --bad: #ef6b5b;
+    --read: #4cc27f; --write: #e0a440; --fresh: #6d9bff;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1200px; margin: 0 auto; padding: 20px 16px 48px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; margin-bottom: 16px; }
+h1 { font-size: 20px; margin: 0; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; }
+.meta { color: var(--muted); font-size: 13px; }
+.controls { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+button { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+button.link { border: 0; background: none; padding: 0; color: var(--accent); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+a { color: var(--accent); }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: var(--muted); margin-right: 6px; }
+.dot.ok { background: var(--good); } .dot.err { background: var(--bad); }
+.banner { padding: 10px 12px; border-radius: 8px; margin-bottom: 14px; border: 1px solid var(--warn); color: var(--warn); display: none; }
+.banner.show { display: block; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; margin-bottom: 16px; }
+.tile, section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+.tile { padding: 12px 14px; }
+.tile .label { color: var(--muted); font-size: 12px; }
+.tile .value { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.tile .sub { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+section { padding: 14px; margin-bottom: 14px; overflow-x: auto; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 14px; margin-bottom: 14px; }
+.grid2 section { margin-bottom: 0; }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+td.num, th.num { text-align: right; }
+td.wrap { white-space: normal; overflow-wrap: anywhere; min-width: 160px; }
+tr.sel td { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.empty { color: var(--muted); padding: 6px 8px; }
+.k-hit, .good { color: var(--good); } .k-partial { color: var(--warn); } .k-miss, .bad { color: var(--bad); }
+.k-first, .k-branch, .k-no_usage { color: var(--muted); }
+svg { display: block; width: 100%; height: 170px; }
+.legend { color: var(--muted); font-size: 12px; margin-top: 6px; }
+.legend i { display: inline-block; width: 10px; height: 10px; margin: 0 4px 0 10px; vertical-align: -1px; border-radius: 2px; }
+.note { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+form.key { display: none; gap: 6px; margin-top: 8px; }
+form.key.show { display: flex; }
+input { font: inherit; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); min-width: 0; flex: 1; }
+.head-row { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.head-row h2 { margin-right: auto; }
+
+/* Shared visual language with the Analysis dashboard. */
+:root {
+  color-scheme: dark;
+  --bg: #101419; --panel: #191f27; --ink: #e3eaf2;
+  --muted: #9caaba; --line: #303a46; --accent: #70d8b6;
+  --good: #70d8b6; --warn: #e9c27b; --bad: #ffa096;
+  --sel: #253b36; --hit: #63521f;
+  --kept: #52677e; --read: #70d8b6; --write: #e9c27b; --fresh: #7188a2;
+}
+body { background: var(--bg); color: var(--ink); font: 14px system-ui, sans-serif; }
+main { max-width: 1600px; padding: 24px; margin: auto; }
+header { gap: 14px; flex-wrap: wrap; }
+h1 { font-size: 24px; margin-right: auto; }
+h2 { font-size: 18px; text-transform: none; letter-spacing: normal; color: var(--ink); }
+a, button.link { color: var(--accent); }
+button, input, select {
+  font: inherit; color: var(--ink); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 5px; padding: 8px;
+}
+button { cursor: pointer; }
+button:hover, select:hover { border-color: var(--accent); }
+button.active, button[aria-pressed="true"] {
+  background: var(--panel); color: var(--accent); border-color: var(--accent);
+}
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+section, .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 18px; }
+.tiles { grid-template-columns: repeat(auto-fit, minmax(min(185px, 100%), 1fr)); gap: 12px; }
+.tile .value { font-size: 25px; margin: 8px 0; }
+.tile .label, .tile .sub, .meta { color: var(--muted); }
+.grid2 { gap: 16px; }
+.grid2 > section { min-width: 0; }
+th, td { border-bottom: 1px solid var(--line); padding: 10px; }
+th { color: var(--muted); font-size: 12px; }
+.num { font-variant-numeric: tabular-nums; }
+.banner { border-radius: 8px; border-color: var(--warn); }
+pre { background: var(--bg); border-color: var(--line); }
+@media (max-width: 700px) {
+  main { padding: 18px; }
+  .grid2 { grid-template-columns: minmax(0, 1fr); }
+  header, .filters { gap: 10px; }
+  input, select { max-width: 100%; }
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f7f8fa; --panel: #ffffff; --ink: #172033;
+  --muted: #5b6475; --line: #d5dce5; --accent: #13745b;
+  --good: #13745b; --warn: #946000; --bad: #b83228;
+  --sel: #e1f1eb; --hit: #fff1b8;
+  --kept: #a9b9cb; --read: #13745b; --write: #ad741b; --fresh: #527698;
+}
+#theme-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Kompressor cache</h1>
+    <span class="meta"><span id="status-dot" class="dot"></span><span id="status">connecting…</span></span>
+    <div class="controls" id="windows"></div>
+    <a id="analysis-link" href="#">Analysis</a>
+    <a id="live-link" href="#">Live</a>
+    <a id="dashboards-link" href="#">Dashboards</a>
+    <a id="refs-link" href="#" hidden>Ref store</a>
+    <a id="maintenance-link" href="#">Maintenance</a>
+    <button id="download" type="button" title="Download this view as JSON Lines">Download JSONL</button>
+    <button id="pause" aria-pressed="false">Pause</button>
+  <button id="theme-toggle" type="button" aria-label="Switch to light theme">Light theme</button>
+</header>
+
+  <div class="banner" id="banner">
+    <span id="banner-text"></span>
+    <form class="key" id="key-form">
+      <input id="key" type="password" autocomplete="off" placeholder="API key">
+      <button type="submit">Use key</button>
+    </form>
+  </div>
+
+  <div class="tiles" id="tiles"></div>
+
+  <section>
+    <h2>Input tokens per interval, by how the provider billed them</h2>
+    <svg id="chart" role="img" aria-label="Cache reads, cache writes and fresh input per interval"></svg>
+    <div class="legend"><i style="background:var(--read)"></i>read from cache <i style="background:var(--write)"></i>written to cache <i style="background:var(--fresh)"></i>fresh input <i style="background:var(--bad)"></i>lost prefix <span id="bucket"></span></div>
+  </section>
+
+  <div class="grid2">
+    <section><h2>Idle gaps before a client turn</h2><div id="gaps"></div>
+      <p class="note">Time from the end of one client request to the start of the next in the same conversation. A five-minute cache entry lapses past 5m unless a keep-warm ping refreshed it.</p></section>
+    <section><h2>Lost prefix</h2><div id="losses"></div>
+      <p class="note">A loss is a prefix the provider held and did not read back. Past the cache lifetime it is expiry; inside it, something rewrote the bytes.</p></section>
+    <section><h2>Keep-warm</h2><div id="keepwarm"></div></section>
+    <section><h2>By model</h2><div id="models"></div></section>
+  </div>
+
+  <section id="detail" hidden>
+    <div class="head-row"><h2 id="detail-title">Conversation</h2><button id="detail-close">Close</button></div>
+    <div id="turns"></div>
+    <p class="note">Each row is compared with what the conversation's previous request left cached. Pings are the proxy's own keep-warm requests.</p>
+  </section>
+
+  <section><h2 id="conv-title">Conversations</h2><div id="conversations"></div></section>
+  <p class="meta" id="footer"></p>
+</main>
+<script>
+"use strict";
+const SETTINGS = /*SETTINGS*/{};
+const WINDOWS = ["1h", "6h", "24h", "3d", "7d", "30d"];
+const state = {
+  window: SETTINGS.window || "6h",
+  fixed: SETTINGS.fixed || null,
+  refresh: Math.max(1, SETTINGS.refresh || 10),
+  conversation: SETTINGS.conversation || null,
+  endpoint: SETTINGS.endpoint || location.pathname,
+  paused: false,
+  timer: null,
+};
+const $ = (id) => document.getElementById(id);
+const nf = new Intl.NumberFormat();
+const num = (v) => (v === null || v === undefined) ? "–" : nf.format(Math.round(v));
+const pct = (v) => (v === null || v === undefined || !isFinite(v)) ? "–" : (v * 100).toFixed(1) + "%";
+const compact = (v) => {
+  if (v === null || v === undefined) return "–";
+  const a = Math.abs(v);
+  if (a >= 1e9) return (v / 1e9).toFixed(2) + "B";
+  if (a >= 1e6) return (v / 1e6).toFixed(2) + "M";
+  if (a >= 1e4) return (v / 1e3).toFixed(1) + "K";
+  return nf.format(Math.round(v));
+};
+const time = (t) => new Date(t).toLocaleTimeString();
+const stamp = (t) => new Date(t).toLocaleString();
+const dur = (msv) => {
+  if (msv === null || msv === undefined) return "–";
+  const s = Math.round(msv / 1000);
+  return s < 120 ? s + "s" : s < 7200 ? (s / 60).toFixed(s < 600 ? 1 : 0) + "m" : s < 172800 ? (s / 3600).toFixed(1) + "h" : Math.round(s / 86400) + "d";
+};
+const KIND = { first: "first", hit: "hit", partial: "partial", miss: "miss", branch: "branch", no_usage: "no usage" };
+const CAUSE = { ttl_expiry: "expiry", prefix_change: "prefix change" };
+
+function el(tag, text, cls) {
+  const node = document.createElement(tag);
+  if (text !== undefined && text !== null) node.textContent = String(text);
+  if (cls) node.className = cls;
+  return node;
+}
+
+// columns: [header, (row) => value | Node, "num"|"wrap"?, (row) => className?]
+function table(target, rows, columns, rowClass) {
+  const host = $(target);
+  host.replaceChildren();
+  if (!rows || rows.length === 0) { host.append(el("div", "Nothing in this window.", "empty")); return; }
+  const t = el("table"), head = el("tr");
+  for (const [name, , kind] of columns) head.append(el("th", name, kind === "num" ? "num" : ""));
+  t.append(el("thead")); t.tHead.append(head);
+  const body = el("tbody");
+  for (const row of rows) {
+    const tr = el("tr");
+    if (rowClass) tr.className = rowClass(row) || "";
+    for (const [, get, kind, cls] of columns) {
+      const classes = [kind === "num" ? "num" : kind === "wrap" ? "wrap" : "", cls ? cls(row) : ""].join(" ").trim();
+      const value = get(row);
+      const td = el("td", value instanceof Node ? undefined : value, classes);
+      if (value instanceof Node) td.append(value);
+      tr.append(td);
+    }
+    body.append(tr);
+  }
+  t.append(body);
+  host.append(t);
+}
+
+function pairs(target, list) {
+  table(target, list.map(([k, v, cls]) => ({ k, v, cls })), [["", (r) => r.k], ["", (r) => r.v, "num", (r) => r.cls || ""]]);
+  const head = $(target).querySelector("thead");
+  if (head) head.remove();
+}
+
+function tiles(d) {
+  const t = d.totals, l = d.losses, k = d.keep_warm, c = d.clients;
+  const writes = t.write_5m + t.write_1h;
+  const tried = k.bridged + k.not_bridged;
+  const items = [
+    ["Read from cache", pct(t.read_share), compact(t.read) + " of " + compact(t.input) + " input tokens"],
+    ["Saved by the cache", pct(t.saved_share), compact(t.cost) + " input-equivalent vs " + compact(t.baseline) + " uncached", t.saved_share < 0 ? "bad" : ""],
+    ["Cache writes", compact(writes), pct(writes ? t.write_1h / writes : 0) + " as one-hour entries"],
+    ["Lost to expiry", compact(l.ttl_expiry_tokens), num(l.ttl_expiry_events) + " turns", l.ttl_expiry_tokens ? "bad" : ""],
+    ["Lost to a prefix change", compact(l.prefix_change_tokens), num(l.prefix_change_events) + " turns", l.prefix_change_tokens ? "bad" : ""],
+    ["What losses cost", compact(l.cost), "input-equivalent, over reading them back"],
+    ["Keep-warm pings", num(k.pings), num(k.warm) + " warm · " + num(k.cold) + " cold · " + num(k.failed) + " failed"],
+    ["Pauses bridged", tried ? num(k.bridged) + " / " + num(tried) : "–", "client turns after > 5m idle, with pings"],
+    ["Ping cost", compact(k.cost), "input-equivalent · " + pct(t.cost ? k.cost / t.cost : 0) + " of input cost"],
+    ["Requests", num(c.requests), num(d.conversations_total) + " conversations · " + num(d.unattributed.requests) + " unattributed"],
+  ];
+  const host = $("tiles");
+  host.replaceChildren();
+  for (const [label, value, sub, cls] of items) {
+    const tile = el("div", undefined, "tile");
+    tile.append(el("div", label, "label"), el("div", value, "value " + (cls || "")), el("div", sub, "sub"));
+    host.append(tile);
+  }
+}
+
+function chart(d) {
+  const svg = $("chart");
+  svg.replaceChildren();
+  const W = svg.clientWidth || 800, H = 170, pad = 4, top = 10;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const NS = "http://www.w3.org/2000/svg";
+  const span = Math.max(1, d.to_ms - d.from_ms), b = d.bucket_ms;
+  const slots = Math.max(1, Math.ceil(span / b));
+  const total = (p) => p.read + p.write + p.uncached;
+  const max = Math.max(1, ...d.timeline.map(total));
+  const step = (W - pad * 2) / slots, w = Math.max(1, step - 1);
+  const rect = (x, y, h, fill, tip) => {
+    const r = document.createElementNS(NS, "rect");
+    r.setAttribute("x", x); r.setAttribute("width", w);
+    r.setAttribute("y", y); r.setAttribute("height", Math.max(0, h));
+    r.setAttribute("fill", fill);
+    if (tip) { const t = document.createElementNS(NS, "title"); t.textContent = tip; r.append(t); }
+    svg.append(r);
+  };
+  for (const p of d.timeline) {
+    const i = Math.floor((p.bucket_ms - d.from_ms) / b);
+    const x = pad + i * step;
+    const scale = (v) => (v / max) * (H - pad - top);
+    const tip = `${time(p.bucket_ms)} — ${num(p.read)} read, ${num(p.write)} written, ${num(p.uncached)} fresh, ${num(p.pings)} pings, ${num(p.lost_tokens)} lost`;
+    let y = H - pad;
+    for (const [v, fill] of [[p.read, "var(--read)"], [p.write, "var(--write)"], [p.uncached, "var(--fresh)"]]) {
+      const h = scale(v); y -= h; rect(x, y, h, fill, tip);
+    }
+    if (p.lost_tokens > 0) rect(x, 0, 4, "var(--bad)", tip);
+  }
+  $("bucket").textContent = "· one bar = " + dur(b);
+}
+
+function render(d) {
+  tiles(d);
+  chart(d);
+  table("gaps", d.gaps.filter((g) => g.turns > 0), [
+    ["Idle", (g) => g.label],
+    ["Turns", (g) => num(g.turns), "num"],
+    ["Read back", (g) => pct(g.turns ? g.hits / g.turns : 0), "num", (g) => g.losses ? "" : "good"],
+    ["Lost", (g) => num(g.losses), "num", (g) => g.losses ? "bad" : ""],
+    ["Tokens lost", (g) => compact(g.lost_tokens), "num"],
+    ["With pings", (g) => num(g.with_pings), "num"],
+  ]);
+  const l = d.losses;
+  pairs("losses", [
+    ["Turns that lost a prefix", num(l.events)],
+    ["Tokens lost", compact(l.tokens), l.tokens ? "bad" : ""],
+    ["· expiry", compact(l.ttl_expiry_tokens) + " in " + num(l.ttl_expiry_events)],
+    ["· prefix change", compact(l.prefix_change_tokens) + " in " + num(l.prefix_change_events)],
+    ["Extra cost, input-equivalent", compact(l.cost)],
+    ["Lost per 100 tokens read", d.totals.read ? (100 * l.tokens / d.totals.read).toFixed(2) : "–"],
+  ]);
+  const k = d.keep_warm, p = d.pings;
+  pairs("keepwarm", [
+    ["Pings", num(k.pings)],
+    ["Conversations kept warm", num(k.conversations)],
+    ["Warm (prefix refreshed)", num(k.warm), "good"],
+    ["Cold (had already lapsed)", num(k.cold), k.cold ? "bad" : ""],
+    ["Failed", num(k.failed), k.failed ? "bad" : ""],
+    ["Prefix tokens refreshed", compact(k.read)],
+    ["Ping input cost, input-equivalent", compact(k.cost)],
+    ["Ping output tokens", num(k.output)],
+    ["Pauses over 5m bridged", num(k.bridged) + " of " + num(k.bridged + k.not_bridged)],
+    ["Ping writes", compact(p.write_5m + p.write_1h)],
+  ]);
+  table("models", d.by_model, [
+    ["Model", (m) => m.model || "–", "wrap"],
+    ["Requests", (m) => num(m.requests), "num"],
+    ["Input", (m) => compact(m.input), "num"],
+    ["Read", (m) => pct(m.read_share), "num"],
+    ["Saved", (m) => pct(m.saved_share), "num", (m) => m.saved_share < 0 ? "bad" : ""],
+    ["Read rate", (m) => m.rates ? "×" + m.rates.read : "–", "num"],
+  ]);
+  $("conv-title").textContent = d.conversations.length < d.conversations_total
+    ? `Conversations — the ${d.conversations.length} costliest of ${d.conversations_total}` : "Conversations";
+  table("conversations", d.conversations, [
+    ["Conversation", (c) => { const b = el("button", c.conversation, "link"); b.addEventListener("click", () => open(c.conversation)); return b; }],
+    ["Model", (c) => c.model || "–", "wrap"],
+    ["Last", (c) => time(c.last_ms)],
+    ["Turns", (c) => num(c.turns), "num"],
+    ["Pings", (c) => num(c.pings), "num"],
+    ["Read", (c) => pct(c.tokens.read_share), "num"],
+    ["Written", (c) => compact(c.tokens.write_5m + c.tokens.write_1h), "num"],
+    ["Lost: expiry", (c) => compact(c.losses.ttl_expiry_tokens), "num", (c) => c.losses.ttl_expiry_tokens ? "bad" : ""],
+    ["Lost: change", (c) => compact(c.losses.prefix_change_tokens), "num", (c) => c.losses.prefix_change_tokens ? "bad" : ""],
+    ["Saved", (c) => pct(c.tokens.saved_share), "num"],
+    ["Longest pause", (c) => dur(c.longest_gap_ms), "num"],
+    ["TTL", (c) => c.long_ttl ? "1h" : "5m"],
+  ], (c) => c.conversation === state.conversation ? "sel" : "");
+  detail(d);
+  const parts = [`${num(d.rows)} rows from ${stamp(d.from_ms)} to ${stamp(d.to_ms)}`];
+  if (d.truncated) parts.push("only the newest rows were read");
+  parts.push("costs are in input-equivalent tokens: fresh input at 1, reads and writes at the model's cache rates");
+  $("footer").textContent = parts.join(" · ");
+}
+
+function detail(d) {
+  const show = Boolean(state.conversation);
+  $("detail").hidden = !show;
+  if (!show) return;
+  $("detail-title").textContent = "Conversation " + state.conversation;
+  const turns = d.turns || [];
+  table("turns", turns, [
+    ["Time", (t) => time(t.time_ms)],
+    ["Idle", (t) => dur(t.gap_ms), "num"],
+    ["", (t) => t.keep_warm ? "ping" : ""],
+    ["Kind", (t) => KIND[t.kind] || t.kind, "", (t) => "k-" + t.kind],
+    ["Cause", (t) => t.cause ? CAUSE[t.cause] || t.cause : ""],
+    ["Messages", (t) => num(t.messages), "num"],
+    ["Expected", (t) => num(t.expected), "num"],
+    ["Read", (t) => num(t.read), "num"],
+    ["Written 5m", (t) => num(t.write_5m), "num"],
+    ["Written 1h", (t) => num(t.write_1h), "num"],
+    ["Fresh", (t) => num(t.uncached), "num"],
+    ["Lost", (t) => t.lost_tokens ? num(t.lost_tokens) : "", "num", (t) => t.lost_tokens ? "bad" : ""],
+    ["Output", (t) => num(t.output), "num"],
+    ["Status", (t) => t.error || (t.status ?? "–"), "wrap", (t) => t.error || (t.status && t.status >= 400) ? "bad" : ""],
+  ]);
+  if (turns.length === 0) $("turns").firstChild.textContent = "This conversation has no rows in this window.";
+}
+
+function open(id) {
+  state.conversation = id;
+  syncUrl();
+  clearTimeout(state.timer);
+  poll().then(() => $("detail").scrollIntoView({ behavior: "smooth", block: "start" }));
+}
+
+function syncUrl() {
+  const params = new URLSearchParams(location.search);
+  params.set("window", state.window);
+  if (state.fixed) { params.set("from", state.fixed[0]); params.set("to", state.fixed[1]); } else { params.delete("from"); params.delete("to"); }
+  if (state.conversation) params.set("conversation", state.conversation); else params.delete("conversation");
+  history.replaceState(null, "", location.pathname + "?" + params.toString());
+}
+
+function setStatus(ok, text) {
+  $("status").textContent = text;
+  $("status-dot").className = "dot " + (ok ? "ok" : "err");
+}
+
+function showBanner(text, askKey) {
+  $("banner-text").textContent = text;
+  $("banner").classList.toggle("show", Boolean(text));
+  $("key-form").classList.toggle("show", askKey);
+}
+
+function storedKey() { try { return sessionStorage.getItem("kompressor-key") || ""; } catch (_) { return ""; } }
+
+function dataUrl(format) {
+  const url = new URL(state.endpoint, location.origin);
+  const params = { format, window: state.window };
+  if (state.conversation) params.conversation = state.conversation;
+  if (state.fixed) { params.from = state.fixed[0]; params.to = state.fixed[1]; }
+  const tenant = new URLSearchParams(location.search).get("tenant");
+  if (tenant) params.tenant = tenant;
+  url.search = new URLSearchParams(params).toString();
+  return url;
+}
+
+// Fetch a JSON Lines export with the key header (a plain link could not carry
+// it) and hand it to the browser as a file named by the server.
+async function downloadJsonl(url, keyValue, button) {
+  const headers = { accept: "application/x-ndjson" };
+  if (keyValue) headers["x-kompressor-key"] = keyValue;
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = "Downloading…";
+  try {
+    const response = await fetch(url, { headers, cache: "no-store" });
+    if (!response.ok) {
+      let message = "HTTP " + response.status;
+      try { const body = await response.json(); message = (body.error && body.error.message) || message; } catch (_) {}
+      throw new Error(message);
+    }
+    const blob = await response.blob();
+    const match = /filename="([^"]+)"/.exec(response.headers.get("content-disposition") || "");
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = match ? match[1] : "kompressor.jsonl";
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  } catch (error) {
+    alert("Download failed: " + error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = label;
+  }
+}
+
+document.getElementById("download").addEventListener("click", event => {
+  downloadJsonl(dataUrl("jsonl"), storedKey(), event.currentTarget);
+});
+
+async function poll() {
+  if (state.paused) return;
+  const url = dataUrl("json");
+  const headers = { accept: "application/json" };
+  const key = storedKey();
+  if (key) headers["x-kompressor-key"] = key;
+  try {
+    const response = await fetch(url, { headers, cache: "no-store" });
+    if (response.status === 401 || response.status === 403) {
+      setStatus(false, "needs a key");
+      showBanner(response.status === 401 ? "This deployment requires an API key." : "That key may not read these statistics.", true);
+      return;
+    }
+    const body = await response.json();
+    if (!response.ok) {
+      setStatus(false, "error " + response.status);
+      showBanner((body.error && body.error.message) || ("HTTP " + response.status), false);
+      return;
+    }
+    showBanner("", false);
+    render(body);
+    setStatus(true, "live");
+  } catch (error) {
+    setStatus(false, "unreachable — retrying");
+  } finally {
+    schedule();
+  }
+}
+
+function schedule() {
+  clearTimeout(state.timer);
+  if (!state.paused) state.timer = setTimeout(poll, state.refresh * 1000);
+}
+
+function windows() {
+  const host = $("windows");
+  host.replaceChildren();
+  if (state.fixed) host.append(el("span", "Fixed date range", "meta"));
+  for (const w of WINDOWS.includes(state.window) ? WINDOWS : [...WINDOWS, state.window]) {
+    const b = el("button", w);
+    b.setAttribute("aria-pressed", String(!state.fixed && w === state.window));
+    b.addEventListener("click", () => { state.fixed = null; state.window = w; windows(); syncUrl(); clearTimeout(state.timer); poll(); });
+    host.append(b);
+  }
+}
+
+$("pause").addEventListener("click", () => {
+  state.paused = !state.paused;
+  $("pause").textContent = state.paused ? "Resume" : "Pause";
+  $("pause").setAttribute("aria-pressed", String(state.paused));
+  if (state.paused) { clearTimeout(state.timer); setStatus(false, "paused"); } else { poll(); }
+});
+$("detail-close").addEventListener("click", () => { state.conversation = null; syncUrl(); clearTimeout(state.timer); poll(); });
+$("key-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  try { sessionStorage.setItem("kompressor-key", $("key").value.trim()); } catch (_) {}
+  $("key").value = "";
+  showBanner("", false);
+  poll();
+});
+document.addEventListener("visibilitychange", () => { if (!document.hidden && !state.paused) { clearTimeout(state.timer); poll(); } });
+
+// The live dashboard and the ref browser sit beside this page: at / and
+// /refs on the statistics listener, and as siblings of /stats/cache under a
+// version prefix.
+const sibling = (path) => location.pathname.replace(/stats\/cache\/?$/, path);
+$("live-link").href = SETTINGS.live || sibling("stats/live");
+$("maintenance-link").href = SETTINGS.live ? "/maintenance" : sibling("maintenance");
+if (SETTINGS.refs) {
+  $("refs-link").href = SETTINGS.refs_path || sibling("refs");
+  $("refs-link").hidden = false;
+}
+const analysisUrl = new URL(SETTINGS.live ? "/analysis" : sibling("stats/analysis"), location.origin);
+if (new URLSearchParams(location.search).has("tenant")) analysisUrl.searchParams.set("tenant", new URLSearchParams(location.search).get("tenant"));
+$("analysis-link").href = analysisUrl;
+windows();
+poll();
+</script>
+<script>
+// The dashboards sit at /trends on the statistics listener and at
+// /v1/stats/trends (or /v2/...) on the API.
+(() => {
+  const link = document.getElementById("dashboards-link");
+  const version = /^\/v[12]\//.exec(location.pathname);
+  const url = new URL(version ? version[0] + "stats/trends" : "/trends", location.origin);
+  const tenant = new URLSearchParams(location.search).get("tenant");
+  if (tenant) url.searchParams.set("tenant", tenant);
+  link.href = url.pathname + url.search;
+})();
+</script>
+</body>
+</html>

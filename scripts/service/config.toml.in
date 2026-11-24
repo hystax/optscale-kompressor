@@ -8,6 +8,11 @@
 
 [server]
 listen = "127.0.0.1:8817"
+# Live statistics — a dashboard at http://<address>/, the prompt-cache
+# analysis at /cache, and JSON at /v1/stats/live and /v1/stats/cache — on a
+# port of their own, whatever surfaces are served.
+# Off unless an address is named; /v1/stats/live is on the API listener either way.
+# stats_listen = "127.0.0.1:8818"
 
 [engine]
 mode = "recoverable"
@@ -18,6 +23,10 @@ max_ref_bytes = 1048576
 [refs]
 backend = "sqlite"
 path = "@STATE@/refs.db"
+# The ref browser — /v1/refs, and /refs on server.stats_listen — lists, shows
+# and deletes stored fragments. Fragments are tool output and can hold secrets,
+# so it is off unless turned on here.
+# browse = true
 
 [stats]
 enabled = true
@@ -46,4 +55,18 @@ path_prefix = "/backend-api/codex"
 base_url = "https://chatgpt.com"
 strip_prefix = false
 api_family = "openai"
+forward_auth = true
+
+# OpenCode Zen and OpenCode Go, for `kompressor wrap opencode`.
+# `kompressor wrap opencode` points opencode's built-in `opencode` and
+# `opencode-go` providers at /zen/v1 and /zen/go/v1 here. One host serves both
+# tiers and every wire shape (Chat Completions, Responses, Messages); the family
+# is read off the path, so one mount covers them. The client's
+# x-opencode-session header is forwarded with the rest — the relay 400s without
+# it. opencode's `openai` and `anthropic` providers use the mounts above.
+[[proxy.upstreams]]
+name = "opencode-zen"
+path_prefix = "/zen"
+base_url = "https://opencode.ai"
+api_family = "auto"
 forward_auth = true

@@ -31,6 +31,11 @@ use crate::bodycodec::BodyEncoding;
 pub(crate) const FIELD: &str = "prompt_cache_retention";
 /// The value this module writes.
 pub(crate) const EXTENDED: &str = "24h";
+/// The other field this module may add: a name for the conversation's cache
+/// route, under `proxy.prompt_cache_key = "conversation"`. It shares the
+/// retention field's rules for where it is sent and what happens when it is
+/// refused, and nothing else.
+pub(crate) const KEY_FIELD: &str = "prompt_cache_key";
 
 /// The models OpenAI documents `prompt_cache_retention: "24h"` for, as of
 /// 2026-11. A dated snapshot of one (`gpt-4.1-2025-04-14`) counts as it.
@@ -104,45 +109,93 @@ pub(crate) fn extend(body: &mut Value) -> bool {
     true
 }
 
+/// Name the conversation's cache route, unless the client named one. An empty
+/// key is no key. Returns whether it was added.
+pub(crate) fn name_cache_route(body: &mut Value, opening: u64) -> bool {
+    let Some(object) = body.as_object_mut() else {
+        return false;
+    };
+    match object.get(KEY_FIELD) {
+        None | Some(Value::Null) => {}
+        Some(Value::String(key)) if key.is_empty() => {}
+        Some(_) => return false,
+    }
+    object.insert(
+        KEY_FIELD.to_string(),
+        Value::String(format!("kmp-{opening:016x}")),
+    );
+    true
+}
+
 /// Whether an error body is about the field: the upstream named it.
+#[cfg(test)]
 pub(crate) fn names_field(body: &[u8]) -> bool {
-    String::from_utf8_lossy(body).contains(FIELD)
+    names(body, FIELD)
+}
+
+fn names(body: &[u8], field: &str) -> bool {
+    String::from_utf8_lossy(body).contains(field)
 }
 
 /// `body` without the field, in the coding it was in, or `None` when it cannot
 /// be read or carried no such field.
+#[cfg(test)]
 pub(crate) fn strip(body: &Bytes, encoding: BodyEncoding, limit: usize) -> Option<Bytes> {
+    strip_fields(body, encoding, limit, &[FIELD])
+}
+
+/// `body` without `fields`, or `None` when it cannot be read or carried none
+/// of them.
+fn strip_fields(
+    body: &Bytes,
+    encoding: BodyEncoding,
+    limit: usize,
+    fields: &[&str],
+) -> Option<Bytes> {
     let plain = encoding.decode(body, limit)?;
     let mut value: Value = serde_json::from_slice(&plain).ok()?;
-    value.as_object_mut()?.remove(FIELD)?;
+    let object = value.as_object_mut()?;
+    let removed = fields
+        .iter()
+        .filter(|field| object.remove(**field).is_some())
+        .count();
+    if removed == 0 {
+        return None;
+    }
     let bytes = serde_json::to_vec(&value).ok()?;
     encoding.encode(&bytes)
 }
 
-/// The upstreams and models that refused the field, so it is not sent there
+/// The upstreams and models that refused a field, so it is not sent there
 /// again. Process-wide and never pruned: the set is bounded by the configured
-/// upstreams times [`SUPPORTED`].
+/// upstreams times the models they serve times the two fields.
 #[derive(Debug, Default)]
 pub struct Rejections {
-    refused: Mutex<HashSet<(String, String)>>,
+    refused: Mutex<HashSet<(String, String, &'static str)>>,
 }
 
 impl Rejections {
+    /// Whether the upstream and model refused `prompt_cache_retention`.
     pub(crate) fn refused(&self, upstream: &str, model: &str) -> bool {
+        self.refused_field(upstream, model, FIELD)
+    }
+
+    pub(crate) fn refused_field(&self, upstream: &str, model: &str, field: &'static str) -> bool {
         self.refused
             .lock()
-            .map(|set| set.contains(&(upstream.to_string(), model.to_string())))
+            .map(|set| set.contains(&(upstream.to_string(), model.to_string(), field)))
             .unwrap_or(false)
     }
 
-    fn refuse(&self, upstream: &str, model: &str) {
+    fn refuse(&self, upstream: &str, model: &str, field: &'static str) {
         if let Ok(mut set) = self.refused.lock() {
-            set.insert((upstream.to_string(), model.to_string()));
+            set.insert((upstream.to_string(), model.to_string(), field));
         }
     }
 }
 
-/// What one request that carries the field needs to recover if it is refused.
+/// What one request that carries a field this proxy added needs to recover if
+/// the field is refused.
 #[derive(Clone, Debug)]
 pub(crate) struct Guard {
     rejections: Arc<Rejections>,
@@ -150,6 +203,8 @@ pub(crate) struct Guard {
     model: String,
     /// The most a body may decode to, for [`strip`].
     limit: usize,
+    /// The fields this request was given.
+    fields: Vec<&'static str>,
 }
 
 impl Guard {
@@ -164,29 +219,78 @@ impl Guard {
             upstream: upstream.to_string(),
             model: model.to_string(),
             limit,
+            fields: vec![FIELD],
         }
     }
 
-    /// Whether this upstream and model have refused the field.
+    /// The same guard for the fields this request was actually given.
+    pub(crate) fn for_fields(mut self, fields: Vec<&'static str>) -> Guard {
+        self.fields = fields;
+        self
+    }
+
+    fn refused_fields(&self) -> Vec<&'static str> {
+        self.fields
+            .iter()
+            .copied()
+            .filter(|field| {
+                self.rejections
+                    .refused_field(&self.upstream, &self.model, field)
+            })
+            .collect()
+    }
+
+    /// Whether this upstream and model have refused a field this request has.
     pub(crate) fn refused(&self) -> bool {
-        self.rejections.refused(&self.upstream, &self.model)
+        !self.refused_fields().is_empty()
     }
 
     /// Record a refusal, once, with a warning: from here on the setting does
     /// nothing for this upstream and model, and that should not be silent.
-    pub(crate) fn refuse(&self) {
-        if !self.refused() {
+    fn refuse_field(&self, field: &'static str) {
+        if !self
+            .rejections
+            .refused_field(&self.upstream, &self.model, field)
+        {
             tracing::warn!(
                 upstream = %self.upstream,
                 model = %self.model,
-                "the upstream refused prompt_cache_retention; sending without it from now on"
+                field,
+                "the upstream refused a field this proxy added; sending without it from now on"
             );
         }
-        self.rejections.refuse(&self.upstream, &self.model);
+        self.rejections.refuse(&self.upstream, &self.model, field);
     }
 
+    /// Record a refusal of `prompt_cache_retention`.
+    #[cfg(test)]
+    pub(crate) fn refuse(&self) {
+        self.refuse_field(FIELD);
+    }
+
+    /// Record a refusal of whichever of this request's fields the error body
+    /// names. Returns whether it named one.
+    pub(crate) fn refuse_named(&self, error: &[u8]) -> bool {
+        let named: Vec<&'static str> = self
+            .fields
+            .iter()
+            .copied()
+            .filter(|field| names(error, field))
+            .collect();
+        for field in &named {
+            self.refuse_field(field);
+        }
+        !named.is_empty()
+    }
+
+    /// How many fields this request was given.
+    pub(crate) fn fields(&self) -> usize {
+        self.fields.len()
+    }
+
+    /// `body` without the fields this upstream and model have refused.
     pub(crate) fn strip(&self, body: &Bytes, encoding: BodyEncoding) -> Option<Bytes> {
-        strip(body, encoding, self.limit)
+        strip_fields(body, encoding, self.limit, &self.refused_fields())
     }
 }
 
@@ -194,6 +298,54 @@ impl Guard {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_cache_route_is_named_only_where_the_client_named_none() {
+        let mut body = json!({"model": "gpt-5.5", "input": "hi"});
+        assert!(name_cache_route(&mut body, 0xabc));
+        assert_eq!(body[KEY_FIELD], "kmp-0000000000000abc");
+        assert!(!name_cache_route(&mut body, 0xdef), "now it has one");
+
+        let mut empty = json!({"prompt_cache_key": ""});
+        assert!(name_cache_route(&mut empty, 1), "an empty key is no key");
+        let mut own = json!({"prompt_cache_key": "codex-session"});
+        assert!(!name_cache_route(&mut own, 1));
+        assert_eq!(own[KEY_FIELD], "codex-session");
+        assert!(!name_cache_route(&mut json!([]), 1));
+    }
+
+    /// Each field is refused on its own: an upstream that will not take the
+    /// cache key keeps the retention it did accept.
+    #[test]
+    fn a_refusal_takes_out_only_the_field_it_names() {
+        let rejections = Arc::new(Rejections::default());
+        let guard = Guard::new(rejections.clone(), "openai", "gpt-5.5", 1 << 20)
+            .for_fields(vec![FIELD, KEY_FIELD]);
+        let body = Bytes::from(
+            json!({"model": "gpt-5.5", "prompt_cache_retention": "24h",
+                   "prompt_cache_key": "kmp-1", "input": "hi"})
+            .to_string(),
+        );
+        assert!(
+            guard.strip(&body, BodyEncoding::Identity).is_none(),
+            "nothing refused yet"
+        );
+        assert!(!guard.refuse_named(br#"{"error":{"message":"Invalid 'temperature'."}}"#));
+        assert!(
+            guard
+                .refuse_named(br#"{"error":{"message":"Unknown parameter: 'prompt_cache_key'."}}"#)
+        );
+        assert!(guard.refused());
+        assert!(rejections.refused_field("openai", "gpt-5.5", KEY_FIELD));
+        assert!(
+            !rejections.refused("openai", "gpt-5.5"),
+            "retention was not named"
+        );
+        let stripped = guard.strip(&body, BodyEncoding::Identity).unwrap();
+        let value: Value = serde_json::from_slice(&stripped).unwrap();
+        assert!(value.get(KEY_FIELD).is_none());
+        assert_eq!(value[FIELD], "24h");
+    }
 
     #[test]
     fn only_the_documented_models_and_their_snapshots_are_asked() {

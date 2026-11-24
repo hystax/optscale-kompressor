@@ -234,6 +234,51 @@ pub fn inject(body: &mut Value, family: ApiFamily) -> Injection {
     Injection::Injected
 }
 
+/// Whether the request's `tool_choice` rules out calling the retrieve tool.
+///
+/// Offering the tool does not make it callable: `"none"` forbids every tool,
+/// and forcing a named one forbids every other. A recoverable elision sent
+/// with either is one the model must answer around, so the caller forwards
+/// such a request whole instead.
+///
+/// Read across the three families at once, because their spellings do not
+/// collide: Chat's `{"type":"function","function":{"name":…}}`, Responses'
+/// `{"type":"function","name":…}` and `allowed_tools`, and Anthropic's
+/// `{"type":"none"}` and `{"type":"tool","name":…}`. A choice not recognised
+/// as either is taken as permitting the call, which is the behaviour before
+/// this check existed.
+pub fn choice_forbids_retrieval(body: &Value, family: ApiFamily) -> bool {
+    let Some(choice) = body.get("tool_choice") else {
+        return false;
+    };
+    if let Some(choice) = choice.as_str() {
+        return choice == "none";
+    }
+    let Some(kind) = choice.get("type").and_then(Value::as_str) else {
+        return false;
+    };
+    match kind {
+        "none" => true,
+        "auto" | "any" | "required" => false,
+        "function" | "tool" => tool_name(choice, family) != Some(RETRIEVE_TOOL_NAME),
+        "allowed_tools" => {
+            let tools = choice
+                .get("allowed_tools")
+                .and_then(|allowed| allowed.get("tools"))
+                .or_else(|| choice.get("tools"))
+                .and_then(Value::as_array);
+            !tools.is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|tool| tool_name(tool, family) == Some(RETRIEVE_TOOL_NAME))
+            })
+        }
+        // A hosted tool forced by type — `file_search`, `web_search` — is
+        // still some other tool.
+        _ => true,
+    }
+}
+
 /// A tool's name in a family's shape, for both injection and call matching.
 pub fn tool_name(tool: &Value, family: ApiFamily) -> Option<&str> {
     match family {
@@ -274,6 +319,55 @@ pub fn arguments_object(arguments: &Value) -> Option<Map<String, Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_choice_forbids_retrieval_only_when_it_rules_our_tool_out() {
+        let forbids = |choice: Value, family| {
+            choice_forbids_retrieval(&json!({ "tool_choice": choice }), family)
+        };
+        let chat = ApiFamily::OpenAiChat;
+        let responses = ApiFamily::OpenAiResponses;
+        let anthropic = ApiFamily::AnthropicMessages;
+
+        assert!(!choice_forbids_retrieval(&json!({}), chat));
+        assert!(forbids(json!("none"), chat));
+        assert!(!forbids(json!("auto"), chat));
+        assert!(!forbids(json!("required"), responses));
+        assert!(forbids(json!({"type": "none"}), anthropic));
+        assert!(!forbids(json!({"type": "any"}), anthropic));
+        assert!(forbids(
+            json!({"type": "tool", "name": "summarize"}),
+            anthropic
+        ));
+        assert!(!forbids(
+            json!({"type": "tool", "name": RETRIEVE_TOOL_NAME}),
+            anthropic
+        ));
+        assert!(forbids(
+            json!({"type": "function", "function": {"name": "summarize"}}),
+            chat
+        ));
+        assert!(forbids(
+            json!({"type": "function", "name": "summarize"}),
+            responses
+        ));
+        assert!(forbids(json!({"type": "file_search"}), responses));
+        assert!(forbids(
+            json!({"type": "allowed_tools", "mode": "auto",
+                   "tools": [{"type": "function", "name": "summarize"}]}),
+            responses
+        ));
+        assert!(!forbids(
+            json!({"type": "allowed_tools", "mode": "auto",
+                   "tools": [{"type": "function", "name": RETRIEVE_TOOL_NAME}]}),
+            responses
+        ));
+        assert!(!forbids(
+            json!({"type": "allowed_tools", "allowed_tools": {"mode": "auto",
+                   "tools": [{"type": "function", "function": {"name": RETRIEVE_TOOL_NAME}}]}}),
+            chat
+        ));
+    }
 
     #[test]
     fn each_family_gets_its_own_tool_shape() {

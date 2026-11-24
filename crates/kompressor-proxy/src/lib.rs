@@ -65,6 +65,7 @@ pub mod authmode;
 mod bodycapture;
 pub mod bodycodec;
 mod cachettl;
+pub mod drift;
 pub mod failopen;
 mod handler;
 pub mod headers;
@@ -74,12 +75,16 @@ pub mod mode;
 mod nonstream;
 mod piggyback;
 pub mod prefixcache;
+mod reasoning;
+pub mod recompact;
 mod retention;
 pub mod retrieve;
 pub mod route;
 pub mod sse;
+pub mod stabilize;
 mod stream;
 pub mod tool;
+pub mod toolcompact;
 pub mod turn;
 mod upstream;
 pub mod websocket;
@@ -112,6 +117,20 @@ pub struct ProxyState {
     /// The upstreams and models that refused `prompt_cache_retention`, so it
     /// is not sent there again.
     pub(crate) retention: Arc<retention::Rejections>,
+    /// The previous request of each conversation, reduced to hashes, so the
+    /// next can say which part of the prefix moved and on which side of this
+    /// proxy. Observation only: nothing reads it to decide what to send.
+    pub(crate) drift: Arc<drift::DriftTracker>,
+    /// The tool order and beta tokens each conversation's first request
+    /// established, for `proxy.tools_order` and `proxy.sticky_beta`.
+    pub(crate) stabilizer: Arc<stabilize::Stabilizer>,
+    /// What each conversation's cold turns decided, for `proxy.cold_recompact`.
+    pub(crate) recompact: Arc<recompact::Recompact>,
+    /// Whether each conversation's tool schemas are compacted, decided when
+    /// it is first seen, for `proxy.tools_compact`.
+    pub(crate) tool_policies: Arc<toolcompact::ToolPolicies>,
+    /// Set by [`ProxyState::fail_next_encode_for_test`]. Never set otherwise.
+    pub(crate) encode_fault: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ProxyState {
@@ -126,13 +145,37 @@ impl ProxyState {
     /// deliberately is not.
     pub fn new(core: Arc<AppCore>, client: reqwest::Client) -> ProxyState {
         let ttl = core.config().proxy.prefix_cache_ttl;
+        let prefixes = Arc::new(prefixcache::PrefixTracker::new(ttl));
+        let keepwarm = Arc::new(keepwarm::KeepWarm::default());
+        let recompact = Arc::new(recompact::Recompact::default());
+        // All of it lives in this process alone, which is what a restart
+        // costs: the Maintenance page asks for the count.
+        let held = (prefixes.clone(), keepwarm.clone(), recompact.clone());
+        core.runtime().holding(move || {
+            let (prefixes, keepwarm, recompact) = &held;
+            let (conversations, frozen, one_hour) = prefixes.held();
+            kompressor_core::runtime::Held {
+                conversations,
+                frozen,
+                one_hour,
+                keep_warm: keepwarm.armed(),
+                recompacted: recompact.tracked(),
+                predicting: recompact.predicting(),
+                wrong_predictions: recompact.wrong_predictions(),
+            }
+        });
         ProxyState {
             core,
             client,
             failopen: Arc::new(FailOpen::default()),
-            prefixes: Arc::new(prefixcache::PrefixTracker::new(ttl)),
-            keepwarm: Arc::new(keepwarm::KeepWarm::default()),
+            prefixes,
+            keepwarm,
             retention: Arc::new(retention::Rejections::default()),
+            drift: Arc::new(drift::DriftTracker::default()),
+            stabilizer: Arc::new(stabilize::Stabilizer::default()),
+            recompact,
+            tool_policies: Arc::new(toolcompact::ToolPolicies::default()),
+            encode_fault: Arc::default(),
         }
     }
 
@@ -145,6 +188,36 @@ impl ProxyState {
     /// Exposed on the same terms as `failopen`: for `/metrics` and for tests.
     pub fn prefixes(&self) -> Arc<prefixcache::PrefixTracker> {
         self.prefixes.clone()
+    }
+
+    /// The proxied requests under way as this is called, which the
+    /// Maintenance page shows. Exposed on the same terms as `prefixes`.
+    pub fn under_way(&self) -> kompressor_core::runtime::InFlight {
+        self.core.runtime().in_flight()
+    }
+
+    /// What this proxy holds in memory alone, as the Maintenance page shows
+    /// it. Exposed on the same terms as `prefixes`.
+    pub fn held(&self) -> Option<kompressor_core::runtime::Held> {
+        self.core.runtime().held()
+    }
+
+    /// What each conversation's cold turns decided, and how its lapse
+    /// predictions have fared. Exposed on the same terms as `prefixes`.
+    pub fn recompact(&self) -> Arc<recompact::Recompact> {
+        self.recompact.clone()
+    }
+
+    /// Have the next rewritten body fail to re-encode in its client's coding,
+    /// as an encoder that errors would.
+    ///
+    /// For tests: no input makes zstd or gzip fail on demand, and what the
+    /// proxy does when one does is a path that has to hold. Nothing in the
+    /// proxy calls it.
+    #[doc(hidden)]
+    pub fn fail_next_encode_for_test(&self) {
+        self.encode_fault
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The keep-warm timers. Exposed on the same terms as `prefixes`.

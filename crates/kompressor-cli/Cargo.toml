@@ -25,7 +25,7 @@ Runs as a library, a CLI, an HTTP API, an MCP server or a reverse proxy."""
 section = "utils"
 priority = "optional"
 assets = [
-    ["../../target/release/kompressor", "usr/bin/", "755"],
+    ["target/release/kompressor", "usr/bin/", "755"],
     ["../../packaging/kompressor.toml", "etc/kompressor/config.toml", "644"],
     ["../../README.md", "usr/share/doc/kompressor/README.md", "644"],
     ["../../docs/QUICKSTART.md", "usr/share/doc/kompressor/QUICKSTART.md", "644"],
@@ -229,6 +229,8 @@ kompressor-server = { path = "../kompressor-server" }
 kompressor-mcp = { path = "../kompressor-mcp" }
 kompressor-proxy = { path = "../kompressor-proxy", default-features = false }
 
+anstream = { workspace = true }
+anstyle = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
 reqwest = { workspace = true }

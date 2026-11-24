@@ -11,12 +11,16 @@
 
 #![forbid(unsafe_code)]
 
+mod backup;
 mod bench;
 mod compress;
+mod db;
 mod error;
 mod explain;
+mod highlight;
 mod input;
 mod report;
+mod restore;
 mod retrieve;
 mod serve;
 mod stats;
@@ -57,6 +61,13 @@ enum Command {
     Bench(BenchCmd),
     /// Load a configuration, validate it, and print it with secrets removed.
     CheckConfig(CheckConfigCmd),
+    /// Write every database to one .tar.gz, without stopping the service.
+    Backup(BackupCmd),
+    /// Put the databases in a backup back. The service must be stopped.
+    Restore(RestoreCmd),
+    /// Describe, check or checkpoint the databases, without stopping the service.
+    #[command(subcommand)]
+    Db(DbCmd),
     /// Run the HTTP API, the MCP tool server and the reverse proxy.
     Serve(ServeCmd),
     /// Serve the tools to an agent runtime that launches this process itself.
@@ -187,6 +198,15 @@ struct CompressCmd {
     /// the compressed payload on standard output stays pipeable.
     #[arg(long)]
     explain: bool,
+    /// Also show the compressed payload on standard error, numbered and
+    /// highlighted: omission markers and their handles, plus JSON, log, diff,
+    /// search, code and config structure. Standard output is unchanged.
+    #[arg(long)]
+    show_output: bool,
+    /// Colour on standard error: auto (a terminal, unless NO_COLOR or
+    /// TERM=dumb), always or never. Standard output is never coloured.
+    #[arg(long, value_enum, default_value_t = highlight::ColorWhen::Auto)]
+    color: highlight::ColorWhen,
 }
 
 #[derive(Args)]
@@ -279,6 +299,24 @@ enum StatsReport {
     },
     /// The most recent fragment-store sample.
     Store,
+    /// What the provider billed and what its prompt cache saved, by model:
+    /// fresh input, cache reads, five-minute and one-hour writes, output, and
+    /// the input priced in input-equivalent tokens against an uncached
+    /// baseline. Keep-warm pings are counted apart.
+    Cache,
+    /// Why messages were left uncompressed, ranked by the tokens they hold,
+    /// and how each engine run ended (compressed, discarded, timed out...).
+    Skips,
+    /// One row per conversation: turns, pings, cache use, cost, engine credit
+    /// and retrieval debit.
+    Conversations {
+        /// Rows to print.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// cost, turns, saved (least net saving first) or recent.
+        #[arg(long, default_value = "cost", value_parser = ["cost", "turns", "saved", "recent"])]
+        sort: String,
+    },
     /// One self-contained HTML page: headline, trend, types, retrievals.
     ///
     /// Written to stdout, so `kompressor stats report > report.html`. No
@@ -349,6 +387,67 @@ enum BenchAction {
 }
 
 #[derive(Args)]
+struct RestoreCmd {
+    /// The archive `kompressor backup` or the Maintenance page wrote.
+    archive: PathBuf,
+    /// The configuration naming where the databases are kept.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// Restore one database, `stats.db` or `refs.db`, and leave the other.
+    #[arg(long, value_name = "NAME")]
+    only: Option<String>,
+    /// Do it. Without this the archive is checked and what would happen is
+    /// printed; nothing is changed.
+    #[arg(long)]
+    yes: bool,
+    /// Print the outcome as one JSON object instead of a summary.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Subcommand)]
+enum DbCmd {
+    /// Size, write-ahead log, schema version and reclaimable space of each.
+    Status(DbArgs),
+    /// Run a full integrity check. Exits 1 if a database is damaged.
+    Check(DbArgs),
+    /// Fold the write-ahead log into the database file.
+    Checkpoint(DbArgs),
+}
+
+#[derive(Args)]
+struct DbArgs {
+    /// One database, `stats.db` or `refs.db`. Both when omitted.
+    name: Option<String>,
+    /// The configuration naming the databases.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// Print one JSON array instead of a line per database.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct BackupCmd {
+    /// Where to write the archive: a file to create, or a directory to put a
+    /// timestamped one in. Defaults to the current directory. An existing
+    /// file is never replaced.
+    #[arg(long, short = 'o', value_name = "PATH")]
+    out: Option<PathBuf>,
+    /// The configuration naming the databases to back up.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// Print what was written as one JSON object instead of a summary.
+    #[arg(long)]
+    json: bool,
+    /// After writing into a directory, keep only this many archives there
+    /// and remove the older ones. Only files named as this command names
+    /// them are ever removed.
+    #[arg(long, value_name = "N")]
+    keep: Option<u32>,
+}
+
+#[derive(Args)]
 struct CheckConfigCmd {
     /// Configuration file. Without one the built-in defaults are validated,
     /// which is a working single-tenant deployment.
@@ -359,7 +458,10 @@ struct CheckConfigCmd {
 fn main() {
     let cli = Cli::parse();
     if let Err(error) = run(cli) {
-        eprintln!("kompressor: {error}");
+        // The agent's own failure is not ours to announce.
+        if !matches!(error, CliError::AgentExit(_)) {
+            eprintln!("kompressor: {error}");
+        }
         std::process::exit(error.code());
     }
 }
@@ -374,6 +476,8 @@ fn run(cli: Cli) -> CliResult {
             forced: args.forced_type,
             json: args.json,
             explain: args.explain,
+            show_output: args.show_output,
+            color: args.color,
         }),
         Command::Detect(args) => compress::detect(compress::DetectArgs {
             file: args.file,
@@ -402,6 +506,17 @@ fn run(cli: Cli) -> CliResult {
                     StatsReport::Retrievals => stats::Report::Retrievals,
                     StatsReport::Request { id } => stats::Report::Request { id },
                     StatsReport::Store => stats::Report::Store,
+                    StatsReport::Cache => stats::Report::Cache,
+                    StatsReport::Skips => stats::Report::Skips,
+                    StatsReport::Conversations { limit, sort } => stats::Report::Conversations {
+                        limit,
+                        order: match sort.as_str() {
+                            "turns" => kompressor_stats::breakdown::ConversationOrder::Turns,
+                            "saved" => kompressor_stats::breakdown::ConversationOrder::Saved,
+                            "recent" => kompressor_stats::breakdown::ConversationOrder::Recent,
+                            _ => kompressor_stats::breakdown::ConversationOrder::Cost,
+                        },
+                    },
                     StatsReport::Report { bucket } => stats::Report::Html { bucket },
                 },
                 stats_path: args.stats_path,
@@ -462,6 +577,28 @@ fn run(cli: Cli) -> CliResult {
         }),
         Command::Unwrap(args) => wrap::unwrap_agent(wrap::UnwrapArgs { agent: args.agent }),
         Command::CheckConfig(args) => check_config(args.config.as_deref()),
+        Command::Backup(args) => backup::run(
+            args.config.as_deref(),
+            args.out.as_deref(),
+            args.json,
+            args.keep,
+        ),
+        Command::Restore(args) => restore::run(
+            &args.archive,
+            args.config.as_deref(),
+            args.only.as_deref(),
+            args.yes,
+            args.json,
+        ),
+        Command::Db(DbCmd::Status(args)) => {
+            db::status(args.config.as_deref(), args.name.as_deref(), args.json)
+        }
+        Command::Db(DbCmd::Check(args)) => {
+            db::check(args.config.as_deref(), args.name.as_deref(), args.json)
+        }
+        Command::Db(DbCmd::Checkpoint(args)) => {
+            db::checkpoint(args.config.as_deref(), args.name.as_deref(), args.json)
+        }
         Command::Serve(args) => {
             let config =
                 Config::load(args.config.as_deref()).map_err(|e| CliError::Usage(e.to_string()))?;

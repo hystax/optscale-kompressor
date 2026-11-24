@@ -23,6 +23,8 @@ tower-http = { workspace = true }
 tokio = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
+# The backup archive is streamed from disk; this is the stream.
+futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -33,9 +35,18 @@ thiserror = { workspace = true }
 # `default-features = false` drops the exporter's own hyper listener and TLS
 # stack — /metrics is served by our router, so none of it would ever run.
 metrics = "0.24"
+# Free space on a filesystem, for the Maintenance page: the standard library
+# has no call for it, and this one is the same on every platform we ship for.
+fs4 = { version = "1", default-features = false, features = ["sync"] }
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 http-body-util = { workspace = true }
 tempfile = "3"
+# To write a configuration the way an operator would, in a test.
+toml = { workspace = true }
+# To open the backup archive the maintenance route answers with.
+tar = { workspace = true }
+flate2 = { workspace = true }
+rusqlite = { workspace = true }

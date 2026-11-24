@@ -45,9 +45,12 @@ and the entries below differ:
   removed on exit, everything outside them preserved byte for byte. `wrap`
   reads the login mode from codex's own `auth.json`; `kompressor unwrap codex`
   removes a block left behind by a session that was killed.
-- **opencode** reads it only for its built-in `openai` provider. A provider
-  declared in `opencode.json` carries its own `options.baseURL`, and config
-  beats environment — so point that provider at the proxy instead.
+- **opencode** (2.x) must not get the variable at all: `OPENAI_BASE_URL` in its
+  environment makes every OpenAI model "unavailable" (measured on 2.2.4). It is
+  wrapped through its configuration instead — `OPENCODE_CONFIG_CONTENT` plus
+  `--standalone` for a launched session, the global `opencode.json` and an
+  `opencode reload` for `--attach`, which is how OpenCode Desktop is reached.
+  [OPENCODE.md](OPENCODE.md) has the details.
 - **claude** reads it and routes correctly. It pins its whole prompt with a
   `cache_control` breakpoint, so compression needs
   `proxy.providers.anthropic.frozen_prefix = "first_seen"`, which the packaged
@@ -66,7 +69,7 @@ Agents kompressor wrap knows:
   cursor        Cursor (GUI editor; base URL set by hand in Settings)
   claude        Claude Code (Anthropic Messages)
   codex         OpenAI Codex CLI (OpenAI Responses), via a -c flag or its config file
-  opencode      opencode (OpenAI Chat; only for its built-in `openai` provider)
+  opencode      opencode CLI/TUI and Desktop (openai, anthropic, OpenCode Zen and Go), via its config
   aider         aider (OpenAI Chat or Anthropic Messages, by model)
 
 Anything else: kompressor wrap --env NAME=root|v1 -- <command> [args]
@@ -253,9 +256,237 @@ $ curl -s localhost:8817/v1/retrieve -H 'content-type: application/json' \
 | `POST /v1/retrieve` | a handle in, the elided bytes out |
 | `POST /v1/detect` | classify a payload without compressing it |
 | `GET /v1/stats/summary` `by_type` `histogram` `requests` `retrievals` `store` | the same reports as `kompressor stats` — mounted only when `stats.enabled` (the default); with statistics off the whole prefix 404s |
+| `GET /v1/stats/live` | live statistics: JSON, or a dashboard that refreshes itself when opened in a browser (`?format=html`) |
+| `GET /v1/stats/cache` | prompt-cache analysis: reads, writes and lost prefixes per conversation, keep-warm, idle gaps — JSON or a page (`?format=html`) |
+| `GET /v1/stats/trends` `yield` `store-health` `keepwarm` `upstream` `engine` | the dashboards: long-horizon trends, yield by content type, ref-store health, keep-warm return, upstream incidents, engine time — JSON or a page (`?format=html`); on the statistics listener at `/trends`, `/yield`, `/store`, `/keepwarm`, `/upstream`, `/engine`, with a conversation timeline at `/timeline` |
+| `GET /v1/refs` | the ref browser: the fragments recoverable compression stored, searchable, as JSON or a page — off unless `refs.browse = true` |
+| `POST /v1/maintenance/backup` | every database as one `.tar.gz`, from the Maintenance page or `curl` — off unless `maintenance.backup = true`; `kompressor backup` does the same from a shell |
 | `GET /healthz` `/readyz` `/metrics` | liveness, readiness, Prometheus |
 
 `/v2` is served as an alias of `/v1` so a client pinned to either keeps working.
+
+### Live statistics on a port of their own
+
+```toml
+[server]
+stats_listen = "127.0.0.1:8818"
+```
+
+Then open `http://127.0.0.1:8818/` for the dashboard, or ask for JSON:
+
+```bash
+curl -s 'http://127.0.0.1:8818/v1/stats/live?window=15m&recent=10'
+```
+
+`http://127.0.0.1:8818/cache` is the cache analysis (below), and
+`/v1/stats/cache` its JSON.
+
+The listener serves only the dashboard, the cache page, the JSON and the probes, and it runs
+whatever surfaces `serve` was started with — so a proxy-only service has a
+dashboard too. Leave `stats_listen` empty to serve `/v1/stats/live` only on the
+API listener. `KOMPRESSOR__SERVER__STATS_LISTEN` sets it from the environment.
+
+### Analysing the prompt cache
+
+`/cache` on the statistics listener, or `/v1/stats/cache` on the API listener,
+shows what the provider's prompt cache did with the traffic the proxy relayed:
+
+- how much input was read from cache, written to it (five-minute and one-hour
+  entries apart) and sent fresh, and what that cost against no cache at all,
+  in input-equivalent tokens so that no price list is needed;
+- every turn that failed to read back what the previous turn of its
+  conversation left cached, and why: **expiry** when the conversation had idled
+  past the cache lifetime (five minutes, or an hour once it wrote one-hour
+  entries), a **prefix change** when it had not — something rewrote the bytes;
+- the idle gaps before client turns, and how often each length was read back;
+- the keep-warm pings: warm, cold, failed, what they cost, and how many pauses
+  over five minutes they bridged;
+- each conversation, the costliest losses first; click one for its turns.
+
+```bash
+curl -s 'http://127.0.0.1:8818/v1/stats/cache?window=24h&conversations=20'
+curl -s 'http://127.0.0.1:8818/v1/stats/cache?window=24h&conversation=0123456789abcdef'
+```
+
+It reads only counts, like the live view, so it needs no switch beyond
+statistics being on, and the same key.
+
+### Browsing the ref store
+
+Recoverable compression keeps what it elided behind a handle. To see what is
+there — what the proxy took out of a session, whether a secret ended up in a
+fragment — turn the ref browser on:
+
+```toml
+[refs]
+browse = true
+```
+
+Then open `/v1/refs` on the API listener, or `http://127.0.0.1:8818/refs` on
+the statistics listener, for a page that lists the fragments newest first, with
+search over their text, handles and request ids, filters by kind, and each
+fragment in full with every time a model asked for it. JSON is the same path:
+
+```bash
+curl -s 'http://127.0.0.1:8080/v1/refs?q=AWS_SECRET&order=largest&limit=20'
+curl -s 'http://127.0.0.1:8080/v1/refs/k_AbC123dEf456'
+curl -s -X DELETE 'http://127.0.0.1:8080/v1/refs/k_AbC123dEf456'
+```
+
+Looking is not using: nothing here restarts a fragment's idle window or counts
+as a retrieval. A key sees only its own tenant's fragments. Fragments are tool
+output, so the browser is off by default — with it on and `auth.mode = "none"`,
+anyone who can reach the listener can read them. `KOMPRESSOR__REFS__BROWSE=true`
+sets it from the environment.
+
+### Backing up
+
+Two files hold what cannot be recomputed: `stats.db`, the history every
+dashboard is drawn from, and `refs.db`, the content behind every handle. A
+backup is a consistent snapshot of both in one `.tar.gz`, taken while the
+service runs.
+
+From a shell on the host — nothing to turn on, and the thing to schedule:
+
+```bash
+kompressor backup --config /etc/kompressor/config.toml --out /var/backups/kompressor
+```
+
+`--out` is a directory to put a timestamped archive in
+(`kompressor-backup-20261120-071530.tar.gz`) or a file to create; an existing
+file is never replaced. The archive is created readable by its owner alone.
+
+From a browser, turn it on:
+
+```toml
+[maintenance]
+backup = true
+```
+
+and open **Maintenance** — beside *Ref store* on every page, at
+`http://127.0.0.1:8818/maintenance` on the statistics listener — then
+*Download backup*. Or:
+
+```bash
+curl -s -X POST -OJ http://127.0.0.1:8080/v1/maintenance/backup
+```
+
+The archive holds every tenant's statistics and every stored fragment, so it is
+off by default, and with API keys configured a tenant's key does not unlock it:
+send the shared secret (`x-kompressor-secret`). The configuration and the
+interception CA are not included — they hold keys.
+
+To have the service take them itself, give it a directory:
+
+```toml
+[maintenance]
+backup_dir = "/var/lib/kompressor/backups"
+backup_every = "1day"
+backup_keep = 7
+```
+
+`serve` then writes an archive whenever the newest one there is older than
+`backup_every`, and keeps the newest `backup_keep`. The schedule is read from
+the directory, so it holds across restarts. Under the shipped systemd unit only
+the state directory is writable, which is why the example is inside it — and a
+backup on the disk it backs up survives a bad upgrade, not a dead disk, so copy
+the archives off the host. The Maintenance page lists them and, with
+`backup = true`, downloads them. From a shell, `kompressor backup --out DIR
+--keep 7` does one round of the same.
+
+To have the service copy them off the host itself, point it at an
+S3-compatible bucket (AWS S3, MinIO, Cloudflare R2, Backblaze B2, Wasabi):
+
+```toml
+[maintenance.s3]
+enabled = true
+bucket = "my-kompressor-backups"
+access_key_id = "AKIA…"
+secret_access_key = "…"
+# anything but AWS S3:
+# endpoint = "https://minio.internal:9000"
+# region = "auto"
+```
+
+Each scheduled archive is then uploaded, with its `.sha256`, as soon as it is
+written; one that could not be (the store was down) is retried every 15
+minutes. The Maintenance page's *Off-site copy* section tests the connection,
+lists the bucket and uploads on demand (it needs `backup = true`, as a
+download does). The key is never shown, and `keep` (default 0, all) can prune
+the bucket — a lifecycle rule on the bucket is the safer way to expire
+archives. To restore, download an archive with any S3 client, check it with
+`sha256sum -c`, and run `kompressor restore` as usual.
+
+The same page describes each database — size, write-ahead log, schema version,
+the space a vacuum would reclaim — with nothing turned on, along with when
+retention last ran and what it removed, how much disk is left, and (*Space*)
+which tables the bytes are in. Four actions need `actions = true`: *Check*
+runs a full integrity check, *Checkpoint* folds the write-ahead log into the
+file, *Vacuum* rewrites the file without its free pages (it needs about twice
+the file's size free, and holds writes while it runs) and *Optimize* gathers
+the statistics SQLite picks indexes by. The first two also run from a shell:
+
+```bash
+kompressor db status --config /etc/kompressor/config.toml
+kompressor db check --config /etc/kompressor/config.toml
+kompressor db checkpoint --config /etc/kompressor/config.toml
+```
+
+`db check` exits 1 if a database is damaged, so a scheduled job can alarm on it.
+
+Every check, checkpoint, vacuum, optimize, trim, delete and verification is
+recorded — from the page or the schedule — and the page shows each database's
+last of each and the recent history; the record survives restarts and erases.
+The top of the page says what is running: version and commit, uptime, the
+binary, and a warning when an upgrade was installed and the service not
+restarted.
+
+`stats.db` is mostly each request's copy of the effective settings. *Trim or
+delete statistics* empties that copy (the requests and every analysis breakdown
+stay), or deletes the requests themselves — before a day, of a tenant, or of
+one `run_id`/`experiment_id`. Always preview first; deleting needs
+`erase = true` and the phrase `delete statistics`, trimming needs only
+`actions = true`. To trim continuously, set in `[stats]`:
+
+```toml
+context_retention_days = 14
+```
+
+`serve` refreshes the planner's statistics daily (`optimize_every = "1day"`),
+and new `refs.db` files hand freed pages back after each sweep; *Vacuum* on an
+older `refs.db` converts it once.
+
+The page ends with a danger zone: *Nuke all stats* deletes every statistic
+recorded, for every tenant, and leaves the fragments and the record of backups
+alone. It is off unless `erase = true`, asks twice, and can only be undone by
+restoring a backup — take one first.
+
+Every backup — scheduled, downloaded, or taken with `kompressor backup` — is
+recorded, and the Maintenance page shows when the last one was and the recent
+history. The Health page carries it as a check: with a schedule it warns when
+the last backup is older than twice `backup_every` (one was missed), and you
+can set the age yourself with `backup_max_age = "7days"`. With neither, the age
+is shown and not judged.
+
+Each scheduled archive (and each from `kompressor backup --out DIR`) has a
+`<name>.sha256` beside it; check a copy anywhere with `sha256sum -c`. *Verify*
+on the page checks an archive as a restore would — checksum, manifest and a
+full integrity check of each database — without stopping anything.
+
+To restore, stop the service and run, on the host:
+
+```bash
+kompressor restore kompressor-backup-20261120-071530.tar.gz --config /etc/kompressor/config.toml
+```
+
+That is a rehearsal: the archive is checked in full — it is a backup this build
+can read, each database in it passes an integrity check — and what would happen
+is printed. Nothing changes until you add `--yes`. Then each existing database
+is moved aside to `<name>.before-restore-<time>`, never deleted, and the
+restored one takes its place with the same owner and permissions. `--only
+stats.db` or `--only refs.db` restores one and leaves the other. It refuses to
+run while the service has the databases open. An older database is migrated
+when the service starts; one written by a newer build is refused.
 
 ---
 
@@ -314,6 +545,15 @@ accounting guard refused the result:
 
 ```bash
 kompressor compress mystery.txt --explain
+```
+
+Add `--show-output` to see the compressed payload itself on standard error,
+numbered, with every omission marker and its handle highlighted. Colour goes to
+standard error only, when it is a terminal (`--color always|never` to choose);
+the payload on standard output is never touched:
+
+```bash
+kompressor compress mystery.txt --explain --show-output
 ```
 
 Fetch a fragment back without a server, narrowing it so you pay for what you
@@ -696,13 +936,23 @@ three places, first match wins:
 | 3 | `$XDG_CONFIG_HOME/kompressor/config.toml`, or `~/.config/kompressor/config.toml` when that variable is unset |
 
 `/etc/kompressor/config.toml` appears nowhere in that list: the service reads it
-only because the unit passes `--config` explicitly. So a bare `kompressor stats`
-run by a human does not find the system config. Worse, if you also have a user
-config it finds *that* one and answers from the wrong store without saying so:
+only because the unit passes `--config` explicitly. `kompressor stats` is the
+one command that looks there too, and only when the search path found nothing.
+If you also have a user config it finds *that* one, and when its store exists
+it answers from the wrong store without saying so:
 
 ```bash
 $ kompressor stats summary      # with a user config present
 requests   6                    # your own store, not /var/lib/kompressor
+```
+
+A user config whose store does *not* exist (left over from running the service
+by hand before installing the package) gives way to the system one, and says so
+on stderr:
+
+```text
+kompressor: ~/.config/kompressor/config.toml names ~/.local/share/kompressor/stats.db,
+which does not exist; reading /var/lib/kompressor/stats.db from /etc/kompressor/config.toml instead.
 ```
 
 Three ways to ask the right one:

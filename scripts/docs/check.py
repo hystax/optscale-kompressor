@@ -425,7 +425,8 @@ def check_counts() -> None:
 
 
 def check_endpoints() -> None:
-    """Every documented HTTP path is served, with statistics on."""
+    """Every documented HTTP path is served, with statistics and the ref
+    browser on — both are mounted or answer only when configured."""
     paths = set()
     for name in DOCS:
         text = (ROOT / name).read_text()
@@ -441,7 +442,7 @@ def check_endpoints() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         config = Path(tmp) / "c.toml"
         config.write_text(
-            '[refs]\nbackend = "memory"\n'
+            '[refs]\nbackend = "memory"\nbrowse = true\n'
             f'[stats]\nenabled = true\npath = "{tmp}/s.db"\n'
             '[log]\nlevel = "error"\n'
         )

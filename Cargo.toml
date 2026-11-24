@@ -7,7 +7,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "1.6.1"
+version = "2.6.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -24,6 +24,10 @@ memchr = "2"
 blake2 = "0.11"
 base64 = "0.23"
 flate2 = "1"
+# The backup archive (`kompressor backup`, the Maintenance page): a plain tar
+# of database snapshots. Default features off drops the xattr support, which
+# a backup of three regular files has no use for.
+tar = { version = "0.4", default-features = false }
 # Request-body decoding. codex sends `content-encoding: zstd` on every request
 # (measured on 0.155.1), and a body the proxy cannot parse is a body it cannot
 # compress — so this is the difference between working and silently not.
@@ -36,7 +40,7 @@ tree-sitter-typescript = "0.23"
 tree-sitter-go = "0.25"
 tree-sitter-rust = "0.24"
 tree-sitter-java = "0.23"
-tree-sitter-c-sharp = "0.23"
+tree-sitter-c-sharp = "0.24"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 
@@ -82,16 +86,34 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["c
 # 0.12's `rustls-tls-webpki-roots` is `webpki-roots` + `__rustls-ring`: one
 # provider, one root store, no platform verifier, and it matches
 # tokio-tungstenite's feature of the same name above.
+#
+# Re-tested against 0.13.5, so a dependency report saying "outdated" can be
+# answered without repeating the experiment:
+#
+#   * the private `__rustls` on its own does not compile — the client calls
+#     `rustls_platform_verifier` from code gated only on that feature.
+#   * `rustls-no-provider` builds and keeps aws-lc-rs out, but needs every
+#     client handed a finished rustls config (it panics at build time without a
+#     provider), and the verifier is still linked: `make macos-pkg-docker`
+#     fails on both Apple targets with "unable to find framework 'Security'"
+#     and "'CoreFoundation'", even though nothing calls it.
+#
+# Revisit when reqwest offers rustls without the platform verifier, or the
+# macOS builder gains an SDK.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "http2", "stream", "json"] }
 url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 
 # --- storage ---
-rusqlite = { version = "0.42", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 
 # --- cli / config ---
 clap = { version = "4", features = ["derive", "env"] }
+# Colour on standard error for `compress --explain`. Both already come in with
+# clap's own coloured help, so naming them adds no crate to the build.
+anstream = "1"
+anstyle = "1"
 toml = "1"
 humantime-serde = "1"
 

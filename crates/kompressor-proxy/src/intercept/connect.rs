@@ -93,14 +93,12 @@ where
     S: tokio::io::AsyncRead + Unpin,
 {
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    let mut read = 0usize;
+    let mut left = MAX_HEADER_BYTES;
 
-    if reader.read_line(&mut line).await.is_err() || line.is_empty() {
-        return Err((Refusal::Unreadable, reader));
-    }
-    read += line.len();
-
+    let line = match read_line_within(&mut reader, &mut left).await {
+        Some(line) if !line.is_empty() => line,
+        _ => return Err((Refusal::Unreadable, reader)),
+    };
     let target = match parse_request_line(line.trim_end()) {
         Ok(t) => t,
         Err(e) => return Err((e, reader)),
@@ -109,23 +107,49 @@ where
     // Drain to the blank line. A CONNECT has no body, so whatever follows the
     // headers belongs to the tunnel.
     loop {
-        let mut header = String::new();
-        match reader.read_line(&mut header).await {
-            Ok(0) => return Err((Refusal::Unreadable, reader)),
-            Ok(n) => {
-                read += n;
-                if header.trim().is_empty() {
-                    break;
-                }
-                if read > MAX_HEADER_BYTES {
-                    return Err((Refusal::Unreadable, reader));
-                }
-            }
-            Err(_) => return Err((Refusal::Unreadable, reader)),
+        match read_line_within(&mut reader, &mut left).await {
+            Some(header) if header.is_empty() => return Err((Refusal::Unreadable, reader)),
+            Some(header) if header.trim().is_empty() => break,
+            Some(_) => {}
+            None => return Err((Refusal::Unreadable, reader)),
         }
     }
 
     Ok((target, reader))
+}
+
+/// One line, newline included, taken out of the `left` bytes the whole header
+/// block may still use. `Some("")` is end of input; `None` is a read error, a
+/// line that is not UTF-8, or one that does not end within the allowance.
+///
+/// `read_line` cannot be used for this: it has no limit, so checking the total
+/// *after* it returns let a client that never sends a newline grow the buffer
+/// without bound, on a listener that reads before it authenticates anything.
+async fn read_line_within<S>(reader: &mut BufReader<S>, left: &mut usize) -> Option<String>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf().await.ok()?;
+        if available.is_empty() {
+            break;
+        }
+        let (take, ended) = match available.iter().position(|byte| *byte == b'\n') {
+            Some(at) => (at + 1, true),
+            None => (available.len(), false),
+        };
+        if take > *left {
+            return None;
+        }
+        *left -= take;
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if ended {
+            break;
+        }
+    }
+    String::from_utf8(line).ok()
 }
 
 /// Tell the client its tunnel is open. Everything after this is its own bytes.
@@ -151,6 +175,120 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    /// A reader that counts what is pulled out of it, so a test can say how
+    /// much of an endless input was actually consumed.
+    struct Counted<R> {
+        inner: R,
+        pulled: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Counted<R> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let before = buf.filled().len();
+            let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+            self.pulled.fetch_add(
+                buf.filled().len() - before,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            poll
+        }
+    }
+
+    /// A request line that never ends is refused once the header allowance is
+    /// spent — not after the whole of it has been buffered. `read_line` has no
+    /// limit of its own, so 64 MiB of `A` used to be read into one `String`
+    /// before the size was looked at.
+    #[test]
+    fn an_endless_request_line_is_refused_at_the_cap() {
+        let pulled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let input = Counted {
+            inner: tokio::io::repeat(b'A').take(64 << 20),
+            pulled: pulled.clone(),
+        };
+        let result = block_on(read_connect(input));
+        assert!(matches!(result, Err((Refusal::Unreadable, _))));
+        let pulled = pulled.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            pulled <= MAX_HEADER_BYTES + 64 * 1024,
+            "{pulled} bytes were read before the refusal"
+        );
+    }
+
+    /// The same for one header with no newline after a valid request line.
+    #[test]
+    fn an_endless_header_is_refused_at_the_cap() {
+        let pulled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let head: &[u8] = b"CONNECT api.anthropic.com:443 HTTP/1.1\r\nX-Pad: ";
+        let input = Counted {
+            inner: head.chain(tokio::io::repeat(b'A').take(64 << 20)),
+            pulled: pulled.clone(),
+        };
+        let result = block_on(read_connect(input));
+        assert!(matches!(result, Err((Refusal::Unreadable, _))));
+        assert!(pulled.load(std::sync::atomic::Ordering::Relaxed) <= MAX_HEADER_BYTES + 64 * 1024);
+    }
+
+    /// Many small headers that together pass the allowance are refused too.
+    #[test]
+    fn headers_that_add_up_past_the_cap_are_refused() {
+        let mut request = b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n".to_vec();
+        for i in 0..2_000 {
+            request.extend_from_slice(format!("X-H{i}: value\r\n").as_bytes());
+        }
+        request.extend_from_slice(b"\r\n");
+        assert!(request.len() > MAX_HEADER_BYTES);
+        let result = block_on(read_connect(&request[..]));
+        assert!(matches!(result, Err((Refusal::Unreadable, _))));
+    }
+
+    /// An ordinary request still reads, and the bytes after the blank line —
+    /// the start of the TLS handshake — are left for the tunnel.
+    #[test]
+    fn a_normal_request_reads_and_leaves_the_handshake_bytes() {
+        let request: &[u8] =
+            b"CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\nProxy-Connection: keep-alive\r\n\r\n\x16\x03\x01hello";
+        let (target, mut reader) = match block_on(read_connect(request)) {
+            Ok(pair) => pair,
+            Err((refusal, _)) => panic!("refused: {refusal:?}"),
+        };
+        assert_eq!(
+            (target.host.as_str(), target.port),
+            ("api.anthropic.com", 443)
+        );
+        let mut rest = Vec::new();
+        block_on(reader.read_to_end(&mut rest)).unwrap();
+        assert_eq!(rest, b"\x16\x03\x01hello");
+    }
+
+    /// Input that ends before the blank line, or is empty, is unreadable.
+    #[test]
+    fn a_request_cut_short_is_unreadable() {
+        for input in [
+            &b""[..],
+            b"CONNECT a:1 HTTP/1.1\r\n",
+            b"CONNECT a:1 HTTP/1.1\r\nHost: a",
+        ] {
+            assert!(
+                matches!(block_on(read_connect(input)), Err((Refusal::Unreadable, _))),
+                "{:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
 
     #[test]
     fn parses_a_normal_connect() {

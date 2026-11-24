@@ -68,6 +68,8 @@ impl fmt::Display for Surface {
 /// One compression of one request: the credit side of the token economy.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OptimizationEvent {
+    #[serde(default)]
+    pub context: Option<crate::context::RunContext>,
     /// Request start in milliseconds since the Unix epoch (see the module doc).
     pub time_ms: i64,
     /// Tenant the request was billed to.
@@ -147,6 +149,7 @@ impl OptimizationEvent {
         mode: Mode,
     ) -> OptimizationEvent {
         OptimizationEvent {
+            context: None,
             time_ms,
             tenant: tenant.into(),
             request_id: request_id.into(),
@@ -195,6 +198,8 @@ impl OptimizationEvent {
 /// One attempt to fetch a fragment back: the debit side of the token economy.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RetrievalEvent {
+    #[serde(default)]
+    pub context: Option<crate::context::RunContext>,
     /// Request start in milliseconds since the Unix epoch.
     pub time_ms: i64,
     /// Tenant the retrieval was billed to.
@@ -251,12 +256,6 @@ pub struct RetrievalEvent {
     /// The split the 2026-11-11 review asked for: a whole-fragment read the
     /// model meant and one whose narrowing failed looked identical before,
     /// and only the second is a cost the tool's guidance can fix.
-    ///
-    /// Not persisted on this line yet: the column is stats schema v14, after
-    /// the v13 that `experimental/v2` already assigned, and it arrives with
-    /// that branch. Claiming v13 here would give one version number two
-    /// schemas, and a database stamped by one line would fail to open on the
-    /// other. Until then the status reaches the model and in-process sinks.
     #[serde(default)]
     pub range_status: Option<String>,
 }
@@ -292,6 +291,14 @@ pub struct ProtectedRefEvent {
 /// saving the provider had already discounted as a cache read.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProxyRequestEvent {
+    #[serde(default)]
+    pub context: Option<crate::context::RunContext>,
+    #[serde(default)]
+    pub timing: Option<crate::context::ProxyTiming>,
+    /// What the proxy saw of the request's cacheable prefix; `None` where it
+    /// could not look (an unparsed body, a relayed frame, a keep-warm ping).
+    #[serde(default)]
+    pub prefix: Option<crate::context::PrefixObservation>,
     /// Request start in milliseconds since the Unix epoch.
     pub time_ms: i64,
     /// Tenant the request was billed to.
@@ -382,6 +389,56 @@ pub struct StoreSample {
     pub live_bytes: i64,
 }
 
+/// One backup: taken, or tried.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupEvent {
+    /// When it finished, milliseconds since the Unix epoch.
+    pub time_ms: i64,
+    /// What asked for it: `schedule`, `http` (the Maintenance page or its
+    /// route) or `cli` (`kompressor backup`).
+    pub origin: String,
+    /// Where the archive went: a path, or `download` for one sent to the
+    /// caller and kept nowhere.
+    pub destination: String,
+    /// Size of the archive. Zero for one that failed.
+    pub bytes: i64,
+    /// Databases in it.
+    pub databases: i64,
+    pub ok: bool,
+    /// Why not, when it failed.
+    pub error: Option<String>,
+}
+
+/// One piece of maintenance work: run, or tried. The Maintenance page's
+/// history, and what "when was this database last checked / vacuumed /
+/// optimized" is answered from after a restart.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceEvent {
+    /// When it finished, milliseconds since the Unix epoch.
+    pub time_ms: i64,
+    /// `check`, `checkpoint`, `vacuum`, `optimize`, `erase`, `delete`,
+    /// `trim` or `verify`.
+    pub action: String,
+    /// What it worked on: a database (`stats.db`, `refs.db`) or an archive's
+    /// name.
+    pub target: String,
+    /// What asked for it: `http` (the Maintenance page or its route),
+    /// `schedule` or `cli`.
+    pub origin: String,
+    /// Who asked, when a caller did: the tenant the credential resolved to.
+    pub actor: Option<String>,
+    pub took_ms: i64,
+    pub ok: bool,
+    /// The target's size before and after, where the action changes it.
+    pub bytes_before: Option<i64>,
+    pub bytes_after: Option<i64>,
+    /// What it found or did, as JSON: an integrity check's problems, the
+    /// rows a delete removed, an archive's verdict.
+    pub detail: Option<String>,
+    /// Why not, when it failed.
+    pub error: Option<String>,
+}
+
 /// Anything the writer can be handed.
 ///
 /// Externally tagged — `{"optimization": {…}}` — rather than carrying a `type`
@@ -415,6 +472,10 @@ pub enum Event {
         /// The request whose rewrite was dropped.
         request_id: String,
     },
+    /// A backup was taken, or failed.
+    Backup(BackupEvent),
+    /// Maintenance work was done on a database or an archive.
+    Maintenance(MaintenanceEvent),
     /// The fragment store was measured.
     StoreSample {
         /// When the sample was taken, milliseconds since the Unix epoch.
@@ -437,6 +498,8 @@ impl Event {
             // an amendment to a row that already carries its own timestamp
             Event::Discarded { .. } => 0,
             Event::StoreSample { time_ms, .. } => *time_ms,
+            Event::Backup(e) => e.time_ms,
+            Event::Maintenance(e) => e.time_ms,
         }
     }
 
@@ -448,7 +511,7 @@ impl Event {
             Event::ProtectedRefs(e) => Some(&e.tenant),
             Event::ProxyRequest(e) => Some(&e.tenant),
             Event::Discarded { tenant, .. } => Some(tenant),
-            Event::StoreSample { .. } => None,
+            Event::StoreSample { .. } | Event::Backup(_) | Event::Maintenance(_) => None,
         }
     }
 }

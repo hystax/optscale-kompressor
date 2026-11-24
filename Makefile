@@ -27,7 +27,7 @@ SHELL := /bin/bash
 help: ## List the targets worth knowing
 	@awk 'BEGIN {FS = ":.*##"; printf "\nkompressor\n"} \
 		/^##@ / { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } \
-		/^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+		/^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-26s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 	@echo
 
 .PHONY: build
@@ -104,9 +104,15 @@ sync-check: ## Org invariants: crates carry `repository`, CI uses only allowed a
 check: lint test bench bench-selftest docs-check ## Everything CI gates on (no docker; see `check-full`)
 
 .PHONY: bench-selftest
-bench-selftest: ## The benchmark reader's own checks. No build, no provider, no spend
+bench-selftest: ## The benchmark and replay scripts' own checks. No provider, no spend
 	python3 scripts/harbor/bench.py --self-test
 	python3 scripts/harbor/ab.py --self-test
+	# The scripts a run is read with. They decide whether a cache loss is
+	# called ours and whether a replay can reach a provider, and until they ran
+	# here a wrong answer from either was found by reading a report. The replay
+	# suite drives a built binary where there is one, and skips that where not.
+	python3 -m unittest discover -s scripts/harbor -p 'test_*.py'
+	python3 -m unittest discover -s scripts/bench -p 'test_*.py'
 
 .PHONY: check-full
 check-full: check e2e ## `check` plus the hermetic end-to-end suite. Needs docker
@@ -135,10 +141,10 @@ test-cache-replay: ## Price a captured run through the proxy: make test-cache-re
 	  -p kompressor-proxy --test cachesavings a_captured_run -- --nocapture
 
 .PHONY: replay-diff
-replay-diff: release ## Byte-compare upstream traffic of two binaries on a capture: make replay-diff BODIES=… BASE_BIN=…
+replay-diff: release ## Byte-compare upstream traffic of two binaries on a capture: make replay-diff BODIES=… BASE_BIN=… [CONFIG=…]
 	@[ -n "$(BODIES)" ] && [ -n "$(BASE_BIN)" ] || { echo "set BODIES (a kompressor-bodies.jsonl) and BASE_BIN (the binary to compare against)" >&2; exit 2; }
-	python3 scripts/bench/replay-bodies.py --bin "$(BASE_BIN)" --capture "$(BODIES)" --out target/replay/base
-	python3 scripts/bench/replay-bodies.py --bin ./$(RELEASE_BIN) --capture "$(BODIES)" --out target/replay/head
+	python3 scripts/bench/replay-bodies.py --bin "$(BASE_BIN)" --capture "$(BODIES)" --out target/replay/base $(if $(CONFIG),--config "$(CONFIG)")
+	python3 scripts/bench/replay-bodies.py --bin ./$(RELEASE_BIN) --capture "$(BODIES)" --out target/replay/head $(if $(CONFIG),--config "$(CONFIG)")
 	python3 scripts/bench/replay-bodies.py --compare target/replay/base target/replay/head
 
 .PHONY: bench
@@ -191,6 +197,43 @@ harbor-watch: ## Live view of the newest benchmark run
 
 harbor-lab: release ## Offline: one codex-shaped turn through the proxy, against a recording upstream
 	scripts/harbor/lab/lab.sh openai
+
+##@ Subscription sweeps (sweep, retrieval and bughunt spend plan quota)
+
+SWEEP := scripts/kompressor-sweep
+
+# claude.sh and opencode.sh measure the repo's release build, so they depend
+# on `release`. codex.sh builds and installs the binary itself (SKIP_BUILD=1 or
+# KOMPRESSOR=... to opt out), so its targets have no prerequisite.
+.PHONY: sweep-claude-all sweep-claude-sweep sweep-claude-retrieval sweep-claude-bughunt
+sweep-claude-all: release ## Claude Code: fixtures, sweep, retrieval, bughunt, report. Costs quota
+	$(SWEEP)/claude.sh all
+sweep-claude-sweep: release ## Claude Code: one compression sweep session. Costs quota
+	$(SWEEP)/claude.sh sweep
+sweep-claude-retrieval: release ## Claude Code: can the model fetch back a planted token? Costs quota
+	$(SWEEP)/claude.sh retrieval
+sweep-claude-bughunt: release ## Claude Code: code compressor + retrieval, eight languages. Costs quota
+	$(SWEEP)/claude.sh bughunt
+
+.PHONY: sweep-codex-all sweep-codex-sweep sweep-codex-retrieval sweep-codex-bughunt
+sweep-codex-all: ## Codex: reset, fixtures, sweep, retrieval, bughunt, report. Costs quota
+	$(SWEEP)/codex.sh all
+sweep-codex-sweep: ## Codex: one compression sweep session. Costs quota
+	$(SWEEP)/codex.sh sweep
+sweep-codex-retrieval: ## Codex: can the model fetch back a planted token? Costs quota
+	$(SWEEP)/codex.sh retrieval
+sweep-codex-bughunt: ## Codex: code compressor + retrieval, eight languages. Costs quota
+	$(SWEEP)/codex.sh bughunt
+
+.PHONY: sweep-opencode-all sweep-opencode-sweep sweep-opencode-retrieval sweep-opencode-bughunt
+sweep-opencode-all: release ## opencode: fixtures, sweep, retrieval, bughunt, report. Costs money
+	$(SWEEP)/opencode.sh all
+sweep-opencode-sweep: release ## opencode: one compression sweep session. Costs money
+	$(SWEEP)/opencode.sh sweep
+sweep-opencode-retrieval: release ## opencode: can the model fetch back a planted token? Costs money
+	$(SWEEP)/opencode.sh retrieval
+sweep-opencode-bughunt: release ## opencode: code compressor + retrieval, eight languages. Costs money
+	$(SWEEP)/opencode.sh bughunt
 
 ##@ Docs
 

@@ -405,7 +405,7 @@ fn num(v: i64) -> String {
 ///
 /// Hand-rolled because the workspace has no date crate and this is the only
 /// place that needs one. Civil-from-days is Howard Hinnant's algorithm.
-fn stamp(ms: i64) -> String {
+pub(crate) fn stamp(ms: i64) -> String {
     let secs = ms.div_euclid(1000);
     let days = secs.div_euclid(86_400);
     let tod = secs.rem_euclid(86_400);

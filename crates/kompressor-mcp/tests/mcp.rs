@@ -857,6 +857,86 @@ async fn kompressor_stats_reports_only_the_calling_tenants_numbers() {
     handle.shutdown().unwrap();
 }
 
+/// Over stateless streamable HTTP a client's JSON-RPC id restarts with every
+/// POST, so it cannot be what tells two tool calls apart in the statistics.
+/// Recorded as `mcp-<id>`, every call a tenant made was one "request".
+#[tokio::test]
+async fn two_calls_sharing_a_json_rpc_id_are_recorded_as_two_requests() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = keyed_config();
+    config.stats.enabled = true;
+    config.stats.path = directory.path().join("stats.db");
+    let (sink, handle) = kompressor_stats::writer::spawn(&kompressor_stats::StatsConfig::at(
+        config.stats.path.clone(),
+    ))
+    .unwrap();
+    let core = Arc::new(AppCore::new(
+        config.clone(),
+        Arc::new(MemoryRefStore::new()),
+        sink.clone(),
+    ));
+    let router = mcp_router(core);
+
+    for lines in [400, 500] {
+        let (status, reply) = rpc(
+            &router,
+            Some(KEY_A),
+            HOST,
+            call(
+                1,
+                "optscale_kompressor_compress",
+                json!({"messages": [{"role": "user", "content": log_payload(lines)}]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+    }
+    sink.flush().unwrap();
+
+    let reader = kompressor_stats::reader::StatsReader::open(&config.stats.path).unwrap();
+    let summary = reader.summary("team-a", 0, i64::MAX).unwrap();
+    assert_eq!(summary.requests, 2);
+    let live = reader.live("team-a", 0, i64::MAX, 10).unwrap();
+    let ids: std::collections::HashSet<&str> = live
+        .recent
+        .iter()
+        .map(|row| row.request_id.as_str())
+        .collect();
+    assert_eq!(ids.len(), 2, "one request id for two calls: {ids:?}");
+    assert!(
+        ids.iter()
+            .all(|id| id.starts_with("mcp-") && id.ends_with("-1"))
+    );
+    drop(reader);
+    handle.shutdown().unwrap();
+}
+
+/// `to` is the caller's. With no `from`, the default window is subtracted from
+/// it — which must saturate, not overflow, at the bottom of the range.
+#[tokio::test]
+async fn a_stats_window_ending_at_the_minimum_timestamp_is_answered() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = keyed_config();
+    config.stats.enabled = true;
+    config.stats.path = directory.path().join("stats.db");
+    let (sink, handle) = kompressor_stats::writer::spawn(&kompressor_stats::StatsConfig::at(
+        config.stats.path.clone(),
+    ))
+    .unwrap();
+    let core = Arc::new(AppCore::new(config, Arc::new(MemoryRefStore::new()), sink));
+    let router = mcp_router(core);
+    let (status, reply) = rpc(
+        &router,
+        Some(KEY_A),
+        HOST,
+        call(7, "optscale_kompressor_stats", json!({"to": i64::MIN})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert!(reply.get("result").is_some(), "{reply}");
+    handle.shutdown().unwrap();
+}
+
 #[tokio::test]
 async fn kompressor_stats_says_so_rather_than_failing_when_statistics_are_off() {
     let router = mcp_router(keyed_core());
@@ -947,5 +1027,106 @@ async fn the_ref_store_the_router_is_built_on_is_the_one_the_config_asks_for() {
     assert!(
         found.is_hit(),
         "the fragment must land in the store the deployment configured"
+    );
+}
+
+/// Every count in a tool schema uses JSON Schema's own vocabulary.
+///
+/// `schemars` renders a `usize` with `"format": "uint"`, which is not a format
+/// the specification defines. Validators ignore it, so nothing breaks — but
+/// Claude Code prints a warning for each one, on every session that lists these
+/// tools, in the place a user reads to find out what went wrong. This keeps the
+/// next `usize` added to a wire type from quietly putting it back.
+#[test]
+fn no_tool_schema_declares_a_format_json_schema_does_not_define() {
+    use schemars::schema_for;
+
+    for (name, schema) in [
+        (
+            "RetrieveInput",
+            schema_for!(kompressor_mcp::wire::RetrieveInput),
+        ),
+        (
+            "RetrieveOutput",
+            schema_for!(kompressor_mcp::wire::RetrieveOutput),
+        ),
+        (
+            "CompressInput",
+            schema_for!(kompressor_mcp::wire::CompressInput),
+        ),
+    ] {
+        let rendered = serde_json::to_string(&schema).expect("schema serialises");
+        assert!(
+            !rendered.contains("\"uint"),
+            "{name} still declares a uint format: use #[schemars(schema_with = \"non_negative_integer\")]"
+        );
+    }
+}
+
+/// A ranged or truncated retrieval says so in a text block, not only in the
+/// envelope.
+///
+/// Claude Desktop's chat surfaces text blocks and drops `structuredContent`, so
+/// a model there sees the fragment and nothing else — `truncated` included,
+/// which is the one field the tool description tells it to act on. Reported from
+/// a real session as "`found`: absent — the response was raw log text with no
+/// envelope fields".
+#[tokio::test]
+async fn a_ranged_retrieval_reports_the_whole_size_in_text() {
+    let core = keyed_core();
+    let router = kompressor_mcp::mcp_router(core.clone());
+
+    // Something long enough to be retained and worth ranging.
+    let body: String = (1..=200)
+        .map(|i| format!("line {i} of the fragment\n"))
+        .collect();
+    let (status, compressed) = rpc(
+        &router,
+        Some(KEY_A),
+        HOST,
+        call(
+            1,
+            "optscale_kompressor_compress_raw",
+            json!({ "content": body }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{compressed}");
+
+    let text = serde_json::to_string(&compressed).unwrap();
+    let Some(handle) = text
+        .split("ref:k_")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+                .next()
+        })
+        .map(|r| format!("k_{r}"))
+    else {
+        // Nothing was elided, so there is nothing to range over.
+        return;
+    };
+
+    let (status, retrieved) = rpc(
+        &router,
+        Some(KEY_A),
+        HOST,
+        call(
+            2,
+            "optscale_kompressor_retrieve",
+            json!({ "ref": handle, "range": { "lines": { "start": 1, "end": 3 } } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{retrieved}");
+
+    let blocks = serde_json::to_string(&retrieved).unwrap();
+    assert!(
+        blocks.contains("[kompressor: a range of ref:"),
+        "a ranged retrieval must say so in text, for clients that show no envelope: {blocks}"
+    );
+    assert!(
+        blocks.contains("lines /"),
+        "the note must carry the whole fragment's size: {blocks}"
     );
 }

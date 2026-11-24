@@ -336,6 +336,13 @@ fn read_meta(object: &Map<String, Value>) -> MessageMeta {
             .get("file_path")
             .and_then(Value::as_str)
             .map(str::to_string),
+        // Anthropic's spelling is accepted beside ours, so a caller relaying a
+        // tool result need not rename the field.
+        tool_error: object
+            .get("tool_error")
+            .or_else(|| object.get("is_error"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         // A message API names no provider, so it is priced as any-prefix.
         ..MessageMeta::default()
     }
@@ -529,5 +536,17 @@ mod tests {
             conversation.messages[1].meta.file_path.as_deref(),
             Some("/tmp/a")
         );
+    }
+
+    #[test]
+    fn a_tool_failure_is_read_under_either_spelling() {
+        let conversation = parse(
+            r#"[{"role":"tool","content":"x","name":"Edit","tool_error":true},
+                {"role":"tool","content":"x","name":"Edit","is_error":true},
+                {"role":"tool","content":"x","name":"Edit"}]"#,
+        );
+        assert!(conversation.messages[0].meta.tool_error);
+        assert!(conversation.messages[1].meta.tool_error);
+        assert!(!conversation.messages[2].meta.tool_error);
     }
 }

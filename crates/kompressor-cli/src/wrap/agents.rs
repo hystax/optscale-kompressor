@@ -16,13 +16,13 @@
 //! # Config-file providers
 //!
 //! An entry claims the variable works, not that it works for every way the tool
-//! can be configured. `opencode` reads `OPENAI_BASE_URL` for its built-in
-//! `openai` provider, but a provider declared in `opencode.json` carries its own
-//! `options.baseURL`, and a config value beats an environment one — so wrapping
-//! a session that uses a custom provider sets a variable nothing reads. That is
-//! the silent failure above, reached by a different road. For those, point the
-//! provider's own `baseURL` at the proxy instead; `--attach` exists to hold a
-//! proxy up while an externally configured agent uses it.
+//! can be configured. A provider whose base URL lives in the tool's own config
+//! file beats any variable, so a wrap that only sets one routes nothing for it.
+//! That is the silent failure above, reached by a different road, and it is why
+//! `opencode` sets no variable at all: its providers are pointed at the proxy
+//! through opencode's configuration instead — see [`opencode`].
+//!
+//! [`opencode`]: super::opencode
 
 use kompressor_core::config::{SubscriptionUpstream, Upstream};
 
@@ -59,6 +59,8 @@ impl Endpoint {
 pub enum Provider {
     Anthropic,
     OpenAi,
+    /// OpenCode Zen and OpenCode Go: one host, `/zen/v1` and `/zen/go/v1`.
+    OpenCodeZen,
 }
 
 impl Provider {
@@ -92,6 +94,20 @@ impl Provider {
                 }),
                 ..Default::default()
             },
+            // One mount for both tiers and every wire shape behind them. Zen
+            // serves Chat Completions, Responses and Messages under the same
+            // prefix, and the family is read off the path's tail, so nothing
+            // here has to know which model a session picked. The client's
+            // `x-opencode-session` header rides through with the rest: the relay
+            // answers 400 without it.
+            Provider::OpenCodeZen => Upstream {
+                name: "opencode-zen".into(),
+                path_prefix: "/zen".into(),
+                base_url: "https://opencode.ai".into(),
+                api_family: "auto".into(),
+                forward_auth: true,
+                ..Default::default()
+            },
         }
     }
 }
@@ -108,6 +124,9 @@ impl Provider {
 pub enum ConfigFile {
     /// `$CODEX_HOME/config.toml`, or `~/.codex/config.toml`.
     Codex,
+    /// opencode's configuration: `OPENCODE_CONFIG_CONTENT` for a session this
+    /// command launches, the global `opencode.json` for `--attach`.
+    OpenCode,
 }
 
 /// How a tool is pointed at the proxy.
@@ -309,16 +328,24 @@ pub const AGENTS: &[Agent] = &[
     Agent {
         name: "opencode",
         binary: "opencode",
-        about: "opencode (OpenAI Chat; only for its built-in `openai` provider)",
-        env: &[("OPENAI_BASE_URL", Endpoint::V1)],
-        providers: &[Provider::OpenAi],
+        about: "opencode CLI/TUI and Desktop (openai, anthropic, OpenCode Zen and Go), via its config",
+        // Deliberately empty, like codex. Measured on 2.2.4: OPENAI_BASE_URL or
+        // ANTHROPIC_BASE_URL in the environment makes every model of that
+        // provider "unavailable", and nothing is sent at all.
+        env: &[],
+        providers: &[Provider::Anthropic, Provider::OpenAi, Provider::OpenCodeZen],
         fixed_env: &[],
-        config: None,
+        config: Some(ConfigFile::OpenCode),
         mcp: None,
         wiring: Wiring::Launch,
         note: Some(
-            "only for opencode's built-in `openai` provider: a provider declared in \
-             opencode.json carries its own options.baseURL, and config beats environment.",
+            "opencode is pointed at the proxy through its own configuration, not the \
+             environment. A launched session runs with --standalone so its private server \
+             sees the overlay. OpenCode Desktop, and a TUI already attached to the background \
+             service, are reached with `kompressor wrap opencode --attach`, which edits the \
+             global opencode.json and reloads the service; `kompressor unwrap opencode` \
+             restores a file left behind. A provider whose baseURL you set yourself is left \
+             alone and not compressed.",
         ),
     },
     Agent {
@@ -362,7 +389,7 @@ impl Agent {
 /// being forwarded to OpenAI.
 pub fn upstreams_for(providers: &[Provider]) -> Vec<Upstream> {
     let mut out = Vec::new();
-    for provider in [Provider::Anthropic, Provider::OpenAi] {
+    for provider in [Provider::Anthropic, Provider::OpenAi, Provider::OpenCodeZen] {
         if providers.contains(&provider) {
             out.push(provider.upstream());
         }
@@ -620,6 +647,45 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[test]
+    fn opencode_is_configured_and_never_handed_a_base_url_variable() {
+        // Measured on 2.2.4: either variable makes that provider's models
+        // "unavailable" and nothing is sent. The old entry set one.
+        let opencode = Agent::find("opencode").expect("opencode is in the catalogue");
+        assert!(opencode.env.is_empty());
+        assert_eq!(opencode.config, Some(ConfigFile::OpenCode));
+        assert_eq!(
+            opencode.providers,
+            &[Provider::Anthropic, Provider::OpenAi, Provider::OpenCodeZen]
+        );
+        let note = opencode.note.expect("the wiring must be explained");
+        assert!(note.contains("--attach") && note.contains("Desktop"));
+    }
+
+    #[test]
+    fn the_zen_mount_serves_both_tiers_without_shadowing_openai() {
+        let ups = upstreams_for(&[Provider::Anthropic, Provider::OpenAi, Provider::OpenCodeZen]);
+        let names: Vec<&str> = ups.iter().map(|u| u.name.as_str()).collect();
+        assert_eq!(names, ["anthropic", "openai", "opencode-zen"]);
+        let zen = &ups[2];
+        assert_eq!(zen.base_url, "https://opencode.ai");
+        assert!(!zen.strip_prefix, "the relay expects /zen/... unchanged");
+        let proxy = kompressor_core::config::ProxyConfig {
+            upstreams: ups.clone(),
+            ..Default::default()
+        };
+        let pick = |path: &str| {
+            kompressor_proxy::route::match_upstream(&proxy, path).map(|u| u.name.clone())
+        };
+        assert_eq!(
+            pick("/zen/go/v1/chat/completions").as_deref(),
+            Some("opencode-zen")
+        );
+        assert_eq!(pick("/zen/v1/messages").as_deref(), Some("opencode-zen"));
+        assert_eq!(pick("/v1/responses").as_deref(), Some("openai"));
+        assert_eq!(pick("/v1/messages").as_deref(), Some("anthropic"));
     }
 
     #[test]

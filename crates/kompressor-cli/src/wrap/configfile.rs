@@ -212,42 +212,74 @@ impl Target {
         (head, foot)
     }
 
-    /// Top-level keys we would write that the file already sets for itself.
+    /// What we would write that the file already defines for itself: its own
+    /// top-level keys, and its own copy of a table we append.
     fn collisions(&self, content: &str) -> Vec<String> {
         let outside = strip_blocks(content);
-        self.head
+        let keys = self
+            .head
             .iter()
             .map(|(key, _)| key)
             .filter(|key| declares_key(&outside, key))
-            .cloned()
-            .collect()
+            .cloned();
+        let tables = self
+            .tables
+            .iter()
+            .filter(|table| declares_table(&outside, &table.name))
+            .map(|table| format!("[{}]", table.name));
+        keys.chain(tables).collect()
     }
 
-    /// Comment out complete top-level assignments using the parser's byte spans.
-    /// Every physical line of a multiline value needs its own comment prefix.
+    /// Comment out the user's own definition of anything we are about to write.
+    ///
+    /// A top-level key is only looked for before the first table header, for
+    /// the same reason [`declares_key`] only reads there: a key of the same
+    /// name inside a table is a different key. A table we append is commented
+    /// out whole, header to the next header, because TOML rejects a table
+    /// defined twice just as it rejects a key.
+    ///
+    /// Whole statements are disabled, not lines: a multi-line string or array
+    /// commented out on its first line only leaves the rest of the value
+    /// standing on its own, which is a file codex will not load.
     fn disable_collisions(&self, body: &str) -> String {
-        type Entries =
-            std::collections::BTreeMap<toml::Spanned<String>, toml::Spanned<toml::Value>>;
-        let Ok(entries) = toml::from_str::<Entries>(body) else {
-            return body.to_string();
-        };
-        let ranges: Vec<_> = entries
+        let keys: Vec<&str> = self.head.iter().map(|(key, _)| key.as_str()).collect();
+        let tables: Vec<&str> = self
+            .tables
             .iter()
-            .filter(|(key, _)| self.head.iter().any(|(name, _)| name == key.get_ref()))
-            .map(|(key, value)| key.span().start..value.span().end)
+            .map(|table| table.name.as_str())
+            .collect();
+        if keys.is_empty() && tables.is_empty() {
+            return body.to_string();
+        }
+        // Each physical line keeps its own ending, so a CRLF file stays CRLF;
+        // `statements` reads the text without them.
+        let physical: Vec<&str> = body.split_inclusive('\n').collect();
+        let lines: Vec<&str> = physical
+            .iter()
+            .map(|line| line.trim_end_matches('\n').trim_end_matches('\r'))
             .collect();
         let mut out = String::with_capacity(body.len());
-        let mut offset = 0;
-        for line in body.split_inclusive('\n') {
-            let end = offset + line.len();
-            if ranges
-                .iter()
-                .any(|range| offset < range.end && end > range.start)
-            {
-                out.push_str(DISABLED);
+        let mut in_tables = false;
+        let mut in_ours = false;
+        for (start, end) in statements(&lines) {
+            let first = lines[start].trim_start();
+            // Any header ends the top level, `[[array]]` included; only a
+            // plain `[table]` can be one of ours.
+            let disable = if first.starts_with('[') {
+                in_tables = true;
+                in_ours = table_header(first).is_some_and(|name| tables.contains(&name.as_str()));
+                in_ours
+            } else if in_tables {
+                in_ours
+            } else {
+                keys.iter().any(|key| assigns(first, key))
+            };
+            for line in &physical[start..end] {
+                if disable {
+                    out.push_str(DISABLED);
+                }
+                out.push_str(line);
             }
-            out.push_str(line);
-            offset = end;
         }
         out
     }
@@ -312,18 +344,95 @@ fn quoted(value: &str) -> String {
 /// Only the region before the first table header counts: `model_provider`
 /// inside `[some.table]` is a different key that happens to share a name.
 fn declares_key(content: &str, key: &str) -> bool {
-    toml::from_str::<toml::Table>(content).is_ok_and(|table| table.contains_key(key))
+    let lines: Vec<&str> = content.lines().collect();
+    statements(&lines)
+        .into_iter()
+        .map(|(start, _)| lines[start].trim_start())
+        .take_while(|line| !line.starts_with('['))
+        .any(|line| assigns(line, key))
 }
 
-/// Whether one line assigns `key`.
+/// Whether `content` opens a `[name]` table of its own.
+fn declares_table(content: &str, name: &str) -> bool {
+    let lines: Vec<&str> = content.lines().collect();
+    statements(&lines)
+        .into_iter()
+        .filter_map(|(start, _)| table_header(lines[start].trim_start()))
+        .any(|header| header == name)
+}
+
+/// Whether one line assigns `key`, in any of the three spellings TOML allows
+/// for a key: bare, `"basic"` or `'literal'`.
 ///
 /// A line already carrying the [`DISABLED`] prefix is a comment and assigns
 /// nothing, which is what makes claiming the file twice idempotent.
-#[cfg(test)]
 fn assigns(line: &str, key: &str) -> bool {
-    line.strip_prefix(key)
-        .map(|rest| rest.trim_start().starts_with('='))
-        .unwrap_or(false)
+    [key.to_string(), format!("\"{key}\""), format!("'{key}'")]
+        .iter()
+        .any(|spelling| {
+            line.strip_prefix(spelling.as_str())
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        })
+}
+
+/// The dotted name a `[table]` header line opens, normalised the way TOML
+/// reads it: `[ a . "b" ]` is `a.b`. `None` for anything that is not a plain
+/// table header, array-of-tables headers included.
+fn table_header(line: &str) -> Option<String> {
+    if !line.starts_with('[') || line.starts_with("[[") {
+        return None;
+    }
+    let mut table = line.parse::<toml::Table>().ok()?;
+    let mut name = Vec::new();
+    loop {
+        let mut entries = table.into_iter();
+        let (key, value) = entries.next()?;
+        if entries.next().is_some() {
+            return None;
+        }
+        name.push(key);
+        match value {
+            toml::Value::Table(inner) if inner.is_empty() => return Some(name.join(".")),
+            toml::Value::Table(inner) => table = inner,
+            _ => return None,
+        }
+    }
+}
+
+/// The file as statements, each the `[start, end)` range of lines it spans.
+///
+/// A value can run over several lines — a multi-line string, an array — and
+/// a line inside one is neither an assignment nor a table header, whatever it
+/// starts with. A statement is grown a line at a time until it parses on its
+/// own; one that never does is left a single line, so a file that is already
+/// broken is read as it was before this existed.
+fn statements(lines: &[&str]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start = 0;
+    while start < lines.len() {
+        let mut end = start + 1;
+        let first = lines[start].trim_start();
+        let opens_a_value = !first.starts_with('#')
+            && !first.starts_with('[')
+            && first.contains('=')
+            && first.parse::<toml::Table>().is_err();
+        if opens_a_value {
+            let mut text = lines[start].to_string();
+            let mut grown = end;
+            while grown < lines.len() {
+                text.push('\n');
+                text.push_str(lines[grown]);
+                grown += 1;
+                if text.parse::<toml::Table>().is_ok() {
+                    end = grown;
+                    break;
+                }
+            }
+        }
+        spans.push((start, end));
+        start = end;
+    }
+    spans
 }
 
 /// Undo [`Target::disable_collisions`], whatever else happened to the file.
@@ -400,9 +509,21 @@ pub fn claim(target: &Target) -> Result<Claimed, CliError> {
         Err(error) => return Err(CliError::runtime("could not read configuration", error)),
     };
     let existed = target.path.exists();
+    // The edit is textual, so it is checked the one way that matters: a file
+    // codex could load before must still load after. A shape the override
+    // does not understand is refused with the file untouched, rather than
+    // written in a form that stops the session before it starts.
     let next = injected_content(target, &current);
-    toml::from_str::<toml::Table>(&next)
-        .map_err(|error| CliError::runtime("could not prepare wrapped configuration", error))?;
+    if current.parse::<toml::Table>().is_ok()
+        && let Err(error) = next.parse::<toml::Table>()
+    {
+        return Err(CliError::Runtime(format!(
+            "{} defines something this command cannot override safely ({}); it was left \
+             untouched. Remove or rename that definition and run this again",
+            target.path.display(),
+            error.message()
+        )));
+    }
 
     // A key the file already sets is commented out for the duration rather
     // than refused. Refusing was the first answer and it was the wrong one: it
@@ -726,8 +847,11 @@ mod tests {
 
     #[test]
     fn an_invalid_injection_leaves_the_configuration_untouched() {
+        // An existing `[model_providers.kompressor]` table is commented out for
+        // the session instead (see the `existing-table` case above); a dotted
+        // key defining the same table is the shape that still cannot be.
         let scratch = Scratch::new("existing-provider");
-        let original = "[model_providers.kompressor]\nname = 'my provider'\n";
+        let original = "model_providers.kompressor.name = 'my provider'\n";
         scratch.write(original);
         let target = scratch.target(9242);
         assert!(claim(&target).is_err());
@@ -1149,5 +1273,86 @@ mod tests {
         assert_eq!(codex_auth(&scratch.0), CodexAuth::ApiKey);
         std::fs::write(scratch.0.join("auth.json"), "not json at all").unwrap();
         assert_eq!(codex_auth(&scratch.0), CodexAuth::ApiKey);
+    }
+
+    /// Each of these parses before the claim. TOML has no override, so a
+    /// claim that misses one of them yields a file codex refuses to load.
+    #[test]
+    fn a_valid_config_stays_valid_toml_while_claimed_and_comes_back_byte_for_byte() {
+        let cases = [
+            (
+                "quoted-key",
+                "\"model_provider\" = \"openai\"\nmodel = \"o3\"\n",
+            ),
+            (
+                "literal-key",
+                "'openai_base_url' = 'https://x.example/v1'\n",
+            ),
+            (
+                "multiline-basic",
+                "openai_base_url = \"\"\"\nhttps://api.openai.com/v1\"\"\"\nmodel = \"o3\"\n",
+            ),
+            (
+                "multiline-literal",
+                "openai_base_url = '''\n[not.a.table]\nhttps://x'''\nmodel = \"o3\"\n",
+            ),
+            (
+                "multiline-array",
+                "model_provider = [\n  \"a\",\n  \"b\",\n]\nmodel = \"o3\"\n",
+            ),
+            (
+                "existing-table",
+                "model = \"o3\"\n\n[model_providers.kompressor]\nname = \"Existing\"\n\
+                 base_url = \"http://localhost:8000/v1\"\n\n[profiles.x]\nmodel = \"o4\"\n",
+            ),
+            (
+                "array-of-tables-first",
+                "[[mcp]]\nmodel_provider = \"inside\"\n",
+            ),
+            (
+                "existing-table-spaced",
+                "[ model_providers . \"kompressor\" ]\nname = \"Existing\"\n",
+            ),
+        ];
+        for (tag, original) in cases {
+            original
+                .parse::<toml::Table>()
+                .unwrap_or_else(|e| panic!("{tag}: the fixture itself: {e}"));
+            let scratch = Scratch::new(&format!("valid-{tag}"));
+            scratch.write(original);
+            let target = scratch.target(9240);
+            claim(&target).unwrap_or_else(|e| panic!("{tag}: {e}"));
+            let claimed = scratch.read();
+            let parsed = claimed
+                .parse::<toml::Table>()
+                .unwrap_or_else(|e| panic!("{tag}: claimed file does not parse: {e}\n{claimed}"));
+            assert_eq!(
+                parsed.get("model_provider").and_then(toml::Value::as_str),
+                Some("kompressor"),
+                "{tag}"
+            );
+            assert_eq!(
+                parsed["model_providers"]["kompressor"]["base_url"].as_str(),
+                Some("http://127.0.0.1:9240/v1"),
+                "{tag}"
+            );
+            release(&target, false).unwrap();
+            assert_eq!(scratch.read(), original, "{tag}");
+        }
+    }
+
+    /// A shape this textual edit cannot override safely is refused, and the
+    /// file is left as it was, rather than written in a form codex rejects.
+    #[test]
+    fn a_claim_that_would_break_a_valid_file_is_refused() {
+        let scratch = Scratch::new("refused");
+        let original = "model_providers.kompressor.name = \"dotted\"\n";
+        original.parse::<toml::Table>().unwrap();
+        scratch.write(original);
+        let target = scratch.target(9241);
+        let error = claim(&target).expect_err("would not parse");
+        assert!(error.to_string().contains("config.toml"), "{error}");
+        assert_eq!(scratch.read(), original);
+        assert_eq!(release(&target, false).unwrap(), Released::NotOurs);
     }
 }

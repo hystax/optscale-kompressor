@@ -290,6 +290,22 @@ pub trait RefStore: Send + Sync {
         meta: &PutMeta,
     ) -> Result<(), StoreError>;
 
+    /// [`Self::put_many`], also reporting the `created_at` each fragment now
+    /// has, in `refs` order — the original one for a re-store.
+    ///
+    /// A cache in front of this store needs it to know a fragment's absolute
+    /// deadline without a read: a re-store of a fragment it had evicted would
+    /// otherwise be cached as created now, and served past the deadline the
+    /// row still enforces. `None` is "not known", which the default answers.
+    fn put_many_created(
+        &self,
+        tenant: &Tenant,
+        refs: &[(RefId, String)],
+        meta: &PutMeta,
+    ) -> Result<Option<Vec<u64>>, StoreError> {
+        self.put_many(tenant, refs, meta).map(|()| None)
+    }
+
     /// Point read scoped by tenant.
     ///
     /// With `touch`, a hit restarts the idle window. Pass `false` for reads
@@ -321,6 +337,23 @@ pub trait RefStore: Send + Sync {
     /// against an explicit instant.
     fn purge_expired(&self, now: u64) -> Result<u64, StoreError>;
 
+    /// Whether the store answers at all, as cheaply as it can be asked.
+    ///
+    /// For readiness probes, which run every few seconds and need a yes or no,
+    /// not the count [`Self::stats`] scans the whole store for. The default is
+    /// that scan, for stores where it is cheap anyway.
+    /// Hand free pages back to the disk, a bounded number at a time, and
+    /// return the bytes given back. What the sweep calls after removing
+    /// expired fragments; zero for a store with nothing to give back, which
+    /// is every store but a file in incremental auto-vacuum mode.
+    fn reclaim(&self) -> Result<u64, StoreError> {
+        Ok(0)
+    }
+
+    fn ping(&self) -> Result<(), StoreError> {
+        self.stats().map(|_| ())
+    }
+
     /// Live rows and bytes.
     fn stats(&self) -> Result<StoreStats, StoreError>;
 
@@ -331,4 +364,14 @@ pub trait RefStore: Send + Sync {
     /// own: `GET /v1/stats/store` authenticated the caller, scoped the tenant,
     /// and then reported every tenant's rows and bytes to it.
     fn stats_for(&self, tenant: &Tenant) -> Result<StoreStats, StoreError>;
+
+    /// The listing side of this store, when it has one.
+    ///
+    /// An accessor rather than methods of this trait, so the point-lookup
+    /// contract stays what every caller on the request path sees, and walking
+    /// the table takes a deliberate step only the ref browser makes. `None`,
+    /// the default, is a store that cannot be browsed.
+    fn browser(&self) -> Option<&dyn crate::browse::RefBrowse> {
+        None
+    }
 }

@@ -1,0 +1,895 @@
+<!DOCTYPE html>
+<html lang="en">
+ <head>
+
+
+  <meta charset="utf-8"/>
+  <meta content="width=device-width,initial-scale=1" name="viewport"/>
+  <title>
+   Kompressor analysis
+  </title>
+  <script>
+// Apply the shared preference before rendering to avoid a theme flash.
+(() => {
+  const key = "kompressor-theme";
+  let theme = "dark";
+  try { if (localStorage.getItem(key) === "light") theme = "light"; } catch (_) {}
+  const apply = (value) => {
+    theme = value === "light" ? "light" : "dark";
+    document.documentElement.dataset.theme = theme;
+    const button = document.getElementById("theme-toggle");
+    if (button) {
+      button.textContent = theme === "dark" ? "Light theme" : "Dark theme";
+      button.setAttribute("aria-label", "Switch to " + (theme === "dark" ? "light" : "dark") + " theme");
+    }
+  };
+  apply(theme);
+  document.addEventListener("DOMContentLoaded", () => {
+    apply(theme);
+    document.getElementById("theme-toggle").addEventListener("click", () => {
+      apply(theme === "dark" ? "light" : "dark");
+      try { localStorage.setItem(key, theme); } catch (_) {}
+    });
+  });
+  window.addEventListener("storage", (event) => {
+    if (event.key === key || event.key === null) apply(event.newValue);
+  });
+})();
+</script>
+<style>
+:root {
+  color-scheme:dark;
+  --ink:#e3eaf2;
+  --bg:#101419;
+  --panel:#191f27;
+  --muted:#9caaba;
+  --line:#303a46;
+  --accent:#70d8b6;
+  --bad:#ffa096;
+}
+* {
+  box-sizing:border-box;
+}
+body {
+  margin:0;
+  background:var(--bg);
+  color:var(--ink);
+  font:14px system-ui,sans-serif;
+}
+main {
+  max-width:1600px;
+  margin:auto;
+  padding:24px;
+}
+header,.filters,nav {
+  display:flex;
+  gap:14px;
+  align-items:center;
+  flex-wrap:wrap;
+}
+h1 {
+  font-size:24px;
+  margin-right:auto;
+}
+h2 {
+  font-size:18px;
+}
+a,button.link {
+  color:var(--accent);
+}
+button,input,select {
+  font:inherit;
+  color:inherit;
+  background:var(--panel);
+  border:1px solid var(--line);
+  border-radius:5px;
+  padding:8px;
+}
+button {
+  cursor:pointer;
+}
+button[aria-selected=true] {
+  border-color:var(--accent);
+  color:var(--accent);
+}
+label {
+  display:inline-flex;
+  gap:8px;
+  align-items:center;
+}
+.filters,nav {
+  margin:18px 0;
+}
+section,.tile {
+  background:var(--panel);
+  padding:18px;
+  border:1px solid var(--line);
+  border-radius:8px;
+  margin:16px 0;
+}
+.tiles {
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(185px,1fr));
+  gap:12px;
+}
+.tile {
+  margin:0;
+}
+.value {
+  font-size:25px;
+  margin:8px 0;
+}
+.muted,small {
+  color:var(--muted);
+}
+.bad {
+  color:var(--bad);
+}
+.scroll {
+  overflow:auto;
+}
+table {
+  width:100%;
+  border-collapse:collapse;
+  white-space:nowrap;
+}
+th,td {
+  text-align:left;
+  border-bottom:1px solid var(--line);
+  padding:10px;
+  vertical-align:top;
+}
+th {
+  color:var(--muted);
+  font-size:12px;
+}
+.num {
+  text-align:right;
+  font-variant-numeric:tabular-nums;
+}
+button.link {
+  border:0;
+  padding:0;
+  background:none;
+  text-align:left;
+}
+td.wrap {
+  white-space:normal;
+  min-width:180px;
+}
+#error {
+  color:var(--bad);
+}
+[hidden] {
+  display:none!important;
+}
+.bar {
+  height:5px;
+  background:var(--accent);
+  margin-top:5px;
+  min-width:1px;
+}
+.grid {
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(350px,1fr));
+  gap:16px;
+}
+.grid section {
+  margin:0;
+}
+summary {
+  cursor:pointer;
+}
+pre {
+  white-space:pre-wrap;
+  overflow-wrap:anywhere;
+}
+#timeline td {
+  max-width:320px;
+}
+#key {
+  width:220px;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f7f8fa; --panel: #ffffff; --ink: #172033;
+  --muted: #5b6475; --line: #d5dce5; --accent: #13745b;
+  --good: #13745b; --warn: #946000; --bad: #b83228;
+  --sel: #e1f1eb; --hit: #fff1b8;
+  --kept: #a9b9cb; --read: #13745b; --write: #ad741b; --fresh: #527698;
+}
+#theme-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+</style>
+ </head>
+ <body>
+  <main>
+   <header>
+    <h1>
+     Kompressor analysis
+    </h1>
+    <a id="live-link">
+     Live
+    </a>
+    <a id="dashboards-link" href="#">Dashboards</a>
+    <a id="cache-link">
+     Cache
+    </a>
+    <a hidden="" id="refs-link">
+     Ref store
+    </a>
+    <a id="maintenance-link" href="#">Maintenance</a>
+   <button id="download" type="button" title="Download the open tab as JSON Lines">Download JSONL</button>
+   <button id="theme-toggle" type="button" aria-label="Switch to light theme">Light theme</button>
+</header>
+   <form class="filters" id="filters">
+    <label>
+     From
+     <input id="from" required="" step="0.001" type="datetime-local"/>
+    </label>
+    <label>
+     To (exclusive)
+     <input id="to" required="" step="0.001" type="datetime-local"/>
+    </label>
+    <button type="submit">
+     Analyze
+    </button>
+    <button id="last-day" type="button">
+     Last 24 hours
+    </button>
+    <span class="muted">
+     Dates use your browser’s timezone
+    </span>
+   </form>
+   <form class="filters" id="auth">
+    <label>
+     API key
+     <input autocomplete="off" id="key" placeholder="Stored for this session" type="password"/>
+    </label>
+    <button>
+     Use key
+    </button>
+   </form>
+   <p id="status" role="status">
+    Loading…
+   </p>
+   <p id="error" role="alert">
+   </p>
+   <p class="muted" id="coverage">
+   </p>
+   <div class="tiles" id="tiles">
+   </div>
+   <p class="muted">
+    Token reduction is estimated per request, including re-sent history. Net subtracts retrieved tokens; it does not measure monetary savings. Cache cost uses a separate baseline. Provider usage includes keep-warm pings. Conversation IDs are prefix fingerprints.
+   </p>
+   <nav aria-label="Analysis views" role="tablist">
+    <button aria-controls="efficiency" aria-selected="true" id="efficiency-tab" role="tab">
+     Conversation efficiency
+    </button>
+    <button aria-controls="opportunities" aria-selected="false" id="opportunities-tab" role="tab" tabindex="-1">
+     Compression opportunities
+    </button>
+<button id="retrieval-tab" role="tab" tabindex="-1" aria-selected="false" aria-controls="retrieval">Retrieval amplification</button>
+<button id="comparison-tab" role="tab" tabindex="-1" aria-selected="false" aria-controls="comparison">Historical comparison</button>
+<button id="latency-tab" role="tab" tabindex="-1" aria-selected="false" aria-controls="latency">Latency & reliability</button>
+   </nav>
+   <div aria-labelledby="efficiency-tab" id="efficiency" role="tabpanel">
+    <section>
+     <header>
+      <h2>
+       Conversations
+      </h2>
+      <label>
+       Sort
+       <select id="sort">
+        <option value="net">
+         Most negative net reduction
+        </option>
+        <option value="retrieval">
+         Highest retrieval debit
+        </option>
+        <option value="loss">
+         Largest cache losses
+        </option>
+        <option value="recent">
+         Most recent
+        </option>
+       </select>
+      </label>
+      <label>
+       Search
+       <input id="search" placeholder="Conversation or model" type="search"/>
+      </label>
+     </header>
+     <p class="muted" id="conversation-count">
+     </p>
+     <div class="scroll" id="conversations">
+     </div>
+     <button hidden="" id="more">
+      Show 100 more
+     </button>
+    </section>
+    <section>
+     <h2>
+      Unattributed activity
+     </h2>
+     <p class="muted">
+      Events without a conversation fingerprint, including other surfaces and retrievals without a request join key.
+     </p>
+     <div class="scroll" id="unattributed">
+     </div>
+    </section>
+   </div>
+   <div aria-labelledby="opportunities-tab" hidden="" id="opportunities" role="tabpanel">
+    <div class="grid">
+     <section>
+      <h2>
+       Compression outcomes
+      </h2>
+      <div class="scroll" id="outcomes">
+      </div>
+     </section>
+     <section>
+      <h2>
+       Skipped token volume
+      </h2>
+      <p class="muted">
+       Skipped tokens are not necessarily recoverable savings. Frozen content is intentionally protected. Opaque content has no measurable token volume.
+      </p>
+      <div class="scroll" id="skips">
+      </div>
+     </section>
+    </div>
+    <section>
+     <h2>
+      Input coverage by model, mode and surface
+     </h2>
+     <p class="muted">
+      Each dimension describes the same traffic; do not add dimensions together.
+     </p>
+     <div class="scroll" id="breakdowns">
+     </div>
+    </section>
+    <section hidden="" id="example">
+     <h2>
+      Example request
+     </h2>
+     <pre id="example-body"></pre>
+    </section>
+   </div>
+
+<div id="retrieval" role="tabpanel" aria-labelledby="retrieval-tab" hidden>
+ <p class="muted">Retained raw events only. Debit/gross is undefined when gross reduction is zero or negative. Counts of withheld asks are separate from store attempts.</p>
+ <p id="retrieval-status" role="status"></p><div id="retrieval-tiles" class="tiles"></div>
+ <section><h2>Requests with the largest retrieval penalty</h2><p id="retrieval-count" class="muted"></p><div id="retrieval-requests" class="scroll"></div></section>
+ <section><h2>Repeated asks for a reference</h2><p id="repeat-count" class="muted"></p><div id="repeat-refs" class="scroll"></div></section>
+ <section><h2>Retrieval rounds per client request</h2><div id="retrieval-rounds" class="scroll"></div></section>
+</div>
+<div id="comparison" role="tabpanel" aria-labelledby="comparison-tab" hidden>
+ <p class="muted">Compare the selected dates above with a baseline. Filters below apply to both comparison periods. Differences are descriptive; workload and task quality are not controlled. Daily experiment archives are collected from this version onward; older legacy rollups lack these dimensions and are excluded. Archived data requires complete UTC days; partial archived days are reported as omitted.</p>
+ <form id="comparison-form" class="filters">
+  <label>Baseline from <input id="baseline-from" type="datetime-local" step="0.001" required></label>
+  <label>Baseline to (exclusive) <input id="baseline-to" type="datetime-local" step="0.001" required></label>
+  <label>Model <input id="compare-model" placeholder="All models"></label>
+  <label>Mode <select id="compare-mode"><option value="">All modes</option><option>recoverable</option><option>lossless</option><option>aggressive</option><option>off</option><option>unrecorded</option></select></label>
+  <label>Surface <select id="compare-surface"><option value="">All surfaces</option><option>proxy</option><option>api</option><option>mcp</option><option>cli</option></select></label>
+  <label>Experiment <input id="compare-experiment_id" placeholder="All experiments"></label>
+  <label>Run <input id="compare-run_id" placeholder="All runs"></label>
+  <button>Compare</button>
+ </form>
+ <p id="comparison-status" role="status"></p><section><h2>Period comparison</h2><p class="muted">Provider totals include keep-warm usage. Normalized values divide by client requests or distinct conversation fingerprints; missing denominators display as unavailable.</p><div id="comparison-metrics" class="scroll"></div></section>
+ <section><h2>Recorded cohorts</h2><div id="comparison-cohorts" class="scroll"></div></section>
+ <section id="cohort-settings" hidden><h2>Recorded policy settings</h2><pre id="cohort-settings-body"></pre></section>
+</div>
+<div id="latency" role="tabpanel" aria-labelledby="latency-tab" hidden>
+ <p class="muted">Client requests only; retained raw events. Response-head wait ends when headers arrive, not at the first token. End-to-end time includes generation and relay. Measured retrieval execution excludes network round trips. Phases overlap and must not be added. Breakdowns show correlations, not compression overhead.</p>
+ <p id="latency-status" role="status"></p>
+ <section><h2>Measured latency distributions</h2><div id="latency-distributions" class="scroll"></div></section>
+ <section><h2>By model, retrieval rounds, prompt size and status</h2><div id="latency-groups" class="scroll"></div></section>
+ <section><h2>Slowest requests</h2><div id="latency-slowest" class="scroll"></div></section>
+ <section id="phase-detail" hidden><h2>Measured upstream attempts</h2><p id="phase-note" class="muted"></p><div id="phase-attempts" class="scroll"></div></section>
+ <section><h2>Errors over time</h2><div id="latency-errors" class="scroll"></div></section>
+</div>
+   <section hidden="" id="detail">
+    <header>
+     <h2 id="detail-title">
+      Conversation timeline
+     </h2>
+     <a id="detail-cache">
+      Open cache details
+     </a>
+     <button id="close">
+      Close
+     </button>
+    </header>
+    <p class="muted" id="detail-note">
+    </p>
+    <div class="scroll" id="timeline">
+    </div>
+   </section>
+  </main>
+ <script>
+"use strict";
+
+const SETTINGS = /*SETTINGS*/{};
+const $ = id => document.getElementById(id),
+  params = new URLSearchParams(location.search);
+const endpoint = SETTINGS.endpoint || location.pathname;
+const base = endpoint.replace(/stats\/analysis\/?$/, ""),
+  tenant = params.get("tenant");
+const path = name => SETTINGS.listener ? {
+  live: "/",
+  cache: "/cache",
+  refs: "/refs"
+}[name] : base + (name === "refs" ? "refs" : "stats/" + name);
+let selected = SETTINGS.conversation,
+  report = null,
+  visible = 100,
+  serial = 0;
+const nf = new Intl.NumberFormat(),
+  num = v => v == null ? "–" : nf.format(Math.round(v)),
+  stamp = t => new Date(t).toLocaleString();
+const el = (tag, text) => {
+  const n = document.createElement(tag);
+  if (text != null) n.textContent = String(text);
+  return n;
+};
+function url(pathname, query = {}) {
+  const u = new URL(pathname, location.origin);
+  for (const [k, v] of Object.entries(query)) if (v != null) u.searchParams.set(k, v);
+  if (tenant) u.searchParams.set("tenant", tenant);
+  return u;
+}
+function key() {
+  try {
+    return sessionStorage.getItem("kompressor-key") || "";
+  } catch (_) {
+    return $("key").value;
+  }
+}
+async function call(u) {
+  const headers = {
+    accept: "application/json"
+  };
+  if (key()) headers["x-kompressor-key"] = key();
+  const r = await fetch(u, {
+    headers,
+    cache: "no-store"
+  });
+  let d;
+  try {
+    d = await r.json();
+  } catch (_) {
+    throw Error("Invalid response (HTTP " + r.status + ")");
+  }
+  if (!r.ok) throw Error(d?.error?.message || "HTTP " + r.status);
+  return d;
+}
+function local(t) {
+  const d = new Date(t);
+  return new Date(t - d.getTimezoneOffset() * 60000).toISOString().slice(0, 23);
+}
+$("from").value = local(SETTINGS.from);
+$("to").value = local(SETTINGS.to);
+for (const name of ["live", "cache", "refs"]) {
+  $(name + "-link").href = url(path(name));
+}
+$("refs-link").hidden = !SETTINGS.refs;
+$("maintenance-link").href = SETTINGS.listener ? "/maintenance" : base + "maintenance";
+function table(id, rows, columns) {
+  const host = $(id);
+  host.replaceChildren();
+  if (!rows.length) {
+    host.append(el("p", "No events in this window."));
+    return;
+  }
+  const t = el("table"),
+    head = el("tr"),
+    body = el("tbody");
+  for (const [label] of columns) head.append(el("th", label));
+  const thead = el("thead");
+  thead.append(head);
+  t.append(thead);
+  for (const r of rows) {
+    const tr = el("tr");
+    for (const [, get, cls] of columns) {
+      const v = get(r),
+        td = el("td", v instanceof Node ? null : v);
+      if (v instanceof Node) td.append(v);
+      if (cls) td.className = cls;
+      if (typeof v === "string" && /^-\d/.test(v)) td.classList.add("bad");
+      tr.append(td);
+    }
+    body.append(tr);
+  }
+  t.append(body);
+  host.append(t);
+}
+function button(text, fn) {
+  const b = el("button", text);
+  b.className = "link";
+  b.onclick = fn;
+  return b;
+}
+function tile(label, value, note) {
+  const t = el("div");
+  t.className = "tile";
+  t.append(el("small", label));
+  const v = el("div", value);
+  v.className = String(value).startsWith("-") ? "value bad" : "value";
+  t.append(v, el("small", note));
+  return t;
+}
+const columns = [["Conversation", c => c.conversation ? button(c.conversation, () => openConversation(c.conversation)) : "Unattributed"], ["Models", c => c.models.join(", ") || "–", "wrap"], ["Active", c => c.last_ms ? stamp(c.first_ms) + " → " + stamp(c.last_ms) : "–", "wrap"], ["Client turns", c => num(c.client_turns), "num"], ["Pings", c => num(c.pings), "num"], ["Compressions", c => num(c.compressions), "num"], ["Gross est.", c => num(c.saved_gross), "num"], ["Retrieved", c => num(c.retrieved_tokens), "num"], ["Net est.", c => num(c.saved_net), "num"], ["Input / output (incl. pings)", c => c.cache ? num(c.cache.tokens.input) + " / " + num(c.cache.tokens.output) : "–", "num"], ["Read / write 5m / 1h", c => c.cache ? [c.cache.tokens.read, c.cache.tokens.write_5m, c.cache.tokens.write_1h].map(num).join(" / ") : "–", "num"], ["Lost prefix (inferred)", c => num(c.cache?.losses.tokens), "num"], ["Loss cost (input-equiv.)", c => num(c.cache?.losses.cost), "num"], ["Retrieval rounds", c => num(c.retrieval_rounds), "num"], ["Avg latency / samples", c => c.latency_samples ? num(c.latency_ms_total / c.latency_samples) + " ms / " + num(c.latency_samples) : "–", "num"], ["Errors", c => num(c.errors), "num"]];
+function conversations() {
+  if (!report) return;
+  const needle = $("search").value.toLowerCase();
+  const rows = report.conversations.filter(c => (c.conversation + " " + c.models.join(" ")).toLowerCase().includes(needle));
+  const sort = $("sort").value;
+  rows.sort((a, b) => sort === "retrieval" ? b.retrieved_tokens - a.retrieved_tokens : sort === "loss" ? (b.cache?.losses.tokens || 0) - (a.cache?.losses.tokens || 0) : sort === "recent" ? b.last_ms - a.last_ms : a.saved_net - b.saved_net);
+  table("conversations", rows.slice(0, visible), columns);
+  $("conversation-count").textContent = `Showing ${Math.min(visible, rows.length)} of ${rows.length} conversations`;
+  $("more").hidden = visible >= rows.length;
+}
+function opportunities(id, rows) {
+  const max = Math.max(1, ...rows.map(r => r.tokens));
+  table(id, rows, [["Category", r => r.name], ["Tokens", r => {
+    const n = el("div", num(r.tokens)),
+      b = el("div");
+    b.className = "bar";
+    b.style.width = 100 * r.tokens / max + "%";
+    n.append(b);
+    return n;
+  }, "num"], ["Messages", r => num(r.messages), "num"], ["Requests", r => num(r.requests), "num"], ["Example", r => r.example_request ? button(r.example_request, () => example(r.example_request)) : "–"]]);
+}
+async function example(id) {
+  $("example").hidden = false;
+  $("example-body").textContent = "Loading…";
+  try {
+    const d = await call(url(base + "stats/requests", {
+      request_id: id
+    }));
+    $("example-body").textContent = JSON.stringify(d, null, 2);
+  } catch (e) {
+    $("example-body").textContent = e.message;
+  }
+  $("example").scrollIntoView({
+    behavior: "smooth",
+    block: "nearest"
+  });
+}
+function timeline() {
+  if (!selected) {
+    $("detail").hidden = true;
+    return;
+  }
+  $("detail").hidden = false;
+  $("detail-title").textContent = "Conversation " + selected;
+  $("detail-cache").href = url(path("cache"), {
+    conversation: selected,
+    from: report.from_ms,
+    to: report.to_ms
+  });
+  $("detail-note").textContent = `${report.turns_total} turns in window. ${report.turns_truncated ? "Showing the latest 2,000 turns. " : ""}Cache loss causes are inferred; ‘first’ has no preceding comparison in this window. Reference links show retrieved handles; expired fragments may no longer be available.`;
+  table("timeline", report.turns || [], [["Time / request", t => stamp(t.time_ms) + "\n" + t.request_id, "wrap"], ["Model / kind", t => (t.model || "–") + (t.keep_warm ? " · keep-warm" : ""), "wrap"], ["Compression est.", t => t.compressions ? num(t.saved_gross) + " removed" : "–", "num"], ["Retrieval debit / rounds", t => num(t.retrieved_tokens) + " / " + num(t.retrieval_rounds), "num"], ["Net est.", t => num(t.saved_net), "num"], ["Fresh / read / writes", t => t.cache ? [t.cache.uncached, t.cache.read, (t.cache.write_5m || 0) + (t.cache.write_1h || 0)].map(num).join(" / ") : "Usage unavailable", "num"], ["Cache outcome", t => t.cache ? t.cache.kind + (t.cache.cause ? " · inferred " + t.cache.cause : "") + " · " + num(t.cache.lost_tokens) + " lost" : "Not classified", "wrap"], ["Latency", t => t.total_ms == null ? "–" : num(t.total_ms) + " ms", "num"], ["Status / error", t => (t.status ?? "–") + (t.error ? " · " + t.error : ""), "wrap"], ["Retrieved refs", t => {
+    const n = el("div");
+    for (const ref of t.references) {
+      if (SETTINGS.refs) {
+        const a = el("a", ref);
+        const u = url(path("refs"));
+        u.hash = ref;
+        a.href = u;
+        n.append(a, el("br"));
+      } else n.append(el("div", ref));
+    }
+    if (t.references_truncated) n.append(el("small", "First 100 refs shown"));
+    return n;
+  }, "wrap"]]);
+}
+async function load() {
+  const seq = ++serial;
+  $("error").textContent = "";
+  $("status").textContent = "Loading…";
+  const from = new Date($("from").value).getTime(),
+    to = new Date($("to").value).getTime();
+  try {
+    if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from || to - from > 90 * 86400000) throw Error("Choose a valid range of at most 90 days.");
+    const d = await call(url(endpoint, {
+      format: "json",
+      from,
+      to,
+      conversation: selected
+    }));
+    if (seq !== serial) return;
+    report = d.report;
+    const all = [...report.conversations, report.unattributed],
+      sum = k => all.reduce((s, c) => s + c[k], 0);
+    $("tiles").replaceChildren(tile("Client turns", num(sum("client_turns")), num(report.conversations.length) + " conversations"), tile("Gross token reduction", num(sum("saved_gross")), "Estimated per request"), tile("Net token reduction", num(sum("saved_net")), num(sum("retrieved_tokens")) + " retrieved tokens"), tile("Provider input", num(report.usage.input), num(report.usage.with_usage) + " of " + num(report.usage.requests) + " rows with usage"), tile("Keep-warm input cost", num(report.ping_usage.cost), "Input-equivalent; output " + num(report.ping_usage.output)));
+    $("coverage").textContent = `Raw event history only; earliest retained event: ${report.raw_available_from_ms == null ? "none" : stamp(report.raw_available_from_ms)}. Retention: ${d.retention_days ? d.retention_days + " days" : "pruning disabled"}. Dropped events since process start: ${d.stats_dropped}. Unattributed client turns: ${report.unattributed.client_turns}. ${report.cache_truncated ? "CACHE DATA PARTIAL: latest 200,000 proxy rows only; cache totals and loss classifications may be incomplete." : ""}`;
+    conversations();
+    table("unattributed", [report.unattributed], columns);
+    for (const id of ["outcomes", "skips", "breakdowns"]) opportunities(id, report[id]);
+    timeline();
+    if (activeTab !== "efficiency") $("detail").hidden = true;
+    $("status").textContent = "Analyzed " + stamp(from) + " to " + stamp(to) + " (exclusive)";
+    const u = new URL(location.href);
+    u.searchParams.set("from", from);
+    u.searchParams.set("to", to);
+    if (selected) u.searchParams.set("conversation", selected);else u.searchParams.delete("conversation");
+    history.replaceState(null, "", u);
+    extraCache.clear();
+    loadExtra(activeTab);
+  } catch (e) {
+    if (seq === serial) {
+      $("status").textContent = "Analysis unavailable; displayed results may be from the previous range.";
+      $("error").textContent = e.message;
+    }
+  }
+}
+function openConversation(id) {
+  $("efficiency-tab").click();
+  selected = id;
+  load().then(() => {
+    if (selected === id) $("detail").scrollIntoView({
+      behavior: "smooth",
+      block: "start"
+    });
+  });
+}
+const tabIds = ["efficiency", "opportunities", "retrieval", "comparison", "latency"];
+let activeTab = "efficiency";
+const extraCache = new Map();
+for (const id of tabIds) {
+  $(id + "-tab").onkeydown = e => {
+    if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) {
+      e.preventDefault();
+      const i = tabIds.indexOf(id);
+      const target = e.key === "Home" ? tabIds[0] : e.key === "End" ? tabIds.at(-1) : tabIds[(i + (e.key === "ArrowLeft" ? -1 : 1) + tabIds.length) % tabIds.length];
+      $(target + "-tab").click();
+      $(target + "-tab").focus();
+    }
+  };
+  $(id + "-tab").onclick = () => {
+    activeTab = id;
+    for (const other of tabIds) {
+      $(other).hidden = other !== id;
+      $(other + "-tab").setAttribute("aria-selected", String(other === id));
+      $(other + "-tab").tabIndex = other === id ? 0 : -1;
+    }
+    $("detail").hidden = id !== "efficiency" || !selected;
+    // The tab lives in the fragment (the server refuses unknown query
+    // parameters) so a reload reopens it.
+    history.replaceState(null, "", location.pathname + location.search + (id === "efficiency" ? "" : "#" + id));
+    loadExtra(id);
+  };
+}
+$("filters").onsubmit = e => {
+  e.preventDefault();
+  visible = 100;
+  load();
+};
+$("auth").onsubmit = e => {
+  e.preventDefault();
+  try {
+    sessionStorage.setItem("kompressor-key", $("key").value.trim());
+  } catch (_) {}
+  load();
+};
+$("last-day").onclick = () => {
+  const now = Date.now();
+  $("from").value = local(now - 86400000);
+  $("to").value = local(now);
+  load();
+};
+$("sort").onchange = () => {
+  visible = 100;
+  conversations();
+};
+$("search").oninput = () => {
+  visible = 100;
+  conversations();
+};
+$("more").onclick = () => {
+  visible += 100;
+  conversations();
+};
+$("close").onclick = () => {
+  selected = null;
+  $("detail").hidden = true;
+  const u = new URL(location.href);
+  u.searchParams.delete("conversation");
+  history.replaceState(null, "", u);
+};
+const pct = v => v == null ? "–" : (v * 100).toFixed(1) + "%";
+const ms = v => v == null ? "–" : num(v) + " ms";
+function refLink(ref) {
+  if (!SETTINGS.refs) return ref;
+  const a = el("a", ref),
+    u = url(path("refs"));
+  u.hash = ref;
+  a.href = u;
+  return a;
+}
+function conversationLink(c) {
+  return c ? button(c, () => openConversation(c)) : "Unattributed";
+}
+function renderRetrieval(d) {
+  $("retrieval-tiles").replaceChildren(tile("Retrieval debit / gross", d.debit_to_gross == null ? "–" : d.debit_to_gross.toFixed(2) + "×", num(d.retrieved_tokens) + " returned / " + num(d.saved_gross) + " removed"), tile("Store attempts / hits", num(d.attempts) + " / " + num(d.hits), num(d.expired) + " expired · " + num(d.missing) + " missing"), tile("Budget-withheld asks", num(d.withheld), "Not store misses"), tile("Ranged / full tokens", num(d.ranged_tokens) + " / " + num(d.full_tokens), "Successful retrieval debit"));
+  $("retrieval-count").textContent = `Showing ${d.requests.length} of ${d.requests_total} requests with retrieval asks; largest debit minus gross first.`;
+  table("retrieval-requests", d.requests, [["Request", r => button(r.request_id, () => exampleFromDiagnostic(r.request_id))], ["Conversation", r => conversationLink(r.conversation)], ["Time", r => stamp(r.time_ms)], ["Gross est.", r => num(r.saved_gross), "num"], ["Retrieved", r => num(r.retrieved_tokens), "num"], ["Net est.", r => num(r.net_reduction), "num"], ["Debit / gross", r => r.debit_to_gross == null ? "–" : r.debit_to_gross.toFixed(2) + "×", "num"], ["Rounds", r => num(r.rounds), "num"]]);
+  $("repeat-count").textContent = `Showing ${d.repeated_refs.length} of ${d.repeated_refs_total} repeated reference groups. Without a fingerprint, repeats are grouped within a request only.`;
+  table("repeat-refs", d.repeated_refs, [["Conversation", r => conversationLink(r.conversation)], ["Reference", r => refLink(r.reference)], ["Asks", r => num(r.asks), "num"], ["Returned tokens", r => num(r.returned_tokens), "num"]]);
+  table("retrieval-rounds", d.rounds, [["Rounds", r => r.name], ["Client requests", r => num(r.count), "num"]]);
+}
+function exampleFromDiagnostic(id) {
+  $("opportunities-tab").click();
+  example(id);
+}
+function renderLatency(d) {
+  $("latency-status").textContent = `${d.requests} of ${d.rows_total} client rows analyzed; ${d.errors} errors; ${d.with_timing} rows with detailed timing. ${d.attempt_details_omitted || 0} upstream attempt details omitted by the per-request cap. ${d.truncated ? "PARTIAL: latest 200,000 rows only." : ""}`;
+  const distributions = [["End-to-end", d.total], ["Summed upstream response-head wait", d.upstream_head_wait], ["Request start to first upstream head", d.first_head], ["Engine execution", d.engine], ["Local retrieval execution (requests with calls)", d.retrieval_execution], ["Individual upstream attempts", d.attempt_wait]];
+  table("latency-distributions", distributions, [["Measurement", r => r[0]], ["Samples", r => num(r[1].samples), "num"], ["Mean", r => ms(r[1].mean), "num"], ["p50", r => ms(r[1].p50), "num"], ["p95", r => ms(r[1].p95), "num"], ["p99", r => ms(r[1].p99), "num"], ["Max", r => ms(r[1].max), "num"]]);
+  table("latency-groups", d.groups, [["Dimension", r => r.dimension], ["Value", r => r.name], ["Requests", r => num(r.requests), "num"], ["Errors", r => num(r.errors), "num"], ["Latency samples", r => num(r.latency.samples), "num"], ["p50", r => ms(r.latency.p50), "num"], ["p95", r => ms(r.latency.p95), "num"]]);
+  table("latency-slowest", d.slowest, [["Request", r => button(r.request_id, () => showPhases(r))], ["Conversation", r => conversationLink(r.conversation)], ["Time", r => stamp(r.time_ms)], ["Model", r => r.model || "–"], ["Total", r => ms(r.total_ms), "num"], ["Retrieval rounds", r => num(r.rounds), "num"], ["Error", r => r.error ? "yes" : "no"], ["First head", r => ms(r.timing?.first_head_ms), "num"]]);
+  table("latency-errors", d.errors_over_time, [["Interval start", r => stamp(r.time_ms)], ["Requests", r => num(r.requests), "num"], ["Errors", r => num(r.errors), "num"], ["Error share", r => pct(r.requests ? r.errors / r.requests : null), "num"]]);
+}
+function showPhases(r) {
+  $("phase-detail").hidden = false;
+  const t = r.timing;
+  $("phase-note").textContent = t ? `${r.request_id}: ${t.attempts_total} upstream attempts (${t.attempts.length} detailed, capped at 64); ${t.retrieval_calls} local answer/refusal executions took ${ms(t.retrieval_execution_ms)}. First response head: ${ms(t.first_head_ms)} from request start.` : "Detailed phase timing was not recorded for this request.";
+  table("phase-attempts", t ? t.attempts.map((a, i) => ({
+    ...a,
+    index: i + 1
+  })) : [], [["Attempt", a => a.index], ["Response-head wait", a => ms(a.duration_ms), "num"], ["Status", a => a.status ?? "no response"], ["Transport failure", a => a.failed ? "yes" : "no"]]);
+  $("phase-detail").scrollIntoView({
+    behavior: "smooth",
+    block: "nearest"
+  });
+}
+let baselineEdited = false;
+function defaultBaseline() {
+  if (!report || baselineEdited) return;
+  const span = report.to_ms - report.from_ms;
+  $("baseline-from").value = local(Math.max(0, report.from_ms - span));
+  $("baseline-to").value = local(report.from_ms);
+}
+function comparisonQuery() {
+  defaultBaseline();
+  const query = {
+    compare_from: new Date($("baseline-from").value).getTime(),
+    compare_to: new Date($("baseline-to").value).getTime()
+  };
+  for (const field of ["model", "mode", "surface", "experiment_id", "run_id"]) {
+    const value = $("compare-" + field).value.trim();
+    if (value) query[field] = value;
+  }
+  return query;
+}
+function metricValue(name, value) {
+  return value == null ? "–" : name.includes("share") ? pct(value) : new Intl.NumberFormat(undefined, {
+    maximumFractionDigits: 2
+  }).format(value);
+}
+function renderComparison(d) {
+  const omitted = d.current.archived_partial_days_omitted + d.baseline.archived_partial_days_omitted;
+  $("comparison-status").textContent = `Current: ${stamp(d.current.from_ms)} → ${stamp(d.current.to_ms)}. Baseline: ${stamp(d.baseline.from_ms)} → ${stamp(d.baseline.to_ms)}. ${omitted ? "INCOMPLETE: " + omitted + " partial archived days omitted; align dates to UTC midnights for complete totals." : ""}`;
+  table("comparison-metrics", Object.entries(d.changes), [["Metric", r => r[0]], ["Current", r => metricValue(r[0], r[1].current), "num"], ["Baseline", r => metricValue(r[0], r[1].baseline), "num"], ["Difference", r => metricValue(r[0], r[1].absolute), "num"], ["Relative change", r => pct(r[1].relative), "num"]]);
+  const rows = [...d.current.rows.map(r => ({
+    ...r,
+    period: "Current"
+  })), ...d.baseline.rows.map(r => ({
+    ...r,
+    period: "Baseline"
+  }))];
+  table("comparison-cohorts", rows, [["Period", r => r.period], ["Model / mode / surface", r => [r.dimension.model, r.dimension.mode, r.dimension.surface].join(" / "), "wrap"], ["Build", r => r.dimension.build_version || "unrecorded"], ["Configuration", r => r.dimension.config_fingerprint ? button(r.dimension.config_fingerprint.slice(0, 12), () => {
+    $("cohort-settings").hidden = false;
+    $("cohort-settings-body").textContent = JSON.stringify(JSON.parse(r.dimension.settings_json), null, 2);
+  }) : "unrecorded"], ["Experiment", r => r.dimension.experiment_id || "unrecorded"], ["Run", r => r.dimension.run_id || "unrecorded"], ["Clients", r => num(r.metrics.client_requests), "num"], ["Conversations", r => num(r.conversations), "num"], ["Net est.", r => num(r.metrics.saved_gross - r.metrics.retrieved_tokens), "num"], ["Provider input", r => num(r.metrics.input_tokens), "num"], ["Usage rows", r => num(r.metrics.usage_rows), "num"]]);
+}
+let extraSerial = 0;
+async function loadExtra(id) {
+  if (!report || !["retrieval", "latency", "comparison"].includes(id)) return;
+  const seq = ++extraSerial,
+    range = {
+      from: report.from_ms,
+      to: report.to_ms
+    };
+  const query = {
+    format: "json",
+    ...range,
+    ...(id === "comparison" ? comparisonQuery() : {})
+  };
+  const cacheKey = JSON.stringify([id, query]);
+  const status = $(id + "-status");
+  status.textContent = "Loading…";
+  try {
+    let data = extraCache.get(cacheKey);
+    if (!data) {
+      const suffix = {
+        retrieval: "retrievals",
+        latency: "latency",
+        comparison: "compare"
+      }[id];
+      data = await call(url(endpoint.replace(/\/$/, "") + "/" + suffix, query));
+      extraCache.set(cacheKey, data);
+    }
+    if (seq !== extraSerial || report.from_ms !== range.from || report.to_ms !== range.to) return;
+    status.textContent = id === "retrieval" ? "Retained-event retrieval analysis." : "";
+    ({
+      retrieval: renderRetrieval,
+      latency: renderLatency,
+      comparison: renderComparison
+    })[id](data);
+  } catch (e) {
+    if (seq === extraSerial) status.textContent = "Analysis unavailable: " + e.message;
+  }
+}
+// Fetch a JSON Lines export with the key header (a plain link could not carry
+// it) and hand it to the browser as a file named by the server.
+async function downloadJsonl(url, keyValue, button) {
+  const headers = { accept: "application/x-ndjson" };
+  if (keyValue) headers["x-kompressor-key"] = keyValue;
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = "Downloading…";
+  try {
+    const response = await fetch(url, { headers, cache: "no-store" });
+    if (!response.ok) {
+      let message = "HTTP " + response.status;
+      try { const body = await response.json(); message = (body.error && body.error.message) || message; } catch (_) {}
+      throw new Error(message);
+    }
+    const blob = await response.blob();
+    const match = /filename="([^"]+)"/.exec(response.headers.get("content-disposition") || "");
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = match ? match[1] : "kompressor.jsonl";
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  } catch (error) {
+    alert("Download failed: " + error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = label;
+  }
+}
+// The open tab's data: the overview for the first two, the diagnostic route
+// for the others, over the range on screen.
+$("download").onclick = e => {
+  if (!report) { $("error").textContent = "Analyze a range before downloading."; return; }
+  const range = { from: report.from_ms, to: report.to_ms };
+  const suffix = { retrieval: "retrievals", latency: "latency", comparison: "compare" }[activeTab];
+  const u = suffix
+    ? url(endpoint.replace(/\/$/, "") + "/" + suffix, { format: "jsonl", ...range, ...(activeTab === "comparison" ? comparisonQuery() : {}) })
+    : url(endpoint, { format: "jsonl", ...range, conversation: selected });
+  downloadJsonl(u, key(), e.currentTarget);
+};
+$("comparison-form").onsubmit = e => {
+  e.preventDefault();
+  baselineEdited = true;
+  extraCache.clear();
+  loadExtra("comparison");
+};
+for (const id of ["baseline-from", "baseline-to"]) $(id).oninput = () => {
+  baselineEdited = true;
+};
+{
+  const tab = location.hash.slice(1);
+  if (tab !== activeTab && tabIds.includes(tab)) $(tab + "-tab").click();
+}
+load();
+</script><script>
+// The dashboards sit at /trends on the statistics listener and at
+// /v1/stats/trends (or /v2/...) on the API.
+(() => {
+  const link = document.getElementById("dashboards-link");
+  const version = /^\/v[12]\//.exec(location.pathname);
+  const url = new URL(version ? version[0] + "stats/trends" : "/trends", location.origin);
+  const tenant = new URLSearchParams(location.search).get("tenant");
+  if (tenant) url.searchParams.set("tenant", tenant);
+  link.href = url.pathname + url.search;
+})();
+</script>
+</body></html>

@@ -49,12 +49,27 @@
 
 #![forbid(unsafe_code)]
 
+pub mod advisor;
+pub mod analysis;
+pub mod breakdown;
+pub mod cache;
 pub mod config;
+pub mod context;
+pub mod dashboards;
 pub mod error;
 pub mod events;
+pub mod health;
+pub mod history;
+pub mod insights;
+pub mod live;
+pub mod prefix;
+pub mod purge;
+pub mod quality;
 pub mod reader;
 pub mod retention;
 pub mod schema;
+pub mod scorecards;
+pub mod traffic;
 pub mod writer;
 
 pub use config::{
@@ -63,8 +78,8 @@ pub use config::{
 };
 pub use error::StatsError;
 pub use events::{
-    Event, OptimizationEvent, ProtectedRefEvent, ProxyRequestEvent, RetrievalEvent, StoreSample,
-    Surface,
+    BackupEvent, Event, MaintenanceEvent, OptimizationEvent, ProtectedRefEvent, ProxyRequestEvent,
+    RetrievalEvent, StoreSample, Surface,
 };
 pub use reader::{
     Bucket, BucketRow, DailyRollup, ModeTotals, ProviderCoverage, ProxyRow, RefCount,
@@ -72,7 +87,7 @@ pub use reader::{
     TypeCoverage,
 };
 pub use retention::PruneCounts;
-pub use writer::{StatsHandle, StatsSink, StatsWriter, null_sink, spawn};
+pub use writer::{StatsHandle, StatsSink, StatsWriter, Upkeep, null_sink, spawn};
 
 #[cfg(test)]
 mod tests {
@@ -168,6 +183,7 @@ mod tests {
         returned_tokens: u32,
     ) -> Event {
         Event::Retrieval(RetrievalEvent {
+            context: None,
             time_ms,
             tenant: tenant.to_string(),
             request_id: request_id.map(str::to_string),
@@ -209,6 +225,9 @@ mod tests {
 
     fn proxy(time_ms: i64, tenant: &str, request_id: &str) -> Event {
         Event::ProxyRequest(ProxyRequestEvent {
+            prefix: None,
+            context: None,
+            timing: None,
             time_ms,
             tenant: tenant.to_string(),
             request_id: request_id.to_string(),
@@ -232,6 +251,43 @@ mod tests {
             error: None,
             keep_warm: false,
         })
+    }
+
+    /// The observation rides on the event and comes back out of the report:
+    /// the writer's column list and the reader's are the same list.
+    #[test]
+    fn a_prefix_observation_survives_the_writer() {
+        use crate::context::{DRIFT_TOOL_SET, PrefixObservation};
+        let harness = Harness::new();
+        let seen = PrefixObservation {
+            compared: true,
+            drift_out: DRIFT_TOOL_SET,
+            tools_bytes: 2_585,
+            body_bytes: 5_170,
+            ..PrefixObservation::default()
+        };
+        let observed = match proxy_in(T0, "acme", "req-1", "c0ffee") {
+            Event::ProxyRequest(mut event) => {
+                event.prefix = Some(seen);
+                Event::ProxyRequest(event)
+            }
+            other => other,
+        };
+        harness.write(vec![observed, proxy(T0 + 1, "acme", "req-2")]);
+
+        let report = harness.reader().prefix("acme", 0, i64::MAX).unwrap();
+        assert!(report.available);
+        assert_eq!(
+            (report.requests, report.observed, report.compared),
+            (2, 1, 1)
+        );
+        let tool_set = report
+            .drift
+            .iter()
+            .find(|s| s.segment == "tool_set")
+            .unwrap();
+        assert_eq!(tool_set.proxy_turns, 1);
+        assert_eq!(report.composition[0].tools_share, 0.5);
     }
 
     #[test]
@@ -819,6 +875,91 @@ mod tests {
         assert_eq!(report.top_refs.len(), 2);
     }
 
+    /// `by_provider` used to join `proxy_requests` on the request id alone.
+    /// Two proxy rows under one id (a retry, a client that reuses its
+    /// `x-request-id`) then counted the compression twice, and a row of the
+    /// same id under another tenant put that tenant's upstream in this one's
+    /// report.
+    #[test]
+    fn provider_coverage_counts_each_compression_once_and_names_only_its_own_hosts() {
+        let harness = Harness::new();
+        let other_host = match proxy(T0, "globex", "req-1") {
+            Event::ProxyRequest(mut event) => {
+                event.upstream = "https://globex.invalid".to_string();
+                Event::ProxyRequest(event)
+            }
+            other => other,
+        };
+        harness.write(vec![
+            optimization(T0, "acme", "req-1", 1_000, 400),
+            proxy(T0, "acme", "req-1"),
+            proxy(T0 + 1, "acme", "req-1"),
+            other_host,
+        ]);
+        let rows = harness.reader().by_provider("acme", 0, i64::MAX).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].requests, 1,
+            "one compression, however many proxy rows"
+        );
+        assert_eq!(
+            (rows[0].tokens_in, rows[0].tokens_out, rows[0].saved),
+            (1_000, 400, 600)
+        );
+        assert_eq!(rows[0].hosts, vec!["https://upstream.invalid".to_string()]);
+
+        // A compression with no proxy row at all still has its line.
+        harness.write(vec![optimization(T0, "solo", "s-1", 50, 40)]);
+        let solo = harness.reader().by_provider("solo", 0, i64::MAX).unwrap();
+        assert_eq!((solo[0].requests, solo[0].saved), (1, 10));
+        assert!(solo[0].hosts.is_empty());
+    }
+
+    /// Design §9.4: a discarded row "still claimed the shrink" until
+    /// `Event::Discarded` amends it, and the savings views leave it out. The
+    /// reader behind `/v1/stats/summary`, the histogram, the MCP stats tool
+    /// and the line `kompressor wrap` prints on exit summed it regardless.
+    #[test]
+    fn a_discarded_rewrite_is_a_request_that_saved_nothing() {
+        let mut harness = Harness::new();
+        harness.write(vec![
+            optimization(T0, "acme", "kept", 1_000, 400),
+            optimization(T0, "acme", "thrown", 1_000, 100),
+            proxy(T0, "acme", "kept"),
+            proxy(T0, "acme", "thrown"),
+            Event::Discarded {
+                tenant: "acme".into(),
+                request_id: "thrown".into(),
+            },
+        ]);
+        let reader = harness.reader();
+        let summary = reader.summary("acme", 0, i64::MAX).unwrap();
+        assert_eq!(summary.requests, 2, "it is still a run");
+        assert_eq!(summary.saved_gross, 600);
+        assert_eq!(summary.saved_net, 600);
+        assert_eq!(
+            summary.by_mode.iter().map(|m| m.saved_gross).sum::<i64>(),
+            600
+        );
+
+        let histogram = reader.histogram("acme", 0, i64::MAX, Bucket::Day).unwrap();
+        assert_eq!(histogram.iter().map(|r| r.requests).sum::<u64>(), 2);
+        assert_eq!(histogram.iter().map(|r| r.saved_gross).sum::<i64>(), 600);
+
+        assert_eq!(reader.session_since(0).unwrap().saved_gross, 600);
+        assert_eq!(
+            reader.by_provider("acme", 0, i64::MAX).unwrap()[0].saved,
+            600
+        );
+        let one = reader
+            .request("acme", "thrown")
+            .unwrap()
+            .expect("the request");
+        assert_eq!(one.saved_gross, 0);
+        drop(reader);
+        harness.shutdown();
+    }
+
     #[test]
     fn every_query_isolates_tenants() {
         let harness = Harness::new();
@@ -1064,6 +1205,18 @@ mod tests {
                      ALTER TABLE proxy_requests DROP COLUMN strip_usage;
                      ALTER TABLE proxy_requests DROP COLUMN cache_write_1h_tokens;
                      ALTER TABLE proxy_requests DROP COLUMN keep_warm;
+                     ALTER TABLE retrieval_events DROP COLUMN context_json;
+                     DROP TABLE request_context;
+                     DROP TABLE daily_analysis;
+                     DROP TABLE daily_analysis_conversations;
+                     ALTER TABLE proxy_requests DROP COLUMN timing_json;
+                     ALTER TABLE proxy_requests DROP COLUMN analysis_archived;
+                     ALTER TABLE optimization_events DROP COLUMN analysis_archived;
+                     ALTER TABLE retrieval_events DROP COLUMN analysis_archived;
+                     ALTER TABLE retrieval_events DROP COLUMN range_status;
+                     ALTER TABLE proxy_requests DROP COLUMN prefix_json;
+                     DROP TABLE backups;
+                     DROP TABLE maintenance_events;
                      PRAGMA user_version = 5;",
                 )
                 .unwrap();
@@ -1108,7 +1261,19 @@ mod tests {
                 ALTER TABLE proxy_requests DROP COLUMN strip_usage;
                 ALTER TABLE proxy_requests DROP COLUMN cache_write_1h_tokens;
                 ALTER TABLE proxy_requests DROP COLUMN keep_warm;
-                PRAGMA user_version = 5;",
+                ALTER TABLE retrieval_events DROP COLUMN context_json;
+                     DROP TABLE request_context;
+                     DROP TABLE daily_analysis;
+                     DROP TABLE daily_analysis_conversations;
+                     ALTER TABLE proxy_requests DROP COLUMN timing_json;
+                     ALTER TABLE proxy_requests DROP COLUMN analysis_archived;
+                     ALTER TABLE optimization_events DROP COLUMN analysis_archived;
+                     ALTER TABLE retrieval_events DROP COLUMN analysis_archived;
+                     ALTER TABLE retrieval_events DROP COLUMN range_status;
+                     ALTER TABLE proxy_requests DROP COLUMN prefix_json;
+                     DROP TABLE backups;
+                     DROP TABLE maintenance_events;
+                     PRAGMA user_version = 5;",
                 )
                 .unwrap();
         }
@@ -1848,3 +2013,10 @@ mod tests {
         assert_eq!(outcome.saved_net(), outcome.saved_gross);
     }
 }
+
+#[cfg(test)]
+mod advisor_tests;
+#[cfg(test)]
+mod analysis_tests;
+#[cfg(test)]
+mod prefix_tests;

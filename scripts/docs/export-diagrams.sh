@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Re-render docs/charts/*.drawio.png from the diagram each one already carries.
+# Re-render docs/charts/*.drawio.png and docs/charts/*/*.drawio.png from the
+# diagram each one already carries.
 #
 # Each chart is a single file: a PNG that renders anywhere, with the drawio XML
 # embedded in it. Editing one in drawio and saving updates both halves at once,
@@ -38,9 +39,11 @@ if [[ -z "${DISPLAY:-}" ]] && command -v xvfb-run >/dev/null; then
 fi
 
 status=0
-for chart in *.drawio.png; do
+# Charts may sit one folder down (keepwarm/), grouped by feature.
+shopt -s nullglob
+for chart in *.drawio.png */*.drawio.png; do
   printf '  %-30s ... ' "$chart"
-  tmp="$(mktemp -t "${chart%.drawio.png}.XXXXXX.png")"
+  tmp="$(mktemp -t "$(basename "${chart%.drawio.png}").XXXXXX.png")"
   if ! "${runner[@]}" drawio -x -f png -e -s 2 -b 20 -o "$tmp" "$chart" >/dev/null 2>&1; then
     echo "FAILED (export)"; rm -f "$tmp"; status=1; continue
   fi

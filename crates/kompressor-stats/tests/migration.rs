@@ -292,24 +292,216 @@ fn a_v11_database_gains_keep_warm_and_its_rows_are_client_requests() {
 }
 
 #[test]
-fn the_ladder_stops_where_experimental_v2_takes_over() {
-    // `experimental/v2` already owns v13 (request context and daily analysis)
-    // and v14 (retrieval range_status). A v13 assigned here would mean a
-    // different schema under the same number: a database this line stamped
-    // 13 would make that line skip its own v13 and fail on v14 with
-    // "duplicate column range_status", and the server would not start.
-    // Raise this only together with that ladder, never past it on its own.
-    assert_eq!(schema::latest_version(), 12);
+fn a_v13_database_gains_range_status_and_keeps_its_retrievals() {
+    // Rows written before the column existed asked for no status at all, so
+    // they read NULL — the same as a retrieval that sent no range — and the
+    // writer fills the column from then on.
+    use kompressor_stats::events::{Event, RetrievalEvent, Surface};
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("stats.db");
-    drop(StatsWriter::open(&StatsConfig::at(&path)).unwrap());
-    let conn = Connection::open(&path).unwrap();
-    let has_status: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('retrieval_events') WHERE name = 'range_status'",
-            [],
-            |row| row.get(0),
+    database_at(&path, 13);
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO retrieval_events
+               (time_ms, tenant, request_id, surface, \"ref\", found, expired, ranged,
+                fragment_bytes, fragment_chars, fragment_tokens, returned_chars,
+                returned_tokens, withheld)
+             VALUES (?1, 'acme', 'req-old', 'proxy', 'k_AbC123dEf456', 1, 0, 0,
+                     400, 400, 100, 400, 100, 0)",
+            [T0],
         )
         .unwrap();
-    assert_eq!(has_status, 0, "range_status is v14, not this line's to add");
+    }
+
+    let mut writer = StatsWriter::open(&StatsConfig::at(&path)).unwrap();
+    writer
+        .write_batch(&[Event::Retrieval(RetrievalEvent {
+            context: None,
+            time_ms: T0 + 1,
+            tenant: "acme".into(),
+            request_id: Some("req-new".into()),
+            surface: Surface::Proxy,
+            reference: "k_AbC123dEf456".into(),
+            found: true,
+            expired: false,
+            ranged: true,
+            fragment_bytes: 120,
+            fragment_chars: 120,
+            fragment_tokens: 30,
+            returned_chars: 120,
+            returned_tokens: 30,
+            withheld: false,
+            range_status: Some("normalized".into()),
+        })])
+        .unwrap();
+    drop(writer);
+
+    let conn = Connection::open(&path).unwrap();
+    let statuses: Vec<(String, Option<String>)> = conn
+        .prepare("SELECT request_id, range_status FROM retrieval_events ORDER BY time_ms")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        statuses,
+        vec![
+            ("req-old".to_string(), None),
+            ("req-new".to_string(), Some("normalized".to_string())),
+        ]
+    );
+}
+
+/// Several processes open one file, and after an upgrade the first to start
+/// all find it behind. Each must come up: the one that gets there first
+/// applies a step, the others wait for it and skip what it did.
+///
+/// Reading the version before taking the write lock had every one of them
+/// start the same step, and all but the first fail on "table already exists"
+/// — a `serve` and an `mcp serve` started together after an upgrade, and one
+/// of them did not start.
+#[test]
+fn openers_racing_to_upgrade_one_database_all_succeed() {
+    // v12 is what the last release before the v13–v15 steps left behind; v0
+    // is a first start with nothing on disk.
+    for from in [12, 0] {
+        for round in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("stats.db");
+            if from > 0 {
+                database_at(&path, from);
+                fill_v5(&path);
+            }
+            let before = (from > 0).then(|| {
+                let conn = Connection::open(&path).unwrap();
+                count(&conn, "SELECT COUNT(*) FROM optimization_events")
+            });
+            let start = std::sync::Barrier::new(4);
+            let versions: Vec<Result<u32, String>> = std::thread::scope(|scope| {
+                let openers: Vec<_> = (0..4)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            start.wait();
+                            schema::open_read_write(&path)
+                                .map(|conn| {
+                                    count(&conn, "SELECT * FROM pragma_user_version") as u32
+                                })
+                                .map_err(|e| e.to_string())
+                        })
+                    })
+                    .collect();
+                openers.into_iter().map(|t| t.join().unwrap()).collect()
+            });
+            for version in &versions {
+                assert_eq!(
+                    version.as_ref().ok(),
+                    Some(&schema::latest_version()),
+                    "from v{from}, round {round}: {versions:?}"
+                );
+            }
+            let conn = Connection::open(&path).unwrap();
+            let sound: String = conn
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(sound, "ok");
+            if let Some(before) = before {
+                assert_eq!(
+                    count(&conn, "SELECT COUNT(*) FROM optimization_events"),
+                    before,
+                    "no row lost or doubled"
+                );
+            }
+        }
+    }
+}
+
+/// Applying the ladder to a database that is already current changes nothing
+/// and leaves no transaction open.
+#[test]
+fn a_database_that_is_already_current_is_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stats.db");
+    let conn = schema::open_read_write(&path).unwrap();
+    let schema_before: i64 = count(&conn, "SELECT * FROM pragma_schema_version");
+    assert_eq!(schema::apply(&conn).unwrap(), schema::latest_version());
+    assert_eq!(schema::apply(&conn).unwrap(), schema::latest_version());
+    assert_eq!(
+        count(&conn, "SELECT * FROM pragma_schema_version"),
+        schema_before,
+        "nothing was altered"
+    );
+    assert!(conn.is_autocommit(), "no transaction left open");
+}
+
+/// v16 adds the record of backups. A v15 database — what 2.5.0 left behind —
+/// gains the table, keeps every row, and the record can be written and read.
+#[test]
+fn a_v15_database_gains_the_backup_record_and_keeps_its_rows() {
+    use kompressor_stats::events::BackupEvent;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stats.db");
+    database_at(&path, 15);
+    fill_v5(&path);
+    let before = {
+        let conn = Connection::open(&path).unwrap();
+        count(&conn, "SELECT COUNT(*) FROM optimization_events")
+    };
+    let event = |time_ms, ok| BackupEvent {
+        time_ms,
+        origin: "cli".to_string(),
+        destination: "/backups/a.tar.gz".to_string(),
+        bytes: 1_024,
+        databases: 2,
+        ok,
+        error: (!ok).then(|| "disk full".to_string()),
+    };
+    // Not migrated yet: a backup does not upgrade the schema to leave a note.
+    assert!(!kompressor_stats::writer::record_backup(&path, &event(T0, true)).unwrap());
+    assert!(
+        !kompressor_stats::writer::record_backup(&dir.path().join("absent.db"), &event(T0, true))
+            .unwrap()
+    );
+    assert!(
+        !dir.path().join("absent.db").exists(),
+        "and creates nothing"
+    );
+    let reader = kompressor_stats::StatsReader::open(&path).unwrap();
+    assert!(
+        reader.backups(10).unwrap().is_empty(),
+        "an older file has none on record"
+    );
+    assert_eq!(reader.last_backup().unwrap(), (None, None));
+    drop(reader);
+
+    StatsWriter::open(&StatsConfig::at(&path)).expect("v15 upgrades");
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(
+        count(&conn, "SELECT * FROM pragma_user_version") as u32,
+        schema::latest_version()
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM optimization_events"),
+        before
+    );
+    drop(conn);
+
+    for (time_ms, ok) in [(T0, true), (T0 + DAY, true), (T0 + 2 * DAY, false)] {
+        assert!(kompressor_stats::writer::record_backup(&path, &event(time_ms, ok)).unwrap());
+    }
+    let reader = kompressor_stats::StatsReader::open(&path).unwrap();
+    let listed = reader.backups(2).unwrap();
+    assert_eq!(listed.len(), 2, "newest first, and no more than asked");
+    assert_eq!(listed[0], event(T0 + 2 * DAY, false));
+    assert_eq!(listed[1].time_ms, T0 + DAY);
+    assert_eq!(
+        reader.last_backup().unwrap(),
+        (Some(T0 + DAY), Some(T0 + 2 * DAY)),
+        "the last that worked, and the failure since"
+    );
+    // Once one works again, the failure is history.
+    assert!(kompressor_stats::writer::record_backup(&path, &event(T0 + 3 * DAY, true)).unwrap());
+    assert_eq!(reader.last_backup().unwrap(), (Some(T0 + 3 * DAY), None));
 }

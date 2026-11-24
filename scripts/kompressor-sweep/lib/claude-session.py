@@ -1,9 +1,8 @@
 """Describe the actual tool results in a Claude stream-json session."""
 import json
 import sys
-import subprocess
-import tempfile
-from pathlib import Path
+
+from replay import analyse
 
 calls = {}
 results = []
@@ -53,28 +52,4 @@ else:
     if "--analyse" in sys.argv:
         index = sys.argv.index("--analyse")
         binary, config = sys.argv[index + 1:index + 3]
-        print("\n  per-payload compression (local replay of actual tool output, not live savings)")
-        print(f"  {'command / tool':<44}{'detected':<15}{'kind':<15}{'chars in':>10}{'out':>10}{'saved':>9}")
-        total_in = total_out = 0
-        with tempfile.TemporaryDirectory(prefix="claude-payloads-") as directory:
-            payload = Path(directory) / "payload.txt"
-            for label, size, _, content in results:
-                payload.write_text(content)
-                outputs = []
-                for command in ("detect", "compress"):
-                    args = [binary, command, "--config", config, "--json"]
-                    if command == "compress":
-                        args += ["--mode", "recoverable"]
-                    run = subprocess.run([*args, str(payload)], capture_output=True, text=True)
-                    if run.returncode:
-                        raise RuntimeError(f"{command} failed: {run.stderr}")
-                    outputs.append(json.loads(run.stdout))
-                detected, compressed = outputs
-                ci, co = compressed["chars_in"], compressed["chars_out"]
-                total_in += ci
-                total_out += co
-                saved = 100 * (ci - co) / ci if ci else 0
-                print(f"  {label[:43]:<44}{str(detected.get('content_type') or 'unknown'):<15}"
-                      f"{str(compressed.get('kind') or 'unchanged'):<15}{ci:>10,}{co:>10,}{saved:>8.2f}%")
-        print(f"\n  tool output chars {total_in:,} -> {total_out:,} "
-              f"({100 * (total_in - total_out) / max(total_in, 1):.2f}% removed in local replay)")
+        analyse([(label, content) for label, _, _, content in results], binary, config)

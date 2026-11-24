@@ -232,12 +232,34 @@ impl Drop for Lock {
     }
 }
 
-fn read_json(path: &Path) -> Map<String, Value> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default()
+/// The settings file as an object; an absent file is an empty one.
+///
+/// Anything else that is not a JSON object is an error, never an empty map.
+/// Treating a file with a trailing comma as empty was how a claim replaced the
+/// user's permissions and hooks with `{"env":{…}}`, and the ownership record
+/// keeps one value, not the file, so nothing could put them back.
+fn read_json(path: &Path) -> Result<Map<String, Value>, CliError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
+        Err(error) => {
+            return Err(CliError::runtime(
+                &format!("could not read {}", path.display()),
+                error,
+            ));
+        }
+    };
+    match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(object)) => Ok(object),
+        Ok(_) => Err(CliError::Runtime(format!(
+            "{} is not a JSON object; fix it and run this again — it was left untouched",
+            path.display()
+        ))),
+        Err(error) => Err(CliError::Runtime(format!(
+            "{} is not valid JSON ({error}); fix it and run this again — it was left untouched",
+            path.display()
+        ))),
+    }
 }
 
 fn write_json(path: &Path, object: &Map<String, Value>) -> Result<(), CliError> {
@@ -272,7 +294,9 @@ pub(super) fn write_owners(path: &Path, owners: &Owners) -> Result<(), CliError>
     }
     let text = serde_json::to_string_pretty(owners)
         .map_err(|e| CliError::runtime("could not render the ownership record", e))?;
-    std::fs::write(path, text + "\n")
+    // Owner-only: for codex and opencode the recorded original is the whole of
+    // the agent's configuration file, which may hold a token.
+    paths::write_private(path, &(text + "\n"))
         .map_err(|e| CliError::runtime(&format!("could not write {}", path.display()), e))
 }
 
@@ -304,7 +328,7 @@ pub fn claim(target: &Target, key: &str, value: &str) -> Result<bool, CliError> 
     let owners_path = target.owners_path();
     let mut owners = read_owners(&owners_path);
 
-    let mut settings = read_json(&target.settings);
+    let mut settings = read_json(&target.settings)?;
     let section = settings
         .entry(target.section.to_string())
         .or_insert_with(|| Value::Object(Map::new()));
@@ -315,13 +339,24 @@ pub fn claim(target: &Target, key: &str, value: &str) -> Result<bool, CliError> 
             target.section
         )));
     }
-    let current = section.get(key).and_then(Value::as_str).map(str::to_string);
+    let mut current = section.get(key).and_then(Value::as_str).map(str::to_string);
 
     let mut claim = owners.keys.remove(key).unwrap_or_default();
+    let had_holders = !claim.holders.is_empty();
     sweep(&mut claim, &owners_path);
     // The original is recorded once, by the first live claimant. A later session
     // observing a proxy URL must not adopt it as "the original" — restoring that
     // on exit would leave the file pointing at a proxy that is gone.
+    //
+    // That holds for a session that died, too. Its record is still here with
+    // every holder swept, and the file still says what it wrote: the proxy URL.
+    // Reading that as the original threw away the one copy of the user's real
+    // value, so the next clean exit "restored" the dead proxy and removed the
+    // record that `unwrap` would have needed. What the dead session owed is
+    // paid first — its recorded original is the value this key had.
+    if had_holders && claim.holders.is_empty() {
+        current = claim.original.clone();
+    }
     if claim.holders.is_empty() {
         claim.original = current.clone();
     }
@@ -386,7 +421,10 @@ pub fn release(target: &Target, key: &str, force: bool) -> Result<Released, CliE
         return Ok(Released::StillInUse);
     }
 
-    let mut settings = read_json(&target.settings);
+    // Read before the ownership record changes: a file that stopped parsing
+    // mid-session keeps its claim, so `unwrap` can finish the job once it is
+    // fixed.
+    let mut settings = read_json(&target.settings)?;
     if let Some(Value::Object(section)) = settings.get_mut(target.section) {
         match &claim.original {
             Some(original) => {
@@ -437,6 +475,7 @@ mod tests {
 
     fn value_at(target: &Target, key: &str) -> Option<String> {
         read_json(&target.settings)
+            .ok()?
             .get(target.section)?
             .get(key)?
             .as_str()
@@ -494,7 +533,7 @@ mod tests {
             value_at(&target, "ANTHROPIC_BASE_URL").as_deref(),
             Some("https://my-gateway.internal")
         );
-        let settings = read_json(&target.settings);
+        let settings = read_json(&target.settings).unwrap();
         assert_eq!(
             settings.get("other").and_then(Value::as_i64),
             Some(1),
@@ -546,6 +585,94 @@ mod tests {
             value_at(&target, "ANTHROPIC_BASE_URL").as_deref(),
             Some("https://real.example"),
             "the restored value is the pre-wrap one, not the first session's proxy"
+        );
+    }
+
+    /// `wrap --attach`, SIGKILL, `wrap --attach` again, Ctrl-C. The second
+    /// session finds the dead one's record and the dead one's proxy URL in the
+    /// file. It must leave by putting back what the user had, not the URL of
+    /// a proxy that is gone.
+    #[test]
+    fn a_claim_after_a_dead_session_keeps_the_real_original() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        for original in [Some("https://original.example"), None] {
+            let scratch = Scratch::new(if original.is_some() {
+                "reclaim"
+            } else {
+                "reclaim-none"
+            });
+            let target = scratch.target();
+            std::fs::create_dir_all(target.settings.parent().unwrap()).unwrap();
+            let owners_path = target.owners_path();
+            let mut owners = Owners::default();
+            owners.keys.insert(
+                "ANTHROPIC_BASE_URL".into(),
+                Claim {
+                    original: original.map(str::to_string),
+                    holders: vec![Holder {
+                        pid: 0,
+                        start_time: Some(1),
+                        lock: None,
+                    }],
+                },
+            );
+            write_owners(&owners_path, &owners).unwrap();
+            std::fs::write(
+                &target.settings,
+                r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8817"},"keep":1}"#,
+            )
+            .unwrap();
+
+            // Same port as the dead session: nothing in the file changes, and
+            // that must not be read as "the original is the proxy".
+            claim(&target, "ANTHROPIC_BASE_URL", "http://127.0.0.1:8817").unwrap();
+            assert_eq!(
+                read_owners(&owners_path).keys["ANTHROPIC_BASE_URL"]
+                    .original
+                    .as_deref(),
+                original,
+                "the record must still hold the user's value"
+            );
+            release(&target, "ANTHROPIC_BASE_URL", false).unwrap();
+            assert_eq!(
+                value_at(&target, "ANTHROPIC_BASE_URL").as_deref(),
+                original,
+                "the dead proxy's URL was restored as if it were the user's"
+            );
+            let text = std::fs::read_to_string(&target.settings).unwrap();
+            assert!(text.contains("\"keep\""), "unrelated keys survive: {text}");
+        }
+    }
+
+    /// The ownership record keeps the original value to restore — for codex
+    /// and opencode, the whole configuration file. It is owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn the_ownership_record_is_readable_by_its_owner_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("private-owners");
+        let target = scratch.target();
+        let owners_path = target.owners_path();
+        let mut owners = Owners::default();
+        owners.keys.insert(
+            "k".into(),
+            Claim {
+                original: Some("token = \"sk-not-for-everyone\"".into()),
+                holders: vec![Holder::me(&target.settings)],
+            },
+        );
+        write_owners(&owners_path, &owners).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&owners_path), 0o600);
+
+        std::fs::set_permissions(&owners_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_owners(&owners_path, &owners).unwrap();
+        assert_eq!(
+            mode(&owners_path),
+            0o600,
+            "an older, looser file is tightened"
         );
     }
 
@@ -723,6 +850,44 @@ mod tests {
             assert!(path.exists(), "the lock file is the lock");
         }
         assert!(!path.exists(), "and it is gone once dropped");
+    }
+
+    /// A settings file that does not parse is one this command cannot merge
+    /// into, and replacing it with `{"env":{…}}` loses everything else in it
+    /// for good: the ownership record keeps one value, not the file. The claim
+    /// must refuse and leave the bytes exactly as they were.
+    #[test]
+    fn a_settings_file_that_does_not_parse_is_refused_not_replaced() {
+        let scratch = Scratch::new("malformed");
+        let target = scratch.target();
+        std::fs::create_dir_all(target.settings.parent().unwrap()).unwrap();
+        let original = r#"{"permissions":{"deny":["Bash(rm *)"]},}"#;
+        std::fs::write(&target.settings, original).unwrap();
+
+        let error = claim(&target, "ANTHROPIC_BASE_URL", "http://127.0.0.1:8817")
+            .expect_err("a file that does not parse must not be overwritten");
+        assert!(error.to_string().contains("settings.local.json"), "{error}");
+        assert_eq!(std::fs::read_to_string(&target.settings).unwrap(), original);
+        assert_eq!(
+            release(&target, "ANTHROPIC_BASE_URL", false).unwrap(),
+            Released::NotOurs,
+            "a refused claim records no owner"
+        );
+        assert_eq!(std::fs::read_to_string(&target.settings).unwrap(), original);
+    }
+
+    /// The user broke the file mid-session. Restoring by rewriting it from an
+    /// empty object would delete what they were in the middle of editing.
+    #[test]
+    fn a_release_does_not_rewrite_a_file_that_stopped_parsing() {
+        let scratch = Scratch::new("broken-mid-session");
+        let target = scratch.target();
+        claim(&target, "ANTHROPIC_BASE_URL", "http://127.0.0.1:8817").unwrap();
+        let edited = r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8817"},"hooks":{"#;
+        std::fs::write(&target.settings, edited).unwrap();
+
+        assert!(release(&target, "ANTHROPIC_BASE_URL", false).is_err());
+        assert_eq!(std::fs::read_to_string(&target.settings).unwrap(), edited);
     }
 
     /// A lock a session left as it crashed, not yet stale when the next wrap

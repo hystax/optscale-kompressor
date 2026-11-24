@@ -1,11 +1,32 @@
-"""Save Claude stage statistics and render the shared sweep report formats."""
+"""Save Claude stage statistics and render the shared sweep report formats.
+
+`SWEEP_AGENT=opencode` relabels it for `opencode.sh`, which saves its stages
+the same way; everything but the labels is the same question for both.
+"""
 import html
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
 import subprocess
 import sys
+
+AGENTS = {
+    "claude": dict(
+        title="Claude compression sweep",
+        page="kompressor-claude-report.html",
+        usage="provider usage (Anthropic)",
+        bill="Claude-plan quota was used; token counts are not a dollar bill.",
+    ),
+    "opencode": dict(
+        title="opencode compression sweep",
+        page="kompressor-opencode-report.html",
+        usage="provider usage (as each upstream reported it)",
+        bill="Billed by whichever provider the model belongs to; see `models` above.",
+    ),
+}
+agent = AGENTS[os.environ.get("SWEEP_AGENT", "claude")]
 
 mode, work = sys.argv[1], Path(sys.argv[2])
 lib = Path(__file__).resolve().parent
@@ -63,14 +84,14 @@ for stage, entry in stages.items():
             """select model, prompt_tokens, cache_read_tokens, cache_write_tokens,
                       completion_tokens from proxy_requests where time_ms >= ?""", (since,)
         ).fetchall()
-    usage = ["", "  provider usage (Anthropic)"]
+    usage = ["", f"  {agent['usage']}"]
     for i, label in enumerate(("fresh input", "cache reads", "cache writes", "output"), 1):
         values = [row[i] for row in rows if row[i] is not None]
         value = f"{sum(values):,}" if values else "not reported"
         usage.append(f"    {label:<14}{value}")
     models = sorted({row[0] for row in rows if row[0]})
     usage.append(f"    models        {', '.join(models) or 'not reported'}")
-    usage.append("  Claude-plan quota was used; token counts are not a dollar bill.")
+    usage.append(f"  {agent['bill']}")
     summary += "\n".join(usage) + "\n"
     print(f"\n== {stage} — live proxy traffic")
     print(summary)
@@ -110,14 +131,14 @@ for name, preset in (("fixture-languages.json", "fixtures"), ("bughunt-languages
         sections.append("<section><h2>Local premise measurement (not live traffic)</h2>" +
                         helper("bughunt-table.py", path, f"--preset={preset}", "--html") + "</section>")
 
-page = work / "kompressor-claude-report.html"
+page = work / agent["page"]
 page.write_text(
     '<!doctype html><html lang="en"><meta charset="utf-8">'
-    '<title>Claude compression sweep</title><style>'
+    f'<title>{agent["title"]}</title><style>'
     'body{max-width:1100px;margin:40px auto;padding:0 24px;font:16px system-ui;color:#172033}'
     'section{margin:32px 0}pre{overflow:auto;background:#f3f5f8;padding:20px}'
     'table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:10px;border-bottom:1px solid #ddd}'
-    '</style><body><h1>Claude compression sweep</h1>'
+    f'</style><body><h1>{agent["title"]}</h1>'
     '<p>Live statistics are saved separately for each stage. Local fixture measurements '
     'describe what can compress, not what the model received.</p>'
     + "\n".join(sections) + "</body></html>"

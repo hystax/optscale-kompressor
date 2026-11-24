@@ -1,0 +1,1394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width,initial-scale=1" name="viewport"/>
+<title>Kompressor dashboards</title>
+<script>
+// Apply the shared preference before rendering to avoid a theme flash.
+(() => {
+  const key = "kompressor-theme";
+  let theme = "dark";
+  try { if (localStorage.getItem(key) === "light") theme = "light"; } catch (_) {}
+  const apply = (value) => {
+    theme = value === "light" ? "light" : "dark";
+    document.documentElement.dataset.theme = theme;
+    const button = document.getElementById("theme-toggle");
+    if (button) {
+      button.textContent = theme === "dark" ? "Light theme" : "Dark theme";
+      button.setAttribute("aria-label", "Switch to " + (theme === "dark" ? "light" : "dark") + " theme");
+    }
+  };
+  apply(theme);
+  document.addEventListener("DOMContentLoaded", () => {
+    apply(theme);
+    document.getElementById("theme-toggle").addEventListener("click", () => {
+      apply(theme === "dark" ? "light" : "dark");
+      try { localStorage.setItem(key, theme); } catch (_) {}
+    });
+  });
+  window.addEventListener("storage", (event) => {
+    if (event.key === key || event.key === null) apply(event.newValue);
+  });
+})();
+</script>
+<style>
+:root {
+  color-scheme: dark;
+  --ink: #e3eaf2; --bg: #101419; --panel: #191f27; --muted: #9caaba;
+  --line: #303a46; --accent: #70d8b6; --good: #70d8b6; --warn: #f2c66d; --bad: #ffa096;
+  --read: #70d8b6; --write: #e0a85a; --fresh: #8fb3d9; --ping: #c39af0; --soft: #262e39;
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+  --ink: #172033; --bg: #f7f8fa; --panel: #ffffff; --muted: #5b6475;
+  --line: #d5dce5; --accent: #13745b; --good: #13745b; --warn: #946000; --bad: #b83228;
+  --read: #13745b; --write: #ad741b; --fresh: #527698; --ping: #7a4fb0; --soft: #eef1f5;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px system-ui, sans-serif; }
+main { max-width: 1600px; margin: auto; padding: 24px 16px; }
+header, .filters, nav.views { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+h1 { font-size: 24px; margin: 0 auto 0 0; }
+h2 { font-size: 17px; margin: 0 0 10px; }
+a { color: var(--accent); }
+button, input, select {
+  font: inherit; color: inherit; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 5px; padding: 7px 9px;
+}
+button { cursor: pointer; }
+nav.views { margin: 18px 0 6px; }
+nav.views a { text-decoration: none; padding: 7px 11px; border: 1px solid var(--line); border-radius: 5px; }
+nav.views a[aria-current=page] { border-color: var(--accent); background: var(--soft); }
+.filters { margin: 12px 0; }
+label { display: inline-flex; gap: 8px; align-items: center; }
+section { background: var(--panel); padding: 16px; border: 1px solid var(--line); border-radius: 8px; margin: 14px 0; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin: 14px 0; }
+.tile { background: var(--panel); padding: 14px; border: 1px solid var(--line); border-radius: 8px; }
+.tile .value { font-size: 23px; margin: 6px 0 2px; font-variant-numeric: tabular-nums; }
+.muted, small, .tile .label { color: var(--muted); }
+.good { color: var(--good); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 0 14px; }
+.scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; white-space: nowrap; font-variant-numeric: tabular-nums; }
+th, td { text-align: right; border-bottom: 1px solid var(--line); padding: 7px 9px; }
+th:first-child, td:first-child, td.text, th.text { text-align: left; }
+th { color: var(--muted); font-weight: 600; }
+tr.pick { cursor: pointer; } tr.pick:hover, tr.pick:focus { background: var(--soft); outline: none; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; color: var(--muted); font-size: 12px; margin: 6px 0; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+svg.chart { width: 100%; height: 190px; display: block; }
+svg.chart text { fill: var(--muted); font-size: 11px; }
+svg.chart .axis { stroke: var(--line); }
+.bar { display: inline-block; height: 8px; background: var(--accent); border-radius: 2px; vertical-align: middle; }
+.note { color: var(--muted); font-size: 13px; margin: 6px 0 0; }
+.verdict { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; padding: 16px; border-radius: 8px;
+  border: 1px solid var(--line); border-left-width: 6px; background: var(--panel); margin: 14px 0; }
+.verdict strong { font-size: 20px; }
+.verdict.ok { border-left-color: var(--good); } .verdict.warn { border-left-color: var(--warn); } .verdict.bad { border-left-color: var(--bad); }
+.area { margin: 18px 0 4px; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+a.check { display: block; color: inherit; text-decoration: none; border-left-width: 4px; }
+a.check:hover, a.check:focus { background: var(--soft); }
+a.check.ok { border-left-color: var(--good); } a.check.warn { border-left-color: var(--warn); }
+a.check.bad { border-left-color: var(--bad); } a.check.info { border-left-color: var(--line); }
+.pill { font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 9px; border: 1px solid currentColor; float: right; }
+.check .limits { display: block; margin-top: 4px; font-size: 12px; }
+#error { color: var(--bad); }
+#status { color: var(--muted); margin: 0; }
+[hidden] { display: none !important; }
+@media (max-width: 640px) { .grid2 { grid-template-columns: 1fr; } h1 { font-size: 20px; } }
+</style>
+</head>
+<body>
+<main>
+<header>
+  <h1>Kompressor dashboards</h1>
+  <a id="live-link" href="#">Live</a>
+  <a id="cache-link" href="#">Cache</a>
+  <a id="analysis-link" href="#">Analysis</a>
+  <a id="refs-link" href="#" hidden>Ref store</a>
+  <a id="maintenance-link" href="#">Maintenance</a>
+  <button id="download" type="button" title="Download this view as JSON Lines">Download JSONL</button>
+  <button id="theme-toggle" type="button" aria-label="Switch to light theme">Light theme</button>
+</header>
+<nav class="views" id="views" aria-label="Dashboards"></nav>
+<form class="filters" id="filters">
+  <label>Window <select id="window"></select></label>
+  <label id="bucket-label" hidden>Per <select id="bucket">
+    <option value="day">day</option><option value="week">week</option><option value="month">month</option>
+  </select></label>
+  <label id="conversation-label" hidden>Conversation <input id="conversation" size="18" placeholder="16 hex digits" autocomplete="off"/></label>
+  <label>Key <input id="key" type="password" size="16" autocomplete="off" placeholder="x-kompressor-key"/></label>
+  <label><input id="auto" type="checkbox" checked/> Auto refresh</label>
+  <button type="submit">Load</button>
+</form>
+<p id="status" role="status">Loading…</p>
+<p id="error" role="alert"></p>
+<div id="content"></div>
+</main>
+<script>
+"use strict";
+const SETTINGS = /*SETTINGS*/{};
+const VIEWS = [
+  { id: "health", title: "Health", api: "stats/health" },
+  { id: "trends", title: "Trends", api: "stats/trends" },
+  { id: "yield", title: "Compression yield", api: "stats/yield" },
+  { id: "timeline", title: "Conversation timeline", api: "stats/timeline" },
+  { id: "store", title: "Store health", api: "stats/store-health" },
+  { id: "keepwarm", title: "Keep-warm return", api: "stats/keepwarm" },
+  { id: "cache-loss", title: "Cache loss vs compression", api: "stats/cache-loss" },
+  { id: "upstream", title: "Upstream health", api: "stats/upstream" },
+  { id: "traffic", title: "Traffic", api: "stats/traffic" },
+  { id: "engine", title: "Engine", api: "stats/engine" },
+  { id: "quality", title: "Data quality", api: "stats/quality" },
+  { id: "models", title: "Models", api: "stats/models" },
+  { id: "activity", title: "Activity", api: "stats/activity" },
+  { id: "cohorts", title: "Conversation cohorts", api: "stats/cohorts" },
+  { id: "prefix", title: "Prefix drift", api: "stats/prefix" },
+  { id: "advisor", title: "Opt-in advisor", api: "stats/advisor" },
+];
+const view = VIEWS.find(v => v.id === SETTINGS.view) || VIEWS[0];
+const $ = id => document.getElementById(id);
+document.title = "Kompressor · " + view.title;
+
+// ------------------------------------------------------------- paths
+// On the statistics listener the pages sit at /trends and so on and the data
+// under /v1; on the API the page is the data route itself, opened in a browser.
+const prefix = SETTINGS.listener ? "/v1/" : location.pathname.replace(/stats\/[a-z-]+\/?$/, "");
+const dataPath = name => prefix + name;
+const pagePath = v => SETTINGS.listener ? "/" + v.id : prefix + v.api;
+const tenant = new URLSearchParams(location.search).get("tenant");
+const withTenant = path => {
+  const url = new URL(path, location.origin);
+  if (tenant) url.searchParams.set("tenant", tenant);
+  return url.pathname + url.search;
+};
+$("live-link").href = withTenant(SETTINGS.listener ? "/" : prefix + "stats/live");
+$("cache-link").href = withTenant(SETTINGS.listener ? "/cache" : prefix + "stats/cache");
+$("analysis-link").href = withTenant(SETTINGS.listener ? "/analysis" : prefix + "stats/analysis");
+$("maintenance-link").href = SETTINGS.listener ? "/maintenance" : prefix + "maintenance";
+if (SETTINGS.refs) {
+  $("refs-link").href = withTenant(SETTINGS.listener ? "/refs" : prefix + "refs");
+  $("refs-link").hidden = false;
+}
+for (const v of VIEWS) {
+  const a = document.createElement("a");
+  a.textContent = v.title;
+  a.href = withTenant(pagePath(v));
+  if (v === view) a.setAttribute("aria-current", "page");
+  $("views").append(a);
+}
+
+// ------------------------------------------------------------- controls
+const WINDOWS = view.id === "trends"
+  ? ["4w", "13w", "26w", "52w", "104w"]
+  : view.id === "health"
+    ? ["5m", "15m", "1h", "6h", "24h", "7d"]
+    : ["1h", "6h", "24h", "7d", "30d", "90d"];
+const windowSelect = $("window");
+const initialWindow = SETTINGS.window || (view.id === "trends" ? "26w" : view.id === "health" ? "1h" : "24h");
+for (const w of new Set([...WINDOWS, initialWindow])) {
+  const option = document.createElement("option");
+  option.value = option.textContent = w;
+  windowSelect.append(option);
+}
+windowSelect.value = initialWindow;
+$("bucket").value = SETTINGS.bucket || "week";
+$("bucket-label").hidden = view.id !== "trends";
+$("conversation-label").hidden = view.id !== "timeline";
+$("conversation").value = SETTINGS.conversation || "";
+$("auto").checked = view.id !== "trends" && view.id !== "timeline";
+const storedKey = () => { try { return sessionStorage.getItem("kompressor-key") || ""; } catch (_) { return ""; } };
+$("key").value = storedKey();
+
+/** Milliseconds in a window label such as 30m, 24h, 7d, 26w. */
+function windowMs(label) {
+  const m = /^(\d+)(s|m|min|h|d|w)$/.exec(label.trim());
+  if (!m) return 86400000;
+  const unit = { s: 1e3, m: 6e4, min: 6e4, h: 3.6e6, d: 8.64e7, w: 6.048e8 }[m[2]];
+  return Number(m[1]) * unit;
+}
+
+function query(format) {
+  const params = new URLSearchParams();
+  if (tenant) params.set("tenant", tenant);
+  if (view.id === "timeline") {
+    const to = Date.now() + 1;
+    params.set("from", String(Math.max(0, to - windowMs(windowSelect.value))));
+    params.set("to", String(to));
+    const conversation = $("conversation").value.trim();
+    if (conversation) params.set("conversation", conversation);
+  } else if (SETTINGS.fixed) {
+    params.set("from", String(SETTINGS.fixed[0]));
+    params.set("to", String(SETTINGS.fixed[1]));
+  } else {
+    params.set("window", windowSelect.value);
+  }
+  if (view.id === "trends") params.set("bucket", $("bucket").value);
+  params.set("format", format);
+  return params;
+}
+const endpoint = () => dataPath(view.id === "timeline" ? "stats/analysis" : view.api);
+
+function remember() {
+  const params = new URLSearchParams(location.search);
+  params.set("window", windowSelect.value);
+  if (view.id === "trends") params.set("bucket", $("bucket").value);
+  if (view.id === "timeline") {
+    const c = $("conversation").value.trim();
+    if (c) params.set("conversation", c); else params.delete("conversation");
+  }
+  history.replaceState(null, "", location.pathname + "?" + params.toString());
+}
+
+// ------------------------------------------------------------- formatting
+const nf = new Intl.NumberFormat();
+const n = x => x == null ? "–" : nf.format(Math.round(x));
+function tok(x) {
+  if (x == null || !isFinite(x)) return "–";
+  const a = Math.abs(x);
+  if (a >= 1e9) return (x / 1e9).toFixed(2) + "B";
+  if (a >= 1e6) return (x / 1e6).toFixed(2) + "M";
+  if (a >= 1e4) return (x / 1e3).toFixed(1) + "K";
+  return nf.format(Math.round(x));
+}
+const pct = (x, digits = 1) => x == null || !isFinite(x) ? "–" : (x * 100).toFixed(digits) + "%";
+function ms(x) {
+  if (x == null || !isFinite(x)) return "–";
+  if (x >= 60000) return (x / 60000).toFixed(1) + " min";
+  if (x >= 1000) return (x / 1000).toFixed(2) + " s";
+  return x.toFixed(x < 10 ? 1 : 0) + " ms";
+}
+function bytes(x) {
+  if (x == null) return "–";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0, v = x;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return (i ? v.toFixed(1) : v) + " " + units[i];
+}
+function secs(x) {
+  if (x == null) return "–";
+  if (x < 120) return x + " s";
+  if (x < 7200) return Math.round(x / 60) + " min";
+  return (x / 3600).toFixed(1) + " h";
+}
+const time = t => t == null ? "–" : new Date(t).toLocaleString();
+const shortTime = t => new Date(t).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+const ratio = (a, b) => b > 0 ? a / b : null;
+
+// ------------------------------------------------------------- DOM helpers
+function el(tag, attrs, ...children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k === "class") node.className = v;
+    else if (k === "style") node.style.cssText = v;
+    else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
+    else node.setAttribute(k, v === true ? "" : v);
+  }
+  for (const child of children.flat()) {
+    if (child == null || child === false) continue;
+    node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+  }
+  return node;
+}
+function section(title, ...body) { return el("section", {}, el("h2", {}, title), ...body); }
+function note(text) { return el("p", { class: "note" }, text); }
+function tiles(items) {
+  return el("div", { class: "tiles" }, items.map(([label, value, sub, cls]) =>
+    el("div", { class: "tile" },
+      el("div", { class: "label" }, label),
+      el("div", { class: "value " + (cls || "") }, value),
+      sub ? el("small", {}, sub) : null)));
+}
+/** columns: [header, cell(row) => text|Node, {text: true}?]; rows: array. */
+function table(columns, rows, options = {}) {
+  if (!rows.length) return el("p", { class: "muted" }, options.empty || "Nothing in this window.");
+  const head = el("tr", {}, columns.map(([h, , o]) => el("th", { class: o && o.text ? "text" : null }, h)));
+  const body = rows.map(row => {
+    const tr = el("tr", options.pick ? {
+      class: "pick", tabindex: "0",
+      onclick: () => options.pick(row),
+      onkeydown: e => { if (e.key === "Enter") options.pick(row); },
+    } : {}, columns.map(([, cell, o]) => {
+      const v = cell(row);
+      return el("td", { class: o && o.text ? "text" : null }, v instanceof Node ? v : (v == null ? "–" : String(v)));
+    }));
+    return tr;
+  });
+  return el("div", { class: "scroll" }, el("table", {}, el("thead", {}, head), el("tbody", {}, body)));
+}
+function meter(share) {
+  const width = Math.max(0, Math.min(1, share || 0)) * 80;
+  return el("span", {}, el("span", { class: "bar", style: "width:" + width.toFixed(1) + "px" }), " ", pct(share));
+}
+function legend(series) {
+  return el("div", { class: "legend" }, series.map(s => el("span", {}, el("i", { style: "background:" + s.color }), s.label)));
+}
+
+// ------------------------------------------------------------- charts
+const SVG = "http://www.w3.org/2000/svg";
+function svg(tag, attrs, ...children) {
+  const node = document.createElementNS(SVG, tag);
+  for (const [k, v] of Object.entries(attrs || {})) node.setAttribute(k, String(v));
+  for (const c of children) if (c != null) node.append(c instanceof Node ? c : document.createTextNode(String(c)));
+  return node;
+}
+/**
+ * Stacked bars per point, with an optional line on its own scale.
+ * points: [{x: label, ...}], bars: [{key, label, color}], line: {key, label, color, fmt}.
+ */
+function chart(points, bars, options = {}) {
+  const W = 900, H = 190, L = 56, R = options.line ? 56 : 12, T = 10, B = 26;
+  const root = svg("svg", { class: "chart", viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none", role: "img", "aria-label": options.label || "chart" });
+  if (!points.length) {
+    root.append(svg("text", { x: W / 2, y: H / 2, "text-anchor": "middle" }, "No data in this window"));
+    return el("div", {}, root);
+  }
+  const fmt = options.fmt || tok;
+  const total = p => bars.reduce((s, b) => s + Math.max(0, p[b.key] || 0), 0);
+  const max = Math.max(1, ...points.map(total));
+  const iw = W - L - R, ih = H - T - B, step = iw / points.length, bw = Math.max(1, step * 0.72);
+  root.append(svg("line", { class: "axis", x1: L, x2: W - R, y1: T + ih, y2: T + ih }));
+  root.append(svg("text", { x: L - 6, y: T + 9, "text-anchor": "end" }, fmt(max)));
+  root.append(svg("text", { x: L - 6, y: T + ih, "text-anchor": "end" }, "0"));
+  points.forEach((p, i) => {
+    let y = T + ih;
+    const x = L + i * step + (step - bw) / 2;
+    for (const b of bars) {
+      const v = Math.max(0, p[b.key] || 0);
+      if (!v) continue;
+      const h = v / max * ih;
+      y -= h;
+      root.append(svg("rect", { x, y, width: bw, height: Math.max(0.5, h), fill: b.color },
+        svg("title", {}, `${p.x}\n${b.label}: ${fmt(v)}`)));
+    }
+  });
+  if (options.line) {
+    const ln = options.line, vals = points.map(p => p[ln.key]).filter(v => v != null && isFinite(v));
+    if (vals.length) {
+      const lmax = ln.max != null ? ln.max : Math.max(...vals), lmin = ln.min != null ? ln.min : Math.min(0, ...vals);
+      const span = lmax - lmin || 1;
+      let d = "";
+      points.forEach((p, i) => {
+        const v = p[ln.key];
+        if (v == null || !isFinite(v)) return;
+        const x = L + i * step + step / 2, y = T + ih - (v - lmin) / span * ih;
+        d += (d ? "L" : "M") + x.toFixed(1) + " " + y.toFixed(1);
+        root.append(svg("circle", { cx: x, cy: y, r: 2.5, fill: ln.color }, svg("title", {}, `${p.x}\n${ln.label}: ${ln.fmt(v)}`)));
+      });
+      root.append(svg("path", { d, fill: "none", stroke: ln.color, "stroke-width": 1.6 }));
+      root.append(svg("text", { x: W - R + 6, y: T + 9 }, ln.fmt(lmax)));
+      root.append(svg("text", { x: W - R + 6, y: T + ih }, ln.fmt(lmin)));
+    }
+  }
+  const ticks = Math.min(points.length, 8);
+  for (let t = 0; t < ticks; t++) {
+    const i = Math.round(t * (points.length - 1) / Math.max(1, ticks - 1));
+    root.append(svg("text", { x: L + i * step + step / 2, y: H - 8, "text-anchor": "middle" }, points[i].x));
+  }
+  return el("div", {}, legend([...bars, ...(options.line ? [options.line] : [])]), root);
+}
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+// ------------------------------------------------------------- views
+const RENDER = {};
+
+const LEVEL_TEXT = { ok: "OK", warn: "Warn", bad: "Bad", info: "Info" };
+const AREAS = [
+  ["upstream", "Upstream"], ["engine", "Engine"], ["retrieval", "Retrieval"], ["store", "Ref store"], ["data", "Statistics"],
+];
+function checkValue(c) {
+  if (c.value == null) return "–";
+  if (c.unit === "share") return pct(c.value, c.value < 0.1 ? 2 : 1);
+  if (c.unit === "ms") return ms(c.value);
+  if (c.unit === "bytes") return bytes(c.value);
+  if (c.unit === "age") return age(c.value);
+  return n(c.value);
+}
+/** A length of time that reads in hours and days. */
+function age(v) {
+  const m = Math.max(0, Math.round(v / 60000));
+  return m < 90 ? m + " min" : m < 2880 ? Math.round(m / 60) + " h" : Math.round(m / 1440) + " d";
+}
+function checkLimit(c, v) { return c.unit === "share" ? pct(v, 0) : c.unit === "ms" ? ms(v) : c.unit === "age" ? age(v) : n(v); }
+function ago(t) {
+  if (t == null) return "never";
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  return (s < 120 ? s + " s" : s < 7200 ? Math.round(s / 60) + " min" : s < 172800 ? (s / 3600).toFixed(1) + " h" : Math.round(s / 86400) + " d") + " ago";
+}
+/** A dashboard link that keeps the window when the target can show it. */
+function viewLink(id) {
+  // The one check whose page is not a dashboard.
+  if (id === "maintenance") return $("maintenance-link").getAttribute("href");
+  const target = VIEWS.find(v => v.id === id);
+  if (!target) return "#";
+  const u = new URL(withTenant(pagePath(target)), location.origin);
+  if (target.id !== "trends" && windowMs(windowSelect.value) <= 7776000000) u.searchParams.set("window", windowSelect.value);
+  return u.pathname + u.search;
+}
+/** One judged check as a tile linking to the dashboard that explains it. */
+function checkCard(c) {
+  const op = c.below ? " < " : " ≥ ";
+  return el("a", { class: "tile check " + c.level, href: viewLink(c.view), title: "Open the " + c.view + " dashboard" },
+    el("div", { class: "label" }, c.title, " ", el("span", { class: "pill " + (c.level === "info" ? "muted" : c.level === "ok" ? "good" : c.level) }, LEVEL_TEXT[c.level])),
+    el("div", { class: "value " + (c.level === "ok" || c.level === "info" ? "" : c.level) }, checkValue(c)),
+    el("small", {}, c.detail),
+    c.warn != null || c.bad != null
+      ? el("small", { class: "limits" }, [c.warn != null ? "warn" + op + checkLimit(c, c.warn) : null, c.bad != null ? "bad" + op + checkLimit(c, c.bad) : null].filter(Boolean).join(" · "))
+      : null);
+}
+function checkGroups(checks, areas) {
+  return areas.flatMap(([area, title]) => {
+    const list = checks.filter(c => c.area === area);
+    return list.length ? [el("h2", { class: "area" }, title), el("div", { class: "tiles" }, list.map(checkCard))] : [];
+  });
+}
+RENDER.health = d => {
+  const judged = d.checks.filter(c => c.level === "warn" || c.level === "bad");
+  const headline = { ok: "Everything looks healthy", warn: "Needs attention", bad: "Unhealthy" }[d.level] || d.level;
+  const engineBy = new Map(d.engine_timeline.map(p => [p.bucket_ms, p.p95_ms]));
+  const points = d.upstream_timeline.map(p => ({
+    x: shortTime(p.bucket_ms), ok: p.requests - p.failed, rl: p.rate_limited, se: p.server_error,
+    other: p.failed - p.rate_limited - p.server_error, p95: engineBy.get(p.bucket_ms),
+  }));
+  const s = d.server;
+  return [
+    el("div", { class: "verdict " + d.level, role: "status" },
+      el("strong", { class: d.level === "ok" ? "good" : d.level }, headline),
+      el("span", { class: "muted" }, judged.length
+        ? judged.map(c => c.title + " (" + checkValue(c) + ")").join(" · ")
+        : "No check is past its threshold in this window."),
+      el("span", { class: "muted", style: "margin-left:auto" },
+        "Last request " + ago(d.last_request_ms) + " · last compression " + ago(d.last_compression_ms) +
+        " · v" + s.version + " · up " + secs(s.uptime_s) + " · mode " + s.mode)),
+    ...checkGroups(d.checks, AREAS),
+    section("Requests and failures",
+      chart(points, [
+        { key: "ok", label: "Answered", color: css("--fresh") },
+        { key: "other", label: "Other failures", color: css("--warn") },
+        { key: "rl", label: "429", color: css("--ping") },
+        { key: "se", label: "5xx", color: css("--bad") },
+      ], { fmt: n, line: { key: "p95", label: "Engine p95", color: css("--accent"), fmt: ms } }),
+      note("Bars count proxied requests per interval, keep-warm pings included; the line is the compression engine's p95 in the same interval.")),
+    section("Recent incidents", table([
+      ["From", r => time(r.from_ms), { text: true }],
+      ["Lasted", r => ms(r.to_ms - r.from_ms)],
+      ["Failures", r => n(r.failures)],
+      ["Statuses", r => Object.entries(r.statuses).map(([k, v]) => k + " × " + v).join(", "), { text: true }],
+      ["Upstreams", r => r.upstreams.join(", "), { text: true }],
+    ], d.incidents, { empty: "No run of 429, 5xx or unanswered requests in this window." })),
+    section("Latest failed requests", table([
+      ["Time", r => time(r.time_ms), { text: true }],
+      ["Status", r => r.status == null ? "none" : r.status],
+      ["Upstream", r => r.upstream, { text: true }],
+      ["Model", r => r.model || "(pass-through)", { text: true }],
+      ["Attempts", r => n(r.attempts)],
+      ["Error", r => r.error || "", { text: true }],
+    ], d.failures, { empty: "No failed requests in this window." })),
+    d.truncated ? note("Part of this window was read from the newest rows only; pick a shorter window for exact figures.") : null,
+  ];
+};
+
+const GROUP_TEXT = { compressed: "Compression rewrote messages", unchanged: "Engine ran, changed nothing", no_engine: "No engine run" };
+RENDER["cache-loss"] = d => {
+  const [comp, unch, none] = d.groups;
+  const rate = g => g ? pct(g.loss_rate) : "–";
+  const net = d.removed_cost_floor - d.excess.cost;
+  const points = d.timeline.map(p => ({
+    x: shortTime(p.bucket_ms), cl: p.compressed_losses, ck: p.compressed_turns - p.compressed_losses,
+    ol: p.other_losses, ok: p.other_turns - p.other_losses,
+  }));
+  return [
+    tiles([
+      ["Loss rate, compressed turns", rate(comp), n(comp.losses) + " of " + n(comp.turns) + " turns", comp.loss_rate > (d.baseline_rate || 0) + 0.05 ? "bad" : ""],
+      ["Baseline loss rate", pct(d.baseline_rate), "turns compression did not touch"],
+      ["Excess losses (estimate)", n(d.excess.events), tok(d.excess.cost) + " input-equivalent", d.excess.events > 0 ? "warn" : "good"],
+      ["Likely: freeze lifted", n(d.likely.events), n(d.freeze_lifted_turns) + " turns had the freeze lifted · " + tok(d.likely.cost), d.likely.events > 0 ? "warn" : ""],
+      ["Upper bound", n(d.with_compression.events), tok(d.with_compression.cost) + " input-equivalent"],
+      ["Removed by compression", tok(d.removed_tokens), "worth at least " + tok(d.removed_cost_floor) + " at cache-read rates"],
+      ["Net, conservative", tok(net), "removed (floor) − excess loss cost", net >= 0 ? "good" : "bad"],
+      ["TTL losses (not compression)", n(d.ttl_losses), tok(d.ttl_loss_cost) + " input-equivalent"],
+    ]),
+    section("Compared client turns by what the engine did", table([
+      ["Group", r => GROUP_TEXT[r.group] || r.group, { text: true }],
+      ["Turns", r => n(r.turns)],
+      ["Prefix-change losses", r => n(r.losses)],
+      ["Loss rate", r => pct(r.loss_rate)],
+      ["Lost tokens", r => tok(r.lost_tokens)],
+      ["Loss cost", r => tok(r.loss_cost)],
+      ["Removed tokens", r => tok(r.removed_tokens)],
+    ], d.groups),
+      note("A turn is compared when the cache walk could check it against the previous one (a hit, partial or miss on the Cache page). " +
+        "TTL losses are left out: an idle cache expires whatever the engine did. The baseline is the loss rate of turns compression did not touch; " +
+        "losses on compressed turns above it are the excess. A freeze lifted means this run froze fewer messages than the conversation's previous run, " +
+        "so it was free to rewrite cached ones.")),
+    section("Turns and prefix-change losses",
+      chart(points, [
+        { key: "ck", label: "Compressed, kept prefix", color: css("--read") },
+        { key: "cl", label: "Compressed, lost prefix", color: css("--bad") },
+        { key: "ok", label: "Other, kept prefix", color: css("--fresh") },
+        { key: "ol", label: "Other, lost prefix", color: css("--warn") },
+      ], { fmt: n })),
+    section("Conversations with compressed turns (" + n(d.conversations_total) + "), costliest losses first", table([
+      ["Conversation", r => r.conversation, { text: true }],
+      ["Model", r => r.model || "–", { text: true }],
+      ["Turns", r => n(r.turns)],
+      ["Compressed", r => n(r.compressed_turns)],
+      ["Freeze lifted", r => n(r.freeze_lifts)],
+      ["Losses", r => n(r.losses)],
+      ["Lost tokens", r => tok(r.lost_tokens)],
+      ["Loss cost", r => tok(r.loss_cost)],
+      ["Removed", r => tok(r.removed_tokens)],
+    ], d.conversations, { pick: openTimeline, empty: "No compressed turns in this window." })),
+    section("Latest losses on compressed turns", table([
+      ["Time", r => time(r.time_ms), { text: true }],
+      ["Conversation", r => r.conversation, { text: true }],
+      ["Messages", r => n(r.messages)],
+      ["Rewritten", r => n(r.compressed_messages)],
+      ["Frozen (before)", r => n(r.frozen) + " (" + n(r.previous_frozen) + ")"],
+      ["Freeze lifted", r => r.freeze_lifted ? "yes" : "no", { text: true }],
+      ["Expected / read", r => tok(r.expected) + " / " + tok(r.read)],
+      ["Lost", r => tok(r.lost_tokens)],
+      ["Cost", r => tok(r.loss_cost)],
+      ["Removed", r => tok(r.removed_tokens)],
+    ], d.losses, { pick: openTimeline, empty: "No prefix was lost on a compressed turn in this window." })),
+    d.truncated ? note("Only the newest 200,000 proxied rows were read.") : null,
+  ];
+};
+
+const CLASS_TEXT = { model: "Model calls", keep_warm: "Keep-warm pings", websocket: "WebSocket upgrades", passthrough: "Pass-through" };
+const KIND_CLASS = { expected: "", client: "warn", upstream: "bad" };
+RENDER.traffic = d => {
+  const cls = name => d.classes.find(c => c.class === name) || { requests: 0, share: null };
+  const points = d.timeline.map(p => ({ x: shortTime(p.bucket_ms), model: p.model, ping: p.keep_warm, ws: p.websocket, pass: p.passthrough }));
+  const errPoints = d.timeline.map(p => ({ x: shortTime(p.bucket_ms), client: p.client, upstream: p.upstream }));
+  const outcomes = [...new Set(d.classes.flatMap(c => Object.keys(c.outcomes)))];
+  return [
+    tiles([
+      ["Requests", n(d.requests), n(cls("model").requests) + " model calls"],
+      ["Pass-through share", pct(cls("passthrough").share), n(cls("passthrough").requests) + " relayed unread"],
+      ["Real error share", pct(d.real_error_share, 2), n(d.real_failures) + " upstream failures of model calls and pings", d.real_error_share > 0.02 ? "bad" : "good"],
+      ["Naive error share", pct(d.naive_error_share, 2), n(d.naive_failures) + " rows outside 2xx or with an error"],
+      ["Noise", pct(d.noise_share, 1), n(d.noise) + " 304s, 101s and redirects"],
+      ["Client-side failures", n(d.client_failures), "refused 4xx and client disconnects", d.client_failures ? "warn" : ""],
+    ]),
+    section("Requests per interval, by class",
+      chart(points, [
+        { key: "model", label: "Model calls", color: css("--accent") },
+        { key: "ping", label: "Keep-warm", color: css("--ping") },
+        { key: "ws", label: "WebSocket", color: css("--write") },
+        { key: "pass", label: "Pass-through", color: css("--fresh") },
+      ], { fmt: n })),
+    section("Failures per interval",
+      chart(errPoints, [
+        { key: "upstream", label: "Upstream (429, 5xx, no answer, broken stream)", color: css("--bad") },
+        { key: "client", label: "Client side (4xx, disconnects)", color: css("--warn") },
+      ], { fmt: n })),
+    section("Class by outcome", table([
+      ["Class", r => CLASS_TEXT[r.class] || r.class, { text: true }],
+      ["Requests", r => n(r.requests)],
+      ["Share", r => pct(r.share)],
+      ...outcomes.map(o => [o.replace(/_/g, " "), r => n(r.outcomes[o] || 0)]),
+      ["Prompt tokens", r => tok(r.prompt_tokens)],
+    ], d.classes.filter(c => c.requests)),
+      note("Expected: ok, not modified (304), redirect, switching (101). Client side: refused (4xx other than 429), client disconnect. " +
+        "Upstream: rate limited (429), server error (5xx), no answer, broken (a 2xx whose stream failed). " +
+        "The real error share counts only upstream failures, and only over model calls and pings; the naive share is what a status-class count reports over every row.")),
+    section("By upstream, API family and status (" + n(d.endpoints_total) + " groups)", table([
+      ["Class", r => CLASS_TEXT[r.class] || r.class, { text: true }],
+      ["Upstream", r => r.upstream, { text: true }],
+      ["API family", r => r.api_family, { text: true }],
+      ["Status", r => r.status == null ? "none" : r.status],
+      ["Outcome", r => el("span", { class: KIND_CLASS[r.kind] || "" }, r.outcome.replace(/_/g, " ")), { text: true }],
+      ["Requests", r => n(r.requests)],
+      ["Last", r => time(r.last_ms), { text: true }],
+    ], d.endpoints)),
+    section("Error messages", table([
+      ["Message", r => r.message, { text: true }],
+      ["Outcome", r => r.outcome.replace(/_/g, " "), { text: true }],
+      ["Requests", r => n(r.requests)],
+      ["Last", r => time(r.last_ms), { text: true }],
+    ], d.errors, { empty: "No error text in this window." }),
+      note("Digits are folded to # so one message with different ids or sizes counts once.")),
+  ];
+};
+
+const SEGMENT_TEXT = { beta: "Beta headers", tool_set: "Tools added or removed", tool_order: "Tool order", tool_defs: "Tool definitions", system: "System prompt", history: "Earlier messages" };
+RENDER.prefix = d => {
+  if (!d.available) {
+    return [note("This database was last written by a build that did not record prefix observations. They start with the first request a current build proxies.")];
+  }
+  const l = d.losses;
+  const explained = l.client.events + l.proxy.events;
+  const share = (a, b) => b ? a / b : null;
+  const lossRows = [
+    ["A segment the client changed", l.client], ["A segment only the proxy changed", l.proxy],
+    ["Compared, and nothing hashed had moved", l.none_seen], ["Nothing to compare with (first request seen, or a branch)", l.not_compared],
+    ["No observation on the row (ping, relayed frame, older row)", l.unobserved],
+  ].map(([label, b]) => ({ label, ...b }));
+  const asked = d.cold.filter(c => c.asked), assumed = d.cold.filter(c => !c.asked);
+  const coldTable = rows => table([
+    ["API family", r => r.api_family, { text: true }],
+    ["Lifetime", r => r.lifetime_s + " s"],
+    ["Margin", r => "+" + r.margin_s + " s"],
+    ["Scored", r => n(r.scored)],
+    ["Predicted cold", r => n(r.predicted)],
+    ["Expired", r => n(r.confirmed)],
+    ["Read it back", r => r.wrong ? el("span", { class: "bad" }, n(r.wrong)) : "0"],
+    ["Partly lost", r => n(r.partial || 0)],
+    ["Lost to a change", r => n(r.drift || 0)],
+    ["Lost, uncompared", r => n(r.unknown || 0)],
+    ["Missed", r => n(r.missed)],
+    ["Precision", r => r.predicted ? pct(r.precision, 2) : "–"],
+    ["Recall", r => r.confirmed + r.missed ? pct(r.recall) : "–"],
+  ], rows, { empty: "No request of a warm conversation reported usage in this window." });
+  return [
+    tiles([
+      ["Observed requests", n(d.observed), "of " + n(d.requests) + " client requests" + (d.truncated ? ", newest only" : "")],
+      ["Compared with the turn before", n(d.compared), pct(share(d.stable, d.compared)) + " with nothing moved"],
+      ["Prefix-change losses", n(l.total.events), tok(l.total.lost_tokens) + " tokens not read back", l.total.events ? "warn" : "good"],
+      ["Put down to the client", n(l.client.events), tok(l.client.lost_tokens) + " tokens"],
+      ["Put down to the proxy", n(l.proxy.events), tok(l.proxy.lost_tokens) + " tokens", l.proxy.events ? "bad" : "good"],
+      ["Explained", pct(share(explained, l.total.events)), n(l.none_seen.events) + " compared with nothing seen to move"],
+    ]),
+    section("What moved, and what it cost", table([
+      ["Segment", r => SEGMENT_TEXT[r.segment] || r.segment, { text: true }],
+      ["Client changed it", r => n(r.client_turns)],
+      ["Put back", r => n(r.repaired_turns)],
+      ["Losses", r => n(r.client_losses)],
+      ["Tokens lost", r => tok(r.client_lost_tokens)],
+      ["Cost", r => tok(r.client_cost)],
+      ["Proxy changed it", r => r.proxy_turns ? el("span", { class: "bad" }, n(r.proxy_turns)) : "0"],
+      ["Losses", r => n(r.proxy_losses)],
+      ["Tokens lost", r => tok(r.proxy_lost_tokens)],
+      ["Cost", r => tok(r.proxy_cost)],
+    ], d.drift),
+      note("Segments are listed in the order a provider renders them. A loss is put down to the earliest one that changed, because everything after the first changed byte is lost whatever else changed with it. Put back counts client changes the proxy undid before they went upstream (a pinned tool order, a kept beta token); those are never blamed for a loss. " +
+        "Cache markers, deferred tools and the string-or-single-block spelling of a message are left out of the comparison, as the provider leaves them out. Cost is in input-equivalent tokens.")),
+    section("Every prefix-change loss, by what explains it", table([
+      ["Explanation", r => r.label, { text: true }],
+      ["Losses", r => n(r.events)],
+      ["Tokens lost", r => tok(r.lost_tokens)],
+      ["Cost", r => tok(r.cost)],
+    ], lossRows)),
+    section("What a request is made of", table([
+      ["Model", r => r.model || "(none)", { text: true }],
+      ["API family", r => r.api_family, { text: true }],
+      ["Requests", r => n(r.requests)],
+      ["Request size", r => bytes(Math.round(r.body_bytes / r.requests))],
+      ["Tools", r => pct(r.tools_share)],
+      ["System", r => pct(r.system_share)],
+      ["Reasoning", r => pct(r.reasoning_share)],
+      ["Reasoning elided", r => r.reasoning_elided_bytes ? pct(share(r.reasoning_elided_bytes, r.body_bytes)) : "–"],
+      ["Opaque conversation", r => pct(r.opaque_share)],
+      ["Tools per request", r => r.tools_per_request.toFixed(1)],
+      ["Deferring", r => pct(share(r.deferring_requests, r.requests))],
+      ["With tool search", r => pct(share(r.tool_search_requests || 0, r.requests))],
+      ["12+ tools, none deferred, no tool search", r => pct(share(r.undeferred_requests, r.requests))],
+      ["Schema bytes compacted", r => r.tools_compacted_requests ? bytes(Math.round(r.tools_compacted_bytes / r.tools_compacted_requests)) + " a request" : "–"],
+    ], d.composition, { empty: "No observed request in this window." }),
+      note("Shares are of request bytes, not tokens: they rank the segments and do not price them. Opaque conversation is the part of the messages the engine holds no text for — tool-call arguments, images, structured results, signatures.")),
+    section("Volatile values in instructions and tool descriptions", tiles([
+      ["Conversations", n(d.volatile.conversations), n(d.volatile.requests) + " requests reported any"],
+      ["Date-times", n(d.volatile.with_timestamps), "requests"],
+      ["Dates", n(d.volatile.with_dates), "requests"],
+      ["UUIDs", n(d.volatile.with_uuids), "requests"],
+      ["JWT-shaped tokens", n(d.volatile.with_jwts), "requests"],
+    ]),
+      note("Counted on a conversation's first request and whenever its instructions or tools changed. A value that changes by itself sits ahead of the whole conversation in the cached prefix.")),
+    section("Predicting a lapse on the request that finds it", coldTable(asked),
+      note("Each request the proxy could have predicted on — one that continues a conversation the provider had served from cache — scored as it arrived: predicted cold when it had been idle longer than the lifetime its previous request asked for, plus the margin. " +
+        "Whether it lost its prefix is the Cache page's reckoning: the request failed to read back what the one before it left. Only a loss of the whole conversation with nothing seen to change is an expiry, and only that confirms a prediction. " +
+        "A read of the instructions and tools alone does not count as alive, since other conversations keep those cached. Partly lost, lost on a request whose prefix changed, and lost with nothing to compare are losses the idle time does not explain; they count against precision. " +
+        "Read it back is the expensive mistake — acting on that prediction would have rewritten a live prefix. Turns that were themselves recompacted are left out: what they read says what was rewritten.")),
+    section("Recompactions on a lapsed cache", tiles([
+      ["On the provider's answer", n(d.recompactions.observed), "it had read nothing and written nothing"],
+      ["On idle time", n(d.recompactions.predicted), "predicted on the turn that found it"],
+      ["Predicted wrongly", n(d.recompactions.predicted_wrong), "the read reached past the instructions and tools: a live prefix rewritten. Counted as the proxy's own breaker counts it, turns with retrieve rounds left out", d.recompactions.predicted_wrong ? "bad" : "good"],
+      ["Conversations", n(d.recompactions.conversations), n(d.recompactions.stale_reads) + " reads rewritten (stale, superseded or matured)"],
+    ]),
+      note("With proxy.cold_recompact on, the turn that finds the provider's cache gone rewrites the whole conversation, and what it decided is replayed on every later turn. Three wrong predictions in an hour end prediction until restart.")),
+    assumed.length ? section("The same, where the request names no lifetime", coldTable(assumed),
+      note("The lifetime is assumed, not asked for, so every row is one guess about the provider's retention.")) : null,
+  ].filter(Boolean);
+};
+
+const VERDICT_TEXT = { turn_on: "Turn on", not_worth_it: "Not worth it", not_enough_data: "Not enough data" };
+const VERDICT_CLASS = { turn_on: "good", not_worth_it: "", not_enough_data: "muted" };
+function factValue(f) {
+  if (f.unit === "share") return pct(f.value);
+  if (f.unit === "bytes") return bytes(Math.round(f.value));
+  if (f.unit === "tokens") return tok(f.value);
+  if (f.unit === "seconds") return f.value + " s";
+  return n(f.value);
+}
+RENDER.advisor = d => {
+  if (!d.available) {
+    return [note("This database was last written by a build that did not record prefix observations. Advice starts with the first requests a current build proxies.")];
+  }
+  const counted = v => d.advice.filter(a => a.verdict === v && a.built);
+  const acted = counted("turn_on").filter(a => a.enabled);
+  const pending = counted("turn_on").filter(a => !a.enabled);
+  const onAgainst = d.advice.filter(a => a.enabled && a.verdict === "not_worth_it");
+  const state = a => !a.built ? el("span", { class: "muted" }, "not built")
+    : a.enabled == null ? "–" : a.enabled ? el("strong", {}, "on") : "off";
+  const verdict = a => {
+    const text = !a.built && a.verdict === "turn_on" ? "Worth building" : VERDICT_TEXT[a.verdict] || a.verdict;
+    return el("strong", { class: VERDICT_CLASS[a.verdict] || "" }, text);
+  };
+  const e = d.effects;
+  return [
+    tiles([
+      ["Worth turning on", n(pending.length), pending.length ? pending.map(a => a.setting).join(", ") : "nothing the evidence asks for is off", pending.length ? "warn" : "good"],
+      ["On, and earning it", n(acted.length), acted.map(a => a.setting).join(", ") || "–"],
+      ["On, without evidence for it", n(onAgainst.length), onAgainst.map(a => a.setting).join(", ") || "–", onAgainst.length ? "warn" : ""],
+      ["Not enough data", n(counted("not_enough_data").length), n(d.compared) + " requests compared with the one before"],
+      ["Input cost in the window", tok(d.input_cost), "input-equivalent tokens; the base of every cost share" + (d.truncated ? "; newest rows only" : "")],
+    ]),
+    section("What the evidence says about each setting", table([
+      ["Setting", a => el("div", { style: "white-space:normal;min-width:20rem;max-width:34rem" },
+        el("strong", {}, a.title), " ", el("code", {}, a.setting),
+        el("div", { class: "muted", style: "margin-top:.2rem" }, a.why)), { text: true }],
+      ["Now", state, { text: true }],
+      ["Verdict", verdict, { text: true }],
+      ["Set", a => a.value ? el("code", {}, a.value) : "–", { text: true }],
+      ["Measured", a => a.measure == null ? "–" : pct(a.measure, a.measure < 0.1 ? 2 : 1)],
+      ["Bar", a => pct(a.threshold, a.threshold < 0.1 ? 1 : 0)],
+      ["Saving, at most", a => a.saving == null ? "–" : tok(a.saving)],
+    ], d.advice),
+      note("Measured and Bar are shares of what each row names: " + d.advice.map(a => a.setting + " — " + a.basis).join("; ") + ". " +
+        "A verdict is that bar applied to an estimate. The bars are the ones the design proposed, not measured optima; savings are ceilings, in input-equivalent tokens over the window, and assume the setting recovers the whole loss put down to it.")),
+    ...d.advice.map(a => section(a.title + " — the figures", table([
+      ["", f => f.label, { text: true }],
+      ["", factValue],
+    ], a.facts, { empty: "No figures in this window." }))),
+    section("What the settings that are on have done", tiles([
+      ["Tool orders put back", n(e.tool_orders_put_back), "client reorders that never reached the provider"],
+      ["Beta tokens put back", n(e.betas_put_back), "requests"],
+      ["Recompactions", n(e.recompactions_observed + e.recompactions_predicted), n(e.recompactions_predicted) + " predicted, " + n(e.predictions_wrong) + " of them wrong", e.predictions_wrong ? "bad" : ""],
+      ["Reads rewritten", n(e.reads_rewritten), "stale, superseded or matured, across the ledgers"],
+      ["Tool schema compacted", bytes(e.tools_compacted_bytes), "over the window"],
+      ["Reasoning elided", bytes(e.reasoning_elided_bytes), "over the window"],
+    ]),
+      note("All zero while everything is off. Compare with the ceilings above once a setting has been on for a while. The detail behind every row is on the Prefix drift page.")),
+  ];
+};
+
+const QUALITY_AREAS = [["requests", "Proxied requests"], ["engine", "Engine runs"], ["retrieval", "Retrievals"], ["limits", "What the database cannot hold"]];
+RENDER.quality = d => {
+  const judged = d.checks.filter(c => c.level === "warn" || c.level === "bad");
+  const headline = { ok: "The figures can be trusted", warn: "Some figures are incomplete", bad: "Figures are unreliable" }[d.level] || d.level;
+  return [
+    el("div", { class: "verdict " + d.level, role: "status" },
+      el("strong", { class: d.level === "ok" ? "good" : d.level }, headline),
+      el("span", { class: "muted" }, judged.length ? judged.map(c => c.title + " (" + checkValue(c) + ")").join(" · ") : "Every judged column is filled as expected."),
+      el("span", { class: "muted", style: "margin-left:auto" },
+        "Raw rows from " + time(d.raw_from_ms) + " · retention " + (d.retention_days ? d.retention_days + " days" : "off") +
+        " · archived through " + (d.archived_through || "none yet"))),
+    ...checkGroups(d.checks, QUALITY_AREAS),
+    section("Rows in this window", table([
+      ["Table", r => r.table, { text: true }],
+      ["Rows", r => n(r.rows)],
+      ["First", r => time(r.first_ms), { text: true }],
+      ["Last", r => time(r.last_ms), { text: true }],
+      ["Within one report's limit", r => r.over_limit ? el("span", { class: "warn" }, "no — truncated") : "yes", { text: true }],
+    ], d.tables)),
+    note("Coverage checks turn warn and bad below their limits; columns this build never writes are shown as Info, not as failures."),
+  ];
+};
+
+RENDER.models = d => {
+  const rows = d.models;
+  const sum = f => rows.reduce((a, r) => a + (f(r) || 0), 0);
+  const tokensIn = sum(r => r.tokens_in), saved = sum(r => r.saved_gross), back = sum(r => r.retrieved_tokens);
+  const idle = sum(r => r.idle_engine_ms);
+  const costliest = rows[0];
+  const best = rows.filter(r => r.tokens_in > 0).sort((a, b) => (b.reduction || 0) - (a.reduction || 0))[0];
+  const points = rows.filter(r => r.billed.input > 0).slice(0, 12).map(r => ({
+    x: r.model || "(none)", fresh: r.billed.uncached, read: r.billed.read,
+    write: r.billed.write_5m + r.billed.write_1h, saved: r.reduction,
+  }));
+  return [
+    tiles([
+      ["Models", n(rows.length), costliest ? "costliest: " + (costliest.model || "(none)") : "no model calls in this window"],
+      ["Engine reduction", pct(ratio(saved, tokensIn)), tok(saved) + " of " + tok(tokensIn) + " shown to the engine", "good"],
+      ["Net of retrieval", tok(saved - back), tok(back) + " put back by " + n(sum(r => r.retrieve_rounds)) + " retrieve rounds"],
+      ["Best reduction", best ? pct(best.reduction) : "–", best ? (best.model || "(none)") : ""],
+      ["Engine time that changed nothing", ms(idle), "runs that rewrote no message", idle > 600000 ? "warn" : ""],
+      ["Upstream failures", n(sum(r => r.upstream_failures)), "429, 5xx, no answer, broken streams", sum(r => r.upstream_failures) ? "warn" : "good"],
+    ]),
+    section("Billed input by model, with the engine's reduction",
+      chart(points, [
+        { key: "read", label: "Cache read", color: css("--read") },
+        { key: "write", label: "Cache write", color: css("--write") },
+        { key: "fresh", label: "Fresh input", color: css("--fresh") },
+      ], { line: { key: "saved", label: "Engine reduction", color: css("--ping"), fmt: pct, min: 0 } }),
+      note("Bars are what the provider billed as input, clients and keep-warm pings together. The line is how much of what the engine was shown it removed — a different base: the engine sees the whole prompt on every turn, the bill counts most of it as cache reads.")),
+    section("Scorecard", table([
+      ["Model", r => r.model || "(none)", { text: true }],
+      ["API family", r => r.api_family, { text: true }],
+      ["Requests", r => n(r.client_requests)],
+      ["Pings", r => n(r.pings)],
+      ["Billed input", r => tok(r.billed.input)],
+      ["Cache read", r => pct(r.billed.read_share)],
+      ["Cache saving", r => r.billed.input ? el("span", { class: r.billed.saved_share < 0 ? "bad" : "" }, pct(r.billed.saved_share)) : "–"],
+      ["Output", r => tok(r.billed.output)],
+      ["Engine runs", r => n(r.engine_runs)],
+      ["Rewrote", r => pct(ratio(r.compressed_runs, r.engine_runs), 0)],
+      ["Reduction", r => r.tokens_in ? meter(r.reduction) : "–"],
+      ["Saved", r => tok(r.saved_gross)],
+      ["Asked back", r => tok(r.retrieved_tokens)],
+      ["Net", r => el("span", { class: r.saved_net < 0 ? "bad" : "" }, tok(r.saved_net))],
+      ["Engine p50", r => ms(r.engine_ms.p50)],
+      ["Engine p95", r => ms(r.engine_ms.p95)],
+      ["Upstream failures", r => r.upstream_failures ? el("span", { class: "warn" }, n(r.upstream_failures) + " (" + pct(r.upstream_failure_share) + ")") : "0"],
+    ], rows, { empty: "No model calls and no engine runs in this window." }),
+      note("Cache saving is the bill against the same input at the fresh price; negative means cache writes cost more than reads saved. Rewrote is the share of engine runs that changed at least one message. Costliest model first."),
+      d.truncated ? note("Only the newest 200,000 engine runs were read; the engine columns cover those.") : null),
+  ];
+};
+
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const ACTIVITY_METRICS = [
+  ["requests", "Model calls", n],
+  ["input_tokens", "Billed input", tok],
+  ["cache_write_tokens", "Cache writes", tok],
+  ["saved_gross", "Engine savings", tok],
+  ["pings", "Keep-warm pings", n],
+];
+let activityMetric = "requests";
+RENDER.activity = d => {
+  // The report is in UTC; the grid is drawn in the viewer's zone, to the hour.
+  const shift = Math.round(-new Date().getTimezoneOffset() / 60);
+  const local = c => {
+    const h = c.weekday * 24 + c.hour + shift;
+    const w = ((h % 168) + 168) % 168;
+    return [Math.floor(w / 24), w % 24];
+  };
+  const [, label, fmt] = ACTIVITY_METRICS.find(m => m[0] === activityMetric) || ACTIVITY_METRICS[0];
+  const grid = Array.from({ length: 7 }, () => new Array(24).fill(0));
+  const byHour = Array.from({ length: 24 }, (_, hour) => ({ x: String(hour).padStart(2, "0"), requests: 0, pings: 0, passthrough: 0, write: 0 }));
+  for (const c of d.cells) {
+    const [w, h] = local(c);
+    grid[w][h] += c[activityMetric] || 0;
+    byHour[h].requests += c.requests; byHour[h].pings += c.pings; byHour[h].passthrough += c.passthrough;
+    byHour[h].write += c.cache_write_tokens;
+  }
+  const max = Math.max(1, ...grid.flat());
+  const picker = el("select", { "aria-label": "Metric", onchange: e => { activityMetric = e.target.value; if (last) $("content").replaceChildren(...RENDER.activity(last).filter(Boolean)); } },
+    ACTIVITY_METRICS.map(([id, text]) => el("option", { value: id, selected: id === activityMetric }, text)));
+  const heat = el("div", { class: "scroll" }, el("table", {},
+    el("thead", {}, el("tr", {}, el("th", { class: "text" }, ""), Array.from({ length: 24 }, (_, h) => el("th", {}, String(h).padStart(2, "0"))))),
+    el("tbody", {}, WEEKDAYS.map((day, w) => el("tr", {},
+      el("th", { class: "text" }, day),
+      grid[w].map((v, h) => el("td", {
+        style: "padding:0;min-width:26px;height:22px;background:color-mix(in srgb, var(--accent) " + (v ? 8 + 82 * v / max : 0).toFixed(0) + "%, transparent)",
+        title: day + " " + String(h).padStart(2, "0") + ":00 — " + label + ": " + fmt(v),
+      }, "")))))));
+  const b = d.busiest && local(d.busiest);
+  const peakStart = d.peak_window_start_hour == null ? null : ((d.peak_window_start_hour + shift) % 24 + 24) % 24;
+  const cells = d.cells.map(c => ({ ...c, at: local(c) })).sort((a, z) => z.requests - a.requests).slice(0, 12);
+  return [
+    tiles([
+      ["Model calls", n(d.requests), "in " + n(d.cells.length) + " of 168 weekly hours"],
+      ["Busiest hour", b ? WEEKDAYS[b[0]] + " " + String(b[1]).padStart(2, "0") + ":00" : "–", d.busiest ? n(d.busiest.requests) + " calls over " + n(d.busiest.days) + " day(s)" : ""],
+      ["Busiest 8 hours", peakStart == null ? "–" : String(peakStart).padStart(2, "0") + ":00–" + String((peakStart + 8) % 24).padStart(2, "0") + ":00", pct(d.peak_window_share) + " of model calls"],
+      ["Billed input", tok(d.input_tokens), tok(d.cache_write_tokens) + " of it written to cache"],
+      ["Cache-write share", pct(ratio(d.cache_write_tokens, d.input_tokens)), "the part of the input paid at the write price", ratio(d.cache_write_tokens, d.input_tokens) > 0.05 ? "warn" : "good"],
+    ]),
+    section("Hour of the week", el("p", { class: "note" }, "Shade: ", picker, " — darker is more. Times are in your browser's zone."), heat),
+    section("By hour of the day",
+      chart(byHour, [
+        { key: "requests", label: "Model calls", color: css("--accent") },
+        { key: "pings", label: "Keep-warm pings", color: css("--ping") },
+        { key: "passthrough", label: "Pass-through", color: css("--fresh") },
+      ], { fmt: n, line: { key: "write", label: "Cache writes", color: css("--write"), fmt: tok, min: 0 } }),
+      note("Hours where cache writes rise without model calls rising are where prefixes were rebuilt: the first turn after a pause, or a cache that lapsed.")),
+    section("Busiest hours", table([
+      ["When", r => WEEKDAYS[r.at[0]] + " " + String(r.at[1]).padStart(2, "0") + ":00", { text: true }],
+      ["Model calls", r => n(r.requests)],
+      ["Days seen", r => n(r.days)],
+      ["Calls per day", r => r.days ? (r.requests / r.days).toFixed(1) : "–"],
+      ["Pings", r => n(r.pings)],
+      ["Billed input", r => tok(r.input_tokens)],
+      ["Cache writes", r => tok(r.cache_write_tokens)],
+      ["Engine savings", r => tok(r.saved_gross)],
+    ], cells)),
+  ];
+};
+
+RENDER.cohorts = d => {
+  const rows = d.cohorts;
+  const total = rows.reduce((a, r) => a + r.billed.cost, 0);
+  const top = [...rows].sort((a, b) => b.billed.cost - a.billed.cost)[0];
+  const single = rows[0] || { conversations: 0 };
+  const points = rows.map(r => ({ x: r.turns, read: r.billed.read, write: r.billed.write_5m + r.billed.write_1h, fresh: r.billed.uncached, share: r.net_saving_share }));
+  return [
+    tiles([
+      ["Conversations", n(d.conversations), n(rows.reduce((a, r) => a + r.client_turns, 0)) + " client turns"],
+      ["Half the cost is in", pct(d.half_cost_conversation_share), "of conversations, costliest first", d.half_cost_conversation_share != null && d.half_cost_conversation_share < 0.1 ? "warn" : ""],
+      ["Costliest cohort", top && total ? top.turns + " turns" : "–", top && total ? pct(top.cost_share) + " of the cost, " + n(top.conversations) + " conversations" : ""],
+      ["One-turn conversations", pct(ratio(single.conversations, d.conversations)), n(single.conversations) + " — mostly side calls and one-shot requests"],
+    ]),
+    section("Billed input by conversation length",
+      chart(points, [
+        { key: "read", label: "Cache read", color: css("--read") },
+        { key: "write", label: "Cache write", color: css("--write") },
+        { key: "fresh", label: "Fresh input", color: css("--fresh") },
+      ], { line: { key: "share", label: "Net compression saving", color: css("--ping"), fmt: pct } }),
+      note("The line is net tokens removed (engine savings less what retrieval put back) over the input the provider was billed for, per cohort.")),
+    section("Cohorts by client turns", table([
+      ["Turns", r => r.turns, { text: true }],
+      ["Conversations", r => n(r.conversations)],
+      ["Client turns", r => n(r.client_turns)],
+      ["Pings", r => n(r.pings)],
+      ["Billed input", r => tok(r.billed.input)],
+      ["Cost share", r => r.cost_share == null ? "–" : meter(r.cost_share)],
+      ["Cache read", r => r.billed.input ? pct(r.billed.read_share) : "–"],
+      ["Cache saving", r => r.billed.input ? el("span", { class: r.billed.saved_share < 0 ? "bad" : "" }, pct(r.billed.saved_share)) : "–"],
+      ["Saved", r => tok(r.saved_gross)],
+      ["Asked back", r => tok(r.retrieved_tokens)],
+      ["Net saving", r => r.net_saving_share == null ? "–" : el("span", { class: r.net_saving_share < 0 ? "bad" : "" }, pct(r.net_saving_share, 2))],
+      ["Retrieve rounds", r => n(r.retrieve_rounds)],
+      ["Errors", r => n(r.errors)],
+      ["Median length", r => ms(r.median_duration_ms)],
+    ], rows),
+      note("A conversation is counted in the window it has rows in, by the client turns it ran there. Cost is input-equivalent tokens: reads and writes at their prices relative to fresh input."),
+      d.truncated ? note("Only the 50,000 costliest conversations were read.") : null),
+  ];
+};
+
+RENDER.trends = d => {
+  const t = d.totals, m = t.metrics;
+  const markers = new Map(d.markers.map(mk => [mk.label, mk.build_version]));
+  const points = d.points.map(p => ({
+    x: p.label + (markers.has(p.label) ? " ▲" : ""),
+    net: Math.max(0, p.net_reduction),
+    cost: p.metrics.input_equivalent_cost,
+    saving: p.cache_saving,
+    requests: p.metrics.client_requests,
+    errors: p.error_share,
+  }));
+  return [
+    tiles([
+      ["Client requests", n(m.client_requests), n(t.conversations) + " conversations"],
+      ["Net tokens removed", tok(t.net_reduction), tok(m.saved_gross) + " removed, " + tok(m.retrieved_tokens) + " asked back"],
+      ["Prompt-cache saving", pct(t.cache_saving), tok(m.input_equivalent_cost) + " input-equivalent of " + tok(m.input_tokens), "good"],
+      ["Keep-warm cost", tok(m.ping_input_equivalent_cost), pct(ratio(m.ping_input_equivalent_cost, m.input_equivalent_cost)) + " of the bill"],
+      ["Error share", pct(t.error_share, 2), n(m.errors) + " failed requests", t.error_share > 0.02 ? "bad" : ""],
+      ["Mean latency", ms(t.mean_latency_ms)],
+    ]),
+    section("Net tokens removed and prompt-cache saving per " + d.bucket,
+      chart(points, [{ key: "net", label: "Net tokens removed", color: css("--accent") }],
+        { line: { key: "saving", label: "Cache saving", color: css("--write"), fmt: v => pct(v, 0), min: 0, max: 1 } }),
+      note("▲ marks the period a build was first seen. Archived days are included, so the trend reaches past the raw-row retention" +
+        (d.truncated ? "; older periods were dropped to keep 400 points." : "."))),
+    section("Input cost per " + d.bucket + " (input-equivalent tokens)",
+      chart(points, [{ key: "cost", label: "Input-equivalent cost", color: css("--fresh") }],
+        { line: { key: "requests", label: "Client requests", color: css("--ping"), fmt: n } })),
+    d.markers.length ? section("Builds", table([
+      ["Build", r => r.build_version, { text: true }],
+      ["First seen", r => r.label, { text: true }],
+    ], d.markers)) : null,
+    section("Per " + d.bucket, table([
+      ["Period", r => r.label, { text: true }],
+      ["Requests", r => n(r.metrics.client_requests)],
+      ["Conversations", r => n(r.conversations)],
+      ["Removed", r => tok(r.metrics.saved_gross)],
+      ["Asked back", r => tok(r.metrics.retrieved_tokens)],
+      ["Net", r => tok(r.net_reduction)],
+      ["Input cost", r => tok(r.metrics.input_equivalent_cost)],
+      ["Cache saving", r => pct(r.cache_saving)],
+      ["Pings", r => n(r.metrics.ping_requests)],
+      ["Errors", r => pct(r.error_share, 2)],
+      ["Mean latency", r => ms(r.mean_latency_ms)],
+      ["Builds", r => r.builds.join(", "), { text: true }],
+    ], [...d.points].reverse().filter(p => p.metrics.client_requests || p.metrics.compressions || p.metrics.ping_requests),
+      { empty: "No activity in this range." })),
+  ];
+};
+
+RENDER.yield = d => {
+  const maxType = Math.max(1, ...d.types.map(t => t.saved_estimate));
+  const unknown = d.unknown_kind;
+  return [
+    tiles([
+      ["Compressing runs", n(d.compressing_runs)],
+      ["Tokens removed", tok(d.saved_gross)],
+      ["Tokens asked back", tok(d.retrieved_tokens), pct(ratio(d.retrieved_tokens, d.saved_gross)) + " of what was removed"],
+      ["Net", tok(d.saved_gross - d.retrieved_tokens), null, "good"],
+    ]),
+    section("What each content type gave up",
+      table([
+        ["Type", r => r.content_type, { text: true }],
+        ["Runs", r => n(r.requests)],
+        ["Messages", r => n(r.messages)],
+        ["Removed (est.)", r => tok(r.saved_estimate)],
+        ["Share", r => meter(r.saved_estimate / maxType)],
+        ["Per message", r => tok(r.saved_estimate / Math.max(1, r.messages))],
+        ["Single-type runs", r => n(r.single_type_requests)],
+        ["Their exact saving", r => tok(r.single_type_saved)],
+      ], d.types),
+      note("The engine records messages per type, not tokens, so each run's saving is split across its types by message count. " +
+        "Runs made of one type alone give the exact figure to check the estimate against.")),
+    section("What retrieval took back, by fragment kind",
+      table([
+        ["Kind", r => r.kind, { text: true }],
+        ["Stored in window", r => n(r.refs_stored)],
+        ["Bytes", r => bytes(r.bytes_stored)],
+        ["Asked for", r => n(r.refs_asked)],
+        ["Asked share", r => meter(r.asked_share)],
+        ["Asks", r => n(r.asks)],
+        ["Hits", r => n(r.hits)],
+        ["Tokens back", r => tok(r.returned_tokens)],
+        ["Median wait to first ask", r => secs(r.median_first_ask_s)],
+      ], [...d.kinds, ...(unknown.asks ? [unknown] : [])],
+        { empty: "The ref store holds nothing from this window." }),
+      note("Kinds come from the ref store, so a handle that has expired and been purged is counted as unknown. " +
+        (d.store_truncated ? "The store census was cut at its newest 200,000 entries." : ""))),
+  ];
+};
+
+RENDER.store = d => {
+  const capShare = ratio(d.live_bytes, d.max_bytes);
+  const samples = d.samples.map(s => ({ x: shortTime(s.time_ms), bytes: s.live_bytes, refs: s.live_refs }));
+  return [
+    tiles([
+      ["Live entries", n(d.live_refs), bytes(d.live_bytes)],
+      ["Of the byte cap", pct(capShare), "cap " + bytes(d.max_bytes), capShare > 0.8 ? "bad" : capShare > 0.5 ? "warn" : "good"],
+      ["Expired, not yet purged", n(d.expired_refs), bytes(d.expired_bytes)],
+      ["Never read", pct(d.never_read_share), "of live entries"],
+      ["Handles minted", n(d.minted_refs), bytes(d.minted_bytes) + " in the window"],
+      ["Asked for", pct(d.asked_share, 2), n(d.asked_refs) + " distinct handles"],
+      ["Asks", n(d.asks), n(d.hits) + " hits"],
+      ["Expired asks", n(d.expired_asks), "lifetime " + secs(d.ttl_seconds) + " idle, " + secs(d.max_lifetime_seconds) + " max",
+        d.expired_asks ? "bad" : ""],
+      ["Missing asks", n(d.missing_asks), n(d.withheld_asks) + " withheld by policy"],
+    ]),
+    section("Store size (all tenants)",
+      chart(samples, [{ key: "bytes", label: "Live bytes", color: css("--fresh") }],
+        { fmt: bytes, line: { key: "refs", label: "Live entries", color: css("--accent"), fmt: n } })),
+    el("div", { class: "grid2" },
+      section("Live entries by age", table([
+        ["Age", r => r.label, { text: true }], ["Entries", r => n(r.refs)], ["Bytes", r => bytes(r.bytes)],
+      ], d.age)),
+      section("Live entries by time to expiry", table([
+        ["Expires in", r => r.label, { text: true }], ["Entries", r => n(r.refs)], ["Bytes", r => bytes(r.bytes)],
+      ], d.expiring))),
+    section("By kind", table([
+      ["Kind", r => r.kind, { text: true }],
+      ["Entries", r => n(r.refs)],
+      ["Bytes", r => bytes(r.bytes)],
+      ["Expired", r => n(r.expired)],
+      ["Never read", r => n(r.never_read)],
+    ], d.by_kind, { empty: "The store is empty." }),
+      note("An expired ask means the lifetime was shorter than the agent's pause; a growing never-read share means the store is holding fragments nobody wants. " +
+        (d.store_truncated ? "The census was cut at the newest 200,000 entries." : ""))),
+  ];
+};
+
+RENDER.keepwarm = d => {
+  const points = d.timeline.map(p => ({ x: shortTime(p.bucket_ms), cost: p.ping_cost, avoided: p.avoided_cost }));
+  return [
+    tiles([
+      ["Pings", n(d.pings), n(d.warm) + " warm, " + n(d.cold) + " cold, " + n(d.failed) + " failed"],
+      ["Ping cost", tok(d.ping_cost), "input-equivalent tokens"],
+      ["Rewrites avoided", tok(d.avoided_cost), n(d.bridged) + " pauses bridged", "good"],
+      ["Net", tok(d.net), "return " + (d.return_ratio == null ? "–" : d.return_ratio.toFixed(2) + "×"), d.net >= 0 ? "good" : "bad"],
+      ["Not bridged", n(d.not_bridged), "pinged, but the prefix was lost anyway", d.not_bridged ? "bad" : ""],
+      ["Unneeded", n(d.unneeded), "pinged pauses shorter than the cache lifetime"],
+      ["After the last turn", n(d.trailing_pings), tok(d.trailing_cost) + " spent", d.trailing_cost > d.avoided_cost ? "warn" : ""],
+      ["Unpinged losses", n(d.unpinged_expired), tok(d.missed_cost) + " lost to the TTL", d.unpinged_expired ? "warn" : ""],
+    ]),
+    section("Ping cost against rewrites avoided",
+      chart(points, [
+        { key: "cost", label: "Ping cost", color: css("--ping") },
+      ], { line: { key: "avoided", label: "Rewrites avoided", color: css("--good"), fmt: tok } })),
+    section("By pause length", table([
+      ["Pause", r => r.label, { text: true }],
+      ["Pauses", r => n(r.pauses)],
+      ["Pinged", r => n(r.pinged)],
+      ["Bridged", r => n(r.bridged)],
+      ["Not bridged", r => n(r.not_bridged)],
+      ["Unneeded", r => n(r.unneeded)],
+      ["Ping cost", r => tok(r.ping_cost)],
+      ["Avoided", r => tok(r.avoided_cost)],
+      ["Net", r => el("span", { class: r.avoided_cost - r.ping_cost >= 0 ? "good" : "bad" }, tok(r.avoided_cost - r.ping_cost))],
+      ["Unpinged losses", r => n(r.unpinged_expired)],
+      ["Their cost", r => tok(r.missed_cost)],
+    ], d.gaps),
+      note("A pause is the idle time before a client turn, measured from the previous client turn. A bucket whose net is negative is one where pinging cost more than it saved; " +
+        "unpinged losses are the ceiling on what longer pinging could recover. Pings after a conversation's last turn include conversations still running at the window's end.")),
+    section(`Conversations (${n(d.conversations.length)} of ${n(d.conversations_total)})`, table([
+      ["Conversation", r => r.conversation, { text: true }],
+      ["Model", r => r.model || "", { text: true }],
+      ["Turns", r => n(r.turns)],
+      ["Pings", r => n(r.pings)],
+      ["Ping cost", r => tok(r.ping_cost)],
+      ["Bridged", r => n(r.bridged)],
+      ["Not bridged", r => n(r.not_bridged)],
+      ["After last turn", r => n(r.trailing_pings)],
+      ["Avoided", r => tok(r.avoided_cost)],
+      ["Unpinged losses", r => tok(r.missed_cost)],
+      ["Net", r => el("span", { class: r.net >= 0 ? "good" : "bad" }, tok(r.net))],
+    ], d.conversations, { pick: openTimeline })),
+  ];
+};
+
+RENDER.upstream = d => {
+  const t = d.totals;
+  const points = d.timeline.map(p => ({
+    x: shortTime(p.bucket_ms), ok: p.requests - p.failed, rl: p.rate_limited, se: p.server_error,
+    other: p.failed - p.rate_limited - p.server_error, p95: p.p95_upstream_ms,
+  }));
+  return [
+    tiles([
+      ["Requests", n(t.requests), n(t.pings) + " keep-warm pings"],
+      ["Failed", n(t.failed), pct(d.error_share, 2) + " of requests", d.error_share > 0.02 ? "bad" : ""],
+      ["Rate limited (429)", n(t.rate_limited), null, t.rate_limited ? "warn" : ""],
+      ["Server errors (5xx)", n(t.server_error), null, t.server_error ? "bad" : ""],
+      ["No answer", n(t.no_status)],
+      ["Other 4xx", n(t.client_error)],
+      ["Retried", n(t.retried), "sent more than once"],
+      ["Upstream p50 / p95", ms(d.upstream_ms.p50) + " / " + ms(d.upstream_ms.p95), "p99 " + ms(d.upstream_ms.p99)],
+    ]),
+    section("Requests and failures",
+      chart(points, [
+        { key: "ok", label: "Answered", color: css("--fresh") },
+        { key: "other", label: "Other failures", color: css("--warn") },
+        { key: "rl", label: "429", color: css("--ping") },
+        { key: "se", label: "5xx", color: css("--bad") },
+      ], { fmt: n, line: { key: "p95", label: "Upstream p95", color: css("--accent"), fmt: ms } })),
+    section("By upstream and model", table([
+      ["Upstream", r => r.upstream, { text: true }],
+      ["Model", r => r.model || "(no model)", { text: true }],
+      ["Requests", r => n(r.mix.requests)],
+      ["Failed", r => n(r.mix.failed)],
+      ["Error share", r => pct(r.error_share, 2)],
+      ["429", r => n(r.mix.rate_limited)],
+      ["5xx", r => n(r.mix.server_error)],
+      ["No answer", r => n(r.mix.no_status)],
+      ["Retried", r => n(r.mix.retried)],
+      ["Upstream p50", r => ms(r.upstream_ms.p50)],
+      ["p95", r => ms(r.upstream_ms.p95)],
+      ["p99", r => ms(r.upstream_ms.p99)],
+      ["Total p95", r => ms(r.total_ms.p95)],
+    ], d.by_upstream),
+      note("Requests with no model are pass-through calls the proxy relays without a model field, such as profile and token-count endpoints.")),
+    section("Incidents", table([
+      ["From", r => time(r.from_ms), { text: true }],
+      ["Lasted", r => ms(r.to_ms - r.from_ms)],
+      ["Failures", r => n(r.failures)],
+      ["Statuses", r => Object.entries(r.statuses).map(([k, v]) => k + " × " + v).join(", "), { text: true }],
+      ["Upstreams", r => r.upstreams.join(", "), { text: true }],
+    ], d.bursts, { empty: "No incidents: no run of three or more 429s, 5xx or unanswered requests within a minute of each other." })),
+    section("Recent failures", table([
+      ["When", r => time(r.time_ms), { text: true }],
+      ["Status", r => r.status == null ? "none" : r.status],
+      ["Upstream", r => r.upstream, { text: true }],
+      ["Model", r => r.model || "", { text: true }],
+      ["Attempts", r => n(r.attempts)],
+      ["Upstream time", r => ms(r.upstream_ms)],
+      ["Ping", r => r.keep_warm ? "yes" : ""],
+      ["Error", r => r.error || "", { text: true }],
+      ["Request", r => r.request_id, { text: true }],
+    ], d.failures, { empty: "No failed requests in this window." })),
+  ];
+};
+
+RENDER.engine = d => {
+  const s = d.server;
+  const points = d.timeline.map(p => ({ x: shortTime(p.bucket_ms), total: p.total_ms, p95: p.p95_ms }));
+  const groupTable = (title, rows) => section(title, table([
+    [title.replace(/^By /, ""), r => r.name, { text: true }],
+    ["Runs", r => n(r.runs)],
+    ["Engine time", r => ms(r.total_ms)],
+    ["p50", r => ms(r.latency.p50)],
+    ["p95", r => ms(r.latency.p95)],
+    ["Max", r => ms(r.latency.max)],
+    ["Tokens in", r => tok(r.tokens_in)],
+    ["Removed", r => tok(r.saved)],
+    ["ms / 1K tokens", r => r.ms_per_1k_tokens == null ? "–" : r.ms_per_1k_tokens.toFixed(2)],
+  ], rows));
+  return [
+    tiles([
+      ["Engine runs", n(d.runs), d.truncated ? "newest 200,000 only" : null],
+      ["Engine time", ms(d.total_ms)],
+      ["p50 / p95", ms(d.latency.p50) + " / " + ms(d.latency.p95)],
+      ["p99 / max", ms(d.latency.p99) + " / " + ms(d.latency.max)],
+      ["Slots in use now", n(s.inflight_limit - s.inflight_free) + " of " + n(s.inflight_limit)],
+      ["Stats events dropped", n(s.stats_dropped), "since start; non-zero means undercounting", s.stats_dropped ? "bad" : "good"],
+    ]),
+    section("Engine time",
+      chart(points, [{ key: "total", label: "Engine time", color: css("--fresh") }],
+        { fmt: ms, line: { key: "p95", label: "p95 per run", color: css("--write"), fmt: ms } })),
+    groupTable("By content type", d.by_type),
+    el("div", { class: "grid2" }, groupTable("By prompt size", d.by_size), groupTable("By outcome", d.by_outcome)),
+    groupTable("By surface", d.by_surface),
+    section("Slowest runs", table([
+      ["When", r => time(r.time_ms), { text: true }],
+      ["Engine time", r => ms(r.engine_ms)],
+      ["Tokens in", r => tok(r.tokens_in)],
+      ["Tokens out", r => tok(r.tokens_out)],
+      ["Messages", r => n(r.messages)],
+      ["Main type", r => r.content_type, { text: true }],
+      ["Outcome", r => r.outcome || "", { text: true }],
+      ["Surface", r => r.surface, { text: true }],
+      ["Request", r => r.request_id, { text: true }],
+    ], d.slowest)),
+    note("A run's content type is the one with the most messages in it. Server figures are this process's, at the time of the request."),
+  ];
+};
+
+RENDER.timeline = response => {
+  // The analysis route wraps its report.
+  const d = response.report || response;
+  if (!d.turns) {
+    const rows = d.conversations.filter(c => c.conversation)
+      .sort((a, b) => b.last_ms - a.last_ms);
+    return [section("Pick a conversation", table([
+      ["Conversation", r => r.conversation, { text: true }],
+      ["Last active", r => time(r.last_ms), { text: true }],
+      ["Model", r => (r.models || []).join(", "), { text: true }],
+      ["Turns", r => n(r.client_turns)],
+      ["Pings", r => n(r.pings)],
+      ["Removed", r => tok(r.saved_gross)],
+      ["Asked back", r => tok(r.retrieved_tokens)],
+      ["Cache read", r => r.cache ? pct(r.cache.tokens.read_share) : "–"],
+      ["Errors", r => n(r.errors)],
+    ], rows, { pick: openTimeline, empty: "No conversations in this window." }))];
+  }
+  const turns = d.turns;
+  const points = turns.map((t, i) => {
+    const c = t.cache || {};
+    return {
+      x: "#" + (i + 1), read: c.read || 0, write: (c.write_5m || 0) + (c.write_1h || 0), fresh: c.uncached || 0,
+      ping: t.keep_warm ? 1 : 0, lost: c.lost_tokens || 0, saved: t.saved_net,
+    };
+  });
+  const sum = (k) => turns.reduce((s, t) => s + (k(t) || 0), 0);
+  const losses = turns.filter(t => t.cache && t.cache.lost_tokens > 0);
+  const clientTurns = turns.filter(t => !t.keep_warm);
+  return [
+    tiles([
+      ["Turns", n(clientTurns.length), n(turns.length - clientTurns.length) + " keep-warm pings" + (d.turns_truncated ? " (newest only)" : "")],
+      ["Span", ms(turns.length ? turns[turns.length - 1].time_ms - turns[0].time_ms : 0), turns.length ? shortTime(turns[0].time_ms) : null],
+      ["Tokens removed", tok(sum(t => t.saved_gross)), tok(sum(t => t.retrieved_tokens)) + " asked back"],
+      ["Retrieval rounds", n(sum(t => t.retrieval_rounds))],
+      ["Cache losses", n(losses.length), tok(sum(t => t.cache && t.cache.lost_tokens)) + " tokens", losses.length ? "warn" : "good"],
+      ["Errors", n(turns.filter(t => t.error || (t.status != null && t.status >= 400)).length)],
+    ]),
+    section("Prompt per turn: what the cache read, wrote and charged fresh",
+      chart(points, [
+        { key: "read", label: "Cache read", color: css("--read") },
+        { key: "write", label: "Cache write", color: css("--write") },
+        { key: "fresh", label: "Fresh input", color: css("--fresh") },
+      ], { line: { key: "saved", label: "Net tokens removed", color: css("--ping"), fmt: tok } }),
+      note("Bars are the prompt the provider billed for each turn; a turn whose bar turns orange after green lost its cached prefix. Hover a bar for its numbers.")),
+    section("Turns", table([
+      ["#", (r) => String(turns.indexOf(r) + 1)],
+      ["When", r => time(r.time_ms), { text: true }],
+      ["Gap", r => r.cache && r.cache.gap_ms != null ? ms(r.cache.gap_ms) : "–"],
+      ["Kind", r => r.keep_warm ? "ping" : (r.cache ? r.cache.kind : "–"), { text: true }],
+      ["Read", r => tok(r.cache && r.cache.read)],
+      ["Written", r => tok(r.cache && ((r.cache.write_5m || 0) + (r.cache.write_1h || 0)))],
+      ["Fresh", r => tok(r.cache && r.cache.uncached)],
+      ["Lost", r => r.cache && r.cache.lost_tokens ? el("span", { class: "bad" }, tok(r.cache.lost_tokens) + " (" + (r.cache.cause || "") + ")") : ""],
+      ["Removed", r => tok(r.saved_gross)],
+      ["Asked back", r => tok(r.retrieved_tokens)],
+      ["Rounds", r => n(r.retrieval_rounds)],
+      ["Latency", r => ms(r.total_ms)],
+      ["Status", r => r.error ? el("span", { class: "bad" }, String(r.status ?? "none") + " " + r.error.slice(0, 80)) : (r.status ?? "")],
+    ], turns)),
+  ];
+};
+
+function openTimeline(row) {
+  const target = new URL(withTenant(pagePath(VIEWS.find(v => v.id === "timeline"))), location.origin);
+  target.searchParams.set("conversation", row.conversation);
+  target.searchParams.set("window", view.id === "timeline" ? windowSelect.value : (windowMs(windowSelect.value) > 7776000000 ? "90d" : windowSelect.value));
+  if (view.id === "timeline") {
+    $("conversation").value = row.conversation;
+    remember();
+    load();
+  } else {
+    location.href = target.pathname + target.search;
+  }
+}
+
+// ------------------------------------------------------------- loading
+let timer = null, inflight = false, last = null;
+async function load() {
+  if (inflight) return;
+  inflight = true;
+  clearTimeout(timer);
+  const key = $("key").value.trim();
+  const headers = {};
+  if (key) headers["x-kompressor-key"] = key;
+  const url = endpoint() + "?" + query("json").toString();
+  try {
+    const started = performance.now();
+    const response = await fetch(url, { headers, cache: "no-store" });
+    if (!response.ok) {
+      let message = response.status + " " + response.statusText;
+      try { const body = await response.json(); if (body.error) message = body.error.message || message; } catch (_) {}
+      if (response.status === 401) message += " — enter a key above";
+      throw new Error(message);
+    }
+    const data = await response.json();
+    last = data;
+    const content = $("content");
+    content.replaceChildren(...RENDER[view.id](data).filter(Boolean));
+    $("error").textContent = "";
+    const took = Math.round(performance.now() - started);
+    $("status").textContent = view.title + " · " + (data.window || windowSelect.value) + " · updated " +
+      new Date().toLocaleTimeString() + " in " + took + " ms";
+  } catch (error) {
+    $("error").textContent = String(error.message || error);
+    $("status").textContent = "";
+  } finally {
+    inflight = false;
+    if ($("auto").checked && !document.hidden) timer = setTimeout(load, Math.max(1, SETTINGS.refresh || 30) * 1000);
+  }
+}
+
+$("filters").addEventListener("submit", event => {
+  event.preventDefault();
+  try { sessionStorage.setItem("kompressor-key", $("key").value.trim()); } catch (_) {}
+  remember();
+  load();
+});
+for (const id of ["window", "bucket"]) $(id).addEventListener("change", () => { remember(); load(); });
+$("auto").addEventListener("change", () => { clearTimeout(timer); if ($("auto").checked) load(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden && $("auto").checked) load(); });
+window.addEventListener("storage", event => {
+  if (event.key === "kompressor-theme" && last) $("content").replaceChildren(...RENDER[view.id](last).filter(Boolean));
+});
+// Charts take their colours from the theme, so redraw once the toggle has
+// applied it (its own listener runs after this one).
+document.getElementById("theme-toggle").addEventListener("click", () => setTimeout(() => {
+  if (last) $("content").replaceChildren(...RENDER[view.id](last).filter(Boolean));
+}, 0));
+$("download").addEventListener("click", async () => {
+  const key = $("key").value.trim();
+  const headers = {};
+  if (key) headers["x-kompressor-key"] = key;
+  try {
+    const response = await fetch(endpoint() + "?" + query("jsonl").toString(), { headers, cache: "no-store" });
+    if (!response.ok) throw new Error(response.status + " " + response.statusText);
+    const blob = await response.blob();
+    const match = /filename="?([^";]+)"?/.exec(response.headers.get("content-disposition") || "");
+    const link = el("a", { href: URL.createObjectURL(blob), download: match ? match[1] : "kompressor-" + view.id + ".jsonl" });
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  } catch (error) {
+    $("error").textContent = "Download failed: " + (error.message || error);
+  }
+});
+load();
+</script>
+</body>
+</html>

@@ -242,6 +242,36 @@ pub struct ProviderCoverage {
     pub ratio: f64,
 }
 
+/// Everything recorded about the asks for one handle.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RefHistory {
+    /// Times it was asked for and the store was read.
+    pub retrievals: u64,
+    /// Times it was there.
+    pub hits: u64,
+    /// Times the budget refused it without reading the store.
+    pub withheld: u64,
+    /// Tokens it re-injected in total.
+    pub returned_tokens: i64,
+    pub first_ms: Option<i64>,
+    pub last_ms: Option<i64>,
+    /// The latest asks, newest first, withheld ones included.
+    pub recent: Vec<RefAsk>,
+}
+
+/// One ask for a handle.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RefAsk {
+    pub time_ms: i64,
+    pub request_id: Option<String>,
+    pub surface: String,
+    pub found: bool,
+    pub expired: bool,
+    pub ranged: bool,
+    pub withheld: bool,
+    pub returned_tokens: i64,
+}
+
 /// One frequently-asked handle.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RefCount {
@@ -407,7 +437,7 @@ impl DailyRollup {
 
 /// Read-only access to `stats.db`.
 pub struct StatsReader {
-    conn: Connection,
+    pub(crate) conn: Connection,
     /// Whether `retrieval_events` has the `withheld` column, which schema v10
     /// adds.
     ///
@@ -471,7 +501,7 @@ impl StatsReader {
     /// `withheld = 0` where the column exists, and the constant true where it
     /// does not — so a query reads "the asks that reached the store" on either
     /// shape. See [`StatsReader::has_withheld`].
-    fn served(&self) -> &'static str {
+    pub(crate) fn served(&self) -> &'static str {
         if self.has_withheld {
             "withheld = 0"
         } else {
@@ -505,7 +535,7 @@ impl StatsReader {
         )?;
         let (messages_compressed, saved_gross): (i64, i64) = self.conn.query_row(
             "SELECT coalesce(sum(messages_compressed), 0),
-                    coalesce(sum(tokens_in - tokens_out), 0)
+                    coalesce(sum(tokens_in - (CASE WHEN coalesce(outcome,'') = 'discarded' THEN tokens_in ELSE tokens_out END)), 0)
              FROM optimization_events WHERE time_ms >= ?1",
             [from_ms],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -529,7 +559,7 @@ impl StatsReader {
     pub fn summary(&self, tenant: &str, from_ms: i64, to_ms: i64) -> Result<Summary, StatsError> {
         let (requests, tokens_in, tokens_out, messages_total, messages_compressed) =
             self.conn.query_row(
-                "SELECT COUNT(*), COALESCE(SUM(tokens_in),0), COALESCE(SUM(tokens_out),0),
+                "SELECT COUNT(*), COALESCE(SUM(tokens_in),0), COALESCE(SUM((CASE WHEN coalesce(outcome,'') = 'discarded' THEN tokens_in ELSE tokens_out END)),0),
                         COALESCE(SUM(messages_total),0), COALESCE(SUM(messages_compressed),0)
                  FROM optimization_events
                  WHERE tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3",
@@ -584,7 +614,7 @@ impl StatsReader {
         let mut by_mode = Vec::new();
         {
             let mut stmt = self.conn.prepare_cached(
-                "SELECT mode, COUNT(*), COALESCE(SUM(tokens_in),0), COALESCE(SUM(tokens_out),0)
+                "SELECT mode, COUNT(*), COALESCE(SUM(tokens_in),0), COALESCE(SUM((CASE WHEN coalesce(outcome,'') = 'discarded' THEN tokens_in ELSE tokens_out END)),0)
                  FROM optimization_events
                  WHERE tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3
                  GROUP BY mode ORDER BY mode",
@@ -612,7 +642,7 @@ impl StatsReader {
         let mut by_surface = Vec::new();
         {
             let mut stmt = self.conn.prepare_cached(
-                "SELECT surface, COUNT(*), COALESCE(SUM(tokens_in),0), COALESCE(SUM(tokens_out),0)
+                "SELECT surface, COUNT(*), COALESCE(SUM(tokens_in),0), COALESCE(SUM((CASE WHEN coalesce(outcome,'') = 'discarded' THEN tokens_in ELSE tokens_out END)),0)
                  FROM optimization_events
                  WHERE tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3
                  GROUP BY surface ORDER BY surface",
@@ -674,7 +704,7 @@ impl StatsReader {
                     SUM(requests), SUM(tokens_in), SUM(tokens_out), SUM(retrieved)
              FROM (
                SELECT {floor} AS bucket, 1 AS requests, tokens_in AS tokens_in,
-                      tokens_out AS tokens_out, 0 AS retrieved
+                      (CASE WHEN coalesce(outcome,'') = 'discarded' THEN tokens_in ELSE tokens_out END) AS tokens_out, 0 AS retrieved
                  FROM optimization_events
                 WHERE tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3
                UNION ALL
@@ -729,16 +759,29 @@ impl StatsReader {
         to_ms: i64,
     ) -> Result<Vec<ProviderCoverage>, StatsError> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT COALESCE(o.provider, '') AS provider,
-                    COUNT(*) AS requests,
-                    SUM(o.tokens_in) AS tokens_in,
-                    SUM(o.tokens_out) AS tokens_out,
-                    COALESCE(GROUP_CONCAT(DISTINCT p.upstream), '') AS hosts
-             FROM optimization_events o
-             LEFT JOIN proxy_requests p ON p.request_id = o.request_id
-             WHERE o.tenant = ?1 AND o.time_ms >= ?2 AND o.time_ms < ?3
-             GROUP BY provider
-             ORDER BY tokens_in DESC, provider",
+            // Two things a plain `LEFT JOIN proxy_requests ON request_id` got
+            // wrong. It fanned out: a request id shared by N proxy rows (a
+            // retried request, a client that reuses its `x-request-id`)
+            // counted the compression N times. And it did not name the tenant,
+            // so another tenant's row with the same id put its upstream host in
+            // this tenant's report. The sums are taken over the events alone,
+            // and the hosts looked up beside them, in this tenant only.
+            "SELECT a.provider, a.requests, a.tokens_in, a.tokens_out,
+                    COALESCE((SELECT GROUP_CONCAT(DISTINCT p.upstream)
+                                FROM proxy_requests p
+                               WHERE p.tenant = ?1
+                                 AND p.request_id IN (
+                                     SELECT o.request_id FROM optimization_events o
+                                      WHERE o.tenant = ?1 AND o.time_ms >= ?2 AND o.time_ms < ?3
+                                        AND COALESCE(o.provider, '') = a.provider)), '') AS hosts
+             FROM (SELECT COALESCE(provider, '') AS provider,
+                          COUNT(*) AS requests,
+                          SUM(tokens_in) AS tokens_in,
+                          SUM((CASE WHEN coalesce(outcome,'') = 'discarded' THEN tokens_in ELSE tokens_out END)) AS tokens_out
+                     FROM optimization_events
+                    WHERE tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3
+                    GROUP BY 1) a
+             ORDER BY a.tokens_in DESC, a.provider",
         )?;
         let rows = stmt.query_map((tenant, from_ms, to_ms), |row| {
             let tokens_in: i64 = row.get(2)?;
@@ -877,6 +920,82 @@ impl StatsReader {
         })
     }
 
+    /// Every recorded ask for one handle, `recent` of them listed.
+    ///
+    /// `handle` is the bare handle body. The `ref` column holds whatever the
+    /// caller asked with, so the three spellings a model uses — bare, `k_`
+    /// and the marker's `ref:k_` — are all matched.
+    pub fn ref_history(
+        &self,
+        tenant: &str,
+        handle: &str,
+        recent: usize,
+    ) -> Result<RefHistory, StatsError> {
+        let (served, withheld_sum) = (self.served(), self.withheld_sum());
+        let prefixed = format!("k_{handle}");
+        let marker = format!("ref:k_{handle}");
+        let spellings = (tenant, handle, prefixed.as_str(), marker.as_str());
+        let mut history = self.conn.query_row(
+            &format!(
+                "SELECT COALESCE(SUM(CASE WHEN {served} THEN 1 ELSE 0 END),0),
+                        COALESCE(SUM(CASE WHEN {served} THEN found ELSE 0 END),0),
+                        {withheld_sum},
+                        COALESCE(SUM(CASE WHEN {served} AND found = 1
+                                          THEN returned_tokens ELSE 0 END),0),
+                        MIN(time_ms), MAX(time_ms)
+                 FROM retrieval_events
+                 WHERE tenant = ?1 AND \"ref\" IN (?2, ?3, ?4)"
+            ),
+            spellings,
+            |row| {
+                Ok(RefHistory {
+                    retrievals: row.get::<_, i64>(0)?.max(0) as u64,
+                    hits: row.get::<_, i64>(1)?.max(0) as u64,
+                    withheld: row.get::<_, i64>(2)?.max(0) as u64,
+                    returned_tokens: row.get(3)?,
+                    first_ms: row.get(4)?,
+                    last_ms: row.get(5)?,
+                    recent: Vec::new(),
+                })
+            },
+        )?;
+
+        let withheld = if self.has_withheld { "withheld" } else { "0" };
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT time_ms, request_id, surface, found, expired, ranged, {withheld},
+                    returned_tokens
+             FROM retrieval_events
+             WHERE tenant = ?1 AND \"ref\" IN (?2, ?3, ?4)
+             ORDER BY time_ms DESC, id DESC
+             LIMIT ?5"
+        ))?;
+        let rows = stmt.query_map(
+            (
+                tenant,
+                handle,
+                prefixed.as_str(),
+                marker.as_str(),
+                recent as i64,
+            ),
+            |row| {
+                Ok(RefAsk {
+                    time_ms: row.get(0)?,
+                    request_id: row.get(1)?,
+                    surface: row.get(2)?,
+                    found: row.get::<_, i64>(3)? != 0,
+                    expired: row.get::<_, i64>(4)? != 0,
+                    ranged: row.get::<_, i64>(5)? != 0,
+                    withheld: row.get::<_, i64>(6)? != 0,
+                    returned_tokens: row.get(7)?,
+                })
+            },
+        )?;
+        for row in rows {
+            history.recent.push(row?);
+        }
+        Ok(history)
+    }
+
     /// One request, joined across compression, retrieval and proxy rows.
     ///
     /// `None` only when the id is unknown to all three tables. A request that
@@ -889,7 +1008,7 @@ impl StatsReader {
         request_id: &str,
     ) -> Result<Option<RequestEconomy>, StatsError> {
         let (compressions, tokens_in, tokens_out, first_opt_time) = self.conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(tokens_in),0), COALESCE(SUM(tokens_out),0), MIN(time_ms)
+            "SELECT COUNT(*), COALESCE(SUM(tokens_in),0), COALESCE(SUM((CASE WHEN coalesce(outcome,'') = 'discarded' THEN tokens_in ELSE tokens_out END)),0), MIN(time_ms)
              FROM optimization_events WHERE tenant = ?1 AND request_id = ?2",
             (tenant, request_id),
             |row| {
@@ -1019,6 +1138,98 @@ impl StatsReader {
             .optional()?)
     }
 
+    /// The newest `limit` backups on record, newest first. Empty for a
+    /// database from before they were recorded.
+    pub fn backups(&self, limit: usize) -> Result<Vec<crate::events::BackupEvent>, StatsError> {
+        let recorded: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'backups'",
+            [],
+            |row| row.get(0),
+        )?;
+        if recorded == 0 {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.conn.prepare_cached(
+            "SELECT time_ms, origin, destination, bytes, databases, ok, error
+             FROM backups ORDER BY time_ms DESC, id DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit.min(1_000) as i64], |row| {
+            Ok(crate::events::BackupEvent {
+                time_ms: row.get(0)?,
+                origin: row.get(1)?,
+                destination: row.get(2)?,
+                bytes: row.get(3)?,
+                databases: row.get(4)?,
+                ok: row.get(5)?,
+                error: row.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// The newest `limit` pieces of maintenance work on record, newest
+    /// first. Empty for a database from before they were recorded.
+    pub fn maintenance(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::events::MaintenanceEvent>, StatsError> {
+        self.maintenance_where("1", limit)
+    }
+
+    /// The newest piece of each kind of work on each target: what the page
+    /// shows as a database's last check, checkpoint, vacuum and optimize, and
+    /// an archive's last verification.
+    pub fn latest_maintenance(&self) -> Result<Vec<crate::events::MaintenanceEvent>, StatsError> {
+        self.maintenance_where(
+            "id IN (SELECT max(id) FROM maintenance_events GROUP BY target, action)",
+            1_000,
+        )
+    }
+
+    fn maintenance_where(
+        &self,
+        filter: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::events::MaintenanceEvent>, StatsError> {
+        if !crate::schema::has_table(&self.conn, "maintenance_events")? {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.conn.prepare_cached(&format!(
+            "SELECT time_ms, action, target, origin, actor, took_ms, ok, bytes_before,
+                    bytes_after, detail, error
+             FROM maintenance_events WHERE {filter} ORDER BY time_ms DESC, id DESC LIMIT ?1"
+        ))?;
+        let rows = statement.query_map([limit.min(1_000) as i64], |row| {
+            Ok(crate::events::MaintenanceEvent {
+                time_ms: row.get(0)?,
+                action: row.get(1)?,
+                target: row.get(2)?,
+                origin: row.get(3)?,
+                actor: row.get(4)?,
+                took_ms: row.get(5)?,
+                ok: row.get(6)?,
+                bytes_before: row.get(7)?,
+                bytes_after: row.get(8)?,
+                detail: row.get(9)?,
+                error: row.get(10)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// When the last backup that worked was taken, and — when one has failed
+    /// since — when that was.
+    pub fn last_backup(&self) -> Result<(Option<i64>, Option<i64>), StatsError> {
+        let recent = self.backups(200)?;
+        let worked = recent.iter().find(|backup| backup.ok).map(|b| b.time_ms);
+        let failed = recent
+            .iter()
+            .take_while(|backup| !backup.ok)
+            .map(|backup| backup.time_ms)
+            .next();
+        Ok((worked, failed))
+    }
+
     /// Daily aggregates, inclusive of both `YYYY-MM-DD` bounds.
     ///
     /// These survive [`crate::StatsWriter::prune`], so they are the only thing
@@ -1072,7 +1283,7 @@ impl StatsReader {
     /// of the 14 asks the store saw was answered — an invented 44% failure
     /// rate, on the one line most readers will look at. Measured on a real
     /// database after the column shipped and before this followed.
-    fn retrieval_totals(
+    pub(crate) fn retrieval_totals(
         &self,
         predicate: &str,
         params: impl rusqlite::Params,
@@ -1096,7 +1307,7 @@ impl StatsReader {
 }
 
 /// `numerator / denominator`, or zero when there is nothing to divide.
-fn ratio(numerator: i64, denominator: i64) -> f64 {
+pub(crate) fn ratio(numerator: i64, denominator: i64) -> f64 {
     if denominator == 0 {
         0.0
     } else {

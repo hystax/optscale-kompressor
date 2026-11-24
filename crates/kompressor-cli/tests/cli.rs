@@ -284,6 +284,151 @@ fn explain_in_json_carries_the_same_report_as_one_field() {
     assert!(!value["explain"]["markers"].as_array().unwrap().is_empty());
 }
 
+/// Standard output and standard error of one `compress` run.
+fn compress_streams(args: &[&str], stdin: &str) -> (Vec<u8>, String) {
+    let assert = kompressor()
+        .env_remove("NO_COLOR")
+        .env_remove("CLICOLOR")
+        .env_remove("CLICOLOR_FORCE")
+        .arg("compress")
+        .args(args)
+        .write_stdin(stdin.to_string())
+        .assert()
+        .success();
+    let output = assert.get_output();
+    (
+        output.stdout.clone(),
+        String::from_utf8(output.stderr.clone()).unwrap(),
+    )
+}
+
+/// `text` without its SGR colour sequences.
+fn strip_sgr(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            for d in chars.by_ref() {
+                if d == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[test]
+fn colour_never_touches_standard_output() {
+    let payload = varying_log();
+    let (plain, _) = compress_streams(&[], &payload);
+    for args in [
+        &["--explain"][..],
+        &["--explain", "--color", "always"],
+        &["--show-output", "--color", "always"],
+        &["--explain", "--show-output", "--color", "always"],
+        &["--explain", "--show-output", "--color", "never"],
+    ] {
+        let (stdout, _) = compress_streams(args, &payload);
+        assert_eq!(stdout, plain, "standard output changed under {args:?}");
+    }
+}
+
+#[test]
+fn a_coloured_report_is_the_plain_report_with_colour_added() {
+    let payload = varying_log();
+    let (_, plain) = compress_streams(&["--explain", "--color", "never"], &payload);
+    let (_, coloured) = compress_streams(&["--explain", "--color", "always"], &payload);
+    let (_, auto) = compress_streams(&["--explain"], &payload);
+    assert!(
+        !plain.contains('\u{1b}'),
+        "never means no escapes: {plain:?}"
+    );
+    assert!(coloured.contains("\u{1b}["), "always means colour");
+    assert_eq!(strip_sgr(&coloured), plain);
+    assert_eq!(
+        auto, plain,
+        "auto on a pipe is plain, so existing scripts see what they always saw"
+    );
+}
+
+#[test]
+fn auto_colour_follows_clicolor_force_and_json_is_never_coloured() {
+    let payload = varying_log();
+    let forced = kompressor()
+        .env_remove("NO_COLOR")
+        .env("CLICOLOR_FORCE", "1")
+        .args(["compress", "--explain"])
+        .write_stdin(payload.clone())
+        .assert()
+        .success();
+    let stderr = String::from_utf8(forced.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("\u{1b}["), "auto honours CLICOLOR_FORCE");
+
+    let (stdout, stderr) = compress_streams(
+        &["--json", "--explain", "--show-output", "--color", "always"],
+        &payload,
+    );
+    assert!(
+        !stdout.contains(&0x1b),
+        "JSON on standard output stays plain"
+    );
+    let value: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(value["explain"]["strategy"], "log");
+    assert!(
+        strip_sgr(&stderr).starts_with("output       "),
+        "with --json the view alone goes to standard error: {stderr}"
+    );
+}
+
+#[test]
+fn show_output_numbers_the_payload_and_picks_out_markers() {
+    let payload = varying_log();
+    let (stdout, stderr) = compress_streams(&["--show-output", "--color", "always"], &payload);
+    let output = String::from_utf8(stdout).unwrap();
+    let view = strip_sgr(&stderr);
+    let mut lines = view.lines();
+    assert!(
+        lines.next().unwrap().contains("read as log"),
+        "the detector's verdict picks the reading: {view}"
+    );
+    let shown: Vec<String> = lines
+        .map(|l| l.split_once(" │ ").map_or("", |(_, t)| t).to_string())
+        .collect();
+    let expected: Vec<&str> = output.trim_end_matches('\n').split('\n').collect();
+    assert_eq!(shown, expected, "each view line is the payload's line");
+    // Bold yellow opens every marker span.
+    assert!(
+        stderr.contains("\u{1b}[1m\u{1b}[33m["),
+        "markers are highlighted: {stderr:?}"
+    );
+
+    let json =
+        r#"[{"id": 1, "name": "alpha", "ok": true}, {"id": 2, "name": "beta", "ok": false}]"#;
+    let (_, stderr) = compress_streams(
+        &["--show-output", "--type", "json", "--color", "always"],
+        json,
+    );
+    assert!(strip_sgr(&stderr).contains("read as json"));
+}
+
+#[test]
+fn a_payload_cannot_send_its_own_escapes_to_the_terminal() {
+    // Under the size gate, so it passes through untouched.
+    let payload = "title\u{1b}]0;pwned\u{7}\nclear\u{1b}[2J";
+    let (stdout, stderr) = compress_streams(&["--show-output", "--color", "never"], payload);
+    assert_eq!(
+        stdout,
+        payload.as_bytes(),
+        "standard output is the payload, verbatim"
+    );
+    assert!(!stderr.contains('\u{1b}'), "{stderr:?}");
+    assert!(stderr.contains("title␛]0;pwned␇"));
+    assert!(stderr.contains("clear␛[2J"));
+}
+
 #[test]
 fn check_config_accepts_the_built_in_defaults_and_prints_them_back() {
     kompressor()
@@ -443,6 +588,7 @@ fn stats_database(dir: &Path) -> PathBuf {
 
     // The debit side: without it every report reads as pure profit.
     sink.send(Event::Retrieval(RetrievalEvent {
+        context: None,
         time_ms: 1_700_000_001_000,
         tenant: "acme".to_string(),
         request_id: Some("req-1".to_string()),
@@ -1238,6 +1384,148 @@ fn the_reported_segfault_buried_in_a_training_log_is_no_longer_hidden() {
     );
 }
 
+/// `mcp serve` fronting one server, answering `tools/list`.
+///
+/// The fronted server is this binary too, but reading a configuration that
+/// names no servers. Pointing it at its own configuration would test the same
+/// guard, and a regression in that guard would then fork without bound rather
+/// than fail. That the spawned process is told it is fronted is covered against
+/// a fake server in `kompressor-mcp`'s `tests/proxy.rs`.
+///
+/// Returns every tool name it listed. With `fronted` set, the process is
+/// started as though some other kompressor had spawned it.
+fn mcp_proxy_tool_names(fronted: bool) -> Vec<String> {
+    let dir = scratch_dir();
+    let inner = dir.join("inner.toml");
+    std::fs::write(&inner, MCP_PLAIN).unwrap();
+    let servers = format!(
+        "[[mcp.servers]]\nname = \"inner\"\ncommand = {binary:?}\n\
+         args = [\"mcp\", \"serve\", \"--config\", {inner:?}]\n",
+        binary = env!("CARGO_BIN_EXE_kompressor"),
+        inner = inner.to_str().unwrap(),
+    );
+    mcp_serve_tools_list(&dir, &servers, fronted).0
+}
+
+/// A configuration for `mcp serve` that touches no disk.
+const MCP_PLAIN: &str = "[refs]\nbackend = \"memory\"\n\n[stats]\nenabled = false\n";
+
+/// Run `mcp serve` with `servers` appended to [`MCP_PLAIN`], ask `tools/list`,
+/// and hang up. Returns the tool names and everything written to stderr.
+fn mcp_serve_tools_list(dir: &Path, servers: &str, fronted: bool) -> (Vec<String>, String) {
+    use std::io::{BufRead, BufReader, Read};
+    use std::process::Stdio;
+
+    let outer = dir.join("mcp-proxy.toml");
+    std::fs::write(&outer, format!("{MCP_PLAIN}\n{servers}")).unwrap();
+
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_kompressor"));
+    command
+        .args(["mcp", "serve", "--config"])
+        .arg(&outer)
+        .env_remove("KOMPRESSOR_CONFIG")
+        .env_remove("KOMPRESSOR_MCP_FRONTED")
+        .env("XDG_CONFIG_HOME", no_config_dir())
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if fronted {
+        command.env("KOMPRESSOR_MCP_FRONTED", "1");
+    }
+    let mut child = command.spawn().expect("mcp serve starts");
+
+    let mut stdin = child.stdin.take().unwrap();
+    for message in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+    ] {
+        writeln!(stdin, "{message}").unwrap();
+    }
+    // Stdin stays open until the answer is in: closing it ends the session.
+    let listed = BufReader::new(child.stdout.take().unwrap())
+        .lines()
+        .map_while(Result::ok)
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(&line).expect("one JSON message a line")
+        })
+        .find(|message| message["id"] == 2)
+        .expect("an answer to tools/list");
+    drop(stdin);
+    let _ = child.wait();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+
+    let names = listed["result"]["tools"]
+        .as_array()
+        .expect("a tool list")
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_string())
+        .collect();
+    (names, stderr)
+}
+
+/// `mcp serve` with `[[mcp.servers]]` is proxy mode: ours unprefixed, the
+/// fronted server's under its name.
+#[test]
+fn mcp_serve_fronts_the_servers_it_names() {
+    let names = mcp_proxy_tool_names(false);
+    assert!(
+        names.iter().any(|n| n == "optscale_kompressor_retrieve"),
+        "ours, unprefixed: {names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .any(|n| n == "inner__optscale_kompressor_retrieve"),
+        "the fronted server's, prefixed: {names:?}"
+    );
+}
+
+/// A process started as somebody's fronted server ignores `[[mcp.servers]]`
+/// and serves only its own tools: the guard that keeps a self-referential
+/// configuration from recursing.
+#[test]
+fn a_fronted_mcp_serve_ignores_its_own_servers() {
+    let names = mcp_proxy_tool_names(true);
+    assert!(
+        names.iter().any(|n| n == "optscale_kompressor_retrieve"),
+        "{names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.contains("__")),
+        "nothing may be fronted: {names:?}"
+    );
+}
+
+/// A server that cannot be fronted says why, on stderr, where a runtime keeps
+/// a stdio server's log — and stdout stays nothing but the protocol, which the
+/// listing parsing every stdout line as JSON-RPC already holds to.
+#[test]
+fn mcp_serve_logs_a_server_it_could_not_front_to_stderr() {
+    let dir = scratch_dir();
+    let (names, stderr) =
+        mcp_serve_tools_list(&dir, "[[mcp.servers]]\nname = \"nowhere\"\n", false);
+    assert!(
+        names.iter().any(|n| n == "optscale_kompressor_retrieve"),
+        "{names:?}"
+    );
+    assert!(
+        stderr.contains("mcp server not fronted"),
+        "nothing said why: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("nowhere") && stderr.contains("names neither command nor url"),
+        "the reason names the server: {stderr:?}"
+    );
+}
+
 /// `serve` as `kompressor wrap` starts it: stdin is a pipe the wrap holds.
 fn supervised_serve() -> std::process::Child {
     supervised_serve_with(&[])
@@ -1300,32 +1588,53 @@ fn a_supervised_proxy_stops_on_the_stop_line() {
 /// later session owns it, and on Windows it has no window to close.
 #[test]
 fn an_orphaned_proxy_stops_once_no_session_uses_it() {
+    // An assertion failure must not leave a proxy running after the test.
+    struct ReapOnDrop(std::process::Child);
+    impl Drop for ReapOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     let clients = tempfile::tempdir().unwrap();
-    let live = clients.path().join("4242.held");
+    let live = clients.path().join(format!("{}.held", std::process::id()));
     let marker = std::fs::File::create(&live).unwrap();
     marker.lock().unwrap();
     // A dead session's marker: nobody holds its lock, so it must not count.
-    std::fs::File::create(clients.path().join("4343.held")).unwrap();
+    // Zero cannot be the proxy's own pid, which the sweep skips.
+    let dead = clients.path().join("0.held");
+    std::fs::File::create(&dead).unwrap();
 
-    let mut child =
-        supervised_serve_with(&["--stop-when-unused".as_ref(), clients.path().as_os_str()]);
+    let mut child = ReapOnDrop(supervised_serve_with(&[
+        "--stop-when-unused".as_ref(),
+        clients.path().as_os_str(),
+    ]));
+    let child = &mut child.0;
     drop(child.stdin.take());
-    let exited_while_used = exited_within(&mut child, std::time::Duration::from_secs(6));
-    if exited_while_used {
-        let _ = child.wait();
+
+    // Startup and the first sweep can take more than six seconds on a busy
+    // runner. Observe a sweep before starting the keep-alive window; merely
+    // seeing a process that has not exited says nothing about its readiness.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while dead.exists() {
+        let status = child.try_wait().expect("the child can be polled");
+        assert!(
+            status.is_none(),
+            "proxy exited before its first sweep: {status:?}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dead session's marker was not reaped"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
+    let exited_while_used = exited_within(child, std::time::Duration::from_secs(6));
     assert!(!exited_while_used, "stopped while a live session used it");
-    assert!(
-        !clients.path().join("4343.held").exists(),
-        "the dead session's marker was not reaped"
-    );
 
     marker.unlock().unwrap();
     drop(marker);
-    let stopped = exited_within(&mut child, std::time::Duration::from_secs(20));
-    if !stopped {
-        let _ = child.kill();
-    }
+    let stopped = exited_within(child, std::time::Duration::from_secs(20));
     assert!(stopped, "an unused orphaned proxy kept running");
     assert!(
         child.wait().unwrap().success(),
@@ -1364,4 +1673,606 @@ fn a_supervised_proxy_outlives_its_supervisor() {
     let _ = child.kill();
     let _ = child.wait();
     assert!(!exited, "end of input stopped the proxy");
+}
+
+/// What `serve` logs to stdout from start to a clean stop, with `NO_COLOR`
+/// set to `no_color` or absent.
+fn serve_stdout(no_color: Option<&str>) -> String {
+    use std::io::Read;
+    let dir = scratch_dir();
+    // The human-readable format: JSON lines carry no colour to begin with.
+    let config = dir.join("text-log.toml");
+    std::fs::write(&config, format!("{MCP_PLAIN}\n[log]\nformat = \"text\"\n")).unwrap();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_kompressor"));
+    command
+        .args([
+            "serve",
+            "--api",
+            "--listen",
+            "127.0.0.1:0",
+            "--stop-on-stdin",
+            "--config",
+        ])
+        .arg(&config)
+        .env_remove("KOMPRESSOR_CONFIG")
+        .env_remove("RUST_LOG")
+        .env_remove("NO_COLOR")
+        .env("XDG_CONFIG_HOME", no_config_dir())
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    if let Some(value) = no_color {
+        command.env("NO_COLOR", value);
+    }
+    let mut child = command.spawn().expect("serve starts");
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "stop").unwrap();
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+    stdout
+}
+
+/// `serve` logs in colour unless `NO_COLOR` says not to. Routing `mcp serve`'s
+/// log to stderr passed an explicit "colour on" for stdout, which overrides
+/// the variable: an operator's `NO_COLOR=1` stopped working for every command
+/// that logs.
+#[test]
+fn serve_honours_no_color_in_its_log() {
+    let plain = serve_stdout(Some("1"));
+    assert!(plain.contains("listening"), "it did log: {plain:?}");
+    assert!(
+        !plain.contains('\u{1b}'),
+        "NO_COLOR is set and the log is coloured: {plain:?}"
+    );
+    let coloured = serve_stdout(None);
+    assert!(
+        coloured.contains('\u{1b}'),
+        "the default is unchanged: {coloured:?}"
+    );
+}
+
+/// `kompressor backup` writes one archive of every database the
+/// configuration names, into the directory it is pointed at, and refuses to
+/// write over one that is there.
+#[test]
+fn backup_writes_one_archive_of_every_database_and_never_replaces_one() {
+    let dir = scratch_dir();
+    let config = dir.join("backup.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[refs]\nbackend = \"sqlite\"\npath = {refs:?}\n\n[stats]\nenabled = true\npath = {stats:?}\n",
+            refs = dir.join("refs.db").to_str().unwrap(),
+            stats = dir.join("stats.db").to_str().unwrap(),
+        ),
+    )
+    .unwrap();
+    let kompressor = || {
+        let mut command = Command::cargo_bin("kompressor").unwrap();
+        command
+            .env_remove("KOMPRESSOR_CONFIG")
+            .env("XDG_CONFIG_HOME", no_config_dir())
+            .current_dir(&dir);
+        command
+    };
+    // Something to back up: a service that ran creates the statistics
+    // database, and a compression stores a fragment.
+    kompressor()
+        .args([
+            "serve",
+            "--api",
+            "--listen",
+            "127.0.0.1:0",
+            "--stop-on-stdin",
+            "--config",
+        ])
+        .arg(&config)
+        .write_stdin("stop\n")
+        .assert()
+        .success();
+    let payload = dir.join("log.txt");
+    std::fs::write(&payload, varying_log()).unwrap();
+    kompressor()
+        .args(["compress", "--config"])
+        .arg(&config)
+        .arg(&payload)
+        .assert()
+        .success();
+
+    let out = dir.join("backups");
+    std::fs::create_dir(&out).unwrap();
+    let assert = kompressor()
+        .args(["backup", "--json", "--config"])
+        .arg(&config)
+        .arg("--out")
+        .arg(&out)
+        .assert()
+        .success();
+    let report: serde_json::Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("one JSON object");
+    let archive = PathBuf::from(report["archive"].as_str().unwrap());
+    assert_eq!(archive.parent(), Some(out.as_path()));
+    let name = archive.file_name().unwrap().to_str().unwrap();
+    assert!(
+        name.starts_with("kompressor-backup-") && name.ends_with(".tar.gz"),
+        "{name}"
+    );
+    assert_eq!(
+        report["bytes"].as_u64(),
+        Some(std::fs::metadata(&archive).unwrap().len())
+    );
+    let names: Vec<&str> = report["manifest"]["databases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|database| database["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["stats.db", "refs.db"]);
+    // A gzip and its checksum, in the format `sha256sum -c` reads, and
+    // nothing else left beside it.
+    assert_eq!(std::fs::read(&archive).unwrap()[..2], [0x1f, 0x8b]);
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 2);
+    let sum = kompressor_core::backup::read_checksum(&archive).expect("a checksum beside it");
+    assert_eq!(sum, kompressor_core::backup::sha256_file(&archive).unwrap());
+    let line = std::fs::read_to_string(kompressor_core::backup::checksum_path(&archive)).unwrap();
+    assert_eq!(line, format!("{sum}  {name}\n"));
+
+    // Named outright, the summary is for a person; asked twice, it refuses.
+    let named = dir.join("mine.tar.gz");
+    let assert = kompressor()
+        .args(["backup", "--config"])
+        .arg(&config)
+        .arg("-o")
+        .arg(&named)
+        .assert()
+        .success();
+    let summary = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(summary.contains("mine.tar.gz"), "{summary}");
+    assert!(
+        summary.contains("stats.db") && summary.contains("schema v"),
+        "{summary}"
+    );
+    let before = std::fs::read(&named).unwrap();
+    let refused = kompressor()
+        .args(["backup", "--config"])
+        .arg(&config)
+        .arg("-o")
+        .arg(&named)
+        .assert()
+        .code(2);
+    let said = String::from_utf8(refused.get_output().stderr.clone()).unwrap();
+    assert!(said.contains("already exists"), "{said}");
+    assert_eq!(std::fs::read(&named).unwrap(), before);
+}
+
+/// With nothing on disk to copy, `backup` fails and says why rather than
+/// writing an archive that holds no database.
+#[test]
+fn backup_with_nothing_on_disk_fails_and_writes_nothing() {
+    let dir = scratch_dir();
+    let config = dir.join("memory.toml");
+    std::fs::write(&config, MCP_PLAIN).unwrap();
+    let assert = Command::cargo_bin("kompressor")
+        .unwrap()
+        .args(["backup", "--config"])
+        .arg(&config)
+        .env_remove("KOMPRESSOR_CONFIG")
+        .env("XDG_CONFIG_HOME", no_config_dir())
+        .current_dir(&dir)
+        .assert()
+        .code(1);
+    let said = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(said.contains("no database to back up"), "{said}");
+    let left: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name != "memory.toml")
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+/// A configuration over on-disk databases in `dir`, holding one fragment
+/// and a statistics database a service created.
+fn on_disk_deployment(dir: &Path) -> PathBuf {
+    let config = dir.join("disk.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[refs]\nbackend = \"sqlite\"\npath = {refs:?}\n\n[stats]\nenabled = true\npath = {stats:?}\n",
+            refs = dir.join("refs.db").to_str().unwrap(),
+            stats = dir.join("stats.db").to_str().unwrap(),
+        ),
+    )
+    .unwrap();
+    run_in(dir)
+        .args([
+            "serve",
+            "--api",
+            "--listen",
+            "127.0.0.1:0",
+            "--stop-on-stdin",
+            "--config",
+        ])
+        .arg(&config)
+        .write_stdin("stop\n")
+        .assert()
+        .success();
+    let payload = dir.join("log.txt");
+    std::fs::write(&payload, varying_log()).unwrap();
+    run_in(dir)
+        .args(["compress", "--config"])
+        .arg(&config)
+        .arg(&payload)
+        .assert()
+        .success();
+    config
+}
+
+fn run_in(dir: &Path) -> Command {
+    let mut command = Command::cargo_bin("kompressor").unwrap();
+    command
+        .env_remove("KOMPRESSOR_CONFIG")
+        .env("XDG_CONFIG_HOME", no_config_dir())
+        .current_dir(dir);
+    command
+}
+
+fn json_of(assert: &assert_cmd::assert::Assert) -> serde_json::Value {
+    serde_json::from_slice(&assert.get_output().stdout).expect("JSON on stdout")
+}
+
+/// `kompressor db` describes, checks and checkpoints the databases a
+/// configuration names, and `check` fails loudly on a damaged one.
+#[test]
+fn db_describes_checks_and_checkpoints_the_databases() {
+    let dir = scratch_dir();
+    let config = on_disk_deployment(&dir);
+    let db = |args: &[&str]| {
+        let mut command = run_in(&dir);
+        command.arg("db").args(args).arg("--config").arg(&config);
+        command
+    };
+
+    let status = json_of(&db(&["status", "--json"]).assert().success());
+    assert_eq!(status[0]["name"], "stats.db");
+    assert_eq!(
+        status[0]["schema_version"],
+        status[0]["expected_schema_version"]
+    );
+    assert_eq!(status[1]["name"], "refs.db");
+    assert!(status[1]["bytes"].as_u64().unwrap() > 0);
+    assert!(status[1]["reclaimable_bytes"].is_u64());
+    db(&["status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("stats.db").and(predicate::str::contains("schema v")));
+    let one = json_of(&db(&["status", "refs.db", "--json"]).assert().success());
+    assert_eq!(one.as_array().unwrap().len(), 1);
+    db(&["status", "config.toml"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("stats.db and refs.db"));
+
+    let checked = json_of(&db(&["check", "--json"]).assert().success());
+    assert!(
+        checked
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["ok"] == true)
+    );
+    db(&["check"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ok"));
+
+    let done = json_of(&db(&["checkpoint", "--json"]).assert().success());
+    assert!(
+        done.as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["complete"] == true)
+    );
+    assert_eq!(done[1]["wal_bytes_after"], 0);
+    assert!(
+        !dir.join("refs.db-wal").exists()
+            || std::fs::metadata(dir.join("refs.db-wal")).unwrap().len() == 0
+    );
+
+    // Damage the store: `check` says which, in SQLite's words, and exits 1.
+    let path = dir.join("refs.db");
+    let mut bytes = std::fs::read(&path).unwrap();
+    for byte in &mut bytes[4_096..8_192] {
+        *byte = 0xAB;
+    }
+    std::fs::write(&path, bytes).unwrap();
+    let failed = db(&["check"]).assert().code(1);
+    let said = String::from_utf8(failed.get_output().stdout.clone()).unwrap();
+    assert!(
+        said.contains("refs.db") && said.contains("DAMAGED"),
+        "{said}"
+    );
+    assert!(
+        said.contains("stats.db") && said.contains("ok"),
+        "the other is still sound: {said}"
+    );
+    db(&["check", "stats.db"]).assert().success();
+}
+
+/// With nothing on disk, `db` says so for each and fails nothing.
+#[test]
+fn db_with_nothing_on_disk_says_so() {
+    let dir = scratch_dir();
+    let config = dir.join("memory.toml");
+    std::fs::write(&config, MCP_PLAIN).unwrap();
+    for action in ["status", "check", "checkpoint"] {
+        run_in(&dir)
+            .args(["db", action, "--config"])
+            .arg(&config)
+            .assert()
+            .success()
+            .stdout(
+                predicate::str::contains("statistics are off")
+                    .and(predicate::str::contains("the ref store is in memory")),
+            );
+    }
+}
+
+/// `backup --keep N` rotates the directory it writes into, and removes
+/// nothing it did not name itself.
+#[test]
+fn backup_keep_rotates_the_directory_it_writes_into() {
+    let dir = scratch_dir();
+    let config = on_disk_deployment(&dir);
+    let out = dir.join("backups");
+    std::fs::create_dir(&out).unwrap();
+    for stale in [
+        "kompressor-backup-20200101-000000.tar.gz",
+        "kompressor-backup-20210101-000000.tar.gz",
+    ] {
+        std::fs::write(out.join(stale), b"old").unwrap();
+    }
+    std::fs::write(out.join("notes.txt"), b"mine").unwrap();
+    let report = json_of(
+        &run_in(&dir)
+            .args(["backup", "--json", "--keep", "2", "--config"])
+            .arg(&config)
+            .arg("--out")
+            .arg(&out)
+            .assert()
+            .success(),
+    );
+    assert_eq!(
+        report["removed"],
+        serde_json::json!(["kompressor-backup-20200101-000000.tar.gz"])
+    );
+    let mut left: Vec<String> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(left.len(), 4, "the new archive with its checksum: {left:?}");
+    assert_eq!(left[0], "kompressor-backup-20210101-000000.tar.gz");
+    assert!(left[2].ends_with(".tar.gz.sha256"), "{left:?}");
+    assert_eq!(left[3], "notes.txt");
+}
+
+/// How many fragments the store at `path` holds.
+fn fragments(dir: &Path, config: &Path) -> u64 {
+    let status = json_of(
+        &run_in(dir)
+            .args(["db", "status", "refs.db", "--json", "--config"])
+            .arg(config)
+            .assert()
+            .success(),
+    );
+    status[0]["bytes"].as_u64().unwrap()
+}
+
+/// `kompressor restore` rehearses by default, restores with `--yes`, moves
+/// what was there aside, and the restored deployment works.
+#[test]
+fn restore_rehearses_then_puts_a_backup_back() {
+    let dir = scratch_dir();
+    let config = on_disk_deployment(&dir);
+    let archive = dir.join("before.tar.gz");
+    let taken = json_of(
+        &run_in(&dir)
+            .args(["backup", "--json", "--config"])
+            .arg(&config)
+            .arg("-o")
+            .arg(&archive)
+            .assert()
+            .success(),
+    );
+    assert_eq!(taken["recorded"], true, "the backup is on record");
+    let handle = {
+        let out = run_in(&dir)
+            .args(["compress", "--config"])
+            .arg(&config)
+            .arg(dir.join("log.txt"))
+            .assert()
+            .success();
+        let text = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+        text.split("ref:")
+            .nth(1)
+            .map(|rest| rest[..14].to_string())
+            .expect("a handle")
+    };
+    // Wreck the store, as a bad disk or a bad day would.
+    std::fs::write(dir.join("refs.db"), b"not a database any more").unwrap();
+    let _ = std::fs::remove_file(dir.join("refs.db-wal"));
+    let _ = std::fs::remove_file(dir.join("refs.db-shm"));
+    run_in(&dir)
+        .args(["retrieve", "--config"])
+        .arg(&config)
+        .arg(&handle)
+        .assert()
+        .failure();
+
+    let restore = |extra: &[&str]| {
+        let mut command = run_in(&dir);
+        command
+            .arg("restore")
+            .arg(&archive)
+            .arg("--config")
+            .arg(&config)
+            .args(extra);
+        command
+    };
+    // A rehearsal: checked, described, nothing changed.
+    restore(&[]).assert().success().stdout(
+        predicate::str::contains("would replace")
+            .and(predicate::str::contains("nothing was changed"))
+            .and(predicate::str::contains("--yes")),
+    );
+    assert_eq!(
+        std::fs::read(dir.join("refs.db")).unwrap(),
+        b"not a database any more"
+    );
+
+    let done = json_of(&restore(&["--yes", "--json"]).assert().success());
+    assert_eq!(done["applied"], true);
+    for database in done["databases"].as_array().unwrap() {
+        assert_eq!(database["restored"], true, "{database}");
+        let aside = database["moved_aside"]
+            .as_str()
+            .expect("moved aside, not deleted");
+        assert!(aside.contains(".before-restore-"), "{aside}");
+        assert!(Path::new(aside).is_file());
+    }
+    // The wreck is kept beside it, and the fragment is back.
+    let aside = done["databases"][1]["moved_aside"].as_str().unwrap();
+    assert_eq!(std::fs::read(aside).unwrap(), b"not a database any more");
+    run_in(&dir)
+        .args(["retrieve", "--config"])
+        .arg(&config)
+        .arg(&handle)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("worker"));
+    run_in(&dir)
+        .args(["db", "check", "--config"])
+        .arg(&config)
+        .assert()
+        .success();
+    assert!(fragments(&dir, &config) > 0);
+
+    // One database only, and the things that are refused before anything moves.
+    restore(&["--only", "stats.db", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "refs.db   left alone: not asked for",
+        ));
+    restore(&["--only", "config.toml"]).assert().code(1);
+    run_in(&dir)
+        .args(["restore", "nowhere.tar.gz", "--config"])
+        .arg(&config)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("is not a file"));
+    std::fs::write(dir.join("junk.tar.gz"), b"junk").unwrap();
+    run_in(&dir)
+        .args(["restore", "junk.tar.gz", "--yes", "--config"])
+        .arg(&config)
+        .assert()
+        .code(1);
+}
+
+/// With the service running, `restore` refuses and says to stop it.
+#[test]
+fn restore_refuses_while_the_service_is_running() {
+    use std::io::{BufRead, BufReader};
+    let dir = scratch_dir();
+    let config = on_disk_deployment(&dir);
+    let archive = dir.join("b.tar.gz");
+    run_in(&dir)
+        .args(["backup", "--config"])
+        .arg(&config)
+        .arg("-o")
+        .arg(&archive)
+        .assert()
+        .success();
+
+    let service = std::process::Command::new(env!("CARGO_BIN_EXE_kompressor"))
+        .args([
+            "serve",
+            "--api",
+            "--listen",
+            "127.0.0.1:0",
+            "--stop-on-stdin",
+            "--config",
+        ])
+        .arg(&config)
+        .env_remove("KOMPRESSOR_CONFIG")
+        // Readiness below is an INFO line. Under an inherited `RUST_LOG=warn`
+        // the service comes up and never says so, and this waited for ever.
+        .env("RUST_LOG", "info")
+        .env("XDG_CONFIG_HOME", no_config_dir())
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("serve starts");
+    // An assertion that fails below must not leave a service holding the
+    // directory's databases open after the test has gone.
+    struct Reaped(std::process::Child);
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut service = Reaped(service);
+    // Up, with its databases open, once it says it is listening.
+    let mut lines = BufReader::new(service.0.stdout.take().unwrap()).lines();
+    assert!(
+        lines
+            .by_ref()
+            .map_while(Result::ok)
+            .any(|line| line.contains("listening")),
+        "serve never came up"
+    );
+    let before = std::fs::read(dir.join("refs.db")).unwrap();
+    for extra in [&[][..], &["--yes"][..]] {
+        run_in(&dir)
+            .arg("restore")
+            .arg(&archive)
+            .arg("--config")
+            .arg(&config)
+            .args(extra)
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains("stop the service first"));
+    }
+    assert_eq!(std::fs::read(dir.join("refs.db")).unwrap(), before);
+    assert!(
+        !std::fs::read_dir(&dir).unwrap().flatten().any(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .contains("before-restore")),
+        "nothing was moved"
+    );
+
+    writeln!(service.0.stdin.take().unwrap(), "stop").unwrap();
+    assert!(service.0.wait().unwrap().success());
+    // Stopped, it goes through.
+    run_in(&dir)
+        .arg("restore")
+        .arg(&archive)
+        .arg("--yes")
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Restored. Start the service."));
 }
