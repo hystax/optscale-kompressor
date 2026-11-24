@@ -299,6 +299,56 @@ fn any_one_hour(body: &Value) -> bool {
     })
 }
 
+/// Whether every cache marker the Messages API reads asks for an hour, and
+/// there is at least one: the request's whole cached prefix then outlives any
+/// pause a keep-warm ping would cover. One five-minute marker anywhere means
+/// the conversation's tail is a five-minute entry (a longer lifetime must come
+/// before a shorter one), so that request is still worth keeping warm.
+pub(crate) fn every_marker_one_hour(body: &Value) -> bool {
+    fn note(object: &Value, markers: &mut usize, short: &mut bool) {
+        if object.get("cache_control").is_some_and(|m| !m.is_null()) {
+            *markers += 1;
+            *short |= !asks_one_hour(object);
+        }
+    }
+    let (mut markers, mut short) = (0usize, false);
+    note(body, &mut markers, &mut short);
+    for key in ["system", "tools"] {
+        for block in body
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            note(block, &mut markers, &mut short);
+        }
+    }
+    for message in body
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for block in message
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            note(block, &mut markers, &mut short);
+            for inner in block
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                note(inner, &mut markers, &mut short);
+            }
+        }
+    }
+    markers > 0 && !short
+}
+
 /// Bytes of plain-text reasoning inside `<think>` spans.
 fn think_spans(text: &str) -> u64 {
     let mut total = 0;

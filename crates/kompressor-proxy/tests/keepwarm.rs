@@ -286,6 +286,34 @@ async fn a_one_hour_request_is_not_kept_warm() {
     assert!(pings(&harness).await.is_empty());
 }
 
+/// Claude Code asks for an hour itself on most conversations; nothing was
+/// upgraded, so the proxy's own flag says nothing and the markers must.
+#[tokio::test]
+async fn a_request_the_client_marked_for_an_hour_is_not_kept_warm() {
+    let harness = keeping_warm(3).await;
+    answering(&harness, "tool_use", 4000).await;
+    let mut body = conversation(1);
+    body["system"][0]["cache_control"]["ttl"] = json!("1h");
+    body["messages"][2]["content"][0]["cache_control"] = json!({"type": "ephemeral", "ttl": "1h"});
+    harness.post("/v1/messages", &body).await;
+    tokio::time::sleep(INTERVAL * 3).await;
+    assert!(pings(&harness).await.is_empty());
+}
+
+/// An hour on the instructions and five minutes on the conversation: the tail
+/// still lapses in five minutes, which is the entry a ping exists to keep.
+#[tokio::test]
+async fn a_five_minute_tail_behind_a_one_hour_opening_is_kept_warm() {
+    let harness = keeping_warm(1).await;
+    answering(&harness, "tool_use", 4000).await;
+    let mut body = conversation(1);
+    body["system"][0]["cache_control"]["ttl"] = json!("1h");
+    body["messages"][2]["content"][0]["cache_control"] = json!({"type": "ephemeral"});
+    harness.post("/v1/messages", &body).await;
+    tokio::time::sleep(INTERVAL + INTERVAL / 2).await;
+    assert_eq!(pings(&harness).await.len(), 1);
+}
+
 #[tokio::test]
 async fn it_can_be_turned_on_for_anthropic_alone() {
     let harness = Harness::with(|config| {

@@ -43,7 +43,8 @@
 //! run they were 13 of the 30 pauses past five minutes; any other `end_turn`
 //! may be the last turn the conversation has, and is not kept warm.
 //!
-//! It does not arm for a request that asked for one-hour entries, which outlast
+//! It does not arm for a request whose every cache marker asks for one-hour
+//! entries, whether the client wrote them or `cache_ttl` did; they outlast
 //! any pause this would cover, nor for one whose `thinking` has a token budget:
 //! `max_tokens` must exceed the budget there, and changing `thinking` changes
 //! the cache key, so no cheap ping exists. Nor below [`MIN_PREFIX_TOKENS`].
@@ -155,6 +156,14 @@ impl Ping {
             .map_or(0, Vec::len);
         let mut body = sent.as_object()?.clone();
         if thinking_has_budget(sent) {
+            return None;
+        }
+        // Read from the body as it goes upstream, so it covers markers the
+        // client wrote as well as those `cache_ttl` upgraded. Checking only
+        // the upgrade armed pings for every Claude Code conversation that asks
+        // for an hour itself: over one week of interactive use, 306 of 592
+        // pings went to one-hour conversations and none bridged a gap.
+        if crate::drift::every_marker_one_hour(sent) {
             return None;
         }
         body.insert("max_tokens".to_string(), json!(1));
