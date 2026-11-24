@@ -1,0 +1,80 @@
+#!/bin/sh
+#
+# PROVIDE: kompressor
+# REQUIRE: LOGIN NETWORKING
+# KEYWORD: shutdown
+#
+# The kompressor compression proxy, supervised by daemon(8).
+#
+#   sysrc kompressor_enable=YES
+#   service kompressor start
+#
+# kompressor_enable (bool):   Run the service. Default NO.
+# kompressor_config (path):   Default /usr/local/etc/kompressor/config.toml.
+# kompressor_args (str):      Surfaces to serve. Default "serve --proxy --api".
+# kompressor_user (str):      Default kompressor.
+# kompressor_group (str):     Default kompressor.
+# kompressor_logfile (path):  stdout and stderr. Default /var/log/kompressor.log.
+
+. /etc/rc.subr
+
+name=kompressor
+rcvar=kompressor_enable
+desc="kompressor compression proxy"
+
+load_rc_config $name
+
+: ${kompressor_enable:=NO}
+: ${kompressor_config:=/usr/local/etc/kompressor/config.toml}
+: ${kompressor_args:="serve --proxy --api"}
+: ${kompressor_user:=kompressor}
+: ${kompressor_group:=kompressor}
+: ${kompressor_logfile:=/var/log/kompressor.log}
+
+# daemon(8), not rc.subr, switches user: with ${name}_user set, rc.subr runs
+# the command through su as that user, and daemon -u needs root to start. So
+# the variable is taken here and cleared for rc.subr. The child is restarted
+# (-r, 3s apart, the systemd unit's RestartSec) if it dies.
+kompressor_runas="${kompressor_user}"
+unset kompressor_user
+
+piddir=/var/run/${name}
+pidfile=${piddir}/${name}.pid
+supervisor_pidfile=${piddir}/daemon.pid
+procname=/usr/local/bin/kompressor
+command=/usr/sbin/daemon
+command_args="-f -r -R 3 -u ${kompressor_runas} -t ${name} -o ${kompressor_logfile} \
+	-p ${pidfile} -P ${supervisor_pidfile} \
+	${procname} ${kompressor_args} --config ${kompressor_config}"
+required_files="${kompressor_config}"
+
+start_precmd="${name}_prestart"
+# rc.subr finds the running instance through ${pidfile}; stop the supervisor
+# first so it does not restart the child it is being asked to stop.
+stop_cmd="${name}_stop"
+
+kompressor_prestart()
+{
+	install -d -o "${kompressor_runas}" -g "${kompressor_group}" -m 0755 "${piddir}"
+	install -d -o "${kompressor_runas}" -g "${kompressor_group}" -m 0755 /var/db/${name}
+	if [ ! -e "${kompressor_logfile}" ]; then
+		install -o "${kompressor_runas}" -g "${kompressor_group}" -m 0640 /dev/null "${kompressor_logfile}"
+	fi
+}
+
+kompressor_stop()
+{
+	local sup child
+	sup=$(check_pidfile "${supervisor_pidfile}" "${command}")
+	child=$(check_pidfile "${pidfile}" "${procname}")
+	if [ -z "${sup}" ] && [ -z "${child}" ]; then
+		echo "${name} not running? (check ${pidfile})."
+		return 1
+	fi
+	echo "Stopping ${name}."
+	[ -n "${sup}" ] && kill -TERM ${sup} 2>/dev/null
+	[ -n "${child}" ] && kill -TERM ${child} 2>/dev/null
+	wait_for_pids ${sup} ${child}
+}
+
+run_rc_command "$1"

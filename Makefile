@@ -339,6 +339,20 @@ win-installer: win-builder ## Windows installer (setup .exe), built in the same 
 	docker run --rm -u "$$(id -u):$$(id -g)" -v "$(CURDIR):/src" $(WIN_SIGN_ENV) \
 		kompressor-windows-builder ./scripts/build/windows.sh installer
 
+.PHONY: freebsd-builder
+freebsd-builder:
+	docker build -f scripts/build/Dockerfile.freebsd -t kompressor-freebsd-builder scripts/build
+
+.PHONY: freebsd
+freebsd: freebsd-builder ## FreeBSD x86_64 binary built in a container
+	docker run --rm -u "$$(id -u):$$(id -g)" -v "$(CURDIR):/src" \
+		kompressor-freebsd-builder ./scripts/build/freebsd.sh bin
+
+.PHONY: freebsd-pkg
+freebsd-pkg: freebsd-builder ## FreeBSD .pkg (binary, rc.d service, config), built in the same container
+	docker run --rm -u "$$(id -u):$$(id -g)" -v "$(CURDIR):/src" \
+		kompressor-freebsd-builder ./scripts/build/freebsd.sh pkg
+
 .PHONY: docker
 docker: ## Container image from the static binary
 	./scripts/build/docker.sh $(DOCKER_IMAGE) $(DOCKER_TAG) $(STATIC_TARGET)

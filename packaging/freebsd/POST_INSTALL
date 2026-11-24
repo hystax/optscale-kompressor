@@ -1,0 +1,29 @@
+#!/bin/sh
+# The service account, its state directory, and the config from its sample.
+#
+# A system user with no login and no fixed uid: ports reserve uids in
+# /usr/ports/UIDs, which a package built outside the ports tree cannot. `pw -R`
+# keeps `pkg -r <root>` installs pointed at that root rather than the host.
+R="${PKG_ROOTDIR:-}"
+R="${R%/}"
+
+if ! pw -R "${R:-/}" groupshow kompressor >/dev/null 2>&1; then
+    pw -R "${R:-/}" groupadd kompressor
+fi
+if ! pw -R "${R:-/}" usershow kompressor >/dev/null 2>&1; then
+    pw -R "${R:-/}" useradd kompressor -g kompressor -c "kompressor daemon" \
+        -d /var/db/kompressor -s /usr/sbin/nologin -h -
+fi
+
+# 0755 and world-readable databases, as on Linux: `kompressor stats` works
+# without sudo. refs.db holds the elided content, so tighten to 0750 and add
+# readers to the group on a machine with other local accounts.
+install -d -o kompressor -g kompressor -m 0755 "$R/var/db/kompressor"
+
+# @sample semantics: the sample is the package's, the config is the operator's.
+CONF="$R${PKG_PREFIX:-/usr/local}/etc/kompressor/config.toml"
+if [ ! -e "$CONF" ]; then
+    cp -p "$CONF.sample" "$CONF"
+fi
+
+exit 0
