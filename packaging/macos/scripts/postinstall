@@ -45,7 +45,7 @@ fi
 
 # launchd expands neither ~ nor $HOME inside a plist, so the real paths are
 # substituted here, at install time.
-sed -e "s|@CONFIG@|$CONF|g" -e "s|@LOGS@|$LOGS|g" "$SHARE/$LABEL.plist.in" > "$PLIST"
+sed -e "s|@CONFIG@|$CONF|g" -e "s|@LOGS@|$LOGS|g" -e "s|@STATE@|$STATE|g" "$SHARE/$LABEL.plist.in" > "$PLIST"
 chown "$CONSOLE_USER" "$PLIST"
 chmod 644 "$PLIST"
 
