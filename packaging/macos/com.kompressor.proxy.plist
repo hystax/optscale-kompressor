@@ -29,6 +29,13 @@
         <string>@CONFIG@</string>
     </array>
 
+    <!-- launchd starts a job in `/`, which is read-only. The config loader
+         expands nothing in a path, so a relative one written by hand would
+         otherwise resolve there and fail every start; here it lands in the
+         state directory instead. -->
+    <key>WorkingDirectory</key>
+    <string>@STATE@</string>
+
     <key>RunAtLoad</key>
     <true/>
 

@@ -691,6 +691,28 @@ pub async fn run(
         bound.push((addr, listener, selected));
     }
     let stats_listener = bind_stats_listener(core.config(), &bound).await?;
+    // Bound here, with the rest, and not where it is served: a certificate
+    // authority that cannot be loaded has to stop the process before anything
+    // answers. Failing after the listeners above were already serving left a
+    // crash-looping agent whose health check passed for a moment on every
+    // restart.
+    let intercept_listener = {
+        let intercept = &core.config().proxy.intercept;
+        match intercept.listen.as_deref() {
+            Some(address) => Some(
+                kompressor_proxy::intercept::Intercept::bind(
+                    address,
+                    &intercept.intercept_hosts,
+                    &intercept.ca_path,
+                    &intercept.alpn,
+                    intercept.leaf_cache_entries,
+                )
+                .await
+                .map_err(|e| CliError::Runtime(e.to_string()))?,
+            ),
+            None => None,
+        }
+    };
     for (addr, listener, selected) in bound {
         let mut enabled = Vec::new();
         if selected.api {
@@ -739,17 +761,8 @@ pub async fn run(
     // can never be pointed at the proxy. It serves the same router the ordinary
     // listeners do -- it only differs in how a connection reaches it -- and it
     // joins the same JoinSet, so `shutdown_grace` already covers it.
-    let intercept = &core.config().proxy.intercept;
-    if let Some(address) = intercept.listen.clone() {
-        let bound = kompressor_proxy::intercept::Intercept::bind(
-            &address,
-            &intercept.intercept_hosts,
-            &intercept.ca_path,
-            &intercept.alpn,
-            intercept.leaf_cache_entries,
-        )
-        .await
-        .map_err(|e| CliError::Runtime(e.to_string()))?;
+    if let Some(bound) = intercept_listener {
+        let intercept = &core.config().proxy.intercept;
         tracing::info!(
             address = %bound.address(),
             hosts = %intercept.intercept_hosts.join(","),

@@ -114,6 +114,13 @@ impl Authority {
     ) -> Result<Self, CaError> {
         install_crypto_provider();
 
+        // A relative `ca_path` resolves against the working directory, which
+        // under launchd is `/`. Every error and log line below names the
+        // directory, so name the one actually used: "at STATE/ca: Read-only
+        // file system" hides that the path meant was `/STATE/ca`.
+        let resolved = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let dir = resolved.as_path();
+
         let cert_path = dir.join("ca.pem");
         let key_path = dir.join("ca.key");
 
