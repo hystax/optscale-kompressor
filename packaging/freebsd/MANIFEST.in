@@ -1,0 +1,23 @@
+name: kompressor
+version: "@VERSION@"
+origin: sysutils/kompressor
+comment: "OptScale Kompressor: deterministic prompt compression for agent traffic"
+maintainer: "Hystax"
+www: "https://github.com/hystax/optscale-kompressor"
+prefix: /usr/local
+abi: "@ABI@"
+arch: "@ABI@"
+licenselogic: single
+licenses: [MIT]
+categories: [sysutils]
+desc: <<EOD
+OptScale Kompressor: deterministic prompt compression for agent traffic.
+Rewrites tool results, logs and API responses in flight into a shorter view
+that says what it removed, and keeps every removed fragment behind a handle
+the model can ask for by name. Runs as a library, a CLI, an HTTP API, an MCP
+server or a reverse proxy.
+
+To run the proxy as a service:
+  sysrc kompressor_enable=YES
+  service kompressor start
+EOD

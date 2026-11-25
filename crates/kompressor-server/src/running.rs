@@ -238,6 +238,8 @@ fn features(core: &AppCore) -> Vec<Feature> {
 }
 
 fn process() -> Process {
+    // Only Linux fills in more from /proc; elsewhere `mut` is unused.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut process = Process {
         pid: std::process::id(),
         user: ["USER", "LOGNAME", "USERNAME"]

@@ -1,0 +1,9 @@
+#!/bin/sh
+# State is NOT removed, deliberately, matching the .deb and .rpm: an ordinary
+# uninstall must not destroy the fragment store and every statistic.
+echo "kompressor: /var/db/kompressor and the 'kompressor' user were kept."
+echo "kompressor: to remove them:  rm -rf /var/db/kompressor && pw userdel kompressor && pw groupdel kompressor"
+if [ -f "${PKG_ROOTDIR:-}${PKG_PREFIX:-/usr/local}/etc/kompressor/config.toml" ]; then
+    echo "kompressor: your edited /usr/local/etc/kompressor/config.toml was kept."
+fi
+exit 0

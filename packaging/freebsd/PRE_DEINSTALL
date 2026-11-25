@@ -1,0 +1,16 @@
+#!/bin/sh
+# Stop the service, and remove the config only if it is still the unedited
+# sample, which is what a port's @sample does. An edited config is kept.
+R="${PKG_ROOTDIR:-}"
+R="${R%/}"
+
+if [ -z "$R" ] && [ -x /usr/local/etc/rc.d/kompressor ]; then
+    /usr/local/etc/rc.d/kompressor onestop >/dev/null 2>&1 || :
+fi
+
+CONF="$R${PKG_PREFIX:-/usr/local}/etc/kompressor/config.toml"
+if [ -f "$CONF" ] && cmp -s "$CONF" "$CONF.sample"; then
+    rm -f "$CONF"
+fi
+
+exit 0

@@ -1,0 +1,85 @@
+# Builder image for the FreeBSD binary and .pkg, cross-built on Linux.
+#
+#   docker build -f scripts/build/Dockerfile.freebsd -t kompressor-freebsd-builder scripts/build
+#   docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/src" kompressor-freebsd-builder
+#
+# Or `make freebsd` / `make freebsd-pkg`. The context is scripts/build because
+# nothing is copied in.
+#
+# Three pieces, none of which a Linux distribution packages:
+#
+#   * a FreeBSD sysroot — libc, libthr, libm and their headers, taken from the
+#     release's own base.txz, so the binary links against exactly what a
+#     FreeBSD machine has. clang and lld are cross-compilers already; they only
+#     need to be pointed at it.
+#   * the Rust target, which rustup ships.
+#   * `pkg` itself. A .pkg is a tar with a manifest whose every file carries a
+#     checksum, and writing that by hand is a format reimplementation waiting to
+#     drift. pkg builds on Linux, so the real tool writes the real package.
+FROM rust:1.95-bookworm
+
+# The oldest supported release, so the binary runs on it and everything newer:
+# FreeBSD keeps libc's symbol versions across majors. Pinned with a digest (the
+# release MANIFEST lists it); bump both together.
+ARG FREEBSD_VERSION=14.4-RELEASE
+ARG FREEBSD_BASE_SHA256=769f60a6eea2938ad6b7943cfbcc17dfaf7d1f7ba59a32b869a00349302df853
+ARG PKG_VERSION=2.9.3
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang lld libarchive-tools xz-utils zstd ca-certificates \
+        build-essential pkg-config git m4 \
+        libbsd-dev libarchive-dev zlib1g-dev libbz2-dev liblzma-dev libzstd-dev libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# The sysroot. Only the directories a link needs are extracted, which is a
+# tenth of base.txz. A release moves to the archive mirror once it reaches end
+# of life, so that is tried second rather than leaving an old pin unbuildable.
+#
+# Absolute symlinks in base point at /lib/..., which inside a sysroot means
+# the Linux host's /lib. Rewritten relative, so they resolve inside it.
+RUN set -eu; \
+    for url in \
+        "https://download.freebsd.org/releases/amd64/${FREEBSD_VERSION}/base.txz" \
+        "http://ftp-archive.freebsd.org/pub/FreeBSD-Archive/old-releases/amd64/${FREEBSD_VERSION}/base.txz"; \
+    do curl -fsSL -o /tmp/base.txz "$url" && break; done; \
+    echo "${FREEBSD_BASE_SHA256}  /tmp/base.txz" | sha256sum -c -; \
+    mkdir -p /opt/freebsd; \
+    bsdtar -xf /tmp/base.txz -C /opt/freebsd ./lib ./usr/lib ./usr/include; \
+    rm -f /tmp/base.txz; \
+    cd /opt/freebsd; \
+    find . -type l -lname '/*' | while read -r link; do \
+        target="$(readlink "$link")"; \
+        ln -sfn "$(realpath -m --relative-to="$(dirname "$link")" "/opt/freebsd$target")" "$link"; \
+    done
+
+# FreeBSD's `pkg`, for `pkg create`. Its build supports Linux.
+RUN git clone --depth 1 --branch "${PKG_VERSION}" https://github.com/freebsd/pkg /tmp/pkg \
+    && cd /tmp/pkg && ./configure --prefix=/usr/local >/dev/null \
+    && make -j"$(nproc)" >/dev/null && make install >/dev/null \
+    && cd / && rm -rf /tmp/pkg \
+    && pkg --version
+
+RUN rustup target add x86_64-unknown-freebsd
+
+# The cross compiler: clang already speaks every target, it needs only the
+# triple and the sysroot. One wrapper serves as cc for the C crates (ring,
+# SQLite, zstd, the grammars) and as cargo's linker.
+RUN for tool in clang clang++; do \
+        printf '#!/bin/sh\nexec %s --target=x86_64-unknown-freebsd14 --sysroot=/opt/freebsd -fuse-ld=lld "$@"\n' "$tool" \
+            > "/usr/local/bin/x86_64-unknown-freebsd-$tool"; \
+        chmod 755 "/usr/local/bin/x86_64-unknown-freebsd-$tool"; \
+    done
+ENV CC_x86_64_unknown_freebsd=x86_64-unknown-freebsd-clang \
+    CXX_x86_64_unknown_freebsd=x86_64-unknown-freebsd-clang++ \
+    AR_x86_64_unknown_freebsd=ar \
+    CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER=x86_64-unknown-freebsd-clang
+
+# Writable by any uid, so `-u` leaves host-owned files; a uid with no passwd
+# entry would otherwise get HOME=/.
+ENV CARGO_HOME=/tmp/cargo \
+    XDG_CACHE_HOME=/tmp/.cache \
+    HOME=/tmp
+RUN mkdir -p /tmp/cargo /tmp/.cache && chmod 1777 /tmp /tmp/cargo /tmp/.cache
+
+WORKDIR /src
+CMD ["./scripts/build/freebsd.sh", "bin"]

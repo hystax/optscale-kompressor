@@ -139,6 +139,11 @@ leg "macos ${MACOS_ARCH:-universal2} .pkg" macos-pkg-docker "$(want_docker)" \
 leg "windows x86_64 .exe + installer" win-installer "$(want_docker)" \
     "target/windows/kompressor-${VERSION}-x86_64-windows.exe" \
     "target/windows/kompressor-${VERSION}-x86_64-setup.exe"
+# FreeBSD, in a container with a FreeBSD sysroot and `pkg`. One leg for both,
+# like Windows: freebsd-pkg leaves the bare binary it packs.
+leg "freebsd x86_64 binary + .pkg" freebsd-pkg "$(want_docker)" \
+    "target/freebsd/kompressor-${VERSION}-x86_64-freebsd" \
+    "target/freebsd/kompressor-${VERSION}-x86_64-freebsd.pkg"
 
 # Checksums over the directory as it ended up, so the file cannot describe an
 # artifact that is not there.
