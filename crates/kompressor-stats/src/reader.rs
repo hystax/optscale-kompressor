@@ -453,6 +453,58 @@ pub struct StatsReader {
     has_withheld: bool,
 }
 
+/// One agent tool's hook-mode results: [`StatsReader::by_tool`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ToolRow {
+    pub tool: String,
+    /// Results the hooks saw.
+    pub results: i64,
+    /// Of those, the ones compressed for real (not shadow).
+    pub compressed_results: i64,
+    pub chars_in: i64,
+    pub tokens_in: i64,
+    /// Estimated tokens removed from what the model received.
+    pub tokens_removed: i64,
+    /// Estimated tokens shadow mode says would have been removed.
+    pub shadow_would_remove: i64,
+    /// MCP results Cursor had already written to a file: unreachable to a
+    /// hook, and the list of servers worth fronting.
+    pub spilled: i64,
+    pub conversations: i64,
+    /// Results over Cursor's spill threshold that reached the model inline,
+    /// compressed, instead of as a file it would have had to open (or, for
+    /// shadow rows, would have). No tokens are claimed for these: without
+    /// compression the model would not have received them inline at all, so
+    /// what they save is the follow-up reads, which a hook cannot see.
+    #[serde(default)]
+    pub kept_inline: i64,
+}
+
+/// Cursor's spill threshold, in characters as `chars_in` counts them: a tool
+/// result over 40,000 bytes is written to a file instead of being inlined.
+pub const SPILL_CHARS: i64 = 40_000;
+
+/// The Cursor dashboard's data: [`StatsReader::cursor`].
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct CursorReport {
+    pub tools: Vec<ToolRow>,
+    /// Usage per conversation, from the desktop's `stop` events. Empty for
+    /// CLI sessions, which do not fire `stop` under `--print`.
+    pub conversations: Vec<CursorConversation>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CursorConversation {
+    pub conversation: String,
+    pub turns: i64,
+    pub model: Option<String>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub last_ms: i64,
+}
+
 /// What one wrapped session did, for the line `kompressor wrap` prints as it
 /// exits.
 ///
@@ -496,6 +548,115 @@ impl StatsReader {
             .unwrap_or(0)
             > 0;
         Ok(StatsReader { conn, has_withheld })
+    }
+
+    /// Hook-mode rows since `from_ms`: how many, and the estimated tokens the
+    /// non-shadow ones removed. For the line `wrap cursor-agent` prints.
+    pub fn hook_session(&self, from_ms: i64) -> Result<(u64, i64), StatsError> {
+        if !self.has_column("optimization_events", "tool")? {
+            return Ok((0, 0));
+        }
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN mode <> 'off'
+                 THEN tokens_in - tokens_out ELSE 0 END), 0)
+             FROM optimization_events WHERE surface = 'hook' AND time_ms >= ?1",
+            [from_ms],
+            |row| Ok((row.get::<_, i64>(0)?.max(0) as u64, row.get(1)?)),
+        )?)
+    }
+
+    /// Hook-mode results per agent tool in a window: what was seen, what was
+    /// removed, and what shadow mode says would have been: gross removal at
+    /// entry, never a bill (docs/design/CURSOR.md, "What gets reported").
+    pub fn by_tool(&self, from_ms: i64, to_ms: i64) -> Result<Vec<ToolRow>, StatsError> {
+        if !self.has_column("optimization_events", "tool")? {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT COALESCE(tool, '(unknown)'),
+                    COUNT(*),
+                    SUM(CASE WHEN mode <> 'off' THEN 1 ELSE 0 END),
+                    COALESCE(SUM(chars_in), 0),
+                    COALESCE(SUM(tokens_in), 0),
+                    COALESCE(SUM(CASE WHEN mode <> 'off' THEN tokens_in - tokens_out ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN mode = 'off' THEN tokens_in - tokens_out ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN json_extract(skipped_by_reason, '$.spilled') > 0
+                                 THEN 1 ELSE 0 END), 0),
+                    COUNT(DISTINCT conversation),
+                    COALESCE(SUM(CASE WHEN COALESCE(tool, '') NOT IN ('Read', 'Grep', 'Fetch')
+                                       AND chars_in > ?3 AND chars_out <= ?3
+                                       AND messages_compressed > 0
+                                 THEN 1 ELSE 0 END), 0)
+             FROM optimization_events
+             WHERE surface = 'hook' AND time_ms >= ?1 AND time_ms < ?2
+             GROUP BY 1 ORDER BY 5 DESC",
+        )?;
+        let rows = statement
+            .query_map([from_ms, to_ms, SPILL_CHARS], |row| {
+                Ok(ToolRow {
+                    tool: row.get(0)?,
+                    results: row.get(1)?,
+                    compressed_results: row.get(2)?,
+                    chars_in: row.get(3)?,
+                    tokens_in: row.get(4)?,
+                    tokens_removed: row.get(5)?,
+                    shadow_would_remove: row.get(6)?,
+                    spilled: row.get(7)?,
+                    conversations: row.get(8)?,
+                    kept_inline: row.get(9)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// The Cursor dashboard: hook-mode results by tool, and the usage the
+    /// desktop's `stop` event reported, per conversation.
+    pub fn cursor(
+        &self,
+        tenant: &str,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<CursorReport, StatsError> {
+        let tools = self.by_tool(from_ms, to_ms)?;
+        let mut statement = self.conn.prepare(
+            "SELECT COALESCE(conversation, '(unknown)'), COUNT(*), MIN(model),
+                    COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0),
+                    COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0),
+                    MAX(time_ms)
+             FROM proxy_requests
+             WHERE api_family = 'cursor' AND tenant = ?1 AND time_ms >= ?2 AND time_ms < ?3
+             GROUP BY 1 ORDER BY 8 DESC LIMIT 200",
+        )?;
+        let conversations = statement
+            .query_map(rusqlite::params![tenant, from_ms, to_ms], |row| {
+                Ok(CursorConversation {
+                    conversation: row.get(0)?,
+                    turns: row.get(1)?,
+                    model: row.get(2)?,
+                    input_tokens: row.get(3)?,
+                    output_tokens: row.get(4)?,
+                    cache_read_tokens: row.get(5)?,
+                    cache_write_tokens: row.get(6)?,
+                    last_ms: row.get(7)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(CursorReport {
+            tools,
+            conversations,
+        })
+    }
+
+    /// Whether `table` has `column`: the reader never migrates, so a file no
+    /// current writer has opened yet has the older shape.
+    fn has_column(&self, table: &str, column: &str) -> Result<bool, StatsError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+            [table, column],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
     }
 
     /// `withheld = 0` where the column exists, and the constant true where it

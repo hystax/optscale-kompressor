@@ -18,6 +18,7 @@ mod db;
 mod error;
 mod explain;
 mod highlight;
+mod hook;
 mod input;
 mod report;
 mod restore;
@@ -77,6 +78,9 @@ enum Command {
     Wrap(WrapCmd),
     /// Undo a `wrap --attach`, restoring the agent's settings file.
     Unwrap(UnwrapCmd),
+    /// Hook mode: compress an agent's tool output from the agent's own hooks.
+    #[command(subcommand)]
+    Hook(HookCmd),
     /// Print the version and the compiled-in features.
     Version,
 }
@@ -115,6 +119,112 @@ struct WrapCmd {
     /// List the agents this command knows.
     #[arg(long)]
     list: bool,
+}
+
+/// `kompressor hook`: the commands an agent's hooks run, and the ones that
+/// register them. See docs/CURSOR.md.
+#[derive(Subcommand)]
+enum HookCmd {
+    /// Answer one Cursor hook event: JSON on stdin, one JSON reply on stdout.
+    /// Always exits 0; any failure is the empty reply.
+    Cursor(HookCursorCmd),
+    /// Print a captured command output compressed, delete it, exit with
+    /// --status. The tail of a rewritten shell command.
+    Emit(HookEmitCmd),
+    /// Register the hooks and the retrieval server with an agent.
+    Install {
+        #[command(subcommand)]
+        agent: HookInstallAgent,
+    },
+    /// Remove exactly what `hook install` wrote.
+    Uninstall {
+        #[command(subcommand)]
+        agent: HookScopeAgent,
+    },
+    /// What is installed, what else answers the same events, whether the
+    /// store is reachable, and when a hook last ran.
+    Status {
+        #[command(subcommand)]
+        agent: HookStatusAgent,
+    },
+}
+
+#[derive(Args)]
+struct HookCursorCmd {
+    /// Configuration file. Installs and `wrap` pass an absolute one, so every
+    /// hook process opens the same store.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// Measure only, whatever the configuration says.
+    #[arg(long)]
+    shadow: bool,
+}
+
+#[derive(Args)]
+struct HookEmitCmd {
+    /// The captured output.
+    file: PathBuf,
+    /// The exit status of the command that produced it; this command exits
+    /// with it on every path.
+    #[arg(long, allow_hyphen_values = true)]
+    status: i32,
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// The agent's generation id, for the statistics row.
+    #[arg(long)]
+    request: Option<String>,
+    /// The agent's conversation id, for the statistics row.
+    #[arg(long)]
+    conversation: Option<String>,
+    #[arg(long)]
+    model: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum HookInstallAgent {
+    /// Cursor, desktop and CLI: ~/.cursor/hooks.json and ~/.cursor/mcp.json.
+    Cursor(HookInstallCursorCmd),
+}
+
+#[derive(Args)]
+struct HookInstallCursorCmd {
+    /// Install into the current workspace's .cursor directory instead of ~/.cursor.
+    #[arg(long)]
+    project: bool,
+    /// Print the entries as JSON and write nothing (for the enterprise path).
+    #[arg(long)]
+    print: bool,
+    /// Measure only: record what would be removed, change nothing.
+    #[arg(long)]
+    shadow: bool,
+    /// Install beside another tool's preToolUse hook on Shell.
+    #[arg(long)]
+    force: bool,
+    /// Add Shell(kompressor) to the Cursor CLI's allow-list.
+    #[arg(long)]
+    allow_list: bool,
+    /// Configuration the hooks run under.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum HookScopeAgent {
+    Cursor {
+        /// The install in the current workspace's .cursor directory.
+        #[arg(long)]
+        project: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookStatusAgent {
+    Cursor {
+        #[arg(long)]
+        project: bool,
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+    },
 }
 
 #[derive(Args)]
@@ -290,6 +400,8 @@ enum StatsReport {
     ByType,
     /// Requests and savings per upstream mount, and the hosts it sent to.
     ByProvider,
+    /// Hook mode (Cursor): results per agent tool, removed and shadow-measured.
+    ByTool,
     /// The retrieval side: hits, expiries, tokens put back.
     Retrievals,
     /// One request's economy, compression and retrievals joined.
@@ -523,6 +635,7 @@ fn run(cli: Cli) -> CliResult {
                     StatsReport::Histogram { bucket } => stats::Report::Histogram { bucket },
                     StatsReport::ByType => stats::Report::ByType,
                     StatsReport::ByProvider => stats::Report::ByProvider,
+                    StatsReport::ByTool => stats::Report::ByTool,
                     StatsReport::Retrievals => stats::Report::Retrievals,
                     StatsReport::Request { id } => stats::Report::Request { id },
                     StatsReport::Store => stats::Report::Store,
@@ -609,6 +722,34 @@ fn run(cli: Cli) -> CliResult {
             list: args.list,
         }),
         Command::Unwrap(args) => wrap::unwrap_agent(wrap::UnwrapArgs { agent: args.agent }),
+        Command::Hook(HookCmd::Cursor(args)) => hook::run_cursor(hook::CursorArgs {
+            config: args.config,
+            shadow: args.shadow,
+        }),
+        Command::Hook(HookCmd::Emit(args)) => hook::run_emit(hook::EmitArgs {
+            file: args.file,
+            status: args.status,
+            config: args.config,
+            request: args.request,
+            conversation: args.conversation,
+            model: args.model,
+        }),
+        Command::Hook(HookCmd::Install {
+            agent: HookInstallAgent::Cursor(args),
+        }) => hook::install::install(hook::install::InstallArgs {
+            project: args.project,
+            print: args.print,
+            shadow: args.shadow,
+            force: args.force,
+            allow_list: args.allow_list,
+            config: args.config,
+        }),
+        Command::Hook(HookCmd::Uninstall {
+            agent: HookScopeAgent::Cursor { project },
+        }) => hook::install::uninstall(project),
+        Command::Hook(HookCmd::Status {
+            agent: HookStatusAgent::Cursor { project, config },
+        }) => hook::install::status(project, config.as_deref()),
         Command::CheckConfig(args) => check_config(args.config.as_deref()),
         Command::Backup(args) => backup::run(
             args.config.as_deref(),

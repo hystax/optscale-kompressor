@@ -85,9 +85,9 @@ pub use events::{
     RoundUsage, StoreSample, Surface,
 };
 pub use reader::{
-    Bucket, BucketRow, DailyRollup, ModeTotals, ProviderCoverage, ProxyRow, RefCount,
-    RequestEconomy, RetrievalSummary, SessionOutcome, StatsReader, Summary, SurfaceTotals,
-    TypeCoverage,
+    Bucket, BucketRow, CursorConversation, CursorReport, DailyRollup, ModeTotals, ProviderCoverage,
+    ProxyRow, RefCount, RequestEconomy, RetrievalSummary, SessionOutcome, StatsReader, Summary,
+    SurfaceTotals, ToolRow, TypeCoverage,
 };
 pub use retention::PruneCounts;
 pub use writer::{StatsHandle, StatsSink, StatsWriter, Upkeep, null_sink, spawn};

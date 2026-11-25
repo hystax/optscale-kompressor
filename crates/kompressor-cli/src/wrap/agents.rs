@@ -142,6 +142,12 @@ pub enum Wiring {
     /// configured by hand, so the wrap prints what to paste and holds the proxy
     /// up until Ctrl-C. `where_` names the settings page, because an
     /// instruction that does not say where to type it is not an instruction.
+    ///
+    /// No entry uses it since the Cursor editor moved to hook mode — its
+    /// base-URL override is called from Cursor's servers and never reaches a
+    /// local proxy. The path is kept for the next GUI tool that does call a
+    /// local URL.
+    #[allow(dead_code)]
     Manual { where_: &'static str },
     /// This proxy cannot compress the tool, and an entry that says so is worth
     /// more than no entry at all.
@@ -151,6 +157,11 @@ pub enum Wiring {
     /// a variable that either does nothing or breaks it — the silent failure
     /// this catalogue exists to avoid, reached by the helpful road.
     Unsupported { why: &'static str },
+    /// The tool is not pointed at the proxy at all: it is handed hooks that
+    /// call this binary, and no proxy is started. `flag` is how one session is
+    /// handed them — Cursor's `--plugin-dir` — so nothing the user owns is
+    /// written. See [`hooks`](super::hooks) and docs/design/CURSOR.md.
+    Hooks { flag: &'static str },
 }
 
 /// How an agent is offered the retrieval tools for the length of a session.
@@ -216,57 +227,50 @@ pub struct Agent {
 pub const AGENTS: &[Agent] = &[
     Agent {
         name: "cursor-agent",
+        // Also found as `agent`: the installer puts both on PATH and the
+        // build names itself `agent`.
         binary: "cursor-agent",
-        about: "Cursor Agent CLI — cannot be compressed (see below)",
+        about: "Cursor Agent CLI — hook mode: tool output compressed by Cursor's own hooks, no proxy",
         env: &[],
         providers: &[],
         fixed_env: &[],
         config: None,
         mcp: None,
-        // Measured against 2026.09.23-86fc751 by pointing `--endpoint` at a
-        // recording server: every call is Connect RPC carrying protobuf —
-        // `content-type: application/proto`, `connect-protocol-version: 1`,
-        // paths like `/aiserver.v1.ServerConfigService/GetServerConfig`. There
-        // is no JSON message array for a wire walker to find and no OpenAI or
-        // Anthropic shape to route, so the engine has nothing to read. Pointed
-        // at the proxy for real, every path 404s and the agent stops with
-        // `Error: [unimplemented]`.
-        wiring: Wiring::Unsupported {
-            why: "cursor-agent talks to Cursor's own API over Connect RPC with protobuf \
-                  bodies, not the OpenAI or Anthropic JSON this proxy understands. There \
-                  is nothing in those requests the engine can read, so wrapping it would \
-                  route traffic through a proxy that cannot compress a byte of it — and \
-                  in fact cannot answer it at all: the paths 404 and the agent stops with \
-                  `[unimplemented]`. Cursor's *editor* can be pointed at this proxy when \
-                  it is using your own API key: `kompressor wrap cursor`.",
+        // The wire is Connect RPC with protobuf bodies to Cursor's own
+        // backend, and the prompt is assembled server-side: measured against
+        // 2026.09.23-86fc751, every path 404s at a proxy. What Cursor does
+        // offer is hooks, run with each tool result before the model sees it,
+        // and `--plugin-dir` to hand them to one session. Measured against
+        // 2026.09.26-dd393fe: docs/design/CURSOR.md, "Test results".
+        wiring: Wiring::Hooks {
+            flag: "--plugin-dir",
         },
-        note: None,
+        note: Some(
+            "No proxy runs: the session is started with --plugin-dir naming a directory of \
+             hooks that call kompressor, removed when it exits. MCP tool results are \
+             compressed; shell output only with [hooks.cursor.shell] enabled; built-in Read, \
+             Grep and Fetch output cannot be. For the editor: `kompressor hook install cursor`.",
+        ),
     },
     Agent {
         name: "cursor",
-        // Never executed: `Wiring::Manual` short-circuits before any launch.
-        // Named rather than left empty so `--list` and the error paths have
-        // something truthful to print.
+        // Never executed: `Unsupported` short-circuits before any launch.
         binary: "cursor",
-        about: "Cursor (GUI editor; base URL set by hand in Settings)",
-        // Rendered into the instructions, not exported: Cursor is not a child
-        // process of this command and never sees its environment.
-        env: &[("OPENAI_BASE_URL", Endpoint::V1)],
-        providers: &[Provider::OpenAi],
+        about: "Cursor (editor) — use `kompressor hook install cursor`; a base-URL override cannot reach a local proxy",
+        env: &[],
+        providers: &[],
         fixed_env: &[],
         config: None,
         mcp: None,
-        wiring: Wiring::Manual {
-            where_: "Settings \u{2192} Models \u{2192} OpenAI API Key \u{2192} Override OpenAI Base URL",
+        wiring: Wiring::Unsupported {
+            why: "Cursor's editor is compressed through its hooks, not this proxy: run \
+                  `kompressor hook install cursor`, then `kompressor hook status cursor`. \
+                  The OpenAI base-URL override in Settings is called from Cursor's servers, \
+                  not from the editor, so an address on this machine is never reached — which \
+                  is why no request ever arrived here that way. Exposing the proxy on a public \
+                  tunnel would put it, and your key, on the internet.",
         },
-        note: Some(
-            "REQUIRES your own OpenAI API key in Settings \u{2192} Models \u{2192} API Keys. \
-             On a Cursor subscription every request goes to Cursor's own servers over \
-             their protobuf API, which this proxy never sees and could not read if it \
-             did — verified 2026-09-25 against a live editor: with the key field empty \
-             and the override toggle off, no request reaches the proxy at all. Cursor \
-             also cannot send custom headers, so a session is attributed to no project.",
-        ),
+        note: None,
     },
     Agent {
         name: "claude",
@@ -424,60 +428,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_gui_tool_is_wired_by_hand_and_never_launched() {
+    fn the_editor_points_at_hook_install_and_prints_no_loopback_url() {
+        // The base-URL override is called from Cursor's servers, so a URL on
+        // this machine is never reached (docs/design/CURSOR.md, "Bring-your-own-key"). An
+        // entry that printed one would send the user to paste something that
+        // cannot work.
         let cursor = Agent::find("cursor").expect("cursor is in the catalogue");
-        let Wiring::Manual { where_ } = cursor.wiring else {
-            panic!("cursor cannot be launched: it is an editor, not a CLI");
+        let Wiring::Unsupported { why } = cursor.wiring else {
+            panic!("the editor is not wrapped; it is installed into");
         };
-        assert!(
-            where_.contains("Base URL"),
-            "the instruction has to name the setting, got {where_:?}"
-        );
-        // The proxy must still be reachable for the endpoint the user pastes.
-        assert_eq!(cursor.providers, &[Provider::OpenAi]);
-        // …and the URL handed over is the one an OpenAI-style client wants:
-        // Cursor appends /chat/completions to it.
-        assert_eq!(cursor.env, &[("OPENAI_BASE_URL", Endpoint::V1)]);
-        // Both facts, because either alone misleads: the key is what makes it
-        // work, and the subscription is what most readers actually have.
-        let note = cursor.note.expect("the precondition must be stated");
-        assert!(
-            note.contains("own OpenAI API key"),
-            "the condition under which this works at all must be stated"
-        );
-        assert!(
-            note.contains("subscription"),
-            "and the case in which it cannot work, which is the common one"
-        );
+        assert!(why.contains("hook install cursor"));
+        assert!(!why.contains("127.0.0.1"));
+        assert!(cursor.env.is_empty() && cursor.providers.is_empty());
     }
 
     #[test]
-    fn the_cursor_cli_is_listed_as_incompatible_rather_than_omitted() {
-        // Measured against 2026.09.23-86fc751: Connect RPC, protobuf bodies,
-        // `/aiserver.v1.*` paths. Leaving it out of the catalogue is worse than
-        // saying so — `wrap` would answer "unknown agent" and recommend
-        // `--env`, which points a tool at a proxy that 404s every request.
+    fn the_cursor_cli_is_handed_hooks_and_no_proxy() {
+        // Connect RPC with protobuf bodies: no proxy could read it. Hooks see
+        // each tool result before the model does, and `--plugin-dir` hands
+        // them to one session.
         let cli = Agent::find("cursor-agent").expect("the CLI is in the catalogue");
-        let Wiring::Unsupported { why } = cli.wiring else {
-            panic!("cursor-agent speaks protobuf; it cannot be wrapped");
-        };
-        assert!(why.contains("protobuf"), "the reason has to be the reason");
-        assert!(
-            why.contains("wrap cursor"),
-            "and it has to point at the thing that does work"
+        assert_eq!(
+            cli.wiring,
+            Wiring::Hooks {
+                flag: "--plugin-dir"
+            }
         );
-        assert!(cli.env.is_empty(), "no variable would help");
-        assert!(cli.providers.is_empty(), "no upstream would help either");
+        assert!(cli.env.is_empty(), "no variable is set");
+        assert!(cli.providers.is_empty(), "no upstream is mounted");
+        assert!(!cli.about.contains("cannot be compressed"));
     }
 
     #[test]
     fn the_editor_and_the_cli_are_different_entries() {
-        // They are different products with different protocols, and conflating
-        // them is how a user ends up pasting a URL that cannot work.
         let editor = Agent::find("cursor").unwrap();
         let cli = Agent::find("cursor-agent").unwrap();
-        assert!(matches!(editor.wiring, Wiring::Manual { .. }));
-        assert!(matches!(cli.wiring, Wiring::Unsupported { .. }));
+        assert!(matches!(editor.wiring, Wiring::Unsupported { .. }));
+        assert!(matches!(cli.wiring, Wiring::Hooks { .. }));
     }
 
     #[test]
@@ -540,10 +527,12 @@ mod tests {
         // side effect through this field: `Unsupported` short-circuits before
         // anything runs, so a registration written for one would be a file
         // written for a session that never happens.
-        for agent in AGENTS
-            .iter()
-            .filter(|a| matches!(a.wiring, Wiring::Unsupported { .. } | Wiring::Manual { .. }))
-        {
+        for agent in AGENTS.iter().filter(|a| {
+            matches!(
+                a.wiring,
+                Wiring::Unsupported { .. } | Wiring::Manual { .. } | Wiring::Hooks { .. }
+            )
+        }) {
             assert!(
                 agent.mcp.is_none(),
                 "{} is never launched, so it can carry no command-line offer",
@@ -604,10 +593,11 @@ mod tests {
         //
         // An `Unsupported` entry is exempt and has to be: it mounts nothing on
         // purpose, because the whole claim it makes is that no mount would
-        // help. It is refused before a proxy is started at all.
+        // help. It is refused before a proxy is started at all. A `Hooks`
+        // entry starts no proxy either.
         for agent in AGENTS
             .iter()
-            .filter(|a| !matches!(a.wiring, Wiring::Unsupported { .. }))
+            .filter(|a| !matches!(a.wiring, Wiring::Unsupported { .. } | Wiring::Hooks { .. }))
         {
             assert!(
                 !agent.providers.is_empty(),
@@ -639,7 +629,11 @@ mod tests {
         // The invariant is about entries that *claim* to route traffic.
         for agent in AGENTS {
             match agent.wiring {
-                Wiring::Manual { .. } | Wiring::Unsupported { .. } => continue,
+                // `Hooks` routes nothing through the proxy: the agent calls
+                // this binary from its own hook points.
+                Wiring::Manual { .. } | Wiring::Unsupported { .. } | Wiring::Hooks { .. } => {
+                    continue;
+                }
                 Wiring::Launch => assert!(
                     !agent.env.is_empty() || agent.config.is_some(),
                     "{} is wired to the proxy by nothing at all",

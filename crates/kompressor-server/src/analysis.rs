@@ -89,7 +89,7 @@ struct Plan {
 const MAX_SPAN_MS: i64 = 90 * 86_400_000;
 const DEFAULT_SPAN_MS: i64 = 86_400_000;
 const MODES: [&str; 5] = ["aggressive", "lossless", "recoverable", "off", "unrecorded"];
-const SURFACES: [&str; 4] = ["api", "mcp", "proxy", "cli"];
+const SURFACES: [&str; 5] = ["api", "mcp", "proxy", "cli", "hook"];
 
 /// Every rule the analysis routes apply to a query, with no I/O, so each can
 /// be tested on its own. `now` is the default end of the range.

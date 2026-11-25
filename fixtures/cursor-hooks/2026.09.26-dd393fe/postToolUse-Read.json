@@ -1,0 +1,20 @@
+{
+  "conversation_id": "00000000-0000-4000-8000-00000000c0de",
+  "session_id": "00000000-0000-4000-8000-00000000c0de",
+  "generation_id": "00000000-0000-4000-8000-0000000000a1",
+  "model": "default",
+  "hook_event_name": "postToolUse",
+  "cursor_version": "2026.09.26-dd393fe",
+  "workspace_roots": [
+    "/workspace/project"
+  ],
+  "transcript_path": "/workspace/.cursor-home/projects/workspace-project/agent-transcripts/x.jsonl",
+  "user_email": null,
+  "tool_name": "Read",
+  "tool_input": {
+    "file_path": "/workspace/project/README.md"
+  },
+  "tool_output": "{\"file_path\": \"/workspace/project/README.md\", \"content_length\": 276}",
+  "duration": 2.0,
+  "tool_use_id": "toolu_read_0001"
+}

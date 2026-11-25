@@ -36,6 +36,9 @@ pub struct Config {
     pub proxy: ProxyConfig,
     pub log: LogConfig,
     pub maintenance: MaintenanceConfig,
+    /// Hook mode: agents that call this binary from their own hook points
+    /// instead of sending traffic through the proxy. Cursor is the one.
+    pub hooks: HooksConfig,
     /// Environment overrides that named a value this build does not know, for
     /// the settings where carrying on regardless is not safe. Reported by
     /// [`Config::validate`]; never read from or written to a file.
@@ -1757,6 +1760,117 @@ impl Default for Upstream {
     }
 }
 
+/// Hook mode: `kompressor hook <agent>`, called by the agent itself with one
+/// JSON event per tool call. See docs/design/CURSOR.md.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HooksConfig {
+    pub cursor: CursorHooksConfig,
+}
+
+/// `[hooks.cursor]`: what `kompressor hook cursor` does with Cursor's events.
+///
+/// Read by every hook process, so a change here takes effect at the next tool
+/// call without touching a file Cursor owns.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CursorHooksConfig {
+    /// Master switch. Installed hooks answer `{}` when this is false.
+    pub enabled: bool,
+    /// Give up and answer `{}` after this long. Must stay below the `timeout`
+    /// the installer writes into `hooks.json` (5 s), so the handler stops
+    /// cleanly before Cursor kills it.
+    #[serde(with = "humantime_serde")]
+    pub deadline: Duration,
+    /// Record what every tool returned and what the engine would have
+    /// removed, without changing anything the model sees.
+    pub shadow: bool,
+    pub mcp: CursorMcpHooksConfig,
+    pub shell: CursorShellHooksConfig,
+}
+
+impl Default for CursorHooksConfig {
+    fn default() -> Self {
+        CursorHooksConfig {
+            enabled: true,
+            deadline: Duration::from_secs(2),
+            shadow: false,
+            mcp: CursorMcpHooksConfig::default(),
+            shell: CursorShellHooksConfig::default(),
+        }
+    }
+}
+
+/// `[hooks.cursor.mcp]`: MCP tool results, replaced through
+/// `updated_mcp_tool_output`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CursorMcpHooksConfig {
+    pub enabled: bool,
+    /// Tools whose results are forwarded untouched. Matched against the name
+    /// after `MCP:`; the hook is not told which server a tool belongs to.
+    pub skip_tools: Vec<String>,
+}
+
+impl Default for CursorMcpHooksConfig {
+    fn default() -> Self {
+        CursorMcpHooksConfig {
+            enabled: true,
+            skip_tools: Vec::new(),
+        }
+    }
+}
+
+/// `[hooks.cursor.shell]`: shell output, compressed by rewriting the command
+/// before it runs. Off by default until a measurement says otherwise.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CursorShellHooksConfig {
+    pub enabled: bool,
+    /// Rewrite only when the Cursor CLI's `approvalMode` is `unrestricted`
+    /// (run everything). Whether an allow-list still sees every executable
+    /// inside the rewritten form is not yet measured, so a rewrite is not
+    /// allowed to stand between a command and an approval decision until it
+    /// is.
+    pub only_when_unrestricted: bool,
+    /// Commands never rewritten, matched on the first word (two for `git`).
+    pub skip: Vec<String>,
+    /// Captured output above this is printed uncompressed rather than read
+    /// into memory. The engine is not streaming.
+    pub max_capture_bytes: u64,
+}
+
+impl Default for CursorShellHooksConfig {
+    fn default() -> Self {
+        CursorShellHooksConfig {
+            enabled: false,
+            only_when_unrestricted: true,
+            skip: [
+                "cd",
+                "pwd",
+                "echo",
+                "export",
+                "mkdir",
+                "touch",
+                "rm",
+                "mv",
+                "cp",
+                "chmod",
+                "which",
+                "git add",
+                "git commit",
+                "git checkout",
+                "git switch",
+                "git push",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            max_capture_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LogConfig {
@@ -1973,6 +2087,58 @@ impl Config {
         }
     }
 
+    /// `KOMPRESSOR__HOOKS__CURSOR__*`.
+    fn apply_hooks_field(&mut self, field: &str, value: &str) {
+        let Some(field) = field.strip_prefix("cursor__") else {
+            return;
+        };
+        let cursor = &mut self.hooks.cursor;
+        let list = |value: &str| -> Vec<String> {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(String::from)
+                .collect()
+        };
+        match field {
+            "enabled" => {
+                cursor.enabled = parse_bool_setting("hooks.cursor.enabled", value, cursor.enabled)
+            }
+            "shadow" => {
+                cursor.shadow = parse_bool_setting("hooks.cursor.shadow", value, cursor.shadow)
+            }
+            "deadline" => {
+                if let Some(d) = parse_duration(value) {
+                    cursor.deadline = d;
+                }
+            }
+            "mcp__enabled" => {
+                cursor.mcp.enabled =
+                    parse_bool_setting("hooks.cursor.mcp.enabled", value, cursor.mcp.enabled)
+            }
+            "mcp__skip_tools" => cursor.mcp.skip_tools = list(value),
+            "shell__enabled" => {
+                cursor.shell.enabled =
+                    parse_bool_setting("hooks.cursor.shell.enabled", value, cursor.shell.enabled)
+            }
+            "shell__only_when_unrestricted" => {
+                cursor.shell.only_when_unrestricted = parse_bool_setting(
+                    "hooks.cursor.shell.only_when_unrestricted",
+                    value,
+                    cursor.shell.only_when_unrestricted,
+                )
+            }
+            "shell__skip" => cursor.shell.skip = list(value),
+            "shell__max_capture_bytes" => {
+                if let Ok(bytes) = value.parse() {
+                    cursor.shell.max_capture_bytes = bytes;
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Every setting as one value, for telling whether something changed any.
     fn settings(&self) -> Option<String> {
         serde_json::to_string(self).ok()
@@ -2136,6 +2302,7 @@ impl Config {
             },
             "engine" => self.apply_engine_field(field, value),
             "proxy" => self.apply_proxy_field(field, value),
+            "hooks" => self.apply_hooks_field(field, value),
             _ => {}
         }
     }
@@ -2570,6 +2737,15 @@ impl Config {
         if self.proxy.matured_quiesce_turns == 0 || self.proxy.matured_max_hold_turns == 0 {
             return Err(ConfigError::Invalid(
                 "proxy.matured_quiesce_turns and proxy.matured_max_hold_turns must be at least 1"
+                    .into(),
+            ));
+        }
+        if self.hooks.cursor.deadline.is_zero()
+            || self.hooks.cursor.deadline >= Duration::from_secs(5)
+        {
+            return Err(ConfigError::Invalid(
+                "hooks.cursor.deadline must be greater than zero and below the 5 s timeout \
+                 `hook install cursor` writes into hooks.json"
                     .into(),
             ));
         }

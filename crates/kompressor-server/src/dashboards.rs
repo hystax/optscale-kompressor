@@ -87,10 +87,11 @@ pub(crate) enum View {
     Cohorts,
     Prefix,
     Advisor,
+    Cursor,
 }
 
 impl View {
-    pub(crate) const ALL: [View; 16] = [
+    pub(crate) const ALL: [View; 17] = [
         View::Health,
         View::Trends,
         View::Yield,
@@ -107,6 +108,7 @@ impl View {
         View::Cohorts,
         View::Prefix,
         View::Advisor,
+        View::Cursor,
     ];
 
     /// The page's path on the statistics listener.
@@ -128,6 +130,7 @@ impl View {
             View::Cohorts => "/cohorts",
             View::Prefix => "/prefix",
             View::Advisor => "/advisor",
+            View::Cursor => "/cursor",
         }
     }
 
@@ -150,6 +153,7 @@ impl View {
             View::Cohorts => "/stats/cohorts",
             View::Prefix => "/stats/prefix",
             View::Advisor => "/stats/advisor",
+            View::Cursor => "/stats/cursor",
         }
     }
 
@@ -171,6 +175,7 @@ impl View {
             View::Cohorts => "cohorts",
             View::Prefix => "prefix",
             View::Advisor => "advisor",
+            View::Cursor => "cursor",
         }
     }
 }
@@ -506,6 +511,12 @@ async fn respond(
             ] {
                 report.mark_enabled(setting, enabled);
             }
+            Ok(answer(format, view, now, window, report))
+        }
+        View::Cursor => {
+            let report: kompressor_stats::CursorReport = state
+                .with_stats(move |r| r.cursor(&tenant, from_ms, to_ms))
+                .await?;
             Ok(answer(format, view, now, window, report))
         }
         View::Prefix => {

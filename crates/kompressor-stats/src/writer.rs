@@ -324,7 +324,7 @@ impl StatsWriter {
                         &e.request_id,
                         e.time_ms,
                         e.model.as_deref(),
-                        Some(e.mode.as_str()),
+                        Some(if e.shadow { "off" } else { e.mode.as_str() }),
                         e.context.as_ref(),
                     )?;
                     insert_optimization(&tx, e)?;
@@ -439,8 +439,10 @@ fn insert_optimization(conn: &Connection, e: &OptimizationEvent) -> Result<(), S
             tokens_in, tokens_out, chars_in, chars_out,
             messages_total, messages_compressed, messages_skipped,
             refs_emitted, ref_bytes_emitted, content_types, protected_by_reason, engine_ms,
-            outcome, skipped_by_reason, frozen_messages, skipped_tokens_by_reason)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
+            outcome, skipped_by_reason, frozen_messages, skipped_tokens_by_reason,
+            tool, conversation)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,
+                 ?25,?26)",
     )?
     .execute(params![
         e.time_ms,
@@ -450,7 +452,7 @@ fn insert_optimization(conn: &Connection, e: &OptimizationEvent) -> Result<(), S
         e.api_family,
         e.model,
         e.provider,
-        e.mode.as_str(),
+        if e.shadow { "off" } else { e.mode.as_str() },
         i64::from(e.tokens_in),
         i64::from(e.tokens_out),
         // SQLite integers are signed 64-bit; a u64 character count that did not
@@ -469,6 +471,8 @@ fn insert_optimization(conn: &Connection, e: &OptimizationEvent) -> Result<(), S
         skipped,
         e.frozen_messages,
         skipped_tokens,
+        e.tool.as_deref(),
+        e.conversation.as_deref(),
     ])?;
     Ok(())
 }

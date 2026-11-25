@@ -85,6 +85,7 @@ the text says so.
 | **MCP server** | `kompressor serve --mcp` (streamable HTTP) or `kompressor mcp serve` (stdio) | tools `optscale_kompressor_retrieve`, `optscale_kompressor_compress`, `optscale_kompressor_compress_raw`, `optscale_kompressor_stats` | LLM gateways and agent runtimes |
 | **LLM proxy** | `kompressor serve --proxy` | transparent reverse proxy for OpenAI Chat Completions, OpenAI Responses, Anthropic Messages: compresses in-flight, injects and executes the retrieve tool, records real usage | any client, by changing `base_url` |
 | **Agent wrap** | `kompressor wrap AGENT` | starts the proxy, points a coding agent at it, runs it, and cleans up; sessions share one proxy | anyone who wants compression without configuring anything (§14.1) |
+| **Hook mode** | `kompressor hook cursor` (called by the agent), `hook emit`, `hook install / uninstall / status cursor`, `wrap cursor-agent` | answers an agent's own hook events with the engine and the fragment store: MCP results replaced through `updated_mcp_tool_output`, shell commands rewritten so their output is compressed before capture; no proxy runs | Cursor, desktop and CLI, whose traffic no proxy can read (§14.1a, docs/CURSOR.md) |
 
 `kompressor serve` with no flags runs all three surfaces on one listener (paths are disjoint); `--api/--mcp/--proxy` select subsets; separate `--listen` per surface is supported so the proxy can be exposed and the API kept internal.
 
@@ -2473,6 +2474,21 @@ access_key_id = ""
 secret_access_key = ""              # redacted wherever the configuration is shown
 path_style = true                   # endpoint/bucket/key rather than bucket.endpoint/key
 keep = 0                            # archives kept in the bucket; 0 = all
+
+[hooks.cursor]                      # hook mode for Cursor (§14.1a, docs/CURSOR.md)
+enabled = true                      # master switch: installed hooks answer {} when false
+deadline = "2s"                     # give up and change nothing; below the 5 s hooks.json timeout
+shadow = false                      # measure what would be removed; change nothing
+
+[hooks.cursor.mcp]
+enabled = true                      # compress MCP tool results (updated_mcp_tool_output)
+skip_tools = []                     # tool names (after `MCP:`) forwarded untouched
+
+[hooks.cursor.shell]
+enabled = false                     # rewrite shell commands so their output is compressed
+only_when_unrestricted = true       # only when the CLI's approvalMode is "unrestricted"
+skip = ["cd", "pwd", "echo", "export", "mkdir", "touch", "rm", "mv", "cp", "chmod", "which", "git add", "git commit", "git checkout", "git switch", "git push"]
+max_capture_bytes = 67108864        # larger captured output is printed uncompressed
 ```
 
 Durations are humantime strings (`2s`, `100ms`, `10m`); sizes are **plain byte
@@ -2567,89 +2583,87 @@ terminal it is shown in; standard output still carries the payload verbatim.
 #### Tools that cannot be wrapped, only instructed
 
 Three of the four ways to point a tool at the proxy are automatable: set a
-base-URL variable, edit a config file, or both. A GUI editor is the fourth, and
-it is not automatable at all. Cursor is not a child process of `wrap`, so it
-never sees the environment `wrap` exports; it has no config file this command
-owns; and there is no CLI to launch. The only wiring that exists is a text box
-in its settings.
+base-URL variable, edit a config file, or both. A GUI editor configured by
+hand is the fourth. `Wiring::Manual` is that case made explicit: the wrap
+starts or adopts the proxy, prints the URL and the settings page it goes in,
+and holds the proxy up until Ctrl-C. No catalogue entry uses it today; the
+path is kept for the next GUI tool that calls a local URL itself. The
+zero-traffic warning that closes every other wrap is suppressed for it: a
+manual session that routes nothing means the user had not finished pasting.
 
-`Wiring::Manual` is that case made explicit rather than faked. `kompressor wrap
-cursor` starts or adopts the proxy exactly as any other wrap does, prints the
-URL and the settings path, and holds the proxy up until Ctrl-C:
+#### 14.1a Cursor: hook mode, not the proxy
 
-```
-  Base URL:  http://127.0.0.1:8817/v1
-  API key:   your own provider key, as usual
+Cursor was the entry `Manual` was written for, and it did not work. The
+"Override OpenAI Base URL" setting is called **from Cursor's servers**, not
+from the editor — "all requests are routed through Cursor's servers for final
+prompt building", a bring-your-own key included — so `http://127.0.0.1:8817/v1`
+is never reachable, which is why no request ever arrived that way
+(design/CURSOR.md §11.2). The `cursor` entry is now `Wiring::Unsupported`: it
+starts nothing, prints no loopback URL, and points at `kompressor hook install
+cursor`.
 
-  In Cursor:
-      Settings → Models → OpenAI API Key → Override OpenAI Base URL
-```
-
-`Endpoint::V1` because Cursor is an OpenAI-style client: it appends
-`/chat/completions` to whatever it is given, so a root URL would produce a bare
-`/messages` at the upstream. Its **Verify** button probes the endpoint before it
-will accept the override, and that probe is a path the proxy does not compress —
-measured: `/v1/models` and `/v1/chat/completions` both relay to the upstream and
-return its `401` for a missing key, rather than the proxy's own `404`, so
-verification behaves exactly as it would without the proxy in the path.
-
-The precondition is printed **before** the URL, not after it. Tested against a
-live editor on 2026-09-25 the other way round: the reader pastes the URL, sends
-a prompt, and nothing arrives — the proxy recorded zero requests while probes
-sent to it in the same minute were logged normally. The screenshot explained it:
-the API-key field was empty and the override toggle was off, so the override was
-never consulted. An instruction whose precondition arrives too late to act on is
-an instruction that wastes the reader's time.
-
-**The subscription path cannot be compressed, and that is most of Cursor's
-users.** On a Cursor plan every request goes to Cursor's own servers over the
-same protobuf Connect API `cursor-agent` uses (below) — this proxy never sees
-it, and could not read it if it did. The override exists only for a
-bring-your-own OpenAI key.
-
-**This path is documented but unverified end to end.** What has been measured is
-that the endpoint is reachable — `/v1/models` and `/v1/chat/completions` relay
-to the upstream and return its `401` rather than the proxy's `404`, so Cursor's
-**Verify** button has something to talk to. That the editor then sends
-OpenAI-shaped chat completions through it is taken from Cursor's documented
-bring-your-own-key behaviour, not from traffic anyone has watched arrive here.
-No Cursor request has ever reached this proxy.
-
-One more limit is printed with the instructions:
-**Cursor cannot send custom headers**, so a session is attributed to no
-project and no tenant beyond the anonymous default. headroom works around this
-  by encoding the project as a `/p/<name>` prefix on the base URL and stripping
-  it in the proxy; OptScale Kompressor does not, so savings land in one bucket.
-
-**The Cursor Agent CLI is a different product and cannot be compressed.**
-`cursor-agent` looks like the obvious thing to wrap — it is a CLI, it takes
-`--endpoint`, and it reads `CURSOR_API_ENDPOINT`. Pointed at a recording server,
-version 2026.09.23-86fc751 turns out to speak **Connect RPC carrying protobuf**:
+`cursor-agent`, pointed at a recording server (2026.09.23-86fc751), speaks
+**Connect RPC carrying protobuf** to Cursor's backend, and the prompt is
+assembled server-side:
 
 ```
 POST /aiserver.v1.ServerConfigService/GetServerConfig
   content-type: application/proto
   connect-protocol-version: 1
-  user-agent: connect-es/1.6.1
 ```
 
-There is no JSON message array for a wire walker to find and no OpenAI or
-Anthropic shape to route, so the engine has nothing to read. Pointed at the
-proxy for real, every path 404s and the agent stops with `Error: [unimplemented]`.
+There is no message array for a wire walker and no OpenAI or Anthropic shape
+to route; pointed at the proxy every path 404s. That finding stands, and it is
+why Cursor is served by a fourth integration style beside proxy, intercept and
+MCP fronting: **hook mode** (design/CURSOR.md). Cursor runs a command with
+each tool result, as JSON on standard input, before the model sees it, and two
+of its replies change what the model receives:
 
-The catalogue carries it as `Wiring::Unsupported` rather than leaving it out.
-Omitting it is worse: `wrap` would answer "unknown agent" and recommend
-`--env NAME=root|v1`, which for this tool sets a variable that either does
-nothing or routes it into a proxy that cannot answer — the silent failure this
-catalogue exists to prevent, reached by the helpful road. The entry is refused
-before a proxy is started or a config file is touched, and the refusal says why
-and points at `kompressor wrap cursor`, which is the path that does work.
+| Tool output | Hook | Reply |
+|---|---|---|
+| MCP results | `postToolUse` | `updated_mcp_tool_output`, the compressed text |
+| Shell output | `preToolUse` | `updated_input.command`: `{ C } > F 2>&1; kompressor hook emit --status "$?" F` |
 
-The zero-traffic warning that closes every other wrap (§14.1) is suppressed for
-manual wiring. That message reads "the agent used a different base URL than the
-one set above (most likely: it ignores that variable)", and for a tool that was
-never launched and whose environment was never set, every clause of it is false.
-A manual session that routes nothing means the user had not finished pasting.
+`kompressor hook cursor` answers them (`crates/kompressor-cli/src/hook/`): it
+always exits 0 and always prints one JSON object, `{}` on any failure, because
+on `preToolUse` an invalid reply blocks the tool call. It never returns
+`permission`. A result is compressed once, as it enters a conversation the
+server holds, so there is no prefix to keep stable and no cache to break.
+
+`cursor-agent` is `Wiring::Hooks { flag: "--plugin-dir" }`. The launch path
+branches before a port is resolved: no proxy, no upstream, no client marker.
+It writes a plugin directory under `$KOMPRESSOR_HOME/run/cursor-plugin-<pid>/`
+— `hooks/hooks.json`, `mcp.json` naming `kompressor mcp serve`, and a
+configuration with `refs.path` and `stats.path` pinned absolute — runs
+`cursor-agent --plugin-dir <dir> <args>`, and removes the directory on exit,
+which is the property `--mcp-config` buys for Claude Code. When hooks are
+already installed in `~/.cursor`, it passes no plugin and says why, since the
+CLI reads those too.
+
+The editor is not launched by `wrap`, so `kompressor hook install cursor`
+writes four entries to `~/.cursor/hooks.json` and one server to
+`~/.cursor/mcp.json`, recording in `$KOMPRESSOR_HOME/installed/cursor.json`
+the bytes each file held before and after. `uninstall` restores an untouched
+file byte for byte and otherwise removes exactly its own entries, leaving and
+naming any the user edited. `install` refuses to stack on another tool's
+`preToolUse` hook on `Shell` (RTK, lean-ctx) without `--force`: with "the last
+reply wins" two rewriters overwrite each other.
+
+Statistics: hook rows carry `surface = 'hook'` (schema v20, which rebuilds
+`optimization_events` to widen its CHECK), `provider = 'cursor'`, `tool`,
+`conversation`, and `request_id` = Cursor's `generation_id`. Shadow mode
+(`[hooks.cursor] shadow`) files `mode = 'off'` rows with the would-be
+`tokens_out`. No `proxy_requests` row is written per tool call; the desktop's
+`stop` event, which reports the turn's token usage, is filed as one with
+`api_family = 'cursor'`. What is reported is gross removal at entry, never
+money. `kompressor stats by-tool` and the dashboard's Cursor page read them.
+
+What it cannot reach: built-in Read, Grep, List and Fetch output (no hook can
+change it); MCP results over Cursor's ~40 KB spill threshold (the hook is
+handed an empty string — front those servers); keep-warm and every
+prefix-cache feature. Shell rewriting is off by default and, until it is
+measured that Cursor's allow-list still sees executables inside the brace
+group, rewrites only under `approvalMode: unrestricted`.
 
 **A wrapped agent that pins its whole prompt compresses nothing.** Claude Code
 puts a `cache_control` breakpoint on its final message, so every wrapped session
@@ -3958,6 +3972,43 @@ CREATE INDEX elisions_request ON elisions (tenant, request_id);
 -- v19: the arm of `proxy.output_shaping` a request's conversation was in,
 -- `treated` or `holdout`; NULL outside the experiment and on older rows.
 ALTER TABLE proxy_requests ADD COLUMN output_shaping TEXT;
+-- v20: hook mode (§14.1a). `surface` admits 'hook', and `tool` and
+-- `conversation` say which agent tool and conversation a result came from.
+-- SQLite cannot alter a CHECK, so the table is rebuilt with every row and id
+-- kept; the ladder turns foreign_keys off around it and checks the keys
+-- before it commits.
+PRAGMA legacy_alter_table=ON;
+CREATE TABLE optimization_events_v20 (
+  id INTEGER PRIMARY KEY, time_ms INTEGER NOT NULL, tenant TEXT NOT NULL, request_id TEXT NOT NULL,
+  surface TEXT NOT NULL CHECK (surface IN ('api','mcp','proxy','cli','hook')),
+  api_family TEXT, model TEXT, provider TEXT,
+  mode TEXT NOT NULL CHECK (mode IN ('aggressive','lossless','recoverable','off')),
+  tokens_in INTEGER NOT NULL, tokens_out INTEGER NOT NULL, chars_in INTEGER NOT NULL, chars_out INTEGER NOT NULL,
+  messages_total INTEGER NOT NULL, messages_compressed INTEGER NOT NULL, messages_skipped INTEGER NOT NULL,
+  refs_emitted INTEGER NOT NULL, ref_bytes_emitted INTEGER NOT NULL,
+  content_types TEXT NOT NULL CHECK (json_valid(content_types)),
+  protected_by_reason TEXT NOT NULL CHECK (json_valid(protected_by_reason)),
+  engine_ms REAL NOT NULL, outcome TEXT, skipped_by_reason TEXT, frozen_messages INTEGER,
+  skipped_tokens_by_reason TEXT, rolled_up INTEGER NOT NULL DEFAULT 0,
+  analysis_archived INTEGER NOT NULL DEFAULT 0, tool TEXT, conversation TEXT);
+INSERT INTO optimization_events_v20 (
+  id, time_ms, tenant, request_id, surface, api_family, model, provider, mode,
+  tokens_in, tokens_out, chars_in, chars_out, messages_total, messages_compressed, messages_skipped,
+  refs_emitted, ref_bytes_emitted, content_types, protected_by_reason, engine_ms, outcome,
+  skipped_by_reason, frozen_messages, skipped_tokens_by_reason, rolled_up, analysis_archived)
+SELECT
+  id, time_ms, tenant, request_id, surface, api_family, model, provider, mode,
+  tokens_in, tokens_out, chars_in, chars_out, messages_total, messages_compressed, messages_skipped,
+  refs_emitted, ref_bytes_emitted, content_types, protected_by_reason, engine_ms, outcome,
+  skipped_by_reason, frozen_messages, skipped_tokens_by_reason, rolled_up, analysis_archived
+FROM optimization_events;
+DROP TABLE optimization_events;
+ALTER TABLE optimization_events_v20 RENAME TO optimization_events;
+PRAGMA legacy_alter_table=OFF;
+CREATE INDEX IF NOT EXISTS oe_tenant_time ON optimization_events (tenant, time_ms);
+CREATE INDEX IF NOT EXISTS oe_request ON optimization_events (request_id);
+CREATE INDEX IF NOT EXISTS oe_outcome ON optimization_events (tenant, outcome);
+CREATE INDEX IF NOT EXISTS oe_tool ON optimization_events (provider, tool);
 ```
 
 ## C. Configuration reference — flat environment mapping

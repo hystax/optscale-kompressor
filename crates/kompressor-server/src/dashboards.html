@@ -146,6 +146,7 @@ const VIEWS = [
   { id: "cohorts", title: "Conversation cohorts", api: "stats/cohorts" },
   { id: "prefix", title: "Prefix drift", api: "stats/prefix" },
   { id: "advisor", title: "Opt-in advisor", api: "stats/advisor" },
+  { id: "cursor", title: "Cursor", api: "stats/cursor" },
 ];
 const view = VIEWS.find(v => v.id === SETTINGS.view) || VIEWS[0];
 const $ = id => document.getElementById(id);
@@ -772,6 +773,47 @@ RENDER.advisor = d => {
       ["Reasoning elided", bytes(e.reasoning_elided_bytes), "over the window"],
     ]),
       note("All zero while everything is off. Compare with the ceilings above once a setting has been on for a while. The detail behind every row is on the Prefix drift page.")),
+  ];
+};
+
+RENDER.cursor = d => {
+  const sum = (rows, k) => rows.reduce((a, r) => a + (r[k] || 0), 0);
+  const tools = d.tools || [];
+  const conversations = d.conversations || [];
+  if (!tools.length && !conversations.length) {
+    return [note("No Cursor hook-mode results in this window. Install the hooks with `kompressor hook install cursor` (add --shadow to measure first), or run a console session with `kompressor wrap cursor-agent`; `kompressor hook status cursor` says whether Cursor is calling them.")];
+  }
+  return [
+    tiles([
+      ["Tool results seen", n(sum(tools, "results")), n(sum(tools, "conversations")) + " conversations"],
+      ["Compressed", n(sum(tools, "compressed_results")), "results the model received smaller"],
+      ["Tokens removed", tok(sum(tools, "tokens_removed")), "estimated, at entry"],
+      ["Shadow would remove", tok(sum(tools, "shadow_would_remove")), "measured, nothing changed"],
+      ["Kept inline", n(sum(tools, "kept_inline")), "over 40 KB, so Cursor would have written them to a file; no tokens claimed"],
+      ["Spilled MCP results", n(sum(tools, "spilled")), "Cursor wrote them to a file; front those servers", sum(tools, "spilled") ? "warn" : ""],
+    ]),
+    section("By tool", table([
+      ["Tool", r => r.tool, { text: true }],
+      ["Results", r => n(r.results)],
+      ["Compressed", r => n(r.compressed_results)],
+      ["Tokens in", r => tok(r.tokens_in)],
+      ["Removed", r => tok(r.tokens_removed)],
+      ["Shadow would remove", r => tok(r.shadow_would_remove)],
+      ["Kept inline", r => n(r.kept_inline)],
+      ["Spilled", r => n(r.spilled)],
+    ], tools, { empty: "No tool results in this window." }),
+      note("Gross removal at entry, not money: a removed token is paid for once per later turn, at a price Cursor sets and a hook cannot see. Only what would have been inline is counted: a result over 40 KB would have been written to a file, so it claims no tokens and is counted under Kept inline. Read, Grep and Fetch are sized but cannot be compressed by any hook.")),
+    section("Usage per conversation (desktop)", table([
+      ["Conversation", r => el("code", {}, r.conversation.slice(0, 12)), { text: true }],
+      ["Model", r => r.model || "–", { text: true }],
+      ["Turns", r => n(r.turns)],
+      ["Input", r => tok(r.input_tokens)],
+      ["Cache read", r => tok(r.cache_read_tokens)],
+      ["Cache write", r => tok(r.cache_write_tokens)],
+      ["Output", r => tok(r.output_tokens)],
+      ["Last", r => ago(r.last_ms), { text: true }],
+    ], conversations, { empty: "No stop events: the CLI does not fire them under --print." }),
+      note("As Cursor's desktop reports each turn to its stop hook. Not a bill; the honest saving is an on/off comparison of these figures, or of Cursor's own usage export.")),
   ];
 };
 

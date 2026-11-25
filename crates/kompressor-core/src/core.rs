@@ -103,6 +103,33 @@ pub struct RequestInfo<'a> {
     pub provider: Option<&'a str>,
 }
 
+/// Who a hook-mode result belongs to, beyond what [`RequestInfo`] carries.
+///
+/// A hook is handed one tool result at a time with no message array around
+/// it, so the tool and the agent's own conversation id are the only way to
+/// group its rows afterwards. Every other surface passes the default.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Attribution<'a> {
+    /// The agent's tool name: `Shell`, `MCP:<tool>`, `Read`.
+    pub tool: Option<&'a str>,
+    /// The agent's conversation id.
+    pub conversation: Option<&'a str>,
+    /// Measure only: retain nothing, and file the row as `mode = 'off'` so
+    /// the would-be removal is never read as a saving.
+    pub shadow: bool,
+    /// The most the agent would have put in front of the model without us.
+    ///
+    /// Cursor writes any tool result over 40,000 bytes to a file and hands
+    /// the model a reference instead, so for such a result the uncompressed
+    /// baseline was not the output: it was nothing inline. Counting the whole
+    /// output as removed claimed ~78k tokens for a `seq 1 20000` the model
+    /// would never have received (measured on the real CLI, 2026-11-25). For
+    /// a payload over this limit the row's `tokens_in` is set to its
+    /// `tokens_out` — no removal is claimed — while `chars_in` keeps the real
+    /// size, which is how a report tells such a result apart.
+    pub inline_limit_bytes: Option<usize>,
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -460,6 +487,31 @@ impl AppCore {
         options: &EngineOptions,
         surface: Surface,
     ) -> (String, CompressOutcome) {
+        self.compress_raw_attributed(
+            identity,
+            content,
+            forced,
+            request,
+            options,
+            surface,
+            &Attribution::default(),
+        )
+    }
+
+    /// [`compress_raw`](Self::compress_raw), with the row attributed to an
+    /// agent tool and conversation, or — with `attribution.shadow` — a dry
+    /// run that retains nothing and returns the input unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compress_raw_attributed(
+        &self,
+        identity: &Identity,
+        content: &str,
+        forced: Option<ForcedType>,
+        request: &RequestInfo<'_>,
+        options: &EngineOptions,
+        surface: Surface,
+        attribution: &Attribution<'_>,
+    ) -> (String, CompressOutcome) {
         let started = Instant::now();
         let time_ms = now_ms();
         let mut refs = options.collector();
@@ -507,12 +559,46 @@ impl AppCore {
             }
         }
 
+        if let Some(limit) = attribution.inline_limit_bytes
+            && content.len() > limit
+        {
+            stats.tokens_in = stats.tokens_out;
+            stats.ratio = 1.0;
+        }
         note_oversized_refusals(&mut stats, &refs, request.request_id);
+        if attribution.shadow {
+            // Nothing is retained, so nothing is published: the row says what
+            // the engine would have removed, and the caller gets its input.
+            self.record_compression_attributed(
+                identity,
+                &stats,
+                request,
+                surface,
+                time_ms,
+                engine_ms,
+                attribution,
+            );
+            return (
+                content.to_string(),
+                CompressOutcome {
+                    stats,
+                    mode: options.mode,
+                },
+            );
+        }
         let retained = self.retain_fragments(identity, &refs, request.request_id, options);
         if !retained && options.mode == Mode::Recoverable {
             discard_compression_stats(&mut stats);
         }
-        self.record_compression(identity, &stats, request, surface, time_ms, engine_ms);
+        self.record_compression_attributed(
+            identity,
+            &stats,
+            request,
+            surface,
+            time_ms,
+            engine_ms,
+            attribution,
+        );
 
         let out = if !retained && options.mode == Mode::Recoverable {
             content.to_string()
@@ -742,6 +828,28 @@ impl AppCore {
         time_ms: i64,
         engine_ms: f64,
     ) {
+        self.record_compression_attributed(
+            identity,
+            stats,
+            request,
+            surface,
+            time_ms,
+            engine_ms,
+            &Attribution::default(),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_compression_attributed(
+        &self,
+        identity: &Identity,
+        stats: &CompressStats,
+        request: &RequestInfo<'_>,
+        surface: Surface,
+        time_ms: i64,
+        engine_ms: f64,
+        attribution: &Attribution<'_>,
+    ) {
         if !self.stats.is_enabled() {
             return;
         }
@@ -782,6 +890,9 @@ impl AppCore {
             );
         }
         event.outcome = Some(outcome.as_str().to_string());
+        event.tool = attribution.tool.map(str::to_string);
+        event.conversation = attribution.conversation.map(str::to_string);
+        event.shadow = attribution.shadow;
         self.stats.send(Event::Optimization(event));
 
         if !stats.protected_refs.is_empty() {

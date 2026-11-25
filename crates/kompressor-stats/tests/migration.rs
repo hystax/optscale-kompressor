@@ -505,3 +505,116 @@ fn a_v15_database_gains_the_backup_record_and_keeps_its_rows() {
     assert!(kompressor_stats::writer::record_backup(&path, &event(T0 + 3 * DAY, true)).unwrap());
     assert_eq!(reader.last_backup().unwrap(), (Some(T0 + 3 * DAY), None));
 }
+
+/// v20 rebuilds `optimization_events` to admit `surface = 'hook'`. A rebuild
+/// is the one kind of migration that can lose rows or re-number them, and
+/// `proxy_requests.compression_event_id` points at those numbers.
+#[test]
+fn the_hook_surface_rebuild_keeps_every_row_its_id_and_the_views() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stats.db");
+    database_at(&path, 19);
+    {
+        let conn = Connection::open(&path).unwrap();
+        for (i, surface) in ["api", "mcp", "proxy", "cli"].iter().enumerate() {
+            conn.execute(
+                "INSERT INTO optimization_events
+                   (id, time_ms, tenant, request_id, surface, mode, tokens_in, tokens_out,
+                    chars_in, chars_out, messages_total, messages_compressed,
+                    messages_skipped, refs_emitted, ref_bytes_emitted, content_types,
+                    protected_by_reason, engine_ms, outcome)
+                 VALUES (?1, ?2, 'acme', ?3, ?4, 'recoverable', 1000, 400, 4000, 1600,
+                         3, 1, 2, 1, 2400, '{\"log\":1}', '{}', 1.5, 'compressed')",
+                rusqlite::params![100 + i as i64, T0 + i as i64, format!("req-{i}"), surface],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO proxy_requests (time_ms, tenant, request_id, api_family, upstream,
+               stream, compression_event_id) VALUES (?1, 'acme', 'req-2', 'anthropic', 'u', 0, 102)",
+            [T0],
+        )
+        .unwrap();
+        // A hook row cannot exist before the rebuild.
+        assert!(
+            conn.execute(
+                "UPDATE optimization_events SET surface = 'hook' WHERE id = 100",
+                []
+            )
+            .is_err()
+        );
+    }
+
+    let writer = StatsWriter::open(&StatsConfig::at(&path)).expect("opens and migrates");
+    let conn = writer.connection();
+    assert_eq!(
+        count(conn, "PRAGMA user_version"),
+        i64::from(schema::latest_version())
+    );
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM optimization_events"), 4);
+    let surfaces: Vec<(i64, String)> = conn
+        .prepare("SELECT id, surface FROM optimization_events ORDER BY id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        surfaces,
+        vec![
+            (100, "api".to_string()),
+            (101, "mcp".to_string()),
+            (102, "proxy".to_string()),
+            (103, "cli".to_string())
+        ],
+        "every row keeps its id and its surface"
+    );
+    assert_eq!(
+        count(
+            conn,
+            "SELECT COUNT(*) FROM proxy_requests p JOIN optimization_events o
+               ON o.id = p.compression_event_id WHERE o.request_id = 'req-2'"
+        ),
+        1,
+        "the foreign key still names the same row"
+    );
+    conn.execute(
+        "INSERT INTO optimization_events
+           (time_ms, tenant, request_id, surface, mode, tokens_in, tokens_out,
+            chars_in, chars_out, messages_total, messages_compressed,
+            messages_skipped, refs_emitted, ref_bytes_emitted, content_types,
+            protected_by_reason, engine_ms, tool, conversation)
+         VALUES (?1, 'acme', 'gen-1', 'hook', 'off', 100, 40, 400, 160, 1, 0, 1, 0, 0,
+                 '{}', '{}', 0.5, 'Shell', 'conv-1')",
+        [T0],
+    )
+    .expect("a hook row is accepted after the rebuild");
+    for view in [
+        "v_type_coverage",
+        "v_outcomes",
+        "v_daily_savings",
+        "v_request_economy",
+        "v_skip_reasons",
+    ] {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {view}"), [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap_or_else(|e| panic!("{view} no longer resolves after the rebuild: {e}"));
+    }
+    let ok: String = conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(ok, "ok");
+    for index in ["oe_tenant_time", "oe_request", "oe_outcome", "oe_tool"] {
+        assert_eq!(
+            count(
+                conn,
+                &format!(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='{index}'"
+                )
+            ),
+            1,
+            "{index} is made again"
+        );
+    }
+}

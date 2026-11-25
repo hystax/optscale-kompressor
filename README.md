@@ -410,10 +410,24 @@ kompressor wrap aider -- --model sonnet    # your own arguments go after --
 kompressor wrap --env NAME=root|v1 -- your-agent
 ```
 
-`wrap` knows `codex`, `claude`, `opencode`, `aider`, `cursor` (prints the base URL
-to set in Cursor's settings; only applies when Cursor uses your own OpenAI key) and
-`cursor-agent` (refused with an explanation: it speaks Connect RPC over protobuf,
-which the proxy cannot read).
+`wrap` knows `codex`, `claude`, `opencode`, `aider` and `cursor-agent`.
+
+### Cursor
+
+Cursor's traffic is protobuf to its own servers, which no proxy can read, so it
+is compressed through Cursor's own hooks instead — no proxy runs:
+
+```bash
+kompressor wrap cursor-agent -- -p "fix the failing test"   # one console session
+kompressor hook install cursor --shadow                      # editor and CLI: measure first
+kompressor hook install cursor                               # then compress MCP results
+kompressor hook status cursor
+```
+
+MCP tool results are compressed; shell output is opt-in; built-in Read and Grep
+output cannot be. How much this saves on Cursor has not been measured yet —
+Cursor already keeps any tool result over ~40 KB out of the conversation, and
+shadow mode is how to find out on your own work. [docs/CURSOR.md](docs/CURSOR.md).
 
 <a id="quick-start-claude-code"></a>
 ### Claude Code

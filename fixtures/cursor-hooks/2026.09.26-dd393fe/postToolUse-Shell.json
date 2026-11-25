@@ -1,0 +1,22 @@
+{
+  "conversation_id": "00000000-0000-4000-8000-00000000c0de",
+  "session_id": "00000000-0000-4000-8000-00000000c0de",
+  "generation_id": "00000000-0000-4000-8000-0000000000a1",
+  "model": "default",
+  "hook_event_name": "postToolUse",
+  "cursor_version": "2026.09.26-dd393fe",
+  "workspace_roots": [
+    "/workspace/project"
+  ],
+  "transcript_path": "/workspace/.cursor-home/projects/workspace-project/agent-transcripts/x.jsonl",
+  "user_email": null,
+  "tool_name": "Shell",
+  "tool_input": {
+    "command": "seq 1 30",
+    "cwd": "",
+    "timeout": 30000
+  },
+  "tool_output": "{\"output\": \"1\\n2\\n3\\n4\\n5\\n6\\n7\\n8\\n9\\n10\\n11\\n12\\n13\\n14\\n15\\n16\\n17\\n18\\n19\\n20\\n21\\n22\\n23\\n24\\n25\\n26\\n27\\n28\\n29\\n30\\n\", \"exitCode\": 0}",
+  "duration": 915.327,
+  "tool_use_id": "toolu_shell_0001"
+}

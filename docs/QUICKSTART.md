@@ -65,8 +65,8 @@ Which agents are known:
 ```console
 $ kompressor wrap --list
 Agents kompressor wrap knows:
-  cursor-agent  Cursor Agent CLI — cannot be compressed (see below)
-  cursor        Cursor (GUI editor; base URL set by hand in Settings)
+  cursor-agent  Cursor Agent CLI — hook mode: tool output compressed by Cursor's own hooks, no proxy
+  cursor        Cursor (editor) — use `kompressor hook install cursor`; a base-URL override cannot reach a local proxy
   claude        Claude Code (Anthropic Messages)
   codex         OpenAI Codex CLI (OpenAI Responses), via a -c flag or its config file
   opencode      opencode CLI/TUI and Desktop (openai, anthropic, OpenCode Zen and Go), via its config

@@ -1,0 +1,20 @@
+{
+  "conversation_id": "00000000-0000-4000-8000-00000000c0de",
+  "session_id": "00000000-0000-4000-8000-00000000c0de",
+  "generation_id": "00000000-0000-4000-8000-0000000000a1",
+  "model": "grok-4.7",
+  "hook_event_name": "stop",
+  "cursor_version": "2026.09.26-dd393fe",
+  "workspace_roots": [
+    "/workspace/project"
+  ],
+  "transcript_path": "/workspace/.cursor-home/projects/workspace-project/agent-transcripts/x.jsonl",
+  "user_email": null,
+  "status": "completed",
+  "loop_count": 0,
+  "model_id": "grok-4.7",
+  "input_tokens": 103689,
+  "output_tokens": 3086,
+  "cache_read_tokens": 91776,
+  "cache_write_tokens": 0
+}

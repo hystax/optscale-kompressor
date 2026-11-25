@@ -33,6 +33,10 @@ pub enum Surface {
     Proxy,
     /// The command-line client.
     Cli,
+    /// An agent's own hook calling this binary once per event
+    /// (`kompressor hook cursor`). Stored from schema v20; see
+    /// docs/design/CURSOR.md.
+    Hook,
 }
 
 impl Surface {
@@ -44,6 +48,7 @@ impl Surface {
             Surface::Mcp => "mcp",
             Surface::Proxy => "proxy",
             Surface::Cli => "cli",
+            Surface::Hook => "hook",
         }
     }
 
@@ -54,6 +59,7 @@ impl Surface {
             "mcp" => Some(Surface::Mcp),
             "proxy" => Some(Surface::Proxy),
             "cli" => Some(Surface::Cli),
+            "hook" => Some(Surface::Hook),
             _ => None,
         }
     }
@@ -133,6 +139,20 @@ pub struct OptimizationEvent {
     /// the view reports those as `unrecorded` rather than folding them into a
     /// real outcome.
     pub outcome: Option<String>,
+    /// The agent tool whose output this was (`Shell`, `MCP:<tool>`, `Read`),
+    /// for a hook-mode event. `None` everywhere else. Schema v20.
+    #[serde(default)]
+    pub tool: Option<String>,
+    /// The agent's own conversation id, for a hook-mode event: what joins the
+    /// results of one session when there is no message array to fingerprint.
+    /// Schema v20.
+    #[serde(default)]
+    pub conversation: Option<String>,
+    /// A measurement of what *would* have been removed, with nothing changed:
+    /// hook mode's shadow rows. Stored as `mode = 'off'`, so the would-be
+    /// `tokens_out` never reads as a saving.
+    #[serde(default)]
+    pub shadow: bool,
 }
 
 impl OptimizationEvent {
@@ -174,6 +194,9 @@ impl OptimizationEvent {
             frozen_messages: 0,
             engine_ms: 0.0,
             outcome: None,
+            tool: None,
+            conversation: None,
+            shadow: false,
         }
     }
 

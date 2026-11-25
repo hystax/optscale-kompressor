@@ -23,6 +23,8 @@ pub enum Report {
     },
     ByType,
     ByProvider,
+    /// Hook mode, per agent tool: docs/CURSOR.md.
+    ByTool,
     Retrievals,
     Request {
         id: String,
@@ -474,6 +476,52 @@ pub fn stats(args: StatsArgs) -> CliResult {
                         row.share * 100.0
                     );
                 }
+            }
+        }
+        Report::ByTool => {
+            let rows = source
+                .only_local("by-tool")?
+                .by_tool(from, to)
+                .map_err(|e| CliError::runtime("reading hook-mode results", e))?;
+            if args.json {
+                print_json(&rows)?;
+            } else if rows.is_empty() {
+                println!(
+                    "no hook-mode results in this window. Cursor's hooks write here once \
+                     installed: `kompressor hook install cursor`"
+                );
+            } else {
+                println!(
+                    "{:<24}  {:>8}  {:>10}  {:>12}  {:>10}  {:>12}  {:>11}  {:>7}",
+                    "tool",
+                    "results",
+                    "compressed",
+                    "tokens in",
+                    "removed",
+                    "shadow would",
+                    "kept inline",
+                    "spilled"
+                );
+                for row in &rows {
+                    println!(
+                        "{:<24}  {:>8}  {:>10}  {:>12}  {:>10}  {:>12}  {:>11}  {:>7}",
+                        row.tool,
+                        row.results,
+                        row.compressed_results,
+                        row.tokens_in,
+                        row.tokens_removed,
+                        row.shadow_would_remove,
+                        row.kept_inline,
+                        row.spilled
+                    );
+                }
+                println!(
+                    "\nEstimated tokens removed at entry, not a bill: a removed token is paid \
+                     for once per later turn at a price Cursor sets. Only what would have been \
+                     inline without compression is counted: Cursor writes a result over 40 KB \
+                     to a file, so those claim no tokens and are counted under `kept inline` \
+                     instead — results the model read directly rather than opening a file."
+                );
             }
         }
         Report::ByProvider => {

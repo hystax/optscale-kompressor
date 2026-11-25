@@ -49,6 +49,7 @@ macro_rules! say {
 
 pub mod agents;
 pub mod configfile;
+pub mod hooks;
 pub mod mcp;
 pub mod opencode;
 pub mod paths;
@@ -208,6 +209,22 @@ pub fn wrap(args: WrapArgs) -> CliResult {
         config.engine.mode = mode
             .parse()
             .map_err(|_| CliError::Usage(format!("unknown mode {mode:?}")))?;
+    }
+
+    // An agent handed hooks needs no proxy, no port and no upstream: the
+    // branch leaves before any of them is resolved.
+    if let Some(agent) = agent
+        && let agents::Wiring::Hooks { flag } = agent.wiring
+    {
+        if args.attach || args.print || args.no_proxy || args.port.is_some() || !args.env.is_empty()
+        {
+            return Err(CliError::Usage(format!(
+                "{} runs no proxy, so --attach, --print, --no-proxy, --port and --env do not \
+                 apply. For the Cursor editor, use `kompressor hook install cursor`.",
+                agent.name
+            )));
+        }
+        return hooks::run(agent, flag, &args.args, config);
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

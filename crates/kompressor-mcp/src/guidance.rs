@@ -72,9 +72,36 @@ conversation, optscale_kompressor_compress_raw for a single payload, \
 optscale_kompressor_stats for what this \
 tenant's compression has cost and saved.";
 
+/// What an agent's session-start hook hands the model, for an agent whose
+/// tool results are compressed by a hook rather than by the proxy.
+///
+/// The same contract as [`SERVER_INSTRUCTIONS`] — a runtime that connects the
+/// tool server shows the model both, and they must not disagree — plus the
+/// one line that matters only here: a shell command that resolves a handle
+/// when the tool server is disabled, unapproved or over the agent's tool
+/// limit. `retrieve_command` is that command up to the handle, with the
+/// binary's absolute path and the configuration it must read.
+pub fn session_guidance(retrieve_command: &str) -> String {
+    let handle = "k_\u{2026}";
+    format!(
+        "{SERVER_INSTRUCTIONS}\n\nIf optscale_kompressor_retrieve is not available in this \
+         session, run this in the shell instead, with the handle in place of {handle}:\n\n  \
+         {retrieve_command} {handle}\n\nIt accepts --lines START:END, --grep PATTERN and \
+         --pointer /json/pointer to narrow what comes back."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_session_guidance_carries_the_contract_and_the_shell_fallback() {
+        let text = session_guidance("'/usr/bin/kompressor' retrieve --config '/c.toml'");
+        assert!(text.starts_with(SERVER_INSTRUCTIONS));
+        assert!(text.contains("'/usr/bin/kompressor' retrieve --config '/c.toml' k_"));
+        assert!(text.contains("--lines"));
+    }
 
     #[test]
     fn the_instructions_name_every_marker_shape_a_model_can_meet() {

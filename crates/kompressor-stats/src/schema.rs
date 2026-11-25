@@ -476,6 +476,54 @@ const V19: &str = r#"
 ALTER TABLE proxy_requests ADD COLUMN output_shaping TEXT;
 "#;
 
+/// Version 20: hook mode. `optimization_events.surface` admits `hook`, and
+/// two columns say which agent tool produced a result and which conversation
+/// it belongs to.
+///
+/// SQLite cannot alter a CHECK constraint, so the table is rebuilt: a copy
+/// with the new definition, every row moved across with its id (so
+/// `proxy_requests.compression_event_id` still points at the same row), the
+/// old one dropped and the copy renamed into its place. `legacy_alter_table`
+/// is on for the rename only: in the modern mode SQLite re-parses every view
+/// on a rename, and the views over this table would fail that check in the
+/// instant between the drop and the rename. With it on, the views are left as
+/// written, and resolve to the renamed table by name. The table's indexes go
+/// with the drop and are made again.
+const V20: &str = r#"
+PRAGMA legacy_alter_table=ON;
+CREATE TABLE optimization_events_v20 (
+  id INTEGER PRIMARY KEY, time_ms INTEGER NOT NULL, tenant TEXT NOT NULL, request_id TEXT NOT NULL,
+  surface TEXT NOT NULL CHECK (surface IN ('api','mcp','proxy','cli','hook')),
+  api_family TEXT, model TEXT, provider TEXT,
+  mode TEXT NOT NULL CHECK (mode IN ('aggressive','lossless','recoverable','off')),
+  tokens_in INTEGER NOT NULL, tokens_out INTEGER NOT NULL, chars_in INTEGER NOT NULL, chars_out INTEGER NOT NULL,
+  messages_total INTEGER NOT NULL, messages_compressed INTEGER NOT NULL, messages_skipped INTEGER NOT NULL,
+  refs_emitted INTEGER NOT NULL, ref_bytes_emitted INTEGER NOT NULL,
+  content_types TEXT NOT NULL CHECK (json_valid(content_types)),
+  protected_by_reason TEXT NOT NULL CHECK (json_valid(protected_by_reason)),
+  engine_ms REAL NOT NULL, outcome TEXT, skipped_by_reason TEXT, frozen_messages INTEGER,
+  skipped_tokens_by_reason TEXT, rolled_up INTEGER NOT NULL DEFAULT 0,
+  analysis_archived INTEGER NOT NULL DEFAULT 0, tool TEXT, conversation TEXT);
+INSERT INTO optimization_events_v20 (
+  id, time_ms, tenant, request_id, surface, api_family, model, provider, mode,
+  tokens_in, tokens_out, chars_in, chars_out, messages_total, messages_compressed, messages_skipped,
+  refs_emitted, ref_bytes_emitted, content_types, protected_by_reason, engine_ms, outcome,
+  skipped_by_reason, frozen_messages, skipped_tokens_by_reason, rolled_up, analysis_archived)
+SELECT
+  id, time_ms, tenant, request_id, surface, api_family, model, provider, mode,
+  tokens_in, tokens_out, chars_in, chars_out, messages_total, messages_compressed, messages_skipped,
+  refs_emitted, ref_bytes_emitted, content_types, protected_by_reason, engine_ms, outcome,
+  skipped_by_reason, frozen_messages, skipped_tokens_by_reason, rolled_up, analysis_archived
+FROM optimization_events;
+DROP TABLE optimization_events;
+ALTER TABLE optimization_events_v20 RENAME TO optimization_events;
+PRAGMA legacy_alter_table=OFF;
+CREATE INDEX IF NOT EXISTS oe_tenant_time ON optimization_events (tenant, time_ms);
+CREATE INDEX IF NOT EXISTS oe_request ON optimization_events (request_id);
+CREATE INDEX IF NOT EXISTS oe_outcome ON optimization_events (tenant, outcome);
+CREATE INDEX IF NOT EXISTS oe_tool ON optimization_events (provider, tool);
+"#;
+
 pub const MIGRATIONS: &[(u32, &str)] = &[
     (1, V1),
     (2, V2),
@@ -496,6 +544,7 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (17, V17),
     (18, V18),
     (19, V19),
+    (20, V20),
 ];
 
 /// The version a freshly migrated database reports in `PRAGMA user_version`.
@@ -519,6 +568,23 @@ pub fn latest_version() -> u32 {
 /// it failed on "table already exists" and did not start. Measured with two
 /// `serve` processes on one v12 file, 15 rounds of 15.
 pub fn apply(conn: &Connection) -> Result<u32, StatsError> {
+    // A step that rebuilds a table (v20) drops the old one, and with foreign
+    // keys enforced that drop is an implicit DELETE the rows of
+    // `proxy_requests` refuse. The pragma cannot change inside a transaction,
+    // so it is turned off around the whole ladder and put back afterwards;
+    // each step checks the keys itself before it commits.
+    let enforced: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    if enforced != 0 {
+        conn.execute_batch("PRAGMA foreign_keys = OFF")?;
+    }
+    let result = apply_ladder(conn);
+    if enforced != 0 {
+        conn.execute_batch("PRAGMA foreign_keys = ON")?;
+    }
+    result
+}
+
+fn apply_ladder(conn: &Connection) -> Result<u32, StatsError> {
     let version_of = |conn: &Connection| -> Result<u32, StatsError> {
         let raw: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         // a negative or absurd user_version is not ours; treat it as unversioned
@@ -549,8 +615,9 @@ pub fn apply(conn: &Connection) -> Result<u32, StatsError> {
         }
         // user_version takes no parameter binding, and the value is a crate
         // constant rather than anything a caller supplies
-        let applied = conn
-            .execute_batch(sql)
+        let applied = dangling_keys(conn)
+            .and_then(|before| conn.execute_batch(sql).map(|()| before))
+            .and_then(|before| foreign_keys_hold(conn, before))
             .and_then(|()| conn.execute_batch(&format!("PRAGMA user_version = {version}")))
             .and_then(|()| conn.execute_batch("COMMIT"));
         match applied {
@@ -563,6 +630,35 @@ pub fn apply(conn: &Connection) -> Result<u32, StatsError> {
     }
 
     Ok(current)
+}
+
+/// How many rows `PRAGMA foreign_key_check` reports.
+fn dangling_keys(conn: &Connection) -> rusqlite::Result<usize> {
+    let mut statement = conn.prepare("PRAGMA foreign_key_check")?;
+    let mut rows = statement.query([])?;
+    let mut count = 0;
+    while rows.next()?.is_some() {
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Refuse a step that left a foreign key dangling: with enforcement off for
+/// the ladder, nothing else would notice. Only what the step added counts — a
+/// file written with enforcement off may hold dangling keys already, and
+/// refusing those would stop it ever being upgraded.
+fn foreign_keys_hold(conn: &Connection, before: usize) -> rusqlite::Result<()> {
+    let after = dangling_keys(conn)?;
+    if after <= before {
+        return Ok(());
+    }
+    Err(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+        Some(format!(
+            "a migration step left {} more dangling foreign key(s)",
+            after - before
+        )),
+    ))
 }
 
 /// Whether the database `conn` is open on has a table called `name`: what a
