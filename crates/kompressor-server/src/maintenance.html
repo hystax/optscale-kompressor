@@ -987,6 +987,14 @@ function runningFacts(running) {
         ? "lapse prediction: on, " + plural(memory.wrong_predictions, "wrong prediction", "wrong predictions") + " since start"
         : tagged("lapse prediction: switched off until restart, after "
             + plural(memory.wrong_predictions, "wrong prediction", "wrong predictions"), "warn"),
+    // Since start, like the wrong predictions: a guard trip is a rewrite that
+    // broke something the provider checks, so any at all is worth a look.
+    memory.guard_trips
+      ? tagged("stability guards: " + plural(memory.guard_trips, "trip", "trips") + " since start, "
+          + count(memory.guard_enforced) + " sent the client's original", "warn")
+      : "stability guards: no trips since start",
+    plural(memory.failopen_after_compressed, "request", "requests")
+      + " sent uncompressed after an earlier turn of the conversation went compressed",
     tagged("a restart forgets all of this", "muted"),
   ];
   return [

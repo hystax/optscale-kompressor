@@ -81,6 +81,14 @@ pub fn compress_content<'a>(
     ctx: &Context,
     applied: &mut Vec<Kind>,
 ) -> (Cow<'a, str>, Option<Kind>) {
+    // Before anything reads it: the point of the bound is that a payload over
+    // it costs nothing. See `EngineOptions::max_compress_bytes`.
+    if opts.above_max_bytes(content) {
+        return (Cow::Borrowed(content), None);
+    }
+    // One bound on parsing for the whole payload, however many ways it is
+    // offered to a grammar below. See `code::PARSE_BUDGET_FACTOR`.
+    let _parse_budget = crate::code::parse_budget(content);
     let oversized_before = refs.oversized_attempts();
     let mark = refs.mark();
     let applied_before = applied.len();
@@ -106,8 +114,7 @@ pub fn compress_content<'a>(
     }
     if refs.is_enabled()
         && result.1.is_some()
-        && chars_len(content).saturating_sub(chars_len(&result.0)) < opts.min_elision_saving_chars
-        && !crate::refs::refs_in(&result.0).is_empty()
+        && worth_less_than_its_fetch(content, &result, role, opts, refs)
     {
         // Worth less than the fetch it invites: see `min_elision_saving_chars`.
         refs.rollback(mark);
@@ -116,6 +123,35 @@ pub fn compress_content<'a>(
         return (Cow::Borrowed(content), None);
     }
     result
+}
+
+/// Whether a compression that leaves a handle saves less than the fetch it
+/// invites: by `min_elision_saving_chars`, or by the net-cost gate when the
+/// caller set one. Markers without a handle are never gated — nothing can be
+/// fetched through them.
+fn worth_less_than_its_fetch(
+    content: &str,
+    result: &(Cow<'_, str>, Option<Kind>),
+    role: &str,
+    opts: &EngineOptions,
+    refs: &mut RefCollector,
+) -> bool {
+    let saved_chars = chars_len(content).saturating_sub(chars_len(&result.0));
+    match &opts.elision_gate {
+        None => {
+            saved_chars < opts.min_elision_saving_chars
+                && !crate::refs::refs_in(&result.0).is_empty()
+        }
+        Some(gate) => {
+            if crate::refs::refs_in(&result.0).is_empty() {
+                return false;
+            }
+            refs.note_gate_consulted();
+            let saved_tokens = crate::tokens::estimate_tokens(content, role)
+                .saturating_sub(crate::tokens::estimate_tokens(&result.0, role));
+            !gate.admits(saved_tokens, result.1, saved_chars)
+        }
+    }
 }
 
 /// Compress a payload whose line-number column, if it had one, is already off.

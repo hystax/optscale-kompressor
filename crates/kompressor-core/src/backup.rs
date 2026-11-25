@@ -1811,7 +1811,9 @@ mod tests {
         kompressor_stats::schema::open_read_write(&config.stats.path)
             .unwrap()
             .execute_batch(
-                "DROP TABLE backups; DROP TABLE maintenance_events; PRAGMA user_version = 15;",
+                "DROP TABLE backups; DROP TABLE maintenance_events; DROP TABLE process_starts;
+                 DROP TABLE retrieve_round_usage; DROP TABLE elisions; \
+                 ALTER TABLE proxy_requests DROP COLUMN output_shaping; PRAGMA user_version = 15;",
             )
             .unwrap();
         let archive = dir.path().join("old.tar.gz");

@@ -256,6 +256,7 @@ pub async fn relay(
                 total_ms: Some(started.elapsed().as_secs_f64() * 1000.0),
                 error: failure,
                 keep_warm: false,
+                output_shaping: None,
                 strip_usage: false,
             }));
     });

@@ -588,3 +588,295 @@ async fn another_conversation_carrying_the_same_bytes_is_still_compressed() {
         "and so does not ship the log whole"
     );
 }
+
+/// An Anthropic turn with its own usage, asking for `handle` or answering.
+fn anthropic_round(handle: Option<&str>, usage: Value) -> Value {
+    let (content, stop) = match handle {
+        Some(handle) => (
+            json!([{"type": "tool_use", "id": "toolu_r", "name": "optscale_kompressor_retrieve",
+                    "input": {"ref": handle}}]),
+            "tool_use",
+        ),
+        None => (json!([{"type": "text", "text": ANSWER}]), "end_turn"),
+    };
+    json!({"id": "msg", "type": "message", "role": "assistant", "content": content,
+           "stop_reason": stop, "usage": usage})
+}
+
+fn retrieve_rounds(
+    events: &kompressor_stats::writer::CapturedEvents,
+) -> (
+    Vec<kompressor_stats::RetrieveRoundsEvent>,
+    Vec<kompressor_stats::ProxyRequestEvent>,
+) {
+    let mut rounds = Vec::new();
+    let mut rows = Vec::new();
+    for event in events.drain() {
+        match event {
+            kompressor_stats::Event::RetrieveRounds(e) => rounds.push(e),
+            kompressor_stats::Event::ProxyRequest(e) => rows.push(e),
+            _ => {}
+        }
+    }
+    (rounds, rows)
+}
+
+/// `proxy_requests` keeps the sum across rounds, which cannot say which
+/// round read what; each round's own usage is filed beside it, so the cost of
+/// the rounds the loop added is measured rather than assumed.
+#[tokio::test]
+async fn each_round_of_a_two_round_retrieve_is_filed_with_its_own_usage() {
+    let harness = Harness::new().await;
+    Mock::given(any())
+        .respond_with(move |request: &Request| {
+            let body = match round_of(&body_text(request)) {
+                0 => anthropic_round(
+                    Some(&handle_in(request)),
+                    json!({"input_tokens": 10, "cache_read_input_tokens": 9_000,
+                           "cache_creation_input_tokens": 1_000, "output_tokens": 20}),
+                ),
+                1 => anthropic_round(
+                    Some(&handle_in(request)),
+                    json!({"input_tokens": 11, "cache_read_input_tokens": 10_000,
+                           "cache_creation_input_tokens": 300, "output_tokens": 25}),
+                ),
+                _ => anthropic_round(
+                    None,
+                    json!({"input_tokens": 12, "cache_read_input_tokens": 10_300,
+                           "cache_creation_input_tokens": 50, "output_tokens": 30}),
+                ),
+            };
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&harness.server)
+        .await;
+
+    let reply = harness
+        .post("/v1/messages", &anthropic_body(&log_payload(400)))
+        .await;
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.header("x-kompressor-retrieve-rounds"), "2");
+
+    let (filed, rows) = retrieve_rounds(&harness.events);
+    let row = rows.last().expect("the request's own row");
+    assert_eq!(row.retrieve_rounds, 2);
+    assert_eq!(row.cache_read_tokens, Some(29_300), "the row keeps the sum");
+    assert_eq!(filed.len(), 1);
+    let filed = &filed[0];
+    assert_eq!(
+        (
+            filed.request_id.as_str(),
+            filed.tenant.as_str(),
+            filed.time_ms
+        ),
+        (row.request_id.as_str(), row.tenant.as_str(), row.time_ms)
+    );
+    let per_round: Vec<_> = filed
+        .rounds
+        .iter()
+        .map(|r| {
+            (
+                r.round,
+                r.input_tokens,
+                r.cache_read_tokens,
+                r.cache_write_tokens,
+                r.output_tokens,
+            )
+        })
+        .collect();
+    assert_eq!(
+        per_round,
+        [
+            (0, Some(10), Some(9_000), Some(1_000), Some(20)),
+            (1, Some(11), Some(10_000), Some(300), Some(25)),
+            (2, Some(12), Some(10_300), Some(50), Some(30)),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_request_that_took_no_round_files_no_round_usage() {
+    let harness = Harness::new().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_answer()))
+        .mount(&harness.server)
+        .await;
+    let reply = harness
+        .post("/v1/messages", &anthropic_body(&log_payload(400)))
+        .await;
+    assert_eq!(reply.status, 200);
+    let (filed, rows) = retrieve_rounds(&harness.events);
+    assert_eq!(rows.len(), 1);
+    assert!(filed.is_empty(), "its one round is the row itself");
+}
+
+/// Search output over five files: the engine elides each file's middle behind
+/// its own handle, so one tool output carries five siblings.
+fn search_payload() -> String {
+    (0..5)
+        .flat_map(|f| {
+            (0..40).map(move |i| {
+                format!(
+                    "src/module_{f}/handler.rs:{}:    let value_{i} = compute_thing(input_{i}, &state);",
+                    i * 3 + 1
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Every handle in the conversation part of a body, in order, without the
+/// tool definition's own examples.
+fn conversation_handles(body: &Value) -> Vec<String> {
+    let mut seen = Vec::new();
+    for id in kompressor_engine::refs_in(&body["messages"].to_string()) {
+        let handle = id.to_string();
+        if !seen.contains(&handle) {
+            seen.push(handle);
+        }
+    }
+    seen
+}
+
+/// Ask for the first handle of the conversation, then answer.
+async fn mount_ask_first_then_answer(harness: &Harness) {
+    Mock::given(any())
+        .respond_with(move |request: &Request| {
+            let body: Value = serde_json::from_slice(&request.body).expect("json");
+            match (
+                round_of(&body_text(request)),
+                conversation_handles(&body).first(),
+            ) {
+                (0, Some(handle)) => ResponseTemplate::new(200).set_body_json(chat_asks(handle)),
+                _ => ResponseTemplate::new(200).set_body_json(chat_answer()),
+            }
+        })
+        .mount(&harness.server)
+        .await;
+}
+
+/// The tool result the proxy appended in the second upstream call.
+fn appended_result(rounds: &[Value]) -> Value {
+    let messages = rounds[1]["messages"].as_array().expect("messages");
+    let last = messages.last().expect("an appended round");
+    assert_eq!(last["role"], "tool");
+    serde_json::from_str(last["content"].as_str().expect("a string result")).expect("JSON")
+}
+
+async fn sibling_run(
+    configure: impl FnOnce(&mut kompressor_core::config::Config),
+) -> (Harness, Vec<Value>) {
+    let harness = Harness::with(configure).await;
+    mount_ask_first_then_answer(&harness).await;
+    let reply = harness
+        .post("/v1/chat/completions", &chat_body(&search_payload()))
+        .await;
+    assert_eq!(reply.json()["choices"][0]["message"]["content"], ANSWER);
+    let rounds = harness.upstream_json().await;
+    assert_eq!(rounds.len(), 2, "one retrieve round, then the answer");
+    (harness, rounds)
+}
+
+#[tokio::test]
+async fn sibling_attachment_off_leaves_the_retrieve_round_as_it_was() {
+    let (_, rounds) = sibling_run(|_| {}).await;
+    let handles = conversation_handles(&rounds[0]);
+    assert!(
+        handles.len() >= 3,
+        "the output must carry siblings: {handles:?}"
+    );
+    let result = appended_result(&rounds);
+    assert_eq!(result["found"], true);
+    assert_eq!(result["ref"], handles[0]);
+    assert!(result.get("siblings").is_none(), "off by default: {result}");
+}
+
+#[tokio::test]
+async fn sibling_attachment_on_carries_the_rest_of_the_output_in_the_second_round() {
+    let (_, off_rounds) = sibling_run(|_| {}).await;
+    let (harness, rounds) =
+        sibling_run(|config| config.proxy.retrieve_attach_siblings = true).await;
+
+    // The first upstream call is the client's turn, compressed: nothing about
+    // it may change, or the setting would move bytes the provider caches.
+    assert_eq!(
+        rounds[0], off_rounds[0],
+        "the first round is the same with it on"
+    );
+    // Nor does the second round touch what the first sent: it only appends.
+    let first = rounds[0]["messages"].as_array().unwrap();
+    let second = rounds[1]["messages"].as_array().unwrap();
+    assert_eq!(
+        &second[..first.len()],
+        &first[..],
+        "only the round is appended"
+    );
+
+    let handles = conversation_handles(&rounds[0]);
+    let result = appended_result(&rounds);
+    assert_eq!(
+        result["ref"], handles[0],
+        "the asked-for fragment is still the answer"
+    );
+    let siblings = result["siblings"].as_array().expect("siblings attached");
+    let attached: Vec<&str> = siblings.iter().filter_map(|s| s["ref"].as_str()).collect();
+    assert_eq!(
+        attached,
+        handles[1..].iter().map(String::as_str).collect::<Vec<_>>(),
+        "every other handle of the same output, in order, and not the asked one"
+    );
+    for (n, sibling) in siblings.iter().enumerate() {
+        let content = sibling["content"].as_str().expect("the fragment itself");
+        assert!(
+            content.contains(&format!("src/module_{}/handler.rs:", n + 1))
+                && content.contains("compute_thing"),
+            "sibling {n} is the elided middle of its own file: {content}"
+        );
+    }
+
+    let row = support::proxy_rows(&harness.events)
+        .into_iter()
+        .last()
+        .expect("a proxy_requests row");
+    let timing = row.timing.expect("timing");
+    assert_eq!(
+        timing.retrieval_siblings_attached,
+        (handles.len() - 1) as u64
+    );
+    assert!(timing.retrieval_sibling_tokens > 0);
+}
+
+#[tokio::test]
+async fn sibling_attachment_stays_inside_the_per_request_token_budget() {
+    // Room for the asked-for fragment and one or two of its siblings, not all.
+    const BUDGET: u32 = 2_600;
+    let (_, rounds) = sibling_run(|config| {
+        config.proxy.retrieve_attach_siblings = true;
+        config.proxy.retrieve_max_tokens_per_request = BUDGET;
+    })
+    .await;
+    let handles = conversation_handles(&rounds[0]);
+    let result = appended_result(&rounds);
+    assert_eq!(
+        result["found"], true,
+        "the asked-for fragment fits: {result}"
+    );
+    let attached = result["siblings"].as_array().map_or(0, Vec::len);
+    assert!(
+        (1..handles.len() - 1).contains(&attached),
+        "some siblings fit and some do not: {attached} of {}",
+        handles.len() - 1
+    );
+    let mut answer = result.clone();
+    answer.as_object_mut().unwrap().remove("siblings");
+    answer.as_object_mut().unwrap().remove("siblings_hint");
+    let mut spent = kompressor_engine::estimate_tokens(&answer.to_string(), "tool");
+    for sibling in result["siblings"].as_array().unwrap() {
+        spent += kompressor_engine::estimate_tokens(&sibling.to_string(), "tool");
+    }
+    assert!(
+        spent <= BUDGET,
+        "{spent} tokens attached against a budget of {BUDGET}"
+    );
+}

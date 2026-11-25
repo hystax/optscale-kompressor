@@ -6,6 +6,7 @@
 //! by stage is what tells those two apart, and it is the only reason an
 //! operator ever learns that, say, every request is timing out in the engine.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -35,6 +36,22 @@ pub enum Stage {
     Inject,
     /// A retrieve round failed upstream, so the previous response stands.
     RetrieveRound,
+    /// A stability guard under `enforce` found a fault the rewrite
+    /// introduced, so the client's original went out. See [`crate::guard`].
+    Guard,
+    /// Not a point in the pipeline but a second count of a request already
+    /// counted at one: its body went out as the client sent it, and an
+    /// earlier turn of the same conversation had gone out compressed.
+    ///
+    /// The case that matters is size. A conversation whose history has been
+    /// going out compressed can have grown past the model's context window in
+    /// its original form, and the one uncompressed turn is then refused by
+    /// the provider rather than merely billed in full. Headroom refuses large
+    /// WebSocket frames in that case; this only counts it, so the rate can be
+    /// read before deciding whether anything more is needed. A request whose
+    /// conversation could not be identified (a body that did not parse, an
+    /// unknown credential) is never counted here.
+    AfterCompressed,
 }
 
 impl Stage {
@@ -49,6 +66,8 @@ impl Stage {
             Stage::Discarded => "discarded",
             Stage::Inject => "inject",
             Stage::RetrieveRound => "retrieve_round",
+            Stage::Guard => "guard",
+            Stage::AfterCompressed => "after_compressed",
         }
     }
 }
@@ -67,6 +86,8 @@ pub struct FailOpen {
     discarded: AtomicU64,
     inject: AtomicU64,
     retrieve_round: AtomicU64,
+    guard: AtomicU64,
+    after_compressed: AtomicU64,
 }
 
 impl FailOpen {
@@ -77,6 +98,13 @@ impl FailOpen {
     /// memory would answer neither well.
     pub fn record(&self, stage: Stage, reason: &dyn std::fmt::Display) {
         self.counter(stage).fetch_add(1, Ordering::Relaxed);
+        // Outside a [`track`]ed request (a stream relayed on its own task,
+        // a test) there is nothing to mark, and that is not an error.
+        let _ = FAILED_OPEN.try_with(|first| {
+            if first.get().is_none() {
+                first.set(Some(stage));
+            }
+        });
         tracing::warn!(stage = stage.as_str(), %reason, "forwarding the request as it arrived");
     }
 
@@ -91,6 +119,8 @@ impl FailOpen {
             Stage::Discarded,
             Stage::Inject,
             Stage::RetrieveRound,
+            Stage::Guard,
+            Stage::AfterCompressed,
         ]
         .into_iter()
         .map(|stage| (stage.as_str(), self.count(stage)))
@@ -112,8 +142,27 @@ impl FailOpen {
             Stage::Discarded => &self.discarded,
             Stage::Inject => &self.inject,
             Stage::RetrieveRound => &self.retrieve_round,
+            Stage::Guard => &self.guard,
+            Stage::AfterCompressed => &self.after_compressed,
         }
     }
+}
+
+tokio::task_local! {
+    /// The first stage the request running on this task gave up at.
+    static FAILED_OPEN: Cell<Option<Stage>>;
+}
+
+/// Run one request with a note of where, if anywhere, it gave up, which
+/// [`failed_open_here`] reads. Every [`FailOpen::record`] made on the
+/// request's own task is noted; one made on a task it spawned is not.
+pub(crate) async fn track<F: std::future::Future>(request: F) -> F::Output {
+    FAILED_OPEN.scope(Cell::new(None), request).await
+}
+
+/// The first stage the current request gave up at, if it has.
+pub(crate) fn failed_open_here() -> Option<Stage> {
+    FAILED_OPEN.try_with(Cell::get).ok().flatten()
 }
 
 #[cfg(test)]
@@ -133,5 +182,24 @@ mod tests {
         assert_eq!(counters.count(Stage::Parse), 1);
         assert_eq!(counters.count(Stage::Walk), 0);
         assert_eq!(counters.snapshot()["compress"], 2);
+        assert_eq!(counters.snapshot()["after_compressed"], 0);
+    }
+
+    #[tokio::test]
+    async fn a_tracked_request_remembers_the_first_stage_it_gave_up_at() {
+        let counters = FailOpen::default();
+        let seen = track(async {
+            assert_eq!(failed_open_here(), None);
+            counters.record(Stage::Walk, &"shape");
+            counters.record(Stage::Discarded, &"grew");
+            failed_open_here()
+        })
+        .await;
+        assert_eq!(seen, Some(Stage::Walk));
+        // Outside any tracked request nothing is remembered, and recording
+        // still counts.
+        counters.record(Stage::Parse, &"not json");
+        assert_eq!(failed_open_here(), None);
+        assert_eq!(counters.count(Stage::Parse), 1);
     }
 }

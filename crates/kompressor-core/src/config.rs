@@ -825,6 +825,59 @@ pub enum FrozenPrefix {
     FirstSeen,
 }
 
+/// What decides whether a compression that leaves a handle is worth the fetch
+/// it invites. See `proxy.elision_gate`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ElisionGate {
+    /// `engine.min_elision_saving_chars`, the same bar for every payload. The
+    /// shipped behaviour.
+    #[default]
+    Fixed,
+    /// `proxy.net_cost_gate`: the saving priced against what a retrieve round
+    /// costs on this conversation, decided once per message (§12.6).
+    NetCost,
+}
+
+/// What a stability guard does when the body going upstream fails its check.
+///
+/// Each guard compares the rewritten body with the one the client sent, after
+/// every rewrite and before it is sent, and trips only on a fault the rewrite
+/// introduced: a body the client already sent broken is the client's, and
+/// forwarding it as it came would not mend it. A trip is counted and logged in
+/// every mode but `off`. See `kompressor_proxy::guard`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardMode {
+    /// The check is not run.
+    Off,
+    /// A trip is counted and logged and the rewritten body still goes out.
+    /// The shipped default, so a guard that is wrong cannot turn a request
+    /// the provider would have accepted into a fail-open.
+    #[default]
+    Observe,
+    /// A trip sends the client's original body instead, as any other
+    /// fail-open does.
+    Enforce,
+}
+
+impl GuardMode {
+    /// Whether the check runs at all.
+    pub fn checks(self) -> bool {
+        self != GuardMode::Off
+    }
+
+    /// Parse an environment value; anything else is `None`.
+    pub fn parse(value: &str) -> Option<GuardMode> {
+        match value.to_ascii_lowercase().as_str() {
+            "off" => Some(GuardMode::Off),
+            "observe" => Some(GuardMode::Observe),
+            "enforce" => Some(GuardMode::Enforce),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RetrieveExecution {
@@ -864,6 +917,28 @@ pub struct ProxyConfig {
     #[serde(with = "humantime_serde")]
     pub compress_timeout: Duration,
     pub max_body_bytes: usize,
+    /// Check that every Anthropic `thinking` and `redacted_thinking` block,
+    /// and every Responses `reasoning` item carrying `encrypted_content`, goes
+    /// upstream byte-identical and in order to what the client sent. See
+    /// [`GuardMode`]; **observe** by default.
+    ///
+    /// The provider verifies a thinking block's `signature` against its bytes
+    /// and refuses the whole request with a 400 when they differ. The walker
+    /// never offers those blocks to the engine, so no rewrite is meant to
+    /// touch them; this is the assertion that none did, re-serialisation
+    /// included. Headroom forwards a mutated body only behind the same
+    /// fingerprint.
+    pub guard_thinking: GuardMode,
+    /// Check the Anthropic Messages body going upstream for three faults the
+    /// provider answers with a 400: more than four `cache_control`
+    /// breakpoints across tools, system and messages; a one-hour breakpoint
+    /// after a five-minute one in that order; a `tool_result` whose
+    /// `tool_use_id` names no `tool_use` in the assistant message before it.
+    /// See [`GuardMode`]; **observe** by default.
+    ///
+    /// Only a fault the rewrite introduced trips it. Headroom hit the
+    /// five-breakpoint 400 twice from its own rewrites.
+    pub guard_upstream_body: GuardMode,
     #[serde(with = "humantime_serde")]
     pub upstream_connect_timeout: Duration,
     #[serde(with = "humantime_serde")]
@@ -923,6 +998,26 @@ pub struct ProxyConfig {
     /// 2% of the tool block; it exists for clients whose tools come from a
     /// schema generator.
     pub tools_compact: bool,
+    /// Append [`Self::output_shaping_text`] to the `system` prompt of
+    /// Anthropic Messages requests, as an experiment. **Off by default.**
+    ///
+    /// The only setting that changes what the model is asked rather than how
+    /// the request is carried. It goes after every `system` block, with no
+    /// breakpoint of its own, so no cached byte before it moves; decided on a
+    /// conversation's first request and held for its life (a conversation
+    /// first seen part-way through is never treated), and
+    /// [`Self::output_shaping_holdout_pct`] of conversations are held out so
+    /// the statistics can compare the two arms. `max_tokens`, thinking and
+    /// effort are left alone.
+    pub output_shaping: bool,
+    /// The share of conversations, in percent, that `output_shaping` holds
+    /// out as the control arm. 30 to 100; 100 runs the experiment with nobody
+    /// treated.
+    pub output_shaping_holdout_pct: u8,
+    /// The instruction `output_shaping` appends. Fixed per conversation from
+    /// its first request, so changing it affects only conversations that
+    /// start afterwards.
+    pub output_shaping_text: String,
     /// Keep sending the `anthropic-beta` tokens a conversation has already
     /// sent. **Off by default.**
     ///
@@ -1042,6 +1137,42 @@ pub struct ProxyConfig {
     /// ended pinging for 50 minutes; [`Self::cache_keep_warm_max_pings`] also
     /// caps it.
     pub cache_keep_warm_background_pings: u32,
+    /// Stop pinging a background wait in a conversation whose earlier
+    /// background waits did not come back. Off by default.
+    ///
+    /// Each background wait the proxy arms (or would have armed, had this
+    /// held it back) is scored at the conversation's next request: it came
+    /// back if that request arrived before its pings ran out or within one
+    /// interval of the last, and did not otherwise. A later background wait
+    /// gets no pings when at least two have been scored and the
+    /// Laplace-smoothed share that came back, `(back + 1) / (scored + 2)`, is
+    /// under a third;
+    /// the first background wait of a conversation is always pinged as
+    /// before. The rule and its constants are in `keepwarm::Prior`.
+    ///
+    /// Replayed over 20 days of interactive Claude Code traffic
+    /// (`scripts/harbor/keepwarm-replay.py`, 2026-11-05 to 11-24) it changed
+    /// nothing: no conversation had a second background wait after one that
+    /// did not come back, and 1,254 of the 1,274 trailing pings the current
+    /// rule sends follow a `tool_use`, which this does not touch. It is here
+    /// for agent runs, where a dead-end background wait is the common case.
+    pub cache_keep_warm_background_prior: bool,
+    /// Send one ping [`Self::cache_keep_warm_one_hour_delay`] after a request
+    /// whose every cache marker asks for an hour and that stopped on
+    /// `tool_use`. Off by default.
+    ///
+    /// Such a request is otherwise not pinged at all: its entry outlives any
+    /// pause eleven pings would cover. One read just before the hour is out
+    /// keeps it for another, for the price of one read, against a rewrite at
+    /// 2x if the client comes back after the hour. Replayed over the same 20
+    /// days it would have sent two pings and bridged nothing: no `tool_use`
+    /// wait on one-hour entries lasted past 55 minutes and came back.
+    pub cache_keep_warm_one_hour: bool,
+    /// When the [`Self::cache_keep_warm_one_hour`] ping goes out, counted from
+    /// the start of the request it repeats. Must be above zero and below the
+    /// hour, or the entry has lapsed before the ping reads it.
+    #[serde(with = "humantime_serde")]
+    pub cache_keep_warm_one_hour_delay: Duration,
     /// The most conversations kept warm at one moment, and `0` for no limit.
     ///
     /// Each one holds the request it re-sends — the whole prompt as this proxy
@@ -1067,6 +1198,36 @@ pub struct ProxyConfig {
     /// reads as a bug to everyone who meets it for the first time.
     pub retrieve_max_rounds: u32,
     pub retrieve_max_tokens_per_request: u32,
+    /// Answer a retrieve call with the other handles of the same tool output
+    /// too, within `retrieve_max_tokens_per_request`. **Off by default.**
+    ///
+    /// A model that has just asked for one handle has said what it is working
+    /// on, and the other elisions of the same output are the obvious next
+    /// asks. On the 89-task run of 2026-10-12, 71 of 181 retrieve rounds were
+    /// second-or-later, and a multi-round request billed 102,011 prompt tokens
+    /// against 56,577 for a single-round one (DESIGN §20 item 13). Attaching
+    /// only ever extends a round the proxy builds itself, after the model's
+    /// call, so no byte the provider has cached moves. Whether the rule would
+    /// have attached what the next round asked for is what
+    /// `scripts/bench/sibling-rounds.py` measures on a capture.
+    pub retrieve_attach_siblings: bool,
+    /// Which gate decides whether a handle-bearing compression ships:
+    /// `fixed` (`engine.min_elision_saving_chars`, the default) or `net_cost`
+    /// ([`Self::net_cost_gate`]). Only `recoverable` mode mints handles, so
+    /// only it is gated.
+    ///
+    /// The fixed 4,000 characters was fitted at $0.03 a retrieve round, and a
+    /// round re-reads the whole prompt: at 300K tokens it costs about $0.06
+    /// before output. The net-cost gate loosens on a short conversation and
+    /// tightens on a long one. It decides each message once, against the
+    /// prompt size the provider last billed for the conversation, and replays
+    /// that decision on every later turn so the message's bytes never move.
+    /// The pins live in memory: a restart re-decides what it forgot.
+    pub elision_gate: ElisionGate,
+    /// The net-cost gate's configuration; see `kompressor_engine::gate`.
+    /// Cache read and write prices come from the provider's price list for
+    /// the request's model, not from here.
+    pub net_cost_gate: kompressor_engine::gate::NetCostModel,
     /// Ceiling on everything kept inline for one request, as a percent of the
     /// tokens the engine looked at. 0 disables the ceiling.
     ///
@@ -1257,6 +1418,35 @@ pub struct ProxyConfig {
     /// this *below* whichever applies, never above.
     #[serde(with = "humantime_serde")]
     pub prefix_cache_ttl: Duration,
+    /// Where the proxy saves what it remembers about each conversation, so a
+    /// restart does not forget it. **Empty — off — and that is the shipped
+    /// default.**
+    ///
+    /// The prefix tracker's freeze watermark, cache evidence, learned
+    /// conversation identities and fetch history, the cold-turn read ledger,
+    /// the pinned tool order and beta tokens, and the tool-compaction
+    /// decision: every per-conversation decision that changes the bytes sent
+    /// upstream. Without them, every conversation open across a restart is
+    /// new to the next process, which freezes it to the client's marker and
+    /// sends bytes the provider holds in compressed form: one lost prefix per
+    /// open conversation. Hashes, counts, flags and fragment handles only —
+    /// never message text (DESIGN §12.10).
+    ///
+    /// Written atomically on graceful shutdown and every
+    /// [`Self::state_save_interval`], read once at start. A file that is
+    /// missing, unreadable, or written by another format version is ignored
+    /// with a log line and the proxy starts with nothing remembered. One
+    /// path per process: two proxies writing one file overwrite each other.
+    pub state_path: String,
+    /// How often the state file is rewritten while serving, so a crash loses
+    /// at most this much. `0s` writes only on graceful shutdown.
+    #[serde(with = "humantime_serde")]
+    pub state_save_interval: Duration,
+    /// Whether the state file is read at start. On by default; it does
+    /// nothing unless [`Self::state_path`] is set. The rollback: `false`
+    /// starts every process with nothing remembered, as before the file
+    /// existed, and ignores what the file holds. The file is still written.
+    pub state_load: bool,
     pub upstreams: Vec<Upstream>,
     pub default_upstream: String,
     pub allow_insecure_upstream: bool,
@@ -1329,6 +1519,10 @@ pub struct ProviderOverrides {
     pub cache_keep_warm: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_read: Option<bool>,
+    /// Prices differ by provider (OpenAI charges no cache write), so whether
+    /// the net-cost gate pays may too.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elision_gate: Option<ElisionGate>,
     /// Engine options, any of `[engine]`'s that a request may override.
     #[serde(skip_serializing_if = "patch_is_empty")]
     pub engine: EngineOptionsPatch,
@@ -1364,7 +1558,8 @@ impl ProviderOverrides {
             superseded_reads,
             matured_reads,
             cache_keep_warm,
-            stale_read
+            stale_read,
+            elision_gate
         );
         out.engine = out.engine.merged(&self.engine);
         out
@@ -1414,6 +1609,14 @@ impl ProviderOverrides {
     }
 }
 
+/// What `proxy.output_shaping` asks for unless configured otherwise: shorter
+/// prose, and nothing taken from the work itself. It names what to leave out
+/// rather than a length, so code, commands and tool calls are not squeezed.
+pub const DEFAULT_OUTPUT_SHAPING_TEXT: &str = "Keep answers concise. Do not restate the \
+     question, repeat what a tool returned, or summarise work already shown; \
+     state the result and anything the user must act on. Code, commands and \
+     tool calls are as long as they need to be.";
+
 impl Default for ProxyConfig {
     fn default() -> Self {
         ProxyConfig {
@@ -1422,6 +1625,8 @@ impl Default for ProxyConfig {
             min_tokens: 512,
             compress_timeout: Duration::from_secs(2),
             max_body_bytes: 64 * 1024 * 1024,
+            guard_thinking: GuardMode::Observe,
+            guard_upstream_body: GuardMode::Observe,
             upstream_connect_timeout: Duration::from_secs(10),
             upstream_read_timeout: Duration::from_secs(600),
             retrieve_tool: RetrieveTool::Auto,
@@ -1433,6 +1638,9 @@ impl Default for ProxyConfig {
             sticky_beta: false,
             reasoning_elide_models: Vec::new(),
             tools_compact: false,
+            output_shaping: false,
+            output_shaping_holdout_pct: 50,
+            output_shaping_text: DEFAULT_OUTPUT_SHAPING_TEXT.to_string(),
             cold_recompact: ColdRecompact::Off,
             cold_recompact_margin: Duration::from_secs(60),
             superseded_reads: false,
@@ -1444,10 +1652,16 @@ impl Default for ProxyConfig {
             cache_keep_warm_interval: Duration::from_secs(270),
             cache_keep_warm_max_pings: 11,
             cache_keep_warm_background_pings: 4,
+            cache_keep_warm_background_prior: false,
+            cache_keep_warm_one_hour: false,
+            cache_keep_warm_one_hour_delay: Duration::from_secs(55 * 60),
             cache_keep_warm_max_conversations: 1_024,
             retrieve_execution: RetrieveExecution::Server,
             retrieve_max_rounds: 3,
             retrieve_max_tokens_per_request: 16_384,
+            retrieve_attach_siblings: false,
+            elision_gate: ElisionGate::Fixed,
+            net_cost_gate: kompressor_engine::gate::NetCostModel::default(),
             keep_inline_max_percent: 40,
             stream_buffer_bytes: 256 * 1024,
             stream_buffer_timeout: Duration::ZERO,
@@ -1462,6 +1676,10 @@ impl Default for ProxyConfig {
             // Off: an age rule is a guess, and guessing cold is the expensive
             // mistake. The observed-zero-cache-read signal needs no config.
             prefix_cache_ttl: Duration::ZERO,
+            // Off: a file on disk is a deployment's decision to make.
+            state_path: String::new(),
+            state_save_interval: Duration::from_secs(60),
+            state_load: true,
             upstreams: Vec::new(),
             default_upstream: String::new(),
             allow_insecure_upstream: false,
@@ -1991,6 +2209,7 @@ impl Config {
             "ref_ttl_seconds" => num!(e.ref_ttl_seconds),
             "ref_max_lifetime_multiplier" => num!(e.ref_max_lifetime_multiplier),
             "max_ref_bytes" => num!(e.max_ref_bytes),
+            "max_compress_bytes" => num!(e.max_compress_bytes),
             "min_elision_saving_chars" => num!(e.min_elision_saving_chars),
             "search_max_files" => num!(e.search_max_files),
             "diff_max_files" => num!(e.diff_max_files),
@@ -2010,6 +2229,10 @@ impl Config {
             "enable_nested_routing" => flag!(e.enable_nested_routing),
             "enable_redraw_fold" => flag!(e.enable_redraw_fold),
             "enable_build_templates" => flag!(e.enable_build_templates),
+            "enable_runtime_frame_collapse" => flag!(e.enable_runtime_frame_collapse),
+            "keep_test_totals" => flag!(e.keep_test_totals),
+            "enable_json_csv" => flag!(e.enable_json_csv),
+            "protect_tool_error_chars" => num!(e.protect_tool_error_chars),
             "enable_gutter_aware_detection" => flag!(e.enable_gutter_aware_detection),
             "enable_lossy_key_factoring" => flag!(e.enable_lossy_key_factoring),
             "enable_stale_read" => flag!(e.enable_stale_read),
@@ -2043,6 +2266,15 @@ impl Config {
                 if let Ok(v) = value.parse() {
                     self.proxy.min_tokens = v;
                 }
+            }
+            // A typo leaves the guard as it was rather than turning it off.
+            "guard_thinking" => {
+                self.proxy.guard_thinking =
+                    GuardMode::parse(value).unwrap_or(self.proxy.guard_thinking);
+            }
+            "guard_upstream_body" => {
+                self.proxy.guard_upstream_body =
+                    GuardMode::parse(value).unwrap_or(self.proxy.guard_upstream_body);
             }
             "retrieve_max_rounds" => {
                 if let Ok(v) = value.parse() {
@@ -2162,6 +2394,16 @@ impl Config {
                 self.proxy.tools_compact =
                     parse_bool_setting("proxy.tools_compact", value, self.proxy.tools_compact);
             }
+            "output_shaping" => {
+                self.proxy.output_shaping =
+                    parse_bool_setting("proxy.output_shaping", value, self.proxy.output_shaping);
+            }
+            "output_shaping_holdout_pct" => {
+                if let Ok(v) = value.parse() {
+                    self.proxy.output_shaping_holdout_pct = v;
+                }
+            }
+            "output_shaping_text" => self.proxy.output_shaping_text = value.to_string(),
             "sticky_beta" => {
                 self.proxy.sticky_beta =
                     parse_bool_setting("proxy.sticky_beta", value, self.proxy.sticky_beta);
@@ -2187,9 +2429,62 @@ impl Config {
                     self.proxy.cache_keep_warm_background_pings = v;
                 }
             }
+            "cache_keep_warm_background_prior" => {
+                self.proxy.cache_keep_warm_background_prior = parse_bool_setting(
+                    "proxy.cache_keep_warm_background_prior",
+                    value,
+                    self.proxy.cache_keep_warm_background_prior,
+                );
+            }
+            "cache_keep_warm_one_hour" => {
+                self.proxy.cache_keep_warm_one_hour = parse_bool_setting(
+                    "proxy.cache_keep_warm_one_hour",
+                    value,
+                    self.proxy.cache_keep_warm_one_hour,
+                );
+            }
+            "cache_keep_warm_one_hour_delay" => match parse_duration(value) {
+                Some(delay) => self.proxy.cache_keep_warm_one_hour_delay = delay,
+                None => tracing::warn!(
+                    value,
+                    "KOMPRESSOR__PROXY__CACHE_KEEP_WARM_ONE_HOUR_DELAY is not a duration; ignored"
+                ),
+            },
             "cache_keep_warm_max_conversations" => {
                 if let Ok(v) = value.parse() {
                     self.proxy.cache_keep_warm_max_conversations = v;
+                }
+            }
+            "retrieve_attach_siblings" => {
+                self.proxy.retrieve_attach_siblings = parse_bool_setting(
+                    "proxy.retrieve_attach_siblings",
+                    value,
+                    self.proxy.retrieve_attach_siblings,
+                );
+            }
+            // Unrecognised values leave the gate standing: it decides what is
+            // elided, so a typo must not quietly change it.
+            "elision_gate" => match value.to_ascii_lowercase().replace('-', "_").as_str() {
+                "fixed" => self.proxy.elision_gate = ElisionGate::Fixed,
+                "net_cost" => self.proxy.elision_gate = ElisionGate::NetCost,
+                _ => tracing::warn!(
+                    value,
+                    "KOMPRESSOR__PROXY__ELISION_GATE is not fixed or net_cost; ignored"
+                ),
+            },
+            "net_cost_gate__expected_reads" => {
+                if let Ok(v) = value.parse() {
+                    self.proxy.net_cost_gate.expected_reads = v;
+                }
+            }
+            "net_cost_gate__output_cost_tokens" => {
+                if let Ok(v) = value.parse() {
+                    self.proxy.net_cost_gate.output_cost_tokens = v;
+                }
+            }
+            "net_cost_gate__fetch_probability" => {
+                if let Ok(v) = value.parse() {
+                    self.proxy.net_cost_gate.fetch_probability = v;
                 }
             }
             "enabled" => {
@@ -2207,6 +2502,19 @@ impl Config {
             "websocket_relay" => {
                 self.proxy.websocket_relay =
                     parse_bool_setting("proxy.websocket_relay", value, self.proxy.websocket_relay);
+            }
+            "state_path" => self.proxy.state_path = value.to_string(),
+            "state_save_interval" => match parse_duration(value) {
+                Some(interval) => self.proxy.state_save_interval = interval,
+                None => tracing::warn!(
+                    value,
+                    "proxy.state_save_interval is not a duration; keeping the configured value"
+                ),
+            },
+            // Reachable from the environment because it is the rollback.
+            "state_load" => {
+                self.proxy.state_load =
+                    parse_bool_setting("proxy.state_load", value, self.proxy.state_load);
             }
             provider if provider.starts_with("providers__") => {
                 let rest = &provider["providers__".len()..];
@@ -2341,6 +2649,37 @@ impl Config {
                 "proxy.cache_keep_warm_interval must be above zero and below the provider's \
                  five-minute cache TTL, or the entry lapses between pings"
                     .into(),
+            ));
+        }
+        if self.proxy.cache_keep_warm_one_hour_delay.is_zero()
+            || self.proxy.cache_keep_warm_one_hour_delay >= Duration::from_secs(3_600)
+        {
+            return Err(ConfigError::Invalid(
+                "proxy.cache_keep_warm_one_hour_delay must be above zero and below the \
+                 one-hour cache TTL, or the entry has lapsed before the ping reads it"
+                    .into(),
+            ));
+        }
+
+        self.proxy
+            .net_cost_gate
+            .validate()
+            .map_err(|e| ConfigError::Invalid(format!("proxy.net_cost_gate: {e}")))?;
+        // Checked whether or not the experiment is on, for the reason the
+        // keep-warm interval is: turning it on later must not meet a value
+        // nobody looked at.
+        if !(30..=100).contains(&self.proxy.output_shaping_holdout_pct) {
+            return Err(ConfigError::Invalid(
+                "proxy.output_shaping_holdout_pct must be between 30 and 100: an \
+                 experiment that holds out fewer conversations cannot measure itself"
+                    .into(),
+            ));
+        }
+        if self.proxy.output_shaping_text.trim().is_empty()
+            || self.proxy.output_shaping_text.chars().count() > 2_000
+        {
+            return Err(ConfigError::Invalid(
+                "proxy.output_shaping_text must be non-empty and at most 2,000 characters".into(),
             ));
         }
         if self.retrieve.max_retrieve_chars == 0 {
@@ -2789,6 +3128,41 @@ mod tests {
     }
 
     #[test]
+    fn the_stability_guards_observe_by_default_and_are_set_from_the_environment() {
+        let mut config = Config::default();
+        assert_eq!(config.proxy.guard_thinking, GuardMode::Observe);
+        assert_eq!(config.proxy.guard_upstream_body, GuardMode::Observe);
+        assert_eq!(config.engine.max_compress_bytes, 0, "no payload bound");
+        config.apply_env(&[
+            ("KOMPRESSOR__PROXY__GUARD_THINKING".into(), "enforce".into()),
+            (
+                "KOMPRESSOR__PROXY__GUARD_UPSTREAM_BODY".into(),
+                "OFF".into(),
+            ),
+            (
+                "KOMPRESSOR__ENGINE__MAX_COMPRESS_BYTES".into(),
+                "1048576".into(),
+            ),
+        ]);
+        assert_eq!(config.proxy.guard_thinking, GuardMode::Enforce);
+        assert_eq!(config.proxy.guard_upstream_body, GuardMode::Off);
+        assert_eq!(config.engine.max_compress_bytes, 1_048_576);
+        // A typo leaves the guard as it was.
+        config.apply_env(&[("KOMPRESSOR__PROXY__GUARD_THINKING".into(), "strict".into())]);
+        assert_eq!(config.proxy.guard_thinking, GuardMode::Enforce);
+
+        let parsed: Config = toml::from_str(
+            "[proxy]\nguard_thinking = \"enforce\"\nguard_upstream_body = \"off\"\n\
+             [engine]\nmax_compress_bytes = 2048\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.proxy.guard_thinking, GuardMode::Enforce);
+        assert_eq!(parsed.proxy.guard_upstream_body, GuardMode::Off);
+        assert_eq!(parsed.engine.max_compress_bytes, 2048);
+        assert!(toml::from_str::<Config>("[proxy]\nguard_thinking = \"strict\"\n").is_err());
+    }
+
+    #[test]
     fn the_prefix_stabilisers_are_off_by_default_and_set_per_provider_or_from_the_environment() {
         let mut config = Config::default();
         assert_eq!(config.proxy.prompt_cache_key, PromptCacheKey::Client);
@@ -3003,6 +3377,77 @@ mod tests {
     }
 
     #[test]
+    fn output_shaping_is_off_by_default_and_its_holdout_cannot_fall_below_thirty() {
+        let mut config = Config::default();
+        assert!(!config.proxy.output_shaping);
+        assert_eq!(config.proxy.output_shaping_holdout_pct, 50);
+        assert_eq!(
+            config.proxy.output_shaping_text,
+            DEFAULT_OUTPUT_SHAPING_TEXT
+        );
+        config.validate().expect("the defaults are valid");
+        config.apply_env(&[
+            ("KOMPRESSOR__PROXY__OUTPUT_SHAPING".into(), "true".into()),
+            (
+                "KOMPRESSOR__PROXY__OUTPUT_SHAPING_HOLDOUT_PCT".into(),
+                "35".into(),
+            ),
+            (
+                "KOMPRESSOR__PROXY__OUTPUT_SHAPING_TEXT".into(),
+                "Be brief.".into(),
+            ),
+        ]);
+        assert!(config.proxy.output_shaping);
+        assert_eq!(config.proxy.output_shaping_holdout_pct, 35);
+        assert_eq!(config.proxy.output_shaping_text, "Be brief.");
+        config.validate().expect("35% is enough");
+        for pct in [0u8, 10, 29, 101, 255] {
+            config.proxy.output_shaping_holdout_pct = pct;
+            assert!(config.validate().is_err(), "{pct}");
+        }
+        config.proxy.output_shaping_holdout_pct = 30;
+        config.validate().expect("30% is the floor");
+        config.proxy.output_shaping_text = "  ".into();
+        assert!(config.validate().is_err(), "an empty instruction");
+        let parsed: Config = toml::from_str(
+            "[proxy]\noutput_shaping = true\noutput_shaping_holdout_pct = 40\n\
+             output_shaping_text = \"Short answers.\"\n",
+        )
+        .expect("parses");
+        assert!(parsed.proxy.output_shaping);
+        assert_eq!(parsed.proxy.output_shaping_holdout_pct, 40);
+        assert_eq!(parsed.proxy.output_shaping_text, "Short answers.");
+    }
+
+    #[test]
+    fn engine_borrows_from_headroom_are_reachable_from_the_environment() {
+        let mut config = Config::default();
+        assert!(config.engine.enable_runtime_frame_collapse);
+        assert!(config.engine.keep_test_totals);
+        assert!(!config.engine.enable_json_csv);
+        assert_eq!(config.engine.protect_tool_error_chars, 2_000);
+        config.apply_env(&[
+            (
+                "KOMPRESSOR__ENGINE__ENABLE_RUNTIME_FRAME_COLLAPSE".into(),
+                "false".into(),
+            ),
+            (
+                "KOMPRESSOR__ENGINE__KEEP_TEST_TOTALS".into(),
+                "false".into(),
+            ),
+            ("KOMPRESSOR__ENGINE__ENABLE_JSON_CSV".into(), "true".into()),
+            (
+                "KOMPRESSOR__ENGINE__PROTECT_TOOL_ERROR_CHARS".into(),
+                "0".into(),
+            ),
+        ]);
+        assert!(!config.engine.enable_runtime_frame_collapse);
+        assert!(!config.engine.keep_test_totals);
+        assert!(config.engine.enable_json_csv);
+        assert_eq!(config.engine.protect_tool_error_chars, 0);
+    }
+
+    #[test]
     fn keep_warm_is_on_by_default_and_reachable_from_the_environment() {
         let mut config = Config::default();
         assert!(config.proxy.cache_keep_warm);
@@ -3053,6 +3498,57 @@ mod tests {
     }
 
     #[test]
+    fn the_retrieval_economics_settings_default_off_and_are_reachable() {
+        let mut config = Config::default();
+        assert!(!config.proxy.retrieve_attach_siblings);
+        assert_eq!(config.proxy.elision_gate, ElisionGate::Fixed);
+        assert_eq!(config.proxy.net_cost_gate.fetch_probability, 0.30);
+        config.apply_env(&[
+            (
+                "KOMPRESSOR__PROXY__RETRIEVE_ATTACH_SIBLINGS".into(),
+                "true".into(),
+            ),
+            ("KOMPRESSOR__PROXY__ELISION_GATE".into(), "net_cost".into()),
+            (
+                "KOMPRESSOR__PROXY__NET_COST_GATE__EXPECTED_READS".into(),
+                "25".into(),
+            ),
+            (
+                "KOMPRESSOR__PROXY__NET_COST_GATE__FETCH_PROBABILITY".into(),
+                "0.2".into(),
+            ),
+        ]);
+        assert!(config.proxy.retrieve_attach_siblings);
+        assert_eq!(config.proxy.elision_gate, ElisionGate::NetCost);
+        assert_eq!(config.proxy.net_cost_gate.expected_reads, 25.0);
+        assert_eq!(config.proxy.net_cost_gate.fetch_probability, 0.2);
+        // A typo leaves the gate as it was.
+        config.apply_env(&[("KOMPRESSOR__PROXY__ELISION_GATE".into(), "netcost".into())]);
+        assert_eq!(config.proxy.elision_gate, ElisionGate::NetCost);
+
+        let parsed: Config = toml::from_str(
+            "[proxy]\nelision_gate = \"net_cost\"\n\
+             [proxy.net_cost_gate]\nexpected_reads = 4\n\
+             [[proxy.net_cost_gate.fetch_table]]\nkind = \"log\"\nbelow_saved_chars = 4000\np = 0.3\n\
+             [proxy.providers.openai]\nelision_gate = \"fixed\"\n",
+        )
+        .expect("parses");
+        assert_eq!(parsed.proxy.elision_gate, ElisionGate::NetCost);
+        assert_eq!(parsed.proxy.net_cost_gate.expected_reads, 4.0);
+        assert_eq!(parsed.proxy.net_cost_gate.fetch_table[0].kind, "log");
+        let openai = parsed.for_provider("openai").expect("scoped");
+        assert_eq!(openai.proxy.elision_gate, ElisionGate::Fixed);
+        assert!(parsed.validate().is_ok());
+
+        let mut broken = parsed.clone();
+        broken.proxy.net_cost_gate.fetch_probability = 2.0;
+        assert!(
+            broken.validate().is_err(),
+            "a probability above one is refused"
+        );
+    }
+
+    #[test]
     fn a_keep_warm_interval_the_cache_would_not_survive_is_rejected() {
         for interval in [Duration::ZERO, Duration::from_secs(300)] {
             let mut config = Config::default();
@@ -3060,6 +3556,67 @@ mod tests {
             assert!(config.validate().is_err(), "{interval:?}");
         }
         assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn the_background_prior_and_the_hour_ping_are_off_and_reachable_from_the_environment() {
+        let mut config = Config::default();
+        assert!(!config.proxy.cache_keep_warm_background_prior);
+        assert!(!config.proxy.cache_keep_warm_one_hour);
+        assert_eq!(
+            config.proxy.cache_keep_warm_one_hour_delay,
+            Duration::from_secs(3_300)
+        );
+        config.apply_env(&[
+            (
+                "KOMPRESSOR__PROXY__CACHE_KEEP_WARM_BACKGROUND_PRIOR".into(),
+                "true".into(),
+            ),
+            (
+                "KOMPRESSOR__PROXY__CACHE_KEEP_WARM_ONE_HOUR".into(),
+                "true".into(),
+            ),
+            (
+                "KOMPRESSOR__PROXY__CACHE_KEEP_WARM_ONE_HOUR_DELAY".into(),
+                "50m".into(),
+            ),
+        ]);
+        assert!(config.proxy.cache_keep_warm_background_prior);
+        assert!(config.proxy.cache_keep_warm_one_hour);
+        assert_eq!(
+            config.proxy.cache_keep_warm_one_hour_delay,
+            Duration::from_secs(3_000)
+        );
+        config.apply_env(&[(
+            "KOMPRESSOR__PROXY__CACHE_KEEP_WARM_ONE_HOUR_DELAY".into(),
+            "soon".into(),
+        )]);
+        assert_eq!(
+            config.proxy.cache_keep_warm_one_hour_delay,
+            Duration::from_secs(3_000),
+            "an unreadable delay leaves the last one standing"
+        );
+        let parsed: Config = toml::from_str(
+            "[proxy]\ncache_keep_warm_one_hour = true\ncache_keep_warm_one_hour_delay = \"58m\"\n",
+        )
+        .expect("parses");
+        assert!(parsed.proxy.cache_keep_warm_one_hour);
+        assert_eq!(
+            parsed.proxy.cache_keep_warm_one_hour_delay,
+            Duration::from_secs(58 * 60)
+        );
+    }
+
+    #[test]
+    fn a_one_hour_ping_delay_the_entry_would_not_survive_is_rejected() {
+        for delay in [Duration::ZERO, Duration::from_secs(3_600)] {
+            let mut config = Config::default();
+            config.proxy.cache_keep_warm_one_hour_delay = delay;
+            assert!(config.validate().is_err(), "{delay:?}");
+        }
+        let mut config = Config::default();
+        config.proxy.cache_keep_warm_one_hour_delay = Duration::from_secs(3_599);
+        assert!(config.validate().is_ok());
     }
 
     #[test]

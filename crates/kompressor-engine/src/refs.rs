@@ -193,6 +193,10 @@ pub struct RefCollector {
     /// everything the payload stashed, so nothing else is left to say why it
     /// went out uncompressed.
     gated: usize,
+    /// Payloads the net-cost gate was asked about, admitted or not. Sticky
+    /// like `gated`; what tells `compress_messages` a message's decision
+    /// depended on the gate's inputs, and so must be pinned.
+    gate_consulted: usize,
 }
 
 /// A point to roll a collector back to.
@@ -237,6 +241,7 @@ impl RefCollector {
             oversized_attempts: 0,
             oversized_refusals: 0,
             gated: 0,
+            gate_consulted: 0,
         }
     }
 
@@ -254,6 +259,7 @@ impl RefCollector {
             oversized_attempts: 0,
             oversized_refusals: 0,
             gated: 0,
+            gate_consulted: 0,
         }
     }
 
@@ -291,6 +297,14 @@ impl RefCollector {
         if fragment.len() > self.max_ref_bytes {
             self.oversized_attempts += 1;
             self.oversized_refusals += 1;
+            return None;
+        }
+        if crate::markers::is_bare_marker(fragment) {
+            // Never an original: see `is_bare_marker`. Counted as an attempt
+            // the store could not honour, like an oversized one, so a
+            // recoverable payload that would ship it behind a marker ships
+            // whole instead. Not a *size* refusal, so not reported as one.
+            self.oversized_attempts += 1;
             return None;
         }
         let id = ref_for(fragment);
@@ -344,6 +358,15 @@ impl RefCollector {
 
     pub(crate) fn note_gated(&mut self) {
         self.gated += 1;
+    }
+
+    /// Payloads the net-cost gate has been asked about so far.
+    pub fn gate_consulted(&self) -> usize {
+        self.gate_consulted
+    }
+
+    pub(crate) fn note_gate_consulted(&mut self) {
+        self.gate_consulted += 1;
     }
 
     pub fn forgive_oversized(&mut self) {
@@ -425,6 +448,7 @@ impl RefCollector {
             oversized_attempts: 0,
             oversized_refusals: 0,
             gated: 0,
+            gate_consulted: 0,
         }
     }
 
@@ -709,6 +733,36 @@ mod tests {
         assert_eq!(refs.stash("a fragment well over the cap"), None);
         assert!(refs.is_empty());
         assert!(refs.stash("small").is_some());
+    }
+
+    /// A marker is a pointer, not a payload: a fragment that is nothing but
+    /// markers is refused, and the refusal vetoes the elision the way an
+    /// oversized one does.
+    #[test]
+    fn a_bare_marker_is_never_stored_as_an_original() {
+        let mut refs = RefCollector::new(1 << 20);
+        for bare in [
+            "[... 40 log lines omitted [ref:k_AbC123dEf456]]",
+            "  # [... 77 body lines omitted from join; retrieve: ref:k_AbC123dEf456]",
+            "\"... 30 similar items omitted [ref:k_AbC123dEf456] ...\",",
+            "…[+1840 chars ref:k_DeF456ghI789]",
+            "[... 3 library frames omitted [ref:k_AbC123dEf456]]\n\n[... 2 rows omitted]",
+            "[Read superseded: src/a.rs was read again later in this conversation [... 1 read omitted [ref:k_AbC123dEf456]]]",
+        ] {
+            let before = refs.oversized_attempts();
+            assert_eq!(refs.stash(bare), None, "{bare}");
+            assert_eq!(refs.oversized_attempts(), before + 1, "{bare}");
+        }
+        assert!(refs.is_empty());
+        assert_eq!(refs.oversized_refusals(), 0, "not a size refusal");
+        // content that merely carries a marker is still content
+        for content in [
+            "error: build failed\n[... 40 log lines omitted [ref:k_AbC123dEf456]]",
+            "retry: connection refused [×4]",
+            "",
+        ] {
+            assert!(refs.stash(content).is_some(), "{content:?}");
+        }
     }
 
     #[test]

@@ -1074,3 +1074,92 @@ async fn a_turn_that_narrates_before_calling_is_still_intercepted() {
         "and our tool call must never reach the client"
     );
 }
+
+/// The streamed loop files each round's usage as the buffered one does.
+#[tokio::test]
+async fn a_streamed_retrieve_files_each_rounds_own_usage() {
+    let harness = Harness::new().await;
+    mount_stream(&harness, ANTHROPIC_ASKS, ANTHROPIC_ANSWERS).await;
+    let reply = harness
+        .post(
+            "/v1/messages",
+            &streaming(anthropic_body(&log_payload(400))),
+        )
+        .await;
+    assert!(reply.text().contains("The disk filled."));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let filed = loop {
+        let filed: Vec<_> = harness
+            .events
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                kompressor_stats::Event::RetrieveRounds(e) => Some(e),
+                _ => None,
+            })
+            .collect();
+        if let Some(filed) = filed.into_iter().next() {
+            break filed;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no per-round usage was filed for the streamed retrieve"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    let per_round: Vec<_> = filed
+        .rounds
+        .iter()
+        .map(|r| (r.round, r.input_tokens, r.output_tokens))
+        .collect();
+    assert_eq!(
+        per_round,
+        [(0, Some(1000), Some(20)), (1, Some(1200), Some(30))]
+    );
+}
+
+/// `proxy.retrieve_attach_siblings` on the streamed path: the round the relay
+/// builds carries the asked-for fragment's siblings, and appends only.
+#[tokio::test]
+async fn a_streamed_retrieve_round_carries_the_siblings_when_asked_to() {
+    // Five files' search output, each file's middle elided behind its own
+    // handle: one tool output, five siblings.
+    let payload: String = (0..5)
+        .flat_map(|f| {
+            (0..40).map(move |i| {
+                format!(
+                    "src/module_{f}/handler.rs:{}:    let value_{i} = compute_thing(input_{i}, &state);",
+                    i * 3 + 1
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    for on in [false, true] {
+        let harness = Harness::with(|config| config.proxy.retrieve_attach_siblings = on).await;
+        mount_stream(&harness, CHAT_ASKS, CHAT_ANSWERS).await;
+        let reply = harness
+            .post("/v1/chat/completions", &streaming(chat_body(&payload)))
+            .await;
+        assert_eq!(reply.status, 200);
+        let rounds = harness.upstream_json().await;
+        assert_eq!(rounds.len(), 2);
+        let first = rounds[0]["messages"].as_array().unwrap();
+        let second = rounds[1]["messages"].as_array().unwrap();
+        assert_eq!(
+            &second[..first.len()],
+            &first[..],
+            "only the round is appended"
+        );
+        let result: Value =
+            serde_json::from_str(second.last().unwrap()["content"].as_str().unwrap()).unwrap();
+        assert_eq!(result["found"], true);
+        let siblings = result["siblings"].as_array().map_or(0, Vec::len);
+        if on {
+            assert_eq!(siblings, 4, "the four other files' fragments: {result}");
+        } else {
+            assert_eq!(siblings, 0, "off by default: {result}");
+        }
+    }
+}

@@ -20,11 +20,13 @@
 //! # What is not kept
 //!
 //! The ledger lives in this process, beside the freeze watermark it depends
-//! on. A restart loses both, and the conversation's next turn then freezes and
-//! sends messages the provider holds compressed: one lost prefix, the price a
-//! restart already has under `frozen_prefix = "first_seen"`. Nothing is
-//! unrecoverable — a replaced read's content is retained behind its handle
-//! like any other fragment.
+//! on. A restart loses both unless `proxy.state_path` keeps them
+//! ([`crate::persist`], which writes and loads the two together), and the
+//! conversation's next turn then freezes and sends messages the provider
+//! holds compressed: one lost prefix, the price a restart has under
+//! `frozen_prefix = "first_seen"` without the file. Nothing is unrecoverable
+//! — a replaced read's content is retained behind its handle like any other
+//! fragment.
 //!
 //! # One recompaction at a time
 //!
@@ -377,6 +379,80 @@ impl Recompact {
     pub fn tracked(&self) -> usize {
         self.ledgers.lock().map_or(0, |ledgers| ledgers.len())
     }
+
+    /// Every recompacted conversation's ledger, for the state file, and the
+    /// conversations left out of it for holding more than
+    /// [`crate::persist::MAX_LEDGER_READS`] reads: the caller leaves their
+    /// watermark out too, since a lowered floor without its ledger would
+    /// send the reads whole into a prefix that holds them replaced.
+    ///
+    /// A reservation or an unanswered recompaction is not written: the
+    /// request behind it ended with this process. Neither are the wrong
+    /// predictions, which switch prediction off until restart on purpose.
+    pub(crate) fn snapshot(
+        &self,
+        clock: &crate::persist::Clock,
+    ) -> (Vec<LedgerRecord>, std::collections::HashSet<u64>) {
+        let mut oversized = std::collections::HashSet::new();
+        let Ok(ledgers) = self.ledgers.lock() else {
+            return (Vec::new(), oversized);
+        };
+        let records = ledgers
+            .iter()
+            .filter(|(_, ledger)| ledger.epoch > 0)
+            .filter(|(conversation, ledger)| {
+                let fits = ledger.reads.len() <= crate::persist::MAX_LEDGER_READS;
+                if !fits {
+                    oversized.insert(**conversation);
+                }
+                fits
+            })
+            .map(|(&conversation, ledger)| LedgerRecord {
+                conversation,
+                age_ms: ledger.at.map_or(0, |at| clock.age(at)),
+                epoch: ledger.epoch,
+                reads: ledger
+                    .reads
+                    .iter()
+                    .map(|(&key, &decision)| (key, decision))
+                    .collect(),
+            })
+            .collect();
+        (records, oversized)
+    }
+
+    /// Replace every ledger with `records`, newest first up to the cap.
+    pub(crate) fn restore(&self, records: Vec<LedgerRecord>, clock: &crate::persist::Clock) {
+        let Ok(mut ledgers) = self.ledgers.lock() else {
+            return;
+        };
+        ledgers.clear();
+        for record in crate::prefixcache::newest(records, REMEMBER, |record| record.age_ms) {
+            if record.reads.len() > crate::persist::MAX_LEDGER_READS || record.epoch == 0 {
+                continue;
+            }
+            ledgers.insert(
+                record.conversation,
+                Ledger {
+                    at: Some(clock.at(record.age_ms)),
+                    reads: record.reads.into_iter().collect(),
+                    epoch: record.epoch,
+                    hold: None,
+                    recompacted_at: 0,
+                },
+            );
+        }
+    }
+}
+
+/// One conversation's ledger in the state file: what its cold turns decided
+/// about each read, by `read_key` — a hash, never the read.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LedgerRecord {
+    conversation: u64,
+    age_ms: u64,
+    epoch: u32,
+    reads: Vec<(u64, ReadDecision)>,
 }
 
 #[cfg(test)]

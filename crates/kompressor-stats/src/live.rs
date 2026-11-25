@@ -808,6 +808,7 @@ mod tests {
             total_ms: Some(total_ms),
             error: status.is_none().then(|| "connect refused".to_string()),
             keep_warm: false,
+            output_shaping: None,
         })
     }
 

@@ -8,6 +8,9 @@
 //! a rule added for one of them holds for all three.
 
 #![forbid(unsafe_code)]
+// `analysis_context` records every policy setting in one `json!` literal,
+// which outgrew the default macro recursion limit.
+#![recursion_limit = "256"]
 
 pub mod auth;
 pub mod backup;

@@ -32,6 +32,10 @@ allow_insecure_upstream = true
 cache_keep_warm_interval = "2s"
 cache_keep_warm_max_pings = 3
 cache_keep_warm_background_pings = 2
+# One ping near the hour for a tool_use wait on one-hour entries; the hour is
+# five seconds here.
+cache_keep_warm_one_hour = true
+cache_keep_warm_one_hour_delay = "5s"
 
 [proxy.providers.anthropic]
 cache_keep_warm = true

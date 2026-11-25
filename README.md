@@ -781,7 +781,7 @@ statistics listener (`server.stats_listen`) as well.
 | `GET /v1/stats/analysis?from=&to=` | the analysis overview (`report`, `stats_dropped`, `retention_days`); defaults to the last 24 h |
 | `GET /v1/stats/analysis/retrievals?from=&to=` | retrieval amplification |
 | `GET /v1/stats/analysis/latency?from=&to=` | latency and reliability |
-| `GET /v1/stats/analysis/compare?from=&to=` | historical comparison; `compare_from`/`compare_to`, `model`, `mode`, `surface`, `experiment_id`, `run_id` |
+| `GET /v1/stats/analysis/compare?from=&to=` | historical comparison; `compare_from`/`compare_to`, `model`, `mode`, `surface`, `experiment_id`, `run_id`; `output_shaping` sets the two arms of `proxy.output_shaping` against each other within the window |
 | `GET /v1/stats/trends?window=26w&bucket=week` | per-period history from raw rows and the daily archive; `window` up to `104w`, `bucket` `day`, `week` or `month`, or `from=&to=` up to 730 days |
 | `GET /v1/stats/yield?window=24h` | tokens removed per content type (estimated by message share) and retrieval asks per fragment kind |
 | `GET /v1/stats/store-health?window=24h` | the ref store's census by kind, age and expiry, its size over time, minted versus asked handles, expired and missing asks |
@@ -877,6 +877,7 @@ per setting, whether it clears the bar.
 | `sticky_beta = true` | re-sends the `anthropic-beta` tokens a conversation already sent when a later request leaves some out |
 | `prompt_cache_key = "conversation"` | names an OpenAI cache route from the conversation's opening where the client named none |
 | `tools_compact = true` | drops schema bookkeeping from tool definitions (`$comment`, a `title` that restates its property's name, a `$schema` no keyword in the schema depends on); about 2% of the tool block on Claude Code |
+| `output_shaping = true` | Anthropic: appends a fixed "answer concisely" block after the last `system` block, for all but `output_shaping_holdout_pct` (default 50, at least 30) of conversations; the only setting that changes what the model is asked, so an experiment, compared per arm at `/v1/stats/analysis/compare` |
 | `cold_recompact = "observed"` or `"predicted"` | under `frozen_prefix = "first_seen"`, rewrites the whole conversation on the turn that finds the provider's cache gone, and replays what that turn decided on every turn after it |
 | `superseded_reads`, `matured_reads` | with `cold_recompact`: on that turn, also replace a file read a later read contains, and compress as source a read left alone for `matured_quiesce_turns` |
 | `reasoning_elide_models = ["…"]` | OpenAI Chat: for the models named, elides the plain-text reasoning of turns before the last user message. Rewrites the finished turn once per user turn |
@@ -920,7 +921,7 @@ Good first issues are labelled
 | `make harbor-gates` | every live-agent benchmark gate, with no provider spend                                        |
 
 
-`cargo test --workspace` runs **1,882 tests** across ten crates; clippy and rustfmt
+`cargo test --workspace` runs **2,236 tests** across ten crates; clippy and rustfmt
 are clean. `make bench-save` and `make golden` move what the tests compare against,
 so both ask before they run.
 

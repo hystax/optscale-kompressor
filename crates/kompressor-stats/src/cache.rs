@@ -1328,6 +1328,7 @@ mod db_tests {
             total_ms: (!keep_warm).then_some(1_000.0),
             error: None,
             keep_warm,
+            output_shaping: None,
         })
     }
 

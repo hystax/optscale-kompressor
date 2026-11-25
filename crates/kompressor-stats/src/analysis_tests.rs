@@ -64,6 +64,7 @@ fn proxy(time: i64, tenant: &str, id: &str, ping: bool) -> Event {
         total_ms: Some(if ping { 9999.0 } else { 100.0 }),
         error: None,
         keep_warm: ping,
+        output_shaping: None,
     })
 }
 fn opt(time: i64, tenant: &str, id: &str) -> Event {

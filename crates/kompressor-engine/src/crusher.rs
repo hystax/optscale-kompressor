@@ -90,6 +90,12 @@ pub fn crush_json(
     // harness that stamps a frame.
     let (preamble, body) = split_harness_preamble(content);
     let parsed = parse(body)?;
+    let csv = if opts.enable_json_csv {
+        json_as_csv(&parsed)
+    } else {
+        None
+    };
+    let mark = refs.mark();
     let crushed = if opts.mode == Mode::Lossless {
         crush_lossless(parsed)
     } else {
@@ -114,9 +120,146 @@ pub fn crush_json(
             sampled
         }
     };
-    let out = serde_json::to_string(&crushed).ok()?;
-    let out = format!("{preamble}{out}");
+    let json = serde_json::to_string(&crushed)
+        .ok()
+        .map(|out| format!("{preamble}{out}"));
+    if let Some(csv) = csv {
+        let csv = format!("{preamble}{csv}");
+        let saves_enough = chars_len(&csv) * 100 <= chars_len(content) * (100 - CSV_MIN_SAVING_PCT);
+        let beats_json = json
+            .as_deref()
+            .is_none_or(|json| chars_len(&csv) < chars_len(json));
+        if saves_enough && beats_json {
+            // Lossless and self-describing, so nothing the JSON reading
+            // stashed is named by what ships.
+            refs.rollback(mark);
+            return Some(csv);
+        }
+    }
+    let out = json?;
     (chars_len(&out) < chars_len(content)).then_some(out)
+}
+
+// ---------------------------------------------------------------------------
+// typed header plus CSV
+// ---------------------------------------------------------------------------
+
+/// What opens the CSV form, and what [`crate::markers::has_envelope`] knows it
+/// by.
+pub const CSV_HEADER: &str = "[json array as csv; ";
+
+/// The CSV form is taken only when it saves at least this share of the
+/// payload: below it, a reader learning a second spelling of the same data is
+/// not worth the bytes. Headroom's threshold.
+const CSV_MIN_SAVING_PCT: usize = 15;
+
+/// A column's type, which is what makes the CSV form reversible: a `str`
+/// column's `12` is the string `"12"`, a `num` column's is the number.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CsvType {
+    Num,
+    Str,
+    Bool,
+    /// Anything else, or a mix: each cell is the value's own JSON.
+    Json,
+}
+
+impl CsvType {
+    fn name(self) -> &'static str {
+        match self {
+            CsvType::Num => "num",
+            CsvType::Str => "str",
+            CsvType::Bool => "bool",
+            CsvType::Json => "json",
+        }
+    }
+
+    fn of(value: &Value) -> Option<CsvType> {
+        match value {
+            Value::Null => None,
+            Value::Number(_) => Some(CsvType::Num),
+            Value::String(_) => Some(CsvType::Str),
+            Value::Bool(_) => Some(CsvType::Bool),
+            Value::Array(_) | Value::Object(_) => Some(CsvType::Json),
+        }
+    }
+}
+
+/// One CSV field, quoted only when it has to be. An empty string is quoted, so
+/// an empty unquoted field can mean `null`.
+fn csv_field(text: &str) -> String {
+    let plain = !text.is_empty()
+        && !text.contains([',', '"', '\n', '\r'])
+        && !text.starts_with(char::is_whitespace)
+        && !text.ends_with(char::is_whitespace);
+    if plain {
+        text.to_string()
+    } else {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    }
+}
+
+/// A top-level array of objects sharing one key order, as a typed header line
+/// and one CSV record per object.
+///
+/// `[json array as csv; 3 rows] id:num,name:str,ok:bool` then the rows. Every
+/// value comes back exactly: numbers keep their source digits
+/// (`arbitrary_precision`), each column's type says how to read its cells, an
+/// empty unquoted cell is `null`, and the key order is the header's. `None`
+/// for anything that is not such an array.
+fn json_as_csv(value: &Value) -> Option<String> {
+    let items = value.as_array()?;
+    if items.len() < MIN_FACTOR_ITEMS {
+        return None;
+    }
+    let first = items[0].as_object()?;
+    let columns: Vec<&String> = first.keys().collect();
+    if columns.is_empty() {
+        return None;
+    }
+    let mut types: Vec<Option<CsvType>> = vec![None; columns.len()];
+    for item in items {
+        let map = item.as_object()?;
+        if map.len() != columns.len() || !map.keys().zip(&columns).all(|(a, b)| a == *b) {
+            return None;
+        }
+        for (slot, cell) in types.iter_mut().zip(map.values()) {
+            if let Some(kind) = CsvType::of(cell) {
+                *slot = match *slot {
+                    None => Some(kind),
+                    Some(known) if known == kind => Some(known),
+                    Some(_) => Some(CsvType::Json),
+                };
+            }
+        }
+    }
+    let types: Vec<CsvType> = types
+        .into_iter()
+        .map(|kind| kind.unwrap_or(CsvType::Str))
+        .collect();
+    let header: Vec<String> = columns
+        .iter()
+        .zip(&types)
+        .map(|(name, kind)| csv_field(&format!("{name}:{}", kind.name())))
+        .collect();
+    let mut out = format!("{CSV_HEADER}{} rows] {}", items.len(), header.join(","));
+    for item in items {
+        let map = item.as_object()?;
+        let cells: Vec<String> = map
+            .values()
+            .zip(&types)
+            .map(|(cell, kind)| match (cell, kind) {
+                (Value::Null, _) => String::new(),
+                (Value::String(text), CsvType::Str) => csv_field(text),
+                (Value::Number(number), CsvType::Num) => number.to_string(),
+                (Value::Bool(flag), CsvType::Bool) => flag.to_string(),
+                (other, _) => csv_field(&dumps(other)),
+            })
+            .collect();
+        out.push('\n');
+        out.push_str(&cells.join(","));
+    }
+    Some(out)
 }
 
 /// Parse `content` as one document, or as NDJSON read as a single array.
@@ -1589,5 +1732,218 @@ mod lossy_factoring_tests {
             ..lossy()
         };
         assert!(run(&input, &off).is_none());
+    }
+}
+
+#[cfg(test)]
+mod csv_tests {
+    use super::*;
+    use crate::types::Mode;
+    use serde_json::json;
+
+    fn options(mode: Mode) -> EngineOptions {
+        EngineOptions {
+            mode,
+            enable_json_csv: true,
+            ..EngineOptions::default()
+        }
+    }
+
+    fn run(input: &str, opts: &EngineOptions) -> (Option<String>, RefCollector) {
+        let mut refs = opts.collector();
+        let out = crush_json(input, opts, &Context::for_role("tool"), &mut refs);
+        (out, refs)
+    }
+
+    /// Read one CSV record starting at `at` (in chars), returning its fields
+    /// (`None` for an empty unquoted one) and where the next record starts.
+    fn record(chars: &[char], mut at: usize) -> (Vec<Option<String>>, usize) {
+        let mut fields = Vec::new();
+        loop {
+            if chars.get(at) == Some(&'"') {
+                let mut field = String::new();
+                at += 1;
+                loop {
+                    match chars[at] {
+                        '"' if chars.get(at + 1) == Some(&'"') => {
+                            field.push('"');
+                            at += 2;
+                        }
+                        '"' => {
+                            at += 1;
+                            break;
+                        }
+                        c => {
+                            field.push(c);
+                            at += 1;
+                        }
+                    }
+                }
+                fields.push(Some(field));
+            } else {
+                let start = at;
+                while at < chars.len() && chars[at] != ',' && chars[at] != '\n' {
+                    at += 1;
+                }
+                let field: String = chars[start..at].iter().collect();
+                fields.push((!field.is_empty()).then_some(field));
+            }
+            match chars.get(at) {
+                Some(',') => at += 1,
+                Some('\n') => return (fields, at + 1),
+                _ => return (fields, at),
+            }
+        }
+    }
+
+    /// Rebuild the array from the CSV form, by its header alone: the claim
+    /// that it is lossless, checked by reversing it.
+    fn decode(text: &str) -> Value {
+        let rest = text.strip_prefix(CSV_HEADER).expect("the header opens it");
+        let (count, rest) = rest.split_once(" rows] ").unwrap();
+        let count: usize = count.parse().unwrap();
+        let chars: Vec<char> = rest.chars().collect();
+        let (header, mut at) = record(&chars, 0);
+        let columns: Vec<(String, String)> = header
+            .into_iter()
+            .map(|field| {
+                let field = field.unwrap();
+                let (name, kind) = field.rsplit_once(':').unwrap();
+                (name.to_string(), kind.to_string())
+            })
+            .collect();
+        let mut items = Vec::new();
+        for _ in 0..count {
+            let (fields, next) = record(&chars, at);
+            at = next;
+            assert_eq!(fields.len(), columns.len());
+            let mut map = Map::new();
+            for ((name, kind), field) in columns.iter().zip(fields) {
+                let value = match (field, kind.as_str()) {
+                    (None, _) => Value::Null,
+                    (Some(text), "str") => Value::String(text),
+                    (Some(text), "bool") => Value::Bool(text == "true"),
+                    (Some(text), _) => serde_json::from_str(&text).unwrap(),
+                };
+                map.insert(name.clone(), value);
+            }
+            items.push(Value::Object(map));
+        }
+        assert_eq!(at, chars.len(), "nothing after the last row");
+        Value::Array(items)
+    }
+
+    fn records(count: usize) -> Value {
+        Value::Array(
+            (0..count)
+                .map(|i| {
+                    json!({"id": i, "name": format!("user {i}"), "active": i % 2 == 0,
+                           "score": 0.5 + i as f64, "team": "core"})
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn an_array_of_records_becomes_a_typed_header_and_rows() {
+        let input = serde_json::to_string_pretty(&records(8)).unwrap();
+        for mode in [Mode::Lossless, Mode::Recoverable, Mode::Aggressive] {
+            let (out, refs) = run(&input, &options(mode));
+            let out = out.expect("the CSV form saves well over 15%");
+            assert!(
+                out.starts_with(
+                    "[json array as csv; 8 rows] id:num,name:str,active:bool,score:num,team:str\n\
+                     0,user 0,true,0.5,core\n"
+                ),
+                "{mode:?}: {out}"
+            );
+            assert!(refs.is_empty(), "lossless needs no handle");
+            assert!(crate::markers::has_envelope(&out));
+            let original: Value = serde_json::from_str(&input).unwrap();
+            assert_eq!(decode(&out), original, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn every_awkward_value_round_trips() {
+        let input = r#"[
+            {"a": "", "b": null, "c": 1e5, "d": "x, \"quoted\"\nsecond line", "e": [1, {"k": "v"}], "f": " pad "},
+            {"a": "12", "b": 3, "c": 0.1000000000000000005, "d": "plain", "e": null, "f": "ok"},
+            {"a": "null", "b": "mixed", "c": -7, "d": "", "e": {"x": true}, "f": null}
+        ]"#;
+        let parsed: Value = serde_json::from_str(input).unwrap();
+        let csv = json_as_csv(&parsed).expect("one key order");
+        assert!(
+            csv.starts_with(
+                "[json array as csv; 3 rows] a:str,b:json,c:num,d:str,e:json,f:str\n\"\",,"
+            ),
+            "an empty string is quoted, a null is empty: {csv}"
+        );
+        assert!(csv.contains("0.1000000000000000005"), "source digits kept");
+        assert_eq!(decode(&csv), parsed);
+    }
+
+    #[test]
+    fn records_with_different_keys_or_order_are_not_tabulated() {
+        let order = json!([{"a": 1, "b": 2}, {"b": 2, "a": 1}, {"a": 3, "b": 4}]);
+        assert!(json_as_csv(&order).is_none());
+        let keys = json!([{"a": 1, "b": 2}, {"a": 1}, {"a": 3, "b": 4}]);
+        assert!(json_as_csv(&keys).is_none());
+        assert!(json_as_csv(&json!([1, 2, 3])).is_none());
+        assert!(json_as_csv(&json!([{"a": 1}])).is_none(), "one record");
+        assert!(json_as_csv(&json!({"a": [{"b": 1}, {"b": 2}]})).is_none());
+    }
+
+    #[test]
+    fn a_saving_under_fifteen_percent_keeps_the_json_reading() {
+        // Long free-text values: the key names are a small share of the bytes.
+        let items: Vec<Value> = (0..4)
+            .map(|i| json!({"k": format!("{i} {}", "word ".repeat(80))}))
+            .collect();
+        let input = Value::Array(items).to_string();
+        let (out, _) = run(&input, &options(Mode::Lossless));
+        assert!(
+            out.as_deref()
+                .is_none_or(|out| !out.starts_with(CSV_HEADER)),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn off_by_default_and_off_means_the_json_reading() {
+        assert!(!EngineOptions::default().enable_json_csv);
+        let input = serde_json::to_string_pretty(&records(8)).unwrap();
+        let off = EngineOptions {
+            mode: Mode::Lossless,
+            ..EngineOptions::default()
+        };
+        let (out, _) = run(&input, &off);
+        let out = out.expect("key factoring still applies");
+        assert!(out.contains("\"__cols__\""), "{out}");
+    }
+
+    #[test]
+    fn a_sampled_reading_that_is_smaller_wins_and_keeps_its_handle() {
+        // Recoverable samples a long array behind one marker, which is far
+        // smaller than every row as CSV, so the JSON reading ships.
+        let input = records(400).to_string();
+        let (out, refs) = run(&input, &options(Mode::Recoverable));
+        let out = out.unwrap();
+        assert!(out.contains("similar items omitted"), "{out}");
+        assert!(!refs.is_empty());
+    }
+
+    #[test]
+    fn the_csv_form_is_deterministic_and_keeps_the_harness_frame() {
+        let body = records(8).to_string();
+        let input = format!("Process exited with code 0\nOutput:\n{body}");
+        let (first, _) = run(&input, &options(Mode::Lossless));
+        let (second, _) = run(&input, &options(Mode::Lossless));
+        let first = first.unwrap();
+        assert_eq!(Some(&first), second.as_ref());
+        assert!(
+            first.starts_with("Process exited with code 0\nOutput:\n[json array as csv; 8 rows]"),
+            "{first}"
+        );
     }
 }

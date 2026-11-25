@@ -69,6 +69,7 @@ pub(crate) fn stats_routes() -> Router<Arc<ServerState>> {
         .route("/stats/retrievals", get(retrievals))
         .route("/stats/requests", get(requests))
         .route("/stats/store", get(store))
+        .merge(crate::measurements::measurement_routes())
         .merge(crate::live::live_routes())
 }
 
@@ -82,7 +83,7 @@ fn unpack(query: Result<Query<StatsQuery>, QueryRejection>) -> Result<StatsQuery
 }
 
 /// Which tenant this report is about.
-fn scope(identity: &Identity, requested: Option<&str>) -> Result<String, ApiError> {
+pub(crate) fn scope(identity: &Identity, requested: Option<&str>) -> Result<String, ApiError> {
     match requested {
         None => Ok(identity.tenant.as_str().to_string()),
         Some(name) if name == identity.tenant.as_str() => Ok(name.to_string()),

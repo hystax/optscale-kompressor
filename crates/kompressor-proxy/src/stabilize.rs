@@ -155,6 +155,72 @@ impl Stabilizer {
     pub fn tracked(&self) -> usize {
         self.entries.lock().map_or(0, |entries| entries.len())
     }
+
+    /// What each conversation pinned, for the state file. A conversation
+    /// whose names are too many or too long to keep is left out, and is new
+    /// to the next process.
+    pub(crate) fn snapshot(&self, clock: &crate::persist::Clock) -> Vec<PinnedRecord> {
+        let Ok(entries) = self.entries.lock() else {
+            return Vec::new();
+        };
+        entries
+            .iter()
+            .map(|(&conversation, pinned)| PinnedRecord {
+                conversation,
+                age_ms: pinned.at.map_or(0, |at| clock.age(at)),
+                tools: pinned.tools.clone(),
+                betas: pinned.betas.clone(),
+            })
+            .filter(PinnedRecord::bounded)
+            .collect()
+    }
+
+    /// Replace what is pinned with `records`, newest first up to the cap.
+    pub(crate) fn restore(&self, records: Vec<PinnedRecord>, clock: &crate::persist::Clock) {
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        let records = records.into_iter().filter(PinnedRecord::bounded).collect();
+        *entries = crate::prefixcache::newest(records, REMEMBER, |record| record.age_ms)
+            .into_iter()
+            .map(|record| {
+                (
+                    record.conversation,
+                    Pinned {
+                        at: Some(clock.at(record.age_ms)),
+                        tools: record.tools,
+                        betas: record.betas,
+                    },
+                )
+            })
+            .collect();
+    }
+}
+
+/// Most tool names, or beta tokens, one conversation may pin and still be
+/// written to the state file.
+const MAX_PINNED: usize = 1024;
+
+/// One conversation's pinned tool order and beta tokens in the state file:
+/// tool names and header tokens, never a tool's definition.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PinnedRecord {
+    conversation: u64,
+    age_ms: u64,
+    tools: Vec<String>,
+    betas: Vec<String>,
+}
+
+impl PinnedRecord {
+    fn bounded(&self) -> bool {
+        let short = |names: &[String]| {
+            names.len() <= MAX_PINNED
+                && names
+                    .iter()
+                    .all(|name| name.len() <= crate::persist::MAX_TEXT_BYTES)
+        };
+        short(&self.tools) && short(&self.betas)
+    }
 }
 
 /// The beta tokens a request carries, in order, each once.

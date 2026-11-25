@@ -682,7 +682,34 @@ impl AppCore {
                 }
             }
         }
+        self.record_elisions(identity, refs, request_id);
         true
+    }
+
+    /// File the handles about to be shipped, with their kind and size: the
+    /// denominator of a fetch probability, which `retrieval_events` alone
+    /// cannot give (it holds only the handles that were asked for). The
+    /// writer keeps the first request to ship each handle.
+    fn record_elisions(&self, identity: &Identity, refs: &RefCollector, request_id: &str) {
+        if !self.stats.is_enabled() {
+            return;
+        }
+        let elided = refs
+            .pairs()
+            .iter()
+            .map(|(id, fragment)| kompressor_stats::events::Elided {
+                reference: id.to_string(),
+                kind: refs.kind_of(id).as_str().to_string(),
+                bytes: fragment.len() as u64,
+            })
+            .collect();
+        self.stats
+            .send(Event::Elisions(kompressor_stats::events::ElisionsEvent {
+                time_ms: now_ms(),
+                tenant: identity.tenant.as_str().to_string(),
+                request_id: request_id.to_string(),
+                refs: elided,
+            }));
     }
 
     /// Push out the retention window of handles sitting in content we declined
@@ -975,6 +1002,47 @@ mod tests {
         }
     }
 
+    /// Every shipped handle is filed with its kind and size, which is what
+    /// a fetch probability is divided by.
+    #[test]
+    fn retained_fragments_are_filed_as_elisions_with_their_kind_and_size() {
+        let (sink, captured) = kompressor_stats::writer::capturing_sink(16);
+        let core = AppCore::new(Config::default(), Arc::new(MemoryRefStore::new()), sink);
+        let identity = Identity::anonymous();
+        let options = core.options_for(&identity, None);
+        let mut refs = options.collector();
+        refs.set_kind(Kind::Json);
+        let json = refs.stash("{\"a\": 1}").unwrap();
+        refs.set_kind(Kind::SourceCode);
+        let code = refs.stash("fn main() {}").unwrap();
+
+        assert!(core.retain_fragments(&identity, &refs, "req-7", &options));
+
+        let filed: Vec<_> = captured
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Elisions(e) => Some(e),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(filed.len(), 1);
+        assert_eq!(filed[0].request_id, "req-7");
+        let shipped: Vec<(String, String, u64)> = filed[0]
+            .refs
+            .iter()
+            .map(|e| (e.reference.clone(), e.kind.clone(), e.bytes))
+            .collect();
+        assert_eq!(
+            shipped,
+            [
+                (json.to_string(), "json".to_string(), 8),
+                (code.to_string(), "source_code".to_string(), 12),
+            ]
+        );
+        assert!(shipped[0].0.starts_with("k_"), "as retrievals name it");
+    }
+
     fn log_payload(lines: usize) -> String {
         (0..lines)
             .map(|i| {
@@ -1195,11 +1263,24 @@ mod tests {
             store.stats().expect("store stats").live_refs > 0,
             "publication retains what was elided"
         );
+        let filed = captured.drain();
         assert_eq!(
-            captured.drain().len(),
+            filed
+                .iter()
+                .filter(|event| matches!(event, Event::Optimization(_)))
+                .count(),
             1,
-            "publication files exactly one event"
+            "publication files exactly one compression"
         );
+        assert_eq!(
+            filed
+                .iter()
+                .filter(|event| matches!(event, Event::Elisions(_)))
+                .count(),
+            1,
+            "and the handles it shipped"
+        );
+        assert_eq!(filed.len(), 2);
     }
 
     #[test]

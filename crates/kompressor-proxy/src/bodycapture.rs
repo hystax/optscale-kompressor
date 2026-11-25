@@ -88,6 +88,28 @@ pub(crate) fn record(
     append_line(path, &record.to_string());
 }
 
+/// Append one retrieve round's submission, if capturing: the body this proxy
+/// built and sent upstream for round `round` of `request_id`, counted from 1.
+///
+/// A direction of its own, `retrieve-round`, rather than a second
+/// `proxy->upstream` line: everything that reads this file takes that
+/// direction as the one body per request the client's turn produced, and a
+/// hidden round is not that. They are recorded at all because nothing else
+/// says which handle each round asked for and what the submission before it
+/// held — the measurement DESIGN §20 item 13 asks for.
+pub(crate) fn record_round(path: &Option<PathBuf>, request_id: &str, round: u32, body: &[u8]) {
+    let Some(path) = path else { return };
+    let record = serde_json::json!({
+        "at_ms": now_ms(),
+        "request_id": request_id,
+        "dir": "retrieve-round",
+        "round": round,
+        "bytes": body.len(),
+        "body": String::from_utf8_lossy(body),
+    });
+    append_line(path, &record.to_string());
+}
+
 /// Append one keep-warm ping, if capturing: the request it was sent for, and
 /// what the provider answered. `read` is `None` when it reported no usage.
 pub(crate) fn record_ping(

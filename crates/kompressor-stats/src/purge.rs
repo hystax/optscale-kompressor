@@ -191,8 +191,13 @@ pub fn purge(
                 "retrieval_events",
                 "protected_ref_events",
                 "proxy_requests",
+                "retrieve_round_usage",
+                "elisions",
                 "request_context",
             ] {
+                if !crate::schema::has_table(&tx, table)? {
+                    continue;
+                }
                 let (filter, values) = filter(&scope, table);
                 let n = tx.execute(
                     &format!("DELETE FROM {table} AS t WHERE {filter}"),

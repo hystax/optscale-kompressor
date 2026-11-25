@@ -15,7 +15,8 @@ compressors.
 
 `kompressor-bodies.jsonl` holds whole request bodies as they arrived from the
 agent, so a conversation can be reassembled in order — which is the unit
-cross-turn folding works on.
+cross-turn folding works on. Each conversation also records the provider its
+body was shaped for and the model, which `kompressor bench price` prices it at.
 
 # What it takes and what it drops
 
@@ -60,6 +61,16 @@ def text_of(message: dict) -> str:
     return output if isinstance(output, str) else ""
 
 
+def provider_of(body: dict) -> str:
+    """The provider a body was shaped for: what `kompressor bench price`
+    prices the conversation at."""
+    if isinstance(body.get("messages"), list) and ("max_tokens" in body or "system" in body):
+        return "anthropic"
+    if "input" in body or isinstance(body.get("messages"), list):
+        return "openai"
+    return ""
+
+
 def conversations_in(run: Path) -> dict:
     """The richest body per conversation in one run dump."""
     bodies = run / "kompressor-bodies.jsonl"
@@ -94,8 +105,8 @@ def conversations_in(run: Path) -> dict:
             except (KeyError, json.JSONDecodeError):
                 continue
             messages = body.get("input") or body.get("messages") or []
-            if len(messages) > len(best.get(conversation, [])):
-                best[conversation] = messages
+            if len(messages) > len(best.get(conversation, ([], "", ""))[0]):
+                best[conversation] = (messages, provider_of(body), str(body.get("model") or ""))
     return best
 
 
@@ -116,7 +127,7 @@ def main() -> int:
 
     out = []
     for run in args.runs:
-        for conversation, messages in conversations_in(run).items():
+        for conversation, (messages, provider, model) in conversations_in(run).items():
             turns = [
                 {"role": str(message.get("role") or "user"), "text": text_of(message)}
                 for message in messages
@@ -125,7 +136,15 @@ def main() -> int:
             turns = [turn for turn in turns if turn["text"].strip()]
             if len(turns) < args.min_turns:
                 continue
-            out.append({"id": conversation, "task": args.task or run.name, "turns": turns})
+            out.append(
+                {
+                    "id": conversation,
+                    "task": args.task or run.name,
+                    "provider": provider,
+                    "model": model,
+                    "turns": turns,
+                }
+            )
 
     if not out:
         print("no conversations found; was the run captured with bodies?", file=sys.stderr)

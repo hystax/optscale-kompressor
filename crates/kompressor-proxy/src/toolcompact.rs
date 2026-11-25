@@ -415,6 +415,46 @@ impl ToolPolicies {
     pub fn tracked(&self) -> usize {
         self.decided.lock().map_or(0, |decided| decided.len())
     }
+
+    /// Each conversation's decision, for the state file. The measurements
+    /// are not written: they are taken again on the next request.
+    pub(crate) fn snapshot(&self, clock: &crate::persist::Clock) -> Vec<PolicyRecord> {
+        let Ok(decided) = self.decided.lock() else {
+            return Vec::new();
+        };
+        decided
+            .iter()
+            .map(|(&conversation, &(at, compacting))| PolicyRecord {
+                conversation,
+                age_ms: clock.age(at),
+                compacting,
+            })
+            .collect()
+    }
+
+    /// Replace every decision with `records`, newest first up to the cap.
+    pub(crate) fn restore(&self, records: Vec<PolicyRecord>, clock: &crate::persist::Clock) {
+        let Ok(mut decided) = self.decided.lock() else {
+            return;
+        };
+        *decided = crate::prefixcache::newest(records, REMEMBER, |record| record.age_ms)
+            .into_iter()
+            .map(|record| {
+                (
+                    record.conversation,
+                    (clock.at(record.age_ms), record.compacting),
+                )
+            })
+            .collect();
+    }
+}
+
+/// One conversation's tool-compaction decision in the state file.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PolicyRecord {
+    conversation: u64,
+    age_ms: u64,
+    compacting: bool,
 }
 
 #[cfg(test)]

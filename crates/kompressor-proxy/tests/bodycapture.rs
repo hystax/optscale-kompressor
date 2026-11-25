@@ -470,3 +470,69 @@ async fn the_capture_records_beta_sets_and_keep_warm_pings() {
         "in the file's own time order"
     );
 }
+
+/// A hidden retrieve round is captured too, under a direction of its own:
+/// without it nothing says which handle each round asked for, which is the
+/// measurement `scripts/bench/sibling-rounds.py` makes (DESIGN §20 item 13).
+#[tokio::test]
+async fn a_retrieve_round_is_captured_as_its_own_direction() {
+    let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("bodies.jsonl");
+    // Safe here: single-threaded test, set before the code under test runs.
+    unsafe { std::env::set_var("KOMPRESSOR_BODY_CAPTURE", &file) };
+
+    let harness = Harness::new().await;
+    Mock::given(any())
+        .respond_with(|request: &wiremock::Request| {
+            let text = String::from_utf8_lossy(&request.body).into_owned();
+            if support::round_of(&text) == 0 {
+                let handle = support::first_handle(&text).expect("a handle");
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "chatcmpl-1",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": null,
+                        "tool_calls": [{"id": "call_r1", "type": "function", "function": {
+                            "name": "optscale_kompressor_retrieve",
+                            "arguments": serde_json::json!({"ref": handle}).to_string()}}]},
+                        "finish_reason": "tool_calls"}],
+                    "usage": {"prompt_tokens": 1000, "completion_tokens": 20}
+                }));
+            }
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-2",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1200, "completion_tokens": 5}
+            }))
+        })
+        .mount(&harness.server)
+        .await;
+    harness
+        .post(
+            "/v1/chat/completions",
+            &support::chat_body(&log_payload(400)),
+        )
+        .await;
+    // Safe here, as above.
+    unsafe { std::env::remove_var("KOMPRESSOR_BODY_CAPTURE") };
+
+    let written = std::fs::read_to_string(&file).expect("the capture file must exist");
+    let lines: Vec<serde_json::Value> = written
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each line is JSON"))
+        .collect();
+    let dirs: Vec<&str> = lines.iter().filter_map(|l| l["dir"].as_str()).collect();
+    assert_eq!(
+        dirs,
+        ["client->proxy", "proxy->upstream", "retrieve-round"],
+        "the client's turn once each way, then the round the proxy built"
+    );
+    let round = &lines[2];
+    assert_eq!(round["round"], 1);
+    assert_eq!(round["request_id"], lines[1]["request_id"]);
+    assert_eq!(
+        harness.upstream_bodies().await[1],
+        round["body"].as_str().unwrap(),
+        "the body is the one sent upstream for that round"
+    );
+}

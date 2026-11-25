@@ -72,6 +72,13 @@ pub struct Conversation {
     /// Task it was captured from, for stratification.
     #[serde(default)]
     pub task: String,
+    /// The provider the conversation was sent to (`anthropic`, `openai`),
+    /// where the capture said. What [`crate::economics`] prices it at.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub provider: String,
+    /// The model it was sent to, where the capture said.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
     pub turns: Vec<Turn>,
 }
 
@@ -299,6 +306,8 @@ mod tests {
         let written = vec![Conversation {
             id: "c1".into(),
             task: "t".into(),
+            provider: String::new(),
+            model: String::new(),
             turns: vec![Turn {
                 role: "tool".into(),
                 text: "hello".into(),

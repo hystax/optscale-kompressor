@@ -34,6 +34,10 @@ pub struct Harness {
     /// Every statistics event the proxy recorded, for tests that ask what was
     /// *accounted*, not just what was returned.
     pub events: kompressor_stats::writer::CapturedEvents,
+    /// What the proxy was built from, so [`Harness::restart`] can build it
+    /// again over the same upstream and fragment store.
+    config: Config,
+    store: Arc<dyn kompressor_store::types::RefStore>,
 }
 
 impl Harness {
@@ -66,8 +70,16 @@ impl Harness {
         }];
         configure(&mut config);
 
+        Harness::build(server, config, store)
+    }
+
+    fn build(
+        server: MockServer,
+        config: Config,
+        store: Arc<dyn kompressor_store::types::RefStore>,
+    ) -> Harness {
         let (sink, events) = kompressor_stats::writer::capturing_sink(256);
-        let core = Arc::new(AppCore::new(config, store, sink));
+        let core = Arc::new(AppCore::new(config.clone(), store.clone(), sink));
         let state = ProxyState::new(core, reqwest::Client::new());
         let failopen = state.failopen();
         Harness {
@@ -75,7 +87,33 @@ impl Harness {
             state,
             failopen,
             events,
+            config,
+            store,
         }
+    }
+
+    /// Stop this proxy the way `serve` does on a signal — saving its state,
+    /// where `proxy.state_path` names a file — and start another from the
+    /// same configuration, in front of the same upstream and fragment store.
+    /// What the upstream received before carries over.
+    pub fn restart(self) -> Harness {
+        self.restart_with(|_| {})
+    }
+
+    /// [`Harness::restart`], with the configuration adjusted for the process
+    /// that comes up.
+    pub fn restart_with(self, configure: impl FnOnce(&mut Config)) -> Harness {
+        self.state.save_state().expect("the state saves");
+        let Harness {
+            server,
+            state,
+            mut config,
+            store,
+            ..
+        } = self;
+        drop(state);
+        configure(&mut config);
+        Harness::build(server, config, store)
     }
 
     pub fn router(&self) -> Router {

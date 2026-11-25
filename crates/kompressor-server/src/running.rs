@@ -14,7 +14,7 @@ use serde_json::Value;
 
 /// The proxy settings that are off, or at a conservative value, unless a
 /// deployment chose otherwise: the ones worth seeing at a glance.
-const OPT_IN: [&str; 13] = [
+const OPT_IN: [&str; 17] = [
     "compress",
     "retrieve_tool",
     "frozen_prefix",
@@ -25,9 +25,13 @@ const OPT_IN: [&str; 13] = [
     "tools_order",
     "sticky_beta",
     "tools_compact",
+    "output_shaping",
+    "output_shaping_holdout_pct",
     "cold_recompact",
     "superseded_reads",
     "matured_reads",
+    "state_path",
+    "state_load",
 ];
 
 #[derive(Debug, Serialize)]
@@ -353,6 +357,8 @@ mod tests {
             conversations: 4,
             predicting,
             wrong_predictions: 3,
+            guard_trips: 2,
+            failopen_after_compressed: 1,
             ..Held::default()
         };
         let stock = core(Config::default());
@@ -373,6 +379,9 @@ mod tests {
             assert_eq!(seen.memory.as_ref().map(|m| m.prediction), Some(shown));
             let json = serde_json::to_value(&seen).expect("json");
             assert_eq!(json["memory"]["wrong_predictions"], 3);
+            assert_eq!(json["memory"]["guard_trips"], 2);
+            assert_eq!(json["memory"]["guard_enforced"], 0);
+            assert_eq!(json["memory"]["failopen_after_compressed"], 1);
         }
     }
 

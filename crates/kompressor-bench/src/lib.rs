@@ -41,6 +41,7 @@
 pub mod baseline;
 pub mod conversation;
 pub mod corpus;
+pub mod economics;
 pub mod metrics;
 pub mod replay;
 pub mod report;

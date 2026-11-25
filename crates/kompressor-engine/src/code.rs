@@ -16,6 +16,102 @@
 //! span between its braces, and the replacement is a comment between the same
 //! two braces.
 
+/// How many bytes the parser may be handed while compressing one payload, as
+/// a multiple of the payload's own length.
+///
+/// Python salvage parses more than once: the whole text, the text under a
+/// synthetic scope, a bisection for the longest parseable prefix under each,
+/// and the same again for the tail after every unparseable point it resumes
+/// past (`MAX_RESUMES`, `MAX_SKIPPED_LINES`). The pipeline then offers the
+/// same payload to the grammar again behind a lead-in, file by file, and
+/// after a long-line clip. Each rung is linear, but together they multiply,
+/// and on text that is not source at all every rung is reached — where
+/// tree-sitter is also slowest, 0.5 to 2.4 MB/s on such text against 6 MB/s
+/// on clean source. Measured in a release build on a loaded machine: 610 KB
+/// of Python followed by 20 KB lines of words and short lines holding lone
+/// carriage returns took 23.2 s to compress, eleven times the proxy's whole
+/// compress deadline, so that request would have gone out uncompressed.
+/// Declining salvage on error-dense text (`MIN_LINES_PER_SALVAGE_ERROR`)
+/// takes it to 1.9 s; this budget as well, to about one second
+/// (`tests/pathological.rs`).
+///
+/// Three passes on a large payload: a clean file needs two, the parse and the
+/// re-parse that validates the edit, and the third leaves room for one rung
+/// of salvage. Salvage that bisects needs more, and on a payload past about
+/// 700 KB it now declines instead; below that the floor decides. The
+/// recorded corpus sits far under it, so `golden.rs` is unchanged.
+///
+/// A budget in bytes rather than a clock, so the answer for a payload is the
+/// same on every machine and every turn: once spent, the parser answers
+/// `None`, which every caller already treats as "decline".
+const PARSE_BUDGET_FACTOR: usize = 3;
+
+/// Small payloads are where salvage pays, so they are given more than three
+/// passes. By arithmetic rather than measurement: a 64 KB file of 1,500 lines
+/// cut off mid-function costs two whole parses and then a bisection of about
+/// eleven under each of two scopes, some 1.5 MB, which this floor covers. At
+/// the slowest rate above it costs at most 0.9 s. Halving it was tried on the
+/// slowest payload a ten-minute run of `tests/pathological.rs` found (94 KB,
+/// 1.4 s): it saved 0.3 s and lost a fifth of the compression, so it stayed.
+const PARSE_BUDGET_FLOOR: usize = 2 * 1024 * 1024;
+
+/// Large ones are bounded outright: two passes over a payload at
+/// `max_code_bytes`' default of 2 MiB, the parse and the re-parse, which is
+/// under two seconds even at the slowest rate above.
+const PARSE_BUDGET_CAP: usize = 4 * 1024 * 1024;
+
+thread_local! {
+    /// Bytes left to parse for the payload being compressed on this thread;
+    /// `None` outside any [`parse_budget`] scope.
+    static PARSE_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The parse budget for one payload, held for as long as it is compressed.
+///
+/// The outermost scope sets the budget and every scope inside it shares it,
+/// so a payload offered to the grammar several ways is bounded once, not once
+/// per way. Dropping the outermost scope ends it.
+pub(crate) struct ParseBudget {
+    owns: bool,
+}
+
+/// Open a parse budget sized for `content`, or join the one already open.
+pub(crate) fn parse_budget(content: &str) -> ParseBudget {
+    PARSE_BUDGET.with(|budget| {
+        if budget.get().is_some() {
+            return ParseBudget { owns: false };
+        }
+        let allowed = content
+            .len()
+            .saturating_mul(PARSE_BUDGET_FACTOR)
+            .clamp(PARSE_BUDGET_FLOOR, PARSE_BUDGET_CAP);
+        budget.set(Some(allowed));
+        ParseBudget { owns: true }
+    })
+}
+
+impl Drop for ParseBudget {
+    fn drop(&mut self) {
+        if self.owns {
+            PARSE_BUDGET.with(|budget| budget.set(None));
+        }
+    }
+}
+
+/// Take `bytes` from the open budget; `false` when there is not that much
+/// left. Unbounded outside any scope.
+#[cfg_attr(not(feature = "code-aware"), allow(dead_code))]
+fn spend_parse_budget(bytes: usize) -> bool {
+    PARSE_BUDGET.with(|budget| match budget.get() {
+        None => true,
+        Some(left) if left < bytes => false,
+        Some(left) => {
+            budget.set(Some(left - bytes));
+            true
+        }
+    })
+}
+
 /// Without the grammars the compressor declines everything rather than guessing
 /// at structure with regexes. That is the same fail-open answer the Python
 /// service gives when its optional grammar pack is not installed: less
@@ -89,6 +185,11 @@ mod imp {
         if content.len() > opts.max_code_bytes {
             return None;
         }
+        // Nor is one nested deeper than any compiler takes. See
+        // `MAX_NESTING`.
+        if nesting_depth(content) > MAX_NESTING {
+            return None;
+        }
 
         // The harness frame is not part of the source, so it comes off before
         // any parse: with it in place the grammar reports a syntax error on
@@ -96,6 +197,7 @@ mod imp {
         // (24.4K, bodies up to 83 lines) were declined for that reason alone.
         let (preamble, source) = split_harness_preamble(content);
 
+        let _budget = super::parse_budget(source);
         let crushed = match language {
             Language::Python => crush_python(source, opts, refs),
             _ => crush_braces(source, opts, refs, language),
@@ -105,6 +207,36 @@ mod imp {
         // Chars, not bytes: every size comparison in this engine counts
         // code points (see `crate::text::chars_len`).
         (chars_len(&result) < chars_len(content)).then_some(result)
+    }
+
+    /// The deepest bracket nesting a payload may have and still be parsed.
+    ///
+    /// CPython refuses source nested more than 200 brackets deep ("too many
+    /// nested parentheses"), and C requires compilers to take no more than
+    /// 256 levels of nesting, so nothing deeper is source a reader wrote. What
+    /// is deeper is data — a JSON value nested thousands deep inside text
+    /// detected as source — and tree-sitter is slowest on it: 27 KB of
+    /// `{"a":[` behind a few hundred lines of Python made each parse of a
+    /// 31 KB payload take tens of milliseconds and the payload 1.4 s, with
+    /// too few errors for salvage to give up early.
+    const MAX_NESTING: usize = 256;
+
+    /// The deepest run of open brackets in `text`, counted without regard to
+    /// strings or comments: a bracket in a string makes the count higher, and
+    /// no real file has 256 of them open at once that way either.
+    fn nesting_depth(text: &str) -> usize {
+        let (mut depth, mut deepest) = (0usize, 0usize);
+        for byte in text.bytes() {
+            match byte {
+                b'(' | b'[' | b'{' => {
+                    depth += 1;
+                    deepest = deepest.max(depth);
+                }
+                b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        deepest
     }
 
     // ---------------------------------------------------------------- grammars
@@ -137,12 +269,16 @@ mod imp {
         }
     }
 
-    /// Parse, or `None` if the grammar cannot be installed at all.
+    /// Parse, or `None` if the grammar cannot be installed at all, or the
+    /// payload's parse budget ([`super::parse_budget`]) is spent.
     ///
     /// Note what this does *not* promise: tree-sitter always returns a tree,
     /// error nodes and all. Whether that tree is acceptable is a separate
     /// question each path answers for itself.
     fn parse(text: &str, language: Language) -> Option<Tree> {
+        if !super::spend_parse_budget(text.len()) {
+            return None;
+        }
         let mut parser = Parser::new();
         parser.set_language(grammar(language)).ok()?;
         parser.parse(text, None)
@@ -288,6 +424,20 @@ mod imp {
         best
     }
 
+    /// Salvage is not tried on text with more than one parse error per this
+    /// many lines.
+    ///
+    /// What salvage is for — a slice that opens mid-body, a file cut off in a
+    /// docstring, a codex middle truncation — is Python with a few errors at
+    /// the cut. Measured: the payloads of the recorded corpus and of the unit
+    /// tests that reach salvage have at most one error per five lines (45 in
+    /// 228); text that is not Python has about as many errors as lines or more
+    /// (3,608 in 2,565 lines of log, multibyte text and source generated by
+    /// `tests/pathological.rs`), and on it every rung of salvage parses the
+    /// whole text again at tree-sitter's slowest, about 0.5 MB/s. That 114 KB
+    /// payload took 3.3 s to compress in a release build.
+    const MIN_LINES_PER_SALVAGE_ERROR: usize = 2;
+
     /// Degrade in steps rather than give up.
     ///
     /// Tool output is not always a whole file, and the strict reading cost real
@@ -303,7 +453,10 @@ mod imp {
     /// what is removed is still only a function body, still marked, still
     /// re-validated.
     fn salvage_python(source: &str) -> Option<Salvage<'_>> {
-        if let Some(tree) = parse_python_clean(source) {
+        let whole = parse(source, Language::Python)?;
+        let errors = error_count(whole.root_node());
+        if errors == 0 {
+            let tree = whole;
             return Some(Salvage {
                 tree,
                 parsed: source.to_string(),
@@ -311,6 +464,12 @@ mod imp {
                 head: source,
                 tail: "",
             });
+        }
+        // Text the grammar cannot read most of is not a cut-off file, and
+        // every rung below would parse it again whole. See
+        // `MIN_LINES_PER_SALVAGE_ERROR`.
+        if errors.saturating_mul(MIN_LINES_PER_SALVAGE_ERROR) > source.lines().count() {
+            return None;
         }
         let scoped = format!("{SYNTHETIC_SCOPE}{source}");
         if let Some(tree) = parse_python_clean(&scoped) {
@@ -1124,6 +1283,101 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn one_parse_budget_bounds_a_payload_however_many_ways_it_is_parsed() {
+        // Outside any scope nothing is bounded.
+        assert!(super::spend_parse_budget(usize::MAX));
+        let small = "x".repeat(10);
+        {
+            let _outer = super::parse_budget(&small);
+            assert!(super::spend_parse_budget(super::PARSE_BUDGET_FLOOR - 1));
+            {
+                // An inner scope shares the outer budget rather than
+                // starting a fresh one.
+                let _inner = super::parse_budget(&small);
+                assert!(super::spend_parse_budget(1));
+                assert!(!super::spend_parse_budget(1), "the budget is spent");
+            }
+            assert!(
+                !super::spend_parse_budget(1),
+                "still spent after the inner scope"
+            );
+        }
+        // The outermost scope's end ends the bound.
+        assert!(super::spend_parse_budget(usize::MAX));
+
+        // Sized by the payload past the floor, and capped.
+        let large = "x".repeat(super::PARSE_BUDGET_CAP);
+        {
+            let _scope = super::parse_budget(&large);
+            assert!(super::spend_parse_budget(super::PARSE_BUDGET_CAP));
+            assert!(!super::spend_parse_budget(1));
+        }
+    }
+
+    #[test]
+    fn a_payload_nested_deeper_than_any_compiler_takes_is_not_parsed() {
+        let opts = options();
+        let source = python_function("accumulate", 40);
+        let run = |text: &str| {
+            let mut refs = opts.collector();
+            crush_code(
+                text,
+                &opts,
+                &Context::default(),
+                &mut refs,
+                Some(Language::Python),
+            )
+        };
+        let nested = |depth: usize| format!("{source}data = {}\n", "[".repeat(depth));
+        assert!(run(&nested(200)).is_some(), "as deep as CPython takes");
+        assert!(run(&nested(257)).is_none());
+    }
+
+    #[test]
+    fn text_the_grammar_mostly_cannot_read_is_not_salvaged() {
+        let opts = options();
+        let mut source = python_function("accumulate", 40);
+        // Cut off mid-body: one error at the cut, salvaged as before.
+        source.push_str("def unfinished(x):\n    return (x +\n");
+        let run = |text: &str| {
+            let mut refs = opts.collector();
+            crush_code(
+                text,
+                &opts,
+                &Context::default(),
+                &mut refs,
+                Some(Language::Python),
+            )
+        };
+        assert!(run(&source).is_some(), "a cut-off file is still salvaged");
+        // The same file followed by more lines of noise than it has lines.
+        for _ in 0..120 {
+            source.push_str("\u{200b}ζωή 日本語 🦀 [====>  ] 42%\r\n");
+        }
+        assert!(run(&source).is_none());
+    }
+
+    #[test]
+    fn a_spent_budget_declines_rather_than_compressing() {
+        let opts = options();
+        let source = python_function("accumulate", 40);
+        let run = || {
+            let mut refs = opts.collector();
+            crush_code(
+                &source,
+                &opts,
+                &Context::default(),
+                &mut refs,
+                Some(Language::Python),
+            )
+        };
+        assert!(run().is_some(), "the fixture must compress");
+        let _scope = super::parse_budget(&source);
+        assert!(super::spend_parse_budget(super::PARSE_BUDGET_FLOOR));
+        assert!(run().is_none());
     }
 
     #[test]

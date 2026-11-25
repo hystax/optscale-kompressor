@@ -754,6 +754,83 @@ fn bench_replay_ignores_a_discovered_config() {
         .stdout(predicate::str::contains("coverage"));
 }
 
+/// `bench price` prices the same recorded turns under both elision gates and
+/// reports removal value minus fetch cost per provider. With a system prompt
+/// so large that every fetch costs more than any elision saves, the net-cost
+/// gate refuses every handle and comes out ahead of the fixed one.
+#[test]
+fn bench_price_reports_both_gates_per_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let search = |module: &str| {
+        (0..5)
+            .flat_map(|f| {
+                (0..40).map(move |i| {
+                    format!(
+                        "src/{module}_{f}/handler.rs:{}:    let value_{i} = compute_thing(input_{i}, &state);",
+                        i * 3 + 1
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let mut lines = vec![serde_json::json!({"conversation_version": 1}).to_string()];
+    for provider in ["anthropic", "openai"] {
+        lines.push(
+            serde_json::json!({
+                "id": provider, "task": "fixture", "provider": provider,
+                "turns": [
+                    {"role": "user", "text": "find every caller"},
+                    {"role": "tool", "text": search("a")},
+                    {"role": "assistant", "text": "and the rest"},
+                    {"role": "tool", "text": search("b")},
+                ]
+            })
+            .to_string(),
+        );
+    }
+    let corpus = write(dir.path(), "conversations.jsonl", &lines.join("\n"));
+    let output = kompressor()
+        .args([
+            "bench",
+            "price",
+            "--json",
+            "--fixed-chars",
+            "0",
+            "--outside-tokens",
+            "5000000",
+            "--conversations",
+            corpus.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&output).expect("JSON");
+    let rows = value["providers"].as_array().expect("rows");
+    assert_eq!(rows.len(), 2, "{value}");
+    for row in rows {
+        assert!(
+            row["fixed"]["detail"]["handle_messages"].as_u64() > Some(0),
+            "{row}"
+        );
+        assert_eq!(row["net_cost"]["detail"]["handle_messages"], 0, "{row}");
+        assert_eq!(row["net_cost_at_least_fixed"], true, "{row}");
+    }
+
+    kompressor()
+        .args([
+            "bench",
+            "price",
+            "--conversations",
+            corpus.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("net-cost net"));
+}
+
 /// The same, for the search path rather than the variable: a config sitting in
 /// the working directory is not read either. Unparseable on purpose — a replay
 /// that read it would fail, and the point is that it is never opened.

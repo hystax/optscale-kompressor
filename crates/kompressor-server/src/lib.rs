@@ -44,6 +44,7 @@ pub mod dashboards;
 pub mod export;
 pub mod live;
 pub mod maintenance;
+mod measurements;
 mod ops;
 pub mod refs;
 mod running;

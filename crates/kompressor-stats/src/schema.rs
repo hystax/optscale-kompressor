@@ -438,6 +438,44 @@ CREATE INDEX maintenance_events_time ON maintenance_events (time_ms);
 CREATE INDEX maintenance_events_target ON maintenance_events (target, action, time_ms);
 "#;
 
+// v18: the three measurements the headroom plan's later tiers are gated on
+// (`measured.rs`). `process_starts`: one row each time `serve` comes up, so a
+// restart can be set against the conversations open across it — nothing
+// recorded a start before, and the conversation fingerprint is stable across
+// restarts, so the turns either side can be paired. No tenant: a process
+// serves every tenant. `retrieve_round_usage`: the provider's usage for each
+// round of a request that ran the retrieve loop, round 0 being the client's
+// own call; `proxy_requests` keeps only the sum, which is what forced the
+// extra-round cost to be estimated by assuming every round read the same
+// prefix. `elisions`: each handle the first time it was shipped, with its
+// kind and size, the denominator a fetch probability needs and
+// `retrieval_events` does not have. Keyed by handle, so a fragment elided
+// again on a later turn keeps its first request.
+const V18: &str = r#"
+CREATE TABLE process_starts (
+ id INTEGER PRIMARY KEY, time_ms INTEGER NOT NULL, version TEXT NOT NULL,
+ pid INTEGER, surfaces TEXT NOT NULL);
+CREATE INDEX process_starts_time ON process_starts (time_ms);
+CREATE TABLE retrieve_round_usage (
+ id INTEGER PRIMARY KEY, time_ms INTEGER NOT NULL, tenant TEXT NOT NULL,
+ request_id TEXT NOT NULL, round INTEGER NOT NULL, input_tokens INTEGER,
+ cache_read_tokens INTEGER, cache_write_tokens INTEGER, output_tokens INTEGER);
+CREATE INDEX retrieve_round_usage_request ON retrieve_round_usage (tenant, request_id);
+CREATE INDEX retrieve_round_usage_time ON retrieve_round_usage (time_ms);
+CREATE TABLE elisions (
+ tenant TEXT NOT NULL, ref TEXT NOT NULL, time_ms INTEGER NOT NULL,
+ request_id TEXT NOT NULL, kind TEXT NOT NULL, bytes INTEGER NOT NULL,
+ PRIMARY KEY (tenant, ref));
+CREATE INDEX elisions_time ON elisions (tenant, time_ms);
+CREATE INDEX elisions_request ON elisions (tenant, request_id);
+"#;
+
+// v19: the arm of `proxy.output_shaping` a request's conversation was in,
+// `treated` or `holdout`; NULL outside the experiment and on older rows.
+const V19: &str = r#"
+ALTER TABLE proxy_requests ADD COLUMN output_shaping TEXT;
+"#;
+
 pub const MIGRATIONS: &[(u32, &str)] = &[
     (1, V1),
     (2, V2),
@@ -456,6 +494,8 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     (15, V15),
     (16, V16),
     (17, V17),
+    (18, V18),
+    (19, V19),
 ];
 
 /// The version a freshly migrated database reports in `PRAGMA user_version`.

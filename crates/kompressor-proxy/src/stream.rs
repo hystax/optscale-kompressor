@@ -74,6 +74,9 @@ pub(crate) struct StreamOutcome {
     pub(crate) rounds: u32,
     pub(crate) injected_tokens: u32,
     pub(crate) usage: Option<Value>,
+    /// Each round's own usage, round 0 first, for the rounds that finished:
+    /// what `retrieve_round_usage` is filed from.
+    pub(crate) round_usage: Vec<Value>,
     /// Why the model stopped, as the provider said in the round the client
     /// was given. Anthropic only; what decides whether to keep the
     /// conversation's cache warm.
@@ -305,12 +308,14 @@ impl StreamRelay {
                 }
                 RoundEnd::Finished { usage, stop_reason } => {
                     turn::add_usage(&mut total, &usage);
+                    outcome.round_usage.push(usage);
                     outcome.stop_reason = stop_reason;
                     break;
                 }
                 RoundEnd::Intercepted { turn, usage } => (turn, usage),
             };
             turn::add_usage(&mut total, &usage);
+            outcome.round_usage.push(usage.clone());
 
             if self.budget.is_spent() {
                 refusals += 1;
@@ -902,6 +907,11 @@ impl StreamRelay {
             tokens = tokens.saturating_add(cost);
             results.push((call.clone(), payload));
         }
+        // As on the buffered path: siblings ride in what the allowance leaves.
+        if !spent && let Some(submission) = self.outbound.json() {
+            let attached = retriever.attach_siblings(submission, &mut results, left);
+            tokens = tokens.saturating_add(attached.tokens);
+        }
 
         let synthetic = turn.as_response();
         let mut next = self.outbound.json().cloned()?;
@@ -911,6 +921,9 @@ impl StreamRelay {
             self.failopen
                 .record(Stage::RetrieveRound, &"could not build the next round");
             return None;
+        }
+        if let Some(submission) = self.outbound.json() {
+            retriever.capture_round(self.budget.rounds + 1, submission);
         }
         self.budget.spend(tokens);
 

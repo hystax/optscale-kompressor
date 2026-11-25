@@ -11,6 +11,7 @@
 //! plausible: a model that fills the gap from memory produces an answer that
 //! looks identical to a correct one and is not.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -84,6 +85,21 @@ pub struct Retriever {
     /// there is nothing to remember it against.
     conversation: Option<u64>,
     timing: Option<Arc<std::sync::Mutex<kompressor_stats::context::ProxyTiming>>>,
+    /// `proxy.retrieve_attach_siblings`: answer a call with the other handles
+    /// of the same tool output too. See [`Retriever::attach_siblings`].
+    siblings: bool,
+    /// Every handle this request has answered or attached, so a sibling is
+    /// never sent twice and never re-sends what the model already has.
+    held: std::sync::Mutex<HashSet<RefId>>,
+}
+
+/// What [`Retriever::attach_siblings`] added to one round.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Attached {
+    /// Fragments attached beside the ones asked for.
+    pub fragments: u32,
+    /// What they cost the next round, in the same estimate as an answer.
+    pub tokens: u32,
 }
 
 impl Retriever {
@@ -105,7 +121,123 @@ impl Retriever {
             prefixes,
             conversation,
             timing: None,
+            siblings: false,
+            held: std::sync::Mutex::default(),
         }
+    }
+
+    /// Turn sibling attachment on or off; see [`Retriever::attach_siblings`].
+    pub fn with_siblings(mut self, on: bool) -> Self {
+        self.siblings = on;
+        self
+    }
+
+    /// Record a round's submission in the body capture, when one is armed: the
+    /// hidden rounds are otherwise in no file, and they are what says which
+    /// handle each round asked for. `round` counts from 1, the first
+    /// submission this proxy built.
+    pub fn capture_round(&self, round: u32, body: &Value) {
+        let path = crate::bodycapture::path();
+        if path.is_some() {
+            crate::bodycapture::record_round(
+                &path,
+                &self.request_id,
+                round,
+                body.to_string().as_bytes(),
+            );
+        }
+    }
+
+    /// Attach to each answered call the content of the other handles from the
+    /// same tool output, while `left` tokens allow.
+    ///
+    /// Off unless `proxy.retrieve_attach_siblings` is set. A model that has
+    /// asked for one handle of an output has said what it is working on, and
+    /// the output's other elisions are the obvious next asks; each one it
+    /// would have asked for is a whole round saved, and a round re-reads the
+    /// prompt (DESIGN §20 item 13). This only ever extends the round being
+    /// built — after the model's call, in content the provider has not yet
+    /// seen — so no cached byte moves.
+    ///
+    /// A "tool output" is one string of `submission`: a tool result, or one
+    /// text block of one. Siblings are taken in the order they appear there,
+    /// and one that does not fit what is left is skipped rather than ending
+    /// the search, so a large fragment does not keep out the small ones after
+    /// it. Every handle this request has already answered or attached is
+    /// skipped too, held on the retriever across the request's rounds, so nothing
+    /// is sent twice. Attached fragments are read with `peek`: the model did not
+    /// ask for them, so they are not retrievals and do not feed keep-inline.
+    pub fn attach_siblings(
+        &self,
+        submission: &Value,
+        results: &mut [(ModelToolCall, String)],
+        mut left: u32,
+    ) -> Attached {
+        let mut attached = Attached::default();
+        if !self.siblings {
+            return attached;
+        }
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        held.extend(results.iter().filter_map(|(call, _)| asked_handle(call)));
+        let mut outputs = Vec::new();
+        strings_of(submission, &mut outputs);
+        for (_, payload) in results.iter_mut() {
+            let Ok(mut answer) = serde_json::from_str::<Value>(payload) else {
+                continue;
+            };
+            if answer.get("found") != Some(&Value::Bool(true)) {
+                continue;
+            }
+            let Some(asked) = answer
+                .get("ref")
+                .and_then(Value::as_str)
+                .and_then(RefId::parse)
+            else {
+                continue;
+            };
+            let needle = format!("ref:{asked}");
+            let mut candidates: Vec<RefId> = Vec::new();
+            for output in outputs.iter().filter(|text| text.contains(&needle)) {
+                for id in kompressor_engine::refs_in(output) {
+                    if id != asked && !held.contains(&id) && !candidates.contains(&id) {
+                        candidates.push(id);
+                    }
+                }
+            }
+            let mut siblings = Vec::new();
+            for id in candidates {
+                let Some(content) = self.core.peek(&self.identity, &id) else {
+                    continue;
+                };
+                let entry = json!({"ref": id.to_string(), "content": content});
+                let tokens = estimate_tokens(&entry.to_string(), "tool");
+                if tokens > left {
+                    continue;
+                }
+                left -= tokens;
+                attached.fragments += 1;
+                attached.tokens = attached.tokens.saturating_add(tokens);
+                held.insert(id);
+                siblings.push(entry);
+            }
+            if siblings.is_empty() {
+                continue;
+            }
+            answer["siblings"] = Value::Array(siblings);
+            answer["siblings_hint"] = Value::String(
+                "the other elisions of the same tool output, attached so they need no further \
+                 call"
+                    .into(),
+            );
+            *payload = answer.to_string();
+        }
+        if let Some(timing) = &self.timing {
+            timing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record_siblings(attached.fragments, attached.tokens);
+        }
+        attached
     }
 
     pub(crate) fn with_timing(
@@ -313,6 +445,24 @@ impl Retriever {
         }
         payload
     }
+}
+
+/// Every string in `value`, depth first.
+fn strings_of<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
+    match value {
+        Value::String(text) => out.push(text),
+        Value::Array(items) => items.iter().for_each(|item| strings_of(item, out)),
+        Value::Object(fields) => fields.values().for_each(|item| strings_of(item, out)),
+        _ => {}
+    }
+}
+
+/// The handle a retrieve call asked for, when its arguments name one.
+pub(crate) fn asked_handle(call: &ModelToolCall) -> Option<RefId> {
+    arguments_object(&call.arguments)?
+        .get("ref")
+        .and_then(Value::as_str)
+        .and_then(RefId::parse)
 }
 
 #[cfg(test)]

@@ -373,5 +373,15 @@ pub(crate) fn prune_on(
         )?,
     };
     conn.execute("DELETE FROM request_context WHERE time_ms<?1 AND NOT EXISTS(SELECT 1 FROM optimization_events o WHERE o.tenant=request_context.tenant AND o.request_id=request_context.request_id) AND NOT EXISTS(SELECT 1 FROM proxy_requests p WHERE p.tenant=request_context.tenant AND p.request_id=request_context.request_id) AND NOT EXISTS(SELECT 1 FROM retrieval_events r WHERE r.tenant=request_context.tenant AND r.request_id=request_context.request_id)",[older_than_ms])?;
+    // The v18 measurement tables: raw rows like the rest, with no archive,
+    // since every figure read from them needs the rows they join to.
+    for table in ["process_starts", "retrieve_round_usage", "elisions"] {
+        if crate::schema::has_table(conn, table)? {
+            conn.execute(
+                &format!("DELETE FROM {table} WHERE time_ms < ?1"),
+                params![older_than_ms],
+            )?;
+        }
+    }
     Ok(counts)
 }

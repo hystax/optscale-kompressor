@@ -1169,6 +1169,24 @@ def keep_warm() -> None:
           "[keep-warm] the client's next request stops the pings",
           f"{before} before, {len(pings_seen())} after")
 
+    # 6. A tool_use stop on one-hour entries: one ping, at the one-hour delay
+    # (`cache_keep_warm_one_hour`, 5s here), not one every interval.
+    reset_provider()
+    hour = keepwarm_body("one-hour", "tool_use")
+    hour["system"][0]["cache_control"]["ttl"] = "1h"
+    post(f"{PROXY}/v1/messages", hour)
+    time.sleep(interval * 2 + 0.5)
+    early = len(pings_seen())
+    time.sleep(5.0 + interval * 2)
+    pings = pings_seen()
+    check(early == 0 and len(pings) == 1,
+          "[keep-warm] a one-hour tool_use wait is pinged once, near the hour",
+          f"{early} before the delay, {len(pings)} after")
+    if pings:
+        check(pings[0]["body"]["system"][0]["cache_control"].get("ttl") == "1h",
+              "[keep-warm] the hour ping repeats the one-hour request",
+              json.dumps(pings[0]["body"]["system"])[:200])
+
 
 def efficiency(floors: dict) -> None:
     """Compression per detected type, through the HTTP surface, in every mode.

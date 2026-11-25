@@ -62,6 +62,7 @@ pub mod health;
 pub mod history;
 pub mod insights;
 pub mod live;
+pub mod measured;
 pub mod prefix;
 pub mod purge;
 pub mod quality;
@@ -69,6 +70,7 @@ pub mod reader;
 pub mod retention;
 pub mod schema;
 pub mod scorecards;
+pub mod shaping;
 pub mod traffic;
 pub mod writer;
 
@@ -78,8 +80,9 @@ pub use config::{
 };
 pub use error::StatsError;
 pub use events::{
-    BackupEvent, Event, MaintenanceEvent, OptimizationEvent, ProtectedRefEvent, ProxyRequestEvent,
-    RetrievalEvent, StoreSample, Surface,
+    BackupEvent, Elided, ElisionsEvent, Event, MaintenanceEvent, OptimizationEvent,
+    ProcessStartEvent, ProtectedRefEvent, ProxyRequestEvent, RetrievalEvent, RetrieveRoundsEvent,
+    RoundUsage, StoreSample, Surface,
 };
 pub use reader::{
     Bucket, BucketRow, DailyRollup, ModeTotals, ProviderCoverage, ProxyRow, RefCount,
@@ -250,6 +253,7 @@ mod tests {
             total_ms: Some(840.0),
             error: None,
             keep_warm: false,
+            output_shaping: None,
         })
     }
 
@@ -1217,6 +1221,10 @@ mod tests {
                      ALTER TABLE proxy_requests DROP COLUMN prefix_json;
                      DROP TABLE backups;
                      DROP TABLE maintenance_events;
+                     DROP TABLE process_starts;
+                     DROP TABLE retrieve_round_usage;
+                     DROP TABLE elisions;
+                     ALTER TABLE proxy_requests DROP COLUMN output_shaping;
                      PRAGMA user_version = 5;",
                 )
                 .unwrap();
@@ -1273,6 +1281,10 @@ mod tests {
                      ALTER TABLE proxy_requests DROP COLUMN prefix_json;
                      DROP TABLE backups;
                      DROP TABLE maintenance_events;
+                     DROP TABLE process_starts;
+                     DROP TABLE retrieve_round_usage;
+                     DROP TABLE elisions;
+                     ALTER TABLE proxy_requests DROP COLUMN output_shaping;
                      PRAGMA user_version = 5;",
                 )
                 .unwrap();
@@ -2018,5 +2030,7 @@ mod tests {
 mod advisor_tests;
 #[cfg(test)]
 mod analysis_tests;
+#[cfg(test)]
+mod measured_tests;
 #[cfg(test)]
 mod prefix_tests;

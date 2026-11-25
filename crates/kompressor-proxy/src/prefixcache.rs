@@ -39,6 +39,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use kompressor_engine::gate::GatePin;
 use kompressor_engine::messages::{CachePricing, PrefixCache};
 use kompressor_engine::refs::RefId;
 use kompressor_wire::ApiFamily;
@@ -49,7 +50,7 @@ use kompressor_wire::ApiFamily;
 /// is an optimisation, not a ledger: forgetting one costs a `Warm` answer,
 /// which is the safe one. Evicting the oldest keeps the working set of an
 /// active session while letting yesterday's fall out.
-const REMEMBER: usize = 4096;
+pub const REMEMBER: usize = 4096;
 
 /// How many opening messages the identity chain covers.
 ///
@@ -236,6 +237,9 @@ struct Seen {
     /// cache once it had answered: what it read plus what it wrote. See
     /// [`PrefixTracker::opened_with`]. `None` until that answer arrives.
     opened_with: Option<u32>,
+    /// Whether a turn of this conversation has gone upstream compressed.
+    /// Sticky. What `Stage::AfterCompressed` asks; nothing decides on it.
+    compressed: bool,
 }
 
 /// Which conversation, under which model, last sent one history.
@@ -284,6 +288,14 @@ pub struct PrefixTracker {
     /// Client requests seen per conversation, so a fetch can be placed in time.
     /// Bounded like `retrieved`, and for the same reason.
     turns: Mutex<HashMap<u64, u64>>,
+    /// The whole billed prompt of each conversation's last answered request,
+    /// per upstream call. What the net-cost gate prices a retrieve round at.
+    /// Bounded like `retrieved`.
+    prompts: Mutex<HashMap<u64, u32>>,
+    /// The net-cost gate's pins, per conversation, with when each
+    /// conversation last pinned anything. Bounded like `retrieved`, and per
+    /// conversation by [`GATE_PINS_PER_CONVERSATION`].
+    gate_pins: Mutex<HashMap<u64, PinnedGate>>,
     /// Extra idle time per conversation, set only by
     /// [`PrefixTracker::age_for_test`]. Empty outside tests.
     aged: Mutex<HashMap<u64, Duration>>,
@@ -371,9 +383,17 @@ fn is_a_cache_loss(before: u32, now: u32, prior_rounds: u32, rounds: u32) -> boo
 
 /// Most handles one conversation may hold inline. A conversation that has
 /// fetched back this many fragments is not being helped by compression.
-const RETRIEVED_PER_CONVERSATION: usize = 64;
+pub const RETRIEVED_PER_CONVERSATION: usize = 64;
 /// Most conversations the retrieved map tracks at once.
-const RETRIEVED_CONVERSATIONS: usize = 1024;
+pub const RETRIEVED_CONVERSATIONS: usize = 1024;
+/// One conversation's net-cost gate pins, with when it last pinned anything.
+type PinnedGate = (Instant, BTreeMap<u64, GatePin>);
+
+/// Most messages one conversation may hold a net-cost gate pin for. Past it a
+/// new message is decided against the current prompt on every turn, which can
+/// move its bytes; a conversation with this many handle-bearing tool results
+/// has not been seen.
+const GATE_PINS_PER_CONVERSATION: usize = 4_096;
 /// A provider's prices for one model, in millionths of its uncached input
 /// price: a cache read, and whatever a token the cache does not hold is billed
 /// as on the way in — a cache write where the provider charges for one,
@@ -441,6 +461,8 @@ impl PrefixTracker {
             lineages: Mutex::new(HashMap::new()),
             retrieved: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
+            prompts: Mutex::new(HashMap::new()),
+            gate_pins: Mutex::new(HashMap::new()),
             aged: Mutex::new(HashMap::new()),
             ahead_ms: std::sync::atomic::AtomicU64::new(0),
             ttl,
@@ -584,6 +606,7 @@ impl PrefixTracker {
         let rewritten =
             cache_read.is_none() && seen.get(&fingerprint).is_some_and(|prior| prior.rewritten);
         let opened_with = seen.get(&fingerprint).and_then(|prior| prior.opened_with);
+        let compressed = seen.get(&fingerprint).is_some_and(|prior| prior.compressed);
 
         // Within one conversation the prefix only grows, so the cache read the
         // provider reports should never fall. When it does, something outside
@@ -625,6 +648,7 @@ impl PrefixTracker {
                 most_messages,
                 rewritten,
                 opened_with,
+                compressed,
             },
         );
     }
@@ -656,6 +680,24 @@ impl PrefixTracker {
     pub fn opened_with(&self, fingerprint: u64) -> Option<u32> {
         let seen = self.seen.lock().ok()?;
         seen.get(&fingerprint)?.opened_with
+    }
+
+    /// Record that the request just filed by [`PrefixTracker::record`] went
+    /// upstream compressed. Called beside it.
+    pub fn record_compressed(&self, fingerprint: u64) {
+        if let Ok(mut seen) = self.seen.lock()
+            && let Some(entry) = seen.get_mut(&fingerprint)
+        {
+            entry.compressed = true;
+        }
+    }
+
+    /// Whether an earlier turn of this conversation went upstream compressed.
+    pub fn was_compressed(&self, fingerprint: u64) -> bool {
+        self.seen
+            .lock()
+            .map(|seen| seen.get(&fingerprint).is_some_and(|entry| entry.compressed))
+            .unwrap_or(false)
     }
 
     /// Record that the response just filed by [`PrefixTracker::record`] also
@@ -1000,6 +1042,70 @@ impl PrefixTracker {
         }
     }
 
+    /// File the whole billed prompt of a conversation's answered request.
+    ///
+    /// A retrieve turn reports usage summed over its rounds, so the figure is
+    /// divided by the upstream calls it took: what one round re-read, which is
+    /// what the next fetch will cost again.
+    pub fn record_prompt(&self, conversation: u64, prompt_tokens: u32, rounds: u32) {
+        let Ok(mut prompts) = self.prompts.lock() else {
+            return;
+        };
+        if prompts.len() >= RETRIEVED_CONVERSATIONS
+            && !prompts.contains_key(&conversation)
+            && let Some(evict) = prompts.keys().next().copied()
+        {
+            prompts.remove(&evict);
+        }
+        prompts.insert(conversation, prompt_tokens / rounds.saturating_add(1));
+    }
+
+    /// The prompt [`Self::record_prompt`] last filed for `conversation`.
+    pub fn last_prompt(&self, conversation: u64) -> Option<u32> {
+        self.prompts.lock().ok()?.get(&conversation).copied()
+    }
+
+    /// The net-cost gate's pins for `conversation`, to hand back to the engine.
+    pub fn gate_pins(&self, conversation: Option<u64>) -> BTreeMap<u64, GatePin> {
+        conversation
+            .and_then(|key| {
+                let pins = self.gate_pins.lock().ok()?;
+                pins.get(&key).map(|(_, held)| held.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Pin what the gate decided for the first time. A pin already held is
+    /// never replaced: the first decision is the one whose bytes went out.
+    pub fn record_gate_pins(&self, conversation: Option<u64>, pins: &[(u64, GatePin)]) {
+        let (Some(conversation), false) = (conversation, pins.is_empty()) else {
+            return;
+        };
+        let now = self.now();
+        let Ok(mut map) = self.gate_pins.lock() else {
+            return;
+        };
+        if map.len() >= RETRIEVED_CONVERSATIONS
+            && !map.contains_key(&conversation)
+            && let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(key, _)| *key)
+        {
+            map.remove(&oldest);
+        }
+        let (at, held) = map
+            .entry(conversation)
+            .or_insert_with(|| (now, BTreeMap::new()));
+        *at = now;
+        for (key, pin) in pins {
+            if held.len() >= GATE_PINS_PER_CONVERSATION {
+                break;
+            }
+            held.entry(*key).or_insert(*pin);
+        }
+    }
+
     /// Pin fragments the engine has shipped whole, so the decision is not
     /// re-taken against a bar that has since moved.
     pub fn record_inlined(&self, conversation: Option<u64>, ids: &[RefId]) {
@@ -1283,6 +1389,7 @@ impl PrefixTracker {
                 most_messages: 0,
                 rewritten: false,
                 opened_with: None,
+                compressed: false,
             },
         );
         observed
@@ -1534,8 +1641,435 @@ pub fn fingerprint(head: &[&str]) -> Option<u64> {
     Some(hash)
 }
 
+/// Everything a [`PrefixTracker`] holds that a restart should not forget, in
+/// the state file's terms (`crate::persist`): ages in place of instants,
+/// lists in place of maps, and no message text.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct TrackerRecord {
+    /// Cache reads, billed prompt and cache writes, summed: the measured
+    /// blend a promotion is priced against.
+    billed: [u64; 3],
+    conversations: Vec<SeenRecord>,
+    openings: Vec<OpeningRecord>,
+    histories: Vec<HistoryRecord>,
+    reopened: u64,
+    lineages: Vec<LineageRecord>,
+    retrieved: Vec<RetrievedRecord>,
+    /// `[conversation, client requests seen]`.
+    turns: Vec<[u64; 2]>,
+    /// The net-cost gate's pins. Without them a restart re-decides every
+    /// message against the prompt as it is now, and a message whose decision
+    /// flips changes bytes the provider has cached.
+    gate_pins: Vec<GatePinsRecord>,
+    /// `[conversation, prompt tokens]`: what the gate prices a new message's
+    /// fetch against until the conversation's next response is filed.
+    prompts: Vec<[u64; 2]>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct GatePinsRecord {
+    conversation: u64,
+    age_ms: u64,
+    /// `(read key, pin)`, read keys being hashes of the message, not its text.
+    pins: Vec<(u64, GatePin)>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct SeenRecord {
+    conversation: u64,
+    age_ms: u64,
+    cache_read: Option<u32>,
+    was_warm: bool,
+    floor: Option<usize>,
+    rounds: u32,
+    idled_past_ttl: bool,
+    most_messages: usize,
+    rewritten: bool,
+    opened_with: Option<u32>,
+    /// Defaulted so a file written before the field existed still loads.
+    #[serde(default)]
+    compressed: bool,
+}
+
+/// One registered opening: the chain hash over its first `len` messages.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct OpeningRecord {
+    len: usize,
+    hash: u64,
+    conversation: u64,
+    age_ms: u64,
+}
+
+/// A conversation's longest history, as identity-chain hashes.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct HistoryRecord {
+    conversation: u64,
+    chain: Vec<u64>,
+    age_ms: u64,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct LineageRecord {
+    key: u64,
+    conversation: u64,
+    model: String,
+    age_ms: u64,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct RetrievedRecord {
+    conversation: u64,
+    handles: Vec<FetchedRecord>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct FetchedRecord {
+    /// The handle's twelve characters, without `k_`.
+    handle: String,
+    first_request: String,
+    promoted: bool,
+    fetches: u32,
+    inlined: bool,
+    recent: Vec<u64>,
+}
+
+/// Keep the `cap` newest of `items`, by `age`.
+pub(crate) fn newest<T>(mut items: Vec<T>, cap: usize, age: impl Fn(&T) -> u64) -> Vec<T> {
+    if items.len() > cap {
+        items.sort_by_key(|item| age(item));
+        items.truncate(cap);
+    }
+    items
+}
+
+impl PrefixTracker {
+    /// What this tracker holds, for the state file. Conversations in `skip`
+    /// are left out of the per-conversation cache evidence and watermark, so
+    /// the next process treats them as new.
+    pub(crate) fn snapshot(
+        &self,
+        clock: &crate::persist::Clock,
+        skip: &std::collections::HashSet<u64>,
+    ) -> TrackerRecord {
+        let billed = self
+            .billed
+            .lock()
+            .map(|billed| [billed.0, billed.1, billed.2])
+            .unwrap_or_default();
+        let conversations = self
+            .seen
+            .lock()
+            .map(|seen| {
+                seen.iter()
+                    .filter(|(key, _)| !skip.contains(key))
+                    .map(|(key, entry)| SeenRecord {
+                        conversation: *key,
+                        age_ms: clock.age(entry.at),
+                        cache_read: entry.cache_read,
+                        was_warm: entry.was_warm,
+                        floor: entry.floor,
+                        rounds: entry.rounds,
+                        idled_past_ttl: entry.idled_past_ttl,
+                        most_messages: entry.most_messages,
+                        rewritten: entry.rewritten,
+                        opened_with: entry.opened_with,
+                        compressed: entry.compressed,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let (openings, histories, reopened) = self
+            .ids
+            .lock()
+            .map(|ids| {
+                (
+                    ids.by_prefix
+                        .iter()
+                        .map(|(&(len, hash), entry)| OpeningRecord {
+                            len,
+                            hash,
+                            conversation: entry.id,
+                            age_ms: clock.age(entry.at),
+                        })
+                        .collect(),
+                    ids.history
+                        .iter()
+                        .map(|(&conversation, (chain, at))| HistoryRecord {
+                            conversation,
+                            chain: chain.clone(),
+                            age_ms: clock.age(*at),
+                        })
+                        .collect(),
+                    ids.reopened,
+                )
+            })
+            .unwrap_or_default();
+        let lineages = self
+            .lineages
+            .lock()
+            .map(|lineages| {
+                lineages
+                    .iter()
+                    .filter(|(_, lineage)| lineage.model.len() <= crate::persist::MAX_TEXT_BYTES)
+                    .map(|(&key, lineage)| LineageRecord {
+                        key,
+                        conversation: lineage.fingerprint,
+                        model: lineage.model.clone(),
+                        age_ms: clock.age(lineage.at),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let retrieved = self
+            .retrieved
+            .lock()
+            .map(|map| {
+                map.iter()
+                    .map(|(&conversation, held)| RetrievedRecord {
+                        conversation,
+                        handles: held
+                            .iter()
+                            .map(|(id, fetched)| FetchedRecord {
+                                handle: id.body().to_string(),
+                                first_request: shortened(&fetched.first_request),
+                                promoted: fetched.promoted,
+                                fetches: fetched.fetches,
+                                inlined: fetched.inlined,
+                                recent: fetched.recent.clone(),
+                            })
+                            .collect(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let turns = self
+            .turns
+            .lock()
+            .map(|turns| turns.iter().map(|(&key, &turn)| [key, turn]).collect())
+            .unwrap_or_default();
+        let gate_pins = self
+            .gate_pins
+            .lock()
+            .map(|map| {
+                map.iter()
+                    .map(|(&conversation, (at, held))| GatePinsRecord {
+                        conversation,
+                        age_ms: clock.age(*at),
+                        pins: held.iter().map(|(&key, &pin)| (key, pin)).collect(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let prompts = self
+            .prompts
+            .lock()
+            .map(|prompts| {
+                prompts
+                    .iter()
+                    .map(|(&key, &tokens)| [key, u64::from(tokens)])
+                    .collect()
+            })
+            .unwrap_or_default();
+        TrackerRecord {
+            billed,
+            conversations,
+            openings,
+            histories,
+            reopened,
+            lineages,
+            retrieved,
+            turns,
+            gate_pins,
+            prompts,
+        }
+    }
+
+    /// Replace what this tracker holds with `record`, each table cut to its
+    /// cap, newest first. Returns how many conversations it now remembers.
+    pub(crate) fn restore(&self, record: TrackerRecord, clock: &crate::persist::Clock) -> usize {
+        if let Ok(mut billed) = self.billed.lock() {
+            *billed = (record.billed[0], record.billed[1], record.billed[2]);
+        }
+        let conversations = newest(record.conversations, REMEMBER, |entry| entry.age_ms);
+        let remembered = conversations.len();
+        if let Ok(mut seen) = self.seen.lock() {
+            *seen = conversations
+                .into_iter()
+                .map(|entry| {
+                    (
+                        entry.conversation,
+                        Seen {
+                            at: clock.at(entry.age_ms),
+                            cache_read: entry.cache_read,
+                            was_warm: entry.was_warm,
+                            floor: entry.floor,
+                            rounds: entry.rounds,
+                            idled_past_ttl: entry.idled_past_ttl,
+                            most_messages: entry.most_messages,
+                            rewritten: entry.rewritten,
+                            opened_with: entry.opened_with,
+                            compressed: entry.compressed,
+                        },
+                    )
+                })
+                .collect();
+        }
+        if let Ok(mut ids) = self.ids.lock() {
+            let mut restored = Identities {
+                reopened: record.reopened,
+                ..Identities::default()
+            };
+            let openings = record
+                .openings
+                .into_iter()
+                .filter(|opening| (1..=IDENTITY_DEPTH).contains(&opening.len))
+                .collect();
+            for opening in newest(openings, REMEMBER, |opening| opening.age_ms) {
+                let fresh = restored
+                    .by_prefix
+                    .insert(
+                        (opening.len, opening.hash),
+                        Identity {
+                            id: opening.conversation,
+                            at: clock.at(opening.age_ms),
+                        },
+                    )
+                    .is_none();
+                if fresh {
+                    *restored.lengths.entry(opening.len).or_insert(0) += 1;
+                }
+            }
+            for mut history in newest(record.histories, REMEMBER, |history| history.age_ms) {
+                history.chain.truncate(IDENTITY_DEPTH);
+                restored.history.insert(
+                    history.conversation,
+                    (history.chain, clock.at(history.age_ms)),
+                );
+            }
+            *ids = restored;
+        }
+        if let Ok(mut lineages) = self.lineages.lock() {
+            *lineages = newest(record.lineages, REMEMBER, |lineage| lineage.age_ms)
+                .into_iter()
+                .filter(|lineage| lineage.model.len() <= crate::persist::MAX_TEXT_BYTES)
+                .map(|lineage| {
+                    (
+                        lineage.key,
+                        Lineage {
+                            fingerprint: lineage.conversation,
+                            model: lineage.model,
+                            at: clock.at(lineage.age_ms),
+                        },
+                    )
+                })
+                .collect();
+        }
+        if let Ok(mut map) = self.retrieved.lock() {
+            map.clear();
+            for conversation in record.retrieved.into_iter().take(RETRIEVED_CONVERSATIONS) {
+                let held: HashMap<RefId, Fetched> = conversation
+                    .handles
+                    .into_iter()
+                    .filter_map(|fetched| {
+                        let id = RefId::parse(&fetched.handle)?;
+                        let mut recent = fetched.recent;
+                        let surplus = recent.len().saturating_sub(DEMAND_WINDOW as usize);
+                        recent.drain(..surplus);
+                        Some((
+                            id,
+                            Fetched {
+                                first_request: shortened(&fetched.first_request),
+                                promoted: fetched.promoted,
+                                fetches: fetched.fetches,
+                                inlined: fetched.inlined,
+                                recent,
+                            },
+                        ))
+                    })
+                    .take(RETRIEVED_PER_CONVERSATION)
+                    .collect();
+                map.insert(conversation.conversation, held);
+            }
+        }
+        if let Ok(mut turns) = self.turns.lock() {
+            *turns = record
+                .turns
+                .into_iter()
+                .take(RETRIEVED_CONVERSATIONS)
+                .map(|[key, turn]| (key, turn))
+                .collect();
+        }
+        if let Ok(mut map) = self.gate_pins.lock() {
+            *map = newest(record.gate_pins, RETRIEVED_CONVERSATIONS, |pins| {
+                pins.age_ms
+            })
+            .into_iter()
+            .map(|pins| {
+                let held = pins
+                    .pins
+                    .into_iter()
+                    .take(GATE_PINS_PER_CONVERSATION)
+                    .collect();
+                (pins.conversation, (clock.at(pins.age_ms), held))
+            })
+            .collect();
+        }
+        if let Ok(mut prompts) = self.prompts.lock() {
+            *prompts = record
+                .prompts
+                .into_iter()
+                .take(RETRIEVED_CONVERSATIONS)
+                .map(|[key, tokens]| (key, u32::try_from(tokens).unwrap_or(u32::MAX)))
+                .collect();
+        }
+        remembered
+    }
+}
+
+/// A request id as the state file keeps it: as it is when short, else a
+/// hash of it. Only ever compared for equality with another request's id,
+/// and after a restart every request is another one.
+fn shortened(request_id: &str) -> String {
+    if request_id.len() <= crate::persist::MAX_TEXT_BYTES {
+        request_id.to_string()
+    } else {
+        format!(
+            "fnv:{:016x}",
+            fingerprint(&[request_id]).unwrap_or_default()
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// The net-cost gate's pins and the prompt it prices against survive the
+    /// state file: without them a restart re-decides a message against the
+    /// prompt as it is then, and a flipped decision moves cached bytes.
+    #[test]
+    fn gate_pins_and_the_last_prompt_survive_a_restart() {
+        let before = PrefixTracker::new(Duration::from_secs(0));
+        let pin = GatePin {
+            prefix_tokens: 120_000,
+            write_ppm: 2_000_000,
+            read_ppm: 100_000,
+        };
+        before.record_gate_pins(Some(7), &[(11, pin), (12, GatePin::default())]);
+        before.record_prompt(7, 90_000, 0);
+        let clock = crate::persist::Clock::writing();
+        let record = before.snapshot(&clock, &std::collections::HashSet::new());
+        let json = serde_json::to_string(&record).unwrap();
+        let after = PrefixTracker::new(Duration::from_secs(0));
+        after.restore(serde_json::from_str(&json).unwrap(), &clock);
+        assert_eq!(after.gate_pins(Some(7)), before.gate_pins(Some(7)));
+        assert_eq!(after.gate_pins(Some(7)).get(&11), Some(&pin));
+        assert_eq!(after.last_prompt(7), Some(90_000));
+        // A file written before these tables existed still loads.
+        let old: TrackerRecord = serde_json::from_str("{}").unwrap();
+        after.restore(old, &clock);
+        assert!(after.gate_pins(Some(7)).is_empty());
+    }
+
     /// The measured cache hit rate the engine prices a prefix rewrite against.
     #[test]
     fn the_hit_rate_is_measured_and_unknown_reads_as_fully_cached() {
@@ -2165,6 +2699,23 @@ mod tests {
             PrefixCache::Cold,
             "a usage-less finish must not erase the provider's answer"
         );
+    }
+
+    #[test]
+    fn a_compressed_turn_is_remembered_for_the_rest_of_the_conversation() {
+        let tracker = PrefixTracker::new(Duration::ZERO);
+        // Nothing filed yet: nothing to mark.
+        tracker.record_compressed(1);
+        assert!(!tracker.was_compressed(1));
+        tracker.record(1, Some(0), None, 0);
+        assert!(!tracker.was_compressed(1));
+        tracker.record_compressed(1);
+        assert!(tracker.was_compressed(1));
+        // Later turns, with usage and without, keep it.
+        tracker.record(1, Some(9_000), None, 0);
+        tracker.record(1, None, None, 0);
+        assert!(tracker.was_compressed(1));
+        assert!(!tracker.was_compressed(2));
     }
 
     #[test]

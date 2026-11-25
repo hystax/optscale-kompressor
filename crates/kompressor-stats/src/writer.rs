@@ -353,9 +353,60 @@ impl StatsWriter {
                          WHERE tenant = ?1 AND request_id = ?2",
                     )?
                     .execute(params![tenant, request_id])?;
+                    // Nothing it minted reached the model, so nothing it
+                    // minted can be fetched: left in, its handles would
+                    // lower every fetch probability.
+                    tx.prepare_cached(
+                        "DELETE FROM elisions WHERE tenant = ?1 AND request_id = ?2",
+                    )?
+                    .execute(params![tenant, request_id])?;
                 }
                 Event::Backup(e) => insert_backup(&tx, e)?,
                 Event::Maintenance(e) => insert_maintenance(&tx, e)?,
+                Event::ProcessStart(e) => {
+                    tx.prepare_cached(
+                        "INSERT INTO process_starts (time_ms, version, pid, surfaces)
+                         VALUES (?1, ?2, ?3, ?4)",
+                    )?
+                    .execute(params![e.time_ms, e.version, e.pid, e.surfaces])?;
+                }
+                Event::RetrieveRounds(e) => {
+                    let mut insert = tx.prepare_cached(
+                        "INSERT INTO retrieve_round_usage (time_ms, tenant, request_id, round,
+                             input_tokens, cache_read_tokens, cache_write_tokens, output_tokens)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    )?;
+                    for round in &e.rounds {
+                        insert.execute(params![
+                            e.time_ms,
+                            e.tenant,
+                            e.request_id,
+                            round.round,
+                            round.input_tokens,
+                            round.cache_read_tokens,
+                            round.cache_write_tokens,
+                            round.output_tokens,
+                        ])?;
+                    }
+                }
+                Event::Elisions(e) => {
+                    // The first request to ship a handle keeps it: a fragment
+                    // elided again on a later turn is the same elision.
+                    let mut insert = tx.prepare_cached(
+                        "INSERT OR IGNORE INTO elisions (tenant, ref, time_ms, request_id, kind, bytes)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    )?;
+                    for elided in &e.refs {
+                        insert.execute(params![
+                            e.tenant,
+                            elided.reference,
+                            e.time_ms,
+                            e.request_id,
+                            elided.kind,
+                            elided.bytes.min(i64::MAX as u64) as i64,
+                        ])?;
+                    }
+                }
                 Event::StoreSample {
                     time_ms,
                     live_refs,
@@ -494,8 +545,8 @@ fn insert_proxy(conn: &Connection, e: &ProxyRequestEvent) -> Result<(), StatsErr
             prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens,
             shadow_prompt_tokens, retrieve_rounds, retrieve_tokens_injected,
             upstream_ms, total_ms, error, conversation, strip_usage, cache_write_1h_tokens,
-            keep_warm, timing_json, prefix_json)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
+            keep_warm, timing_json, prefix_json, output_shaping)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
     )?
     .execute(params![
         e.time_ms,
@@ -522,6 +573,7 @@ fn insert_proxy(conn: &Connection, e: &ProxyRequestEvent) -> Result<(), StatsErr
         i64::from(e.keep_warm),
         e.timing.as_ref().map(serde_json::to_string).transpose()?,
         e.prefix.as_ref().map(serde_json::to_string).transpose()?,
+        e.output_shaping,
     ])?;
     // `compression_event_id` stays NULL. The rowid it would point at may not
     // exist yet — the proxy can finish a request before the compression event

@@ -862,6 +862,71 @@ fn no_payload_is_query_dependent() {
     );
 }
 
+/// [`no_payload_is_query_dependent`] with the net-cost gate deciding instead of
+/// the fixed one: its inputs are the conversation's prompt size and prices,
+/// never the question, and this keeps it that way.
+#[test]
+fn no_payload_is_query_dependent_under_the_net_cost_gate() {
+    const QUERIES: [&str; 3] = [
+        "find the failing test and fix it",
+        "summarise the build errors in this log",
+        "which files reference the parser module?",
+    ];
+    let records = load();
+    let opts = EngineOptions {
+        elision_gate: Some(kompressor_engine::gate::ElisionGate::new(
+            std::sync::Arc::new(kompressor_engine::gate::NetCostModel::default()),
+            kompressor_engine::gate::GatePin {
+                prefix_tokens: 60_000,
+                write_ppm: 1_250_000,
+                read_ppm: 50_000,
+            },
+        )),
+        ..EngineOptions::default()
+    };
+    let mut dependent = Vec::new();
+    let mut consulted = 0;
+
+    for record in &records {
+        let mut baseline: Option<String> = None;
+        for query in QUERIES {
+            let mut refs = opts.collector();
+            let ctx = Context {
+                role: &record.role,
+                preceding_user_text: query,
+                ..Default::default()
+            };
+            let mut applied = Vec::new();
+            let (output, _) = compress_content(
+                &record.content,
+                &record.role,
+                &opts,
+                None,
+                &mut refs,
+                &ctx,
+                &mut applied,
+            );
+            consulted += refs.gate_consulted();
+            match &baseline {
+                None => baseline = Some(output.into_owned()),
+                Some(first) if *first != output.as_ref() => {
+                    dependent.push(record.content_id.clone());
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    assert!(consulted > 0, "the gate has to have been asked something");
+    assert!(
+        dependent.is_empty(),
+        "{} payloads changed with the question: {:?}",
+        dependent.len(),
+        &dependent[..dependent.len().min(10)]
+    );
+}
+
 /// Detection is also checked directly, so a size-gate change cannot silently
 /// mask a routing regression.
 #[test]

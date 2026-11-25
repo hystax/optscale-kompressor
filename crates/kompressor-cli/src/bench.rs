@@ -17,6 +17,105 @@ use serde_json::json;
 use crate::compress::print_json;
 use crate::error::{CliError, CliResult};
 
+/// Arguments of `kompressor bench price`.
+pub struct PriceArgs {
+    pub conversations: PathBuf,
+    pub config: Option<PathBuf>,
+    pub fixed_chars: usize,
+    pub outside_tokens: u32,
+    pub json: bool,
+}
+
+/// Price a conversation corpus under both elision gates, per provider.
+///
+/// The A/B DESIGN §19 asks for in place of live runs: the same recorded turns
+/// under each gate, so run length cannot be what differs. Read like `bench
+/// replay` reads its configuration — the explicit file or the defaults, never
+/// discovery or the environment.
+pub fn price_corpus(args: PriceArgs) -> CliResult {
+    use kompressor_bench::economics::{Gate, price};
+
+    let conversations = kompressor_bench::load_conversations(&args.conversations)
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
+    let config = match args.config.as_deref() {
+        Some(path) => {
+            kompressor_core::Config::load_file(path).map_err(|e| CliError::Usage(e.to_string()))?
+        }
+        None => kompressor_core::Config::default(),
+    };
+    let options = EngineOptions {
+        mode: Mode::Recoverable,
+        ..config.engine
+    };
+    let model = std::sync::Arc::new(config.proxy.net_cost_gate.clone());
+    let fixed = price(
+        &conversations,
+        &options,
+        &Gate::Fixed(args.fixed_chars),
+        &model,
+        args.outside_tokens,
+    );
+    let net = price(
+        &conversations,
+        &options,
+        &Gate::NetCost(model.clone()),
+        &model,
+        args.outside_tokens,
+    );
+
+    let providers: BTreeSet<&String> = fixed.keys().chain(net.keys()).collect();
+    if args.json {
+        let rows: Vec<_> = providers
+            .iter()
+            .map(|provider| {
+                let a = fixed.get(*provider).cloned().unwrap_or_default();
+                let b = net.get(*provider).cloned().unwrap_or_default();
+                json!({
+                    "provider": provider,
+                    "fixed": {"net": a.net(), "detail": a},
+                    "net_cost": {"net": b.net(), "detail": b},
+                    "net_cost_at_least_fixed": b.net() >= a.net(),
+                })
+            })
+            .collect();
+        print_json(&json!({
+            "conversations": args.conversations.display().to_string(),
+            "fixed_chars": args.fixed_chars,
+            "outside_tokens": args.outside_tokens,
+            "net_cost_gate": *model,
+            "providers": rows,
+        }))?;
+        return Ok(());
+    }
+    println!(
+        "{:<12} {:>6} {:>14} {:>14} {:>14}  verdict",
+        "provider", "convs", "fixed net", "net-cost net", "difference"
+    );
+    for provider in providers {
+        let a = fixed.get(provider).cloned().unwrap_or_default();
+        let b = net.get(provider).cloned().unwrap_or_default();
+        println!(
+            "{:<12} {:>6} {:>14.0} {:>14.0} {:>+14.0}  {}",
+            provider,
+            a.conversations.max(b.conversations),
+            a.net(),
+            b.net(),
+            b.net() - a.net(),
+            if b.net() >= a.net() {
+                "net-cost at least fixed"
+            } else {
+                "fixed ahead"
+            }
+        );
+    }
+    println!(
+        "removal value minus expected fetch cost, in tokens at the uncached input price; \
+         fixed gate = {} chars",
+        args.fixed_chars
+    );
+    Ok(())
+}
+
 /// Arguments of `kompressor bench replay`.
 pub struct ReplayArgs {
     pub corpus: PathBuf,

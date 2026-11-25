@@ -35,6 +35,7 @@ use crate::options::EngineOptions;
 use crate::preamble::split_harness_preamble;
 use crate::refs::RefCollector;
 use crate::text::{chars_len, is_blank, join_lines, split_lines};
+use crate::traces::{collapse_runtime_frames, test_lines_to_keep};
 use crate::types::Context;
 
 /// A separator line that names what follows: `==== file ====`, `--- section ---`,
@@ -297,6 +298,27 @@ fn crush_body(
     refs: &mut RefCollector,
     identity: Identity,
 ) -> Option<String> {
+    // Runtime frames go first, so the fold and the scorer see a trace that is
+    // already its own code: a collapsed run is one marker line, which both of
+    // them keep verbatim. Lossless has no marker that would give them back.
+    if !opts.enable_runtime_frame_collapse || opts.is_lossless() {
+        return fold_body(content, opts, refs, identity);
+    }
+    let lines = split_lines(content);
+    let Some(collapsed) = collapse_runtime_frames(&lines, refs) else {
+        return fold_body(content, opts, refs, identity);
+    };
+    let collapsed = join_lines(&collapsed);
+    fold_body(&collapsed, opts, refs, identity).or(Some(collapsed))
+}
+
+/// Fold a body whose runtime frames, if any, are already collapsed.
+fn fold_body(
+    content: &str,
+    opts: &EngineOptions,
+    refs: &mut RefCollector,
+    identity: Identity,
+) -> Option<String> {
     let lossless = opts.is_lossless();
     // only byte-identical lines may fold, which is what makes the lossless
     // reading recoverable from the `[×N]` count alone
@@ -443,7 +465,15 @@ fn fold_templates(
     // does not continue its run starts a new one, and nothing earlier can be
     // joined again.
     let mut previous: Option<String> = None;
-    for &line in body {
+    // A test run's totals and first assertion stand on their own, the way a
+    // marker does: folding them into a sibling would leave the count the agent
+    // acts on behind a handle.
+    let test_lines: HashSet<usize> = if opts.keep_test_totals {
+        test_lines_to_keep(body).into_iter().collect()
+    } else {
+        HashSet::new()
+    };
+    for (at, &line) in body.iter().enumerate() {
         if SECTION.is_match(line) {
             // A separator starts a new document: fold within one, never across.
             // Folding keeps the *first* occurrence globally, so a line repeated
@@ -461,7 +491,7 @@ fn fold_templates(
             members.push(Vec::new());
             continue;
         }
-        if has_marker(line) {
+        if has_marker(line) || test_lines.contains(&at) {
             // A marker is the only path back to the fragment it names, so a
             // line carrying one has to survive verbatim. Folding would keep the
             // *first* such line and hide the rest inside a fragment, leaving
@@ -725,6 +755,11 @@ fn crush_scored(lines: &[&str], opts: &EngineOptions, refs: &mut RefCollector) -
             .filter(|(_, line)| has_marker(line))
             .map(|(index, _)| index),
     );
+    // A test run's totals line and its first assertion are what the agent
+    // acts on; they are kept whatever they score.
+    if opts.keep_test_totals {
+        keep.extend(test_lines_to_keep(lines));
+    }
     let error_indices: Vec<usize> = scores
         .iter()
         .enumerate()

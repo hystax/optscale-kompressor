@@ -18,7 +18,39 @@ pub fn has_marker(text: &str) -> bool {
     MARKERS.iter().any(|m| text.contains(m))
 }
 
-/// Whether the output declares a reversible columnar envelope.
+/// A line that is a marker and nothing else, behind an optional comment
+/// leader: `[... 4 log lines omitted [ref:k_…]]`, `# [... 12 body lines
+/// omitted from f; retrieve: ref:k_…]`, `"... 30 similar items omitted ..."`,
+/// `…[+812 chars ref:k_…]`, `[Read superseded: …]`.
+static BARE_MARKER_LINE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+    regex::Regex::new(concat!(
+        r#"^\s*(?:#|//|/\*|--|;|\*)?\s*"#,
+        r#"(?:\[(?:\.\.\. |Read (?:stale|superseded|content stale)).*\]"#,
+        r#"|"?\.\.\. \d+ similar items omitted.*\.\.\."?,?"#,
+        r#"|…\[\+\d+ chars.*\])"#,
+        r#"\s*(?:\*/)?\s*$"#,
+    ))
+    .unwrap()
+});
+
+/// Whether `text` is nothing but markers: every non-blank line one, and at
+/// least one line.
+///
+/// Such a text is never stored as an original. A fragment is what a handle
+/// gives back, and a marker given back in place of content sends the model
+/// round again for something one more hop away, or gone — the store would be
+/// holding a pointer and calling it the payload. Headroom refuses the same
+/// (`compression_store.py`).
+pub fn is_bare_marker(text: &str) -> bool {
+    let mut lines = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .peekable();
+    lines.peek().is_some() && lines.all(|line| has_marker(line) && BARE_MARKER_LINE.is_match(line))
+}
+
+/// Whether the output declares a reversible columnar envelope: key factoring's
+/// `__cols__`, or the typed-header CSV form of an array of objects.
 ///
 /// Key factoring removes the repeated key names of a homogeneous collection and
 /// is reversible by construction from the envelope itself, so it needs no
@@ -26,7 +58,7 @@ pub fn has_marker(text: &str) -> bool {
 /// has to recognise it explicitly or it would refuse a transform that loses
 /// nothing.
 pub fn has_envelope(text: &str) -> bool {
-    text.contains("\"__cols__\"")
+    text.contains("\"__cols__\"") || text.contains(crate::crusher::CSV_HEADER)
 }
 
 /// Whether `after` differs from `before` in layout alone.

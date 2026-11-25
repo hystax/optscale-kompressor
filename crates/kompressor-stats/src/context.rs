@@ -19,6 +19,13 @@ pub struct ProxyTiming {
     pub attempts: Vec<UpstreamAttempt>,
     pub retrieval_calls: u64,
     pub retrieval_execution_ms: f64,
+    /// Fragments `proxy.retrieve_attach_siblings` attached beside the ones
+    /// the model asked for, and what they cost the rounds that carried them.
+    /// Absent on rows written before the setting existed, which read as 0.
+    #[serde(default)]
+    pub retrieval_siblings_attached: u64,
+    #[serde(default)]
+    pub retrieval_sibling_tokens: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UpstreamAttempt {
@@ -50,6 +57,10 @@ impl ProxyTiming {
     pub fn record_retrieval(&mut self, duration_ms: f64) {
         self.retrieval_calls += 1;
         self.retrieval_execution_ms += duration_ms;
+    }
+    pub fn record_siblings(&mut self, fragments: u32, tokens: u32) {
+        self.retrieval_siblings_attached += u64::from(fragments);
+        self.retrieval_sibling_tokens += u64::from(tokens);
     }
 }
 

@@ -502,7 +502,14 @@ fn surfaces_for_intercept(core: &Arc<AppCore>) -> Surfaces {
     }
 }
 
-fn compose(core: &Arc<AppCore>, surfaces: Surfaces, client: reqwest::Client) -> Router {
+/// `proxy` is the one proxy state every listener that serves the proxy shares,
+/// so a conversation is one conversation whichever listener it arrives on and
+/// there is one set of memories to save. `None` serves no proxy.
+fn compose(
+    core: &Arc<AppCore>,
+    surfaces: Surfaces,
+    proxy: Option<&kompressor_proxy::ProxyState>,
+) -> Router {
     // The probes go on every listener, whatever it serves. With per-surface
     // addresses a proxy-only listener would otherwise have no `/healthz` at
     // all — and because the proxy is a catch-all, the probe would not 404, it
@@ -519,10 +526,55 @@ fn compose(core: &Arc<AppCore>, surfaces: Surfaces, client: reqwest::Client) -> 
     if surfaces.mcp {
         app = app.merge(kompressor_mcp::mcp_router(core.clone()));
     }
-    if surfaces.proxy && core.config().proxy.enabled {
-        app = app.merge(kompressor_proxy::proxy_router(core.clone(), client));
+    if surfaces.proxy
+        && core.config().proxy.enabled
+        && let Some(proxy) = proxy
+    {
+        app = app.merge(proxy.clone().into_router());
     }
     app
+}
+
+/// Save the proxy's per-conversation state every `proxy.state_save_interval`
+/// until shutdown. `None` when there is no state file or no interval; the
+/// shutdown save in [`run`] happens either way.
+fn scheduled_state_saves(
+    core: &AppCore,
+    proxy: Option<&kompressor_proxy::ProxyState>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let proxy = proxy?.clone();
+    let config = core.config();
+    let every = config.proxy.state_save_interval;
+    if config.proxy.state_path.trim().is_empty() || every.is_zero() {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(every);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The first tick is immediate, and there is nothing new to save yet.
+        ticks.tick().await;
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => break,
+                _ = ticks.tick() => save_proxy_state(&proxy).await,
+            }
+        }
+    }))
+}
+
+/// Write the proxy's state file off the runtime, logging the outcome.
+async fn save_proxy_state(proxy: &kompressor_proxy::ProxyState) {
+    let proxy = proxy.clone();
+    match tokio::task::spawn_blocking(move || proxy.save_state()).await {
+        Ok(Ok(Some(path))) => {
+            tracing::debug!(path = %path.display(), "saved the proxy state");
+        }
+        Ok(Ok(None)) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "could not save the proxy state"),
+        Err(error) => tracing::warn!(%error, "saving the proxy state stopped"),
+    }
 }
 
 fn upstream_client(config: &Config) -> Result<reqwest::Client, CliError> {
@@ -713,6 +765,14 @@ pub async fn run(
             None => None,
         }
     };
+    record_start(&core, bound.iter().map(|(_, _, selected)| *selected));
+    // One proxy state for every listener that serves the proxy, built only
+    // when one does: building it reads the state file, and a process that
+    // serves no proxy must not write that file over the one that does.
+    let serves_proxy = core.config().proxy.enabled
+        && (bound.iter().any(|(_, _, selected)| selected.proxy) || intercept_listener.is_some());
+    let proxy =
+        serves_proxy.then(|| kompressor_proxy::ProxyState::new(core.clone(), client.clone()));
     for (addr, listener, selected) in bound {
         let mut enabled = Vec::new();
         if selected.api {
@@ -726,7 +786,7 @@ pub async fn run(
         }
         tracing::info!(address = %addr, surfaces = %enabled.join(","), mode = %core.config().engine.mode, "listening");
         core.runtime().listening(addr.to_string(), &enabled);
-        let app = compose(&core, selected, client.clone());
+        let app = compose(&core, selected, proxy.as_ref());
         let mut rx = shutdown_rx.clone();
         servers.spawn(async move {
             axum::serve(listener, app)
@@ -772,7 +832,7 @@ pub async fn run(
         );
         core.runtime()
             .listening(bound.address().to_string(), &["interception"]);
-        let app = compose(&core, surfaces_for_intercept(&core), client.clone());
+        let app = compose(&core, surfaces_for_intercept(&core), proxy.as_ref());
         let mut rx = shutdown_rx.clone();
         servers.spawn(async move {
             bound
@@ -790,6 +850,7 @@ pub async fn run(
 
     let backups = scheduled_backups(core.clone(), shutdown_rx.clone());
     let optimizes = scheduled_optimize(core.clone(), shutdown_rx.clone());
+    let state_saves = scheduled_state_saves(&core, proxy.as_ref(), shutdown_rx.clone());
     let upkeep = maintenance(core.clone(), shutdown_rx);
     let mut serve_error = None;
     tokio::select! {
@@ -810,6 +871,14 @@ pub async fn run(
     }
 
     let _ = upkeep.await;
+    // After the listeners have drained, so what the last requests decided is
+    // in it, and after the timer has stopped, so the two never race.
+    if let Some(state_saves) = state_saves {
+        let _ = state_saves.await;
+    }
+    if let Some(proxy) = &proxy {
+        save_proxy_state(proxy).await;
+    }
     // A backup under way when the stop came is finished, not cut short: the
     // task checks for shutdown between backups, never inside one.
     if let Some(backups) = backups {
@@ -832,6 +901,38 @@ pub async fn run(
         return Err(CliError::Runtime(error));
     }
     Ok(())
+}
+
+/// File this start in `process_starts`, once everything is bound: what a
+/// restart is set against the conversations open across it from
+/// (`/v1/stats/restarts`). A restart forgets every conversation's frozen
+/// prefix, keep-warm timer and recompaction, and nothing else records when one
+/// happened.
+fn record_start(core: &AppCore, bound: impl Iterator<Item = Surfaces>) {
+    let mut serving = Surfaces::default();
+    for selected in bound {
+        serving.api |= selected.api;
+        serving.mcp |= selected.mcp;
+        serving.proxy |= selected.proxy;
+    }
+    let surfaces: Vec<&str> = [
+        ("api", serving.api),
+        ("mcp", serving.mcp),
+        ("proxy", serving.proxy),
+    ]
+    .into_iter()
+    .filter_map(|(name, on)| on.then_some(name))
+    .collect();
+    core.stats().send(kompressor_stats::Event::ProcessStart(
+        kompressor_stats::ProcessStartEvent {
+            time_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as i64),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            pid: Some(std::process::id()),
+            surfaces: surfaces.join(","),
+        },
+    ));
 }
 
 /// Bind `server.stats_listen`, when it names an address.
@@ -1128,6 +1229,45 @@ mod tests {
         config.refs.backend = RefsBackend::Memory;
         config.stats.enabled = false;
         config
+    }
+
+    #[test]
+    fn a_start_is_filed_with_the_surfaces_actually_bound() {
+        let (sink, events) = kompressor_stats::writer::capturing_sink(4);
+        let core = AppCore::new(
+            test_config(),
+            Arc::new(kompressor_store::memory::MemoryRefStore::new()),
+            sink,
+        );
+        record_start(
+            &core,
+            [
+                Surfaces {
+                    api: true,
+                    mcp: false,
+                    proxy: false,
+                },
+                Surfaces {
+                    api: false,
+                    mcp: false,
+                    proxy: true,
+                },
+            ]
+            .into_iter(),
+        );
+        let starts: Vec<_> = events
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                kompressor_stats::Event::ProcessStart(start) => Some(start),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].surfaces, "api,proxy");
+        assert_eq!(starts[0].version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(starts[0].pid, Some(std::process::id()));
+        assert!(starts[0].time_ms > 0);
     }
 
     /// A bucket that keeps what is PUT to it, and refuses everything while
@@ -1584,7 +1724,8 @@ mod tests {
 
     fn app(surfaces: Surfaces) -> Router {
         let (core, _running) = build_core(test_config()).expect("core builds");
-        compose(&core, surfaces, reqwest::Client::new())
+        let proxy = kompressor_proxy::ProxyState::new(core.clone(), reqwest::Client::new());
+        compose(&core, surfaces, Some(&proxy))
     }
 
     async fn status(app: Router, method: &str, path: &str, body: &str) -> StatusCode {

@@ -61,7 +61,9 @@ pub(crate) async fn handle(
 ) -> Response {
     let request_id = request_id(request.headers());
     let span = tracing::info_span!("proxy", request_id = %request_id);
-    run(state, request, request_id).instrument(span).await
+    // Tracked so the request can tell, once its body is decided, whether it
+    // gave up anywhere: what `Stage::AfterCompressed` counts.
+    crate::failopen::track(run(state, request, request_id).instrument(span)).await
 }
 
 async fn run(state: ProxyState, request: axum::extract::Request, request_id: String) -> Response {
@@ -251,6 +253,9 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         auth_mode.is_subscription(),
         &mut prepared,
     );
+    // After every rewrite, on the body as it will go out, and before anything
+    // copies it: the keep-warm ping and the capture below both read it.
+    guard_the_rewrite(&state, family, route.origin(), &decoded, &mut prepared);
 
     // The client is back in this conversation, so whatever was keeping its
     // cache warm has done its job. Cancelled before this request is sent, so a
@@ -305,6 +310,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     // arrived, in the coding they arrived in. Only a body this proxy rewrote
     // is re-encoded, and if that fails the original ships rather than a body
     // whose `content-encoding` lies about it.
+    let mut sent_as_received = prepared.body == decoded;
     let outbound_body = if prepared.body == decoded {
         // Unchanged: the bytes that arrived, in the coding they arrived in.
         wire
@@ -322,28 +328,30 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
                 state
                     .failopen
                     .record(Stage::Parse, &"the rewritten body could not be re-encoded");
-                // The client's original goes out, so nothing was recompacted:
-                // the provider will cache these bytes, and the conversation
-                // keeps the freeze and the ledger that go with them. Dropping
-                // the reservation frees it for the next turn that finds the
-                // cache gone.
-                prepared.pending_recompaction = None;
-                prepared.reservation = None;
-                prepared.recompacted = None;
-                if let Some(seen) = prepared.observation.as_mut() {
-                    seen.recompacted = None;
-                    seen.ledger_reads = 0;
-                }
-                // The drift tracker was told the rewritten body went out.
-                // It did not: the next request is to be compared with the
-                // client's own bytes on both sides.
-                if let Some(conversation) = prepared.prefix {
-                    state.drift.sent_as_received(conversation, prepared.ticket);
-                }
+                forget_the_rewrite(&state, &mut prepared);
+                sent_as_received = true;
                 wire
             }
         }
     };
+    // Counting only. A request that went out as the client sent it, having
+    // given up somewhere, in a conversation an earlier turn of which went out
+    // compressed: see `Stage::AfterCompressed` for why that one is worth a
+    // number of its own.
+    let sent_compressed = !sent_as_received && prepared.saved_tokens > 0;
+    if !sent_compressed
+        && let Some(stage) = crate::failopen::failed_open_here()
+        && let Some(conversation) = prepared.prefix
+        && state.prefixes.was_compressed(conversation)
+    {
+        state.failopen.record(
+            Stage::AfterCompressed,
+            &format_args!(
+                "gave up at {} after an earlier turn went out compressed",
+                stage.as_str()
+            ),
+        );
+    }
     // The commit point of a recompaction: this body is what the provider will
     // cache, so from here the conversation has no freeze and its ledger holds
     // what this turn decided.
@@ -413,6 +421,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
                 prepared.prefix,
             )
             .with_timing(outbound.timing())
+            .with_siblings(proxy.retrieve_attach_siblings)
         });
     let budget = Budget::new(
         proxy.retrieve_max_rounds,
@@ -431,6 +440,7 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     );
     recorder.timing = Some(outbound.timing());
     recorder.keep_warm = keep_warm;
+    recorder.compressed = sent_compressed;
 
     if prepared.stream {
         stream_response(
@@ -461,6 +471,117 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         )
         .await
     }
+}
+
+/// The client's original goes out instead of the rewrite, so nothing was
+/// recompacted: the provider will cache these bytes, and the conversation
+/// keeps the freeze and the ledger that go with them. Dropping the reservation
+/// frees it for the next turn that finds the cache gone.
+fn forget_the_rewrite(state: &ProxyState, prepared: &mut Prepared) {
+    prepared.pending_recompaction = None;
+    prepared.reservation = None;
+    prepared.recompacted = None;
+    if let Some(seen) = prepared.observation.as_mut() {
+        seen.recompacted = None;
+        seen.ledger_reads = 0;
+    }
+    // The drift tracker was told the rewritten body went out. It did not: the
+    // next request is to be compared with the client's own bytes on both
+    // sides.
+    if let Some(conversation) = prepared.prefix {
+        state.drift.sent_as_received(conversation, prepared.ticket);
+    }
+}
+
+/// Run the stability guards (`proxy.guard_thinking`,
+/// `proxy.guard_upstream_body`) over a rewritten body, and under `enforce`
+/// put the client's original back in its place. See [`crate::guard`].
+///
+/// Both bodies are parsed again here rather than taken from `prepared.json`:
+/// what is checked has to be the bytes that go out, after every rewrite and
+/// its serialisation, and the client's as they arrived. A body this proxy did
+/// not change is not looked at.
+fn guard_the_rewrite(
+    state: &ProxyState,
+    family: Option<ApiFamily>,
+    origin: &str,
+    decoded: &Bytes,
+    prepared: &mut Prepared,
+) {
+    use crate::guard::{Guard, Verdict, check_thinking, check_upstream_body};
+    use kompressor_core::config::GuardMode;
+
+    if prepared.body != *decoded
+        && let Some(fault) = state
+            .rewrite_fault
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+        && let Ok(mut value) = serde_json::from_slice::<Value>(&prepared.body)
+    {
+        fault(&mut value);
+        if let Ok(out) = serde_json::to_vec(&value) {
+            prepared.body = Bytes::from(out);
+        }
+    }
+    let Some(family) = family else {
+        return;
+    };
+    if prepared.body == *decoded {
+        return;
+    }
+    let config = state.core.config_for(Some(family.provider()));
+    let thinking = config.proxy.guard_thinking;
+    let upstream_body = config.proxy.guard_upstream_body;
+    if !thinking.checks() && !upstream_body.checks() {
+        return;
+    }
+    let (Ok(original), Ok(sent)) = (
+        serde_json::from_slice::<Value>(decoded),
+        serde_json::from_slice::<Value>(&prepared.body),
+    ) else {
+        return;
+    };
+    let mut enforced: Option<(Guard, String)> = None;
+    for (guard, mode) in [
+        (Guard::Thinking, thinking),
+        (Guard::UpstreamBody, upstream_body),
+    ] {
+        if !mode.checks() {
+            continue;
+        }
+        let verdict = match guard {
+            Guard::Thinking => check_thinking(&original, &sent, family),
+            Guard::UpstreamBody => check_upstream_body(&original, &sent, family),
+        };
+        match verdict {
+            Verdict::Pass => {}
+            Verdict::ClientInvalid(reason) => state.guards.client_invalid(&reason),
+            Verdict::Trip(reason) => {
+                state.guards.trip(guard, mode, &reason);
+                if mode == GuardMode::Enforce && enforced.is_none() {
+                    enforced = Some((guard, reason));
+                }
+            }
+        }
+    }
+    let Some((guard, reason)) = enforced else {
+        return;
+    };
+    state
+        .failopen
+        .record(Stage::Guard, &format_args!("{}: {reason}", guard.as_str()));
+    // The client's bytes, with only the model renamed where its upstream
+    // needs that: the one change made before any rewrite, and not one a
+    // guard checks.
+    prepared.body = model_for_upstream(decoded.clone(), Some(family), origin);
+    prepared.json = None;
+    prepared.saved_tokens = 0;
+    prepared.injected = false;
+    prepared.strip_usage = false;
+    prepared.tools_compacted_bytes = 0;
+    prepared.reasoning_elided_bytes = 0;
+    forget_the_rewrite(state, prepared);
 }
 
 /// Ask OpenAI to keep this prompt's cache entry for a day, when
@@ -552,11 +673,11 @@ fn keep_warm_for(
     identity: &Identity,
     upstream: &str,
 ) -> Option<KeepWarmPlan> {
-    if family != Some(ApiFamily::AnthropicMessages) || prepared.one_hour {
+    if family != Some(ApiFamily::AnthropicMessages) {
         return None;
     }
     let proxy = &state.core.config_for(Some("anthropic")).proxy;
-    if !proxy.cache_keep_warm {
+    if !proxy.cache_keep_warm || (prepared.one_hour && !proxy.cache_keep_warm_one_hour) {
         return None;
     }
     let conversation = prepared.prefix?;
@@ -577,23 +698,43 @@ fn keep_warm_for(
         prepared.model.clone(),
         upstream,
         conversation,
+        proxy.cache_keep_warm_one_hour,
     )?;
+    // An entry asked to last an hour gets one ping near its end, after a
+    // `tool_use` only (`proxy.cache_keep_warm_one_hour`): no background
+    // schedule, so an `end_turn` arms nothing.
+    if ping.one_hour || prepared.one_hour {
+        return Some(KeepWarmPlan {
+            state: state.clone(),
+            ping,
+            schedule: crate::keepwarm::Schedule {
+                interval: proxy.cache_keep_warm_one_hour_delay,
+                max_pings: 1,
+            },
+            background: None,
+            background_prior: false,
+        });
+    }
     // Read from what the client sent, not what compression made of it: see
     // `client_background_wait`. Parsed again only when the two differ.
     let rewritten = (prepared.body != *client).then_some(client.as_ref());
-    let background = (proxy.cache_keep_warm_background_pings > 0)
+    let wait = (proxy.cache_keep_warm_background_pings > 0)
         .then(|| crate::keepwarm::client_background_wait(rewritten, sent))
-        .flatten()
-        .map(|wait| crate::keepwarm::Schedule {
-            interval: proxy.cache_keep_warm_interval,
-            max_pings: wait.max_pings(
-                proxy.cache_keep_warm_interval,
-                wait.cap(
-                    proxy.cache_keep_warm_background_pings,
-                    proxy.cache_keep_warm_max_pings,
-                ),
+        .flatten();
+    let background_prior = proxy.cache_keep_warm_background_prior
+        && wait
+            .as_ref()
+            .is_some_and(crate::keepwarm::Wait::may_be_a_dead_end);
+    let background = wait.map(|wait| crate::keepwarm::Schedule {
+        interval: proxy.cache_keep_warm_interval,
+        max_pings: wait.max_pings(
+            proxy.cache_keep_warm_interval,
+            wait.cap(
+                proxy.cache_keep_warm_background_pings,
+                proxy.cache_keep_warm_max_pings,
             ),
-        });
+        ),
+    });
     Some(KeepWarmPlan {
         state: state.clone(),
         ping,
@@ -602,6 +743,7 @@ fn keep_warm_for(
             max_pings: proxy.cache_keep_warm_max_pings,
         },
         background,
+        background_prior,
     })
 }
 
@@ -613,6 +755,10 @@ pub(crate) struct KeepWarmPlan {
     /// The schedule for an `end_turn` while a background task runs, or `None`
     /// when there is no such task (or that case is turned off).
     background: Option<crate::keepwarm::Schedule>,
+    /// The background wait may be a dead end and
+    /// `proxy.cache_keep_warm_background_prior` is on: the conversation's
+    /// earlier waits decide whether it is pinged ([`crate::keepwarm::Prior`]).
+    background_prior: bool,
 }
 
 /// What the compression stage decided to send.
@@ -668,6 +814,9 @@ struct Prepared {
     tools_compactable_bytes: usize,
     /// Bytes of earlier-turn reasoning taken out of the conversation.
     reasoning_elided_bytes: usize,
+    /// The conversation's arm of `proxy.output_shaping`, when it is in the
+    /// experiment.
+    output_shaping: Option<crate::outputshape::Arm>,
 }
 
 impl Prepared {
@@ -687,6 +836,7 @@ impl Prepared {
             tools_compacted_bytes: 0,
             tools_compactable_bytes: 0,
             reasoning_elided_bytes: 0,
+            output_shaping: None,
             body,
             json: None,
             saved_tokens: 0,
@@ -802,6 +952,7 @@ fn passthrough_with_stable_tools(
         tools_compacted_bytes: 0,
         tools_compactable_bytes: 0,
         reasoning_elided_bytes: 0,
+        output_shaping: None,
     }
 }
 
@@ -1152,6 +1303,48 @@ fn compact_tool_schemas(state: &ProxyState, identified: &Identified, prepared: &
     }
 }
 
+/// Append the output-shaping instruction to a treated conversation's system
+/// prompt, under `proxy.output_shaping`. See [`crate::outputshape`].
+///
+/// Asked of every Anthropic conversation, on or off, for the reason
+/// `compact_tool_schemas` is: the answer is fixed by the first request.
+fn shape_output(state: &ProxyState, identified: &Identified, prepared: &mut Prepared) {
+    if identified.family != ApiFamily::AnthropicMessages {
+        return;
+    }
+    let proxy = &state
+        .core
+        .config_for(Some(identified.family.provider()))
+        .proxy;
+    let Some(decision) = state.output_shaping.decide(
+        identified.fingerprint,
+        identified.opening,
+        identified.messages,
+        proxy.output_shaping,
+        proxy.output_shaping_holdout_pct,
+        &proxy.output_shaping_text,
+    ) else {
+        return;
+    };
+    prepared.output_shaping = Some(decision.arm);
+    let Some(text) = decision.text else {
+        return;
+    };
+    let mut parsed = None;
+    let value = match prepared.json.as_mut() {
+        Some(value) => value,
+        None => match serde_json::from_slice::<Value>(&prepared.body) {
+            Ok(value) => parsed.insert(value),
+            Err(_) => return,
+        },
+    };
+    if crate::outputshape::append_instruction(value, &text)
+        && let Ok(out) = serde_json::to_vec(value)
+    {
+        prepared.body = Bytes::from(out);
+    }
+}
+
 /// Send this request's tools in the order the conversation's first request
 /// used, under `proxy.tools_order = "pinned"`. See [`crate::stabilize`].
 ///
@@ -1440,6 +1633,9 @@ async fn prepare(
         // Asked of every conversation, on or off: the answer is fixed by the
         // first request, and has to be on record before the setting changes.
         compact_tool_schemas(state, identified, &mut prepared);
+        // Before the observation, which then describes the system prompt
+        // that is sent.
+        shape_output(state, identified, &mut prepared);
         if state
             .core
             .config_for(family.map(ApiFamily::provider))
@@ -1770,6 +1966,18 @@ async fn prepare_inner(
             (state.recompact.reads(key), decide)
         });
 
+    // `proxy.elision_gate = "net_cost"`: the engine prices each new message's
+    // elision against this conversation's prompt, and replays its pins.
+    let options = crate::netgate::gated_options(
+        options,
+        proxy,
+        &state.prefixes,
+        conversation,
+        family,
+        model.as_deref(),
+        long_ttl,
+        before.saturating_add(outside_tokens(&value)),
+    );
     let compressed = compress_with_ledger(
         state,
         identity,
@@ -1907,6 +2115,7 @@ async fn prepare_inner(
                 tools_compacted_bytes: 0,
                 tools_compactable_bytes: 0,
                 reasoning_elided_bytes: 0,
+                output_shaping: None,
             }
         }
         Err(error) => {
@@ -2180,6 +2389,9 @@ async fn compress_with_ledger(
             // against a bar that will have moved, is how a promoted fragment
             // gets re-elided and loses the prefix a second time.
             prefixes.record_inlined(conversation, &outcome.stats.kept_inline_refs);
+            // Likewise the net-cost gate's first decisions: replayed on every
+            // later turn, so the message's bytes never follow the prompt.
+            prefixes.record_gate_pins(conversation, &outcome.stats.gate_pins);
             let saved = outcome
                 .stats
                 .tokens_in
@@ -2815,6 +3027,7 @@ async fn buffered_response(
             .ok()
             .and_then(|body| body.get("stop_reason")?.as_str().map(str::to_string));
     }
+    recorder.round_usage = relayed.round_usage;
     recorder.finish(
         Some(relayed.status.as_u16()),
         relayed.rounds,
@@ -2917,8 +3130,9 @@ async fn stream_response(
     let (tx, rx) = tokio::sync::mpsc::channel::<ClientChunk>(32);
     let mut recorder = recorder;
     tokio::spawn(async move {
-        let outcome = relay.run(upstream, tx).await;
+        let mut outcome = relay.run(upstream, tx).await;
         recorder.stop_reason = outcome.stop_reason.clone();
+        recorder.round_usage = std::mem::take(&mut outcome.round_usage);
         // A stream the client walked out on still gets a row, and the row says
         // so. Without the note it is a healthy 200 carrying usage for tokens
         // that reached nobody, which is worse than no row at all: it is a row
@@ -3027,6 +3241,9 @@ pub(crate) struct Recorder {
     pub(crate) keep_warm: Option<KeepWarmPlan>,
     /// How the model stopped, where the path that relayed it could tell.
     pub(crate) stop_reason: Option<String>,
+    /// This request's body went upstream compressed, which the prefix tracker
+    /// is told once the request is filed (`Stage::AfterCompressed`).
+    pub(crate) compressed: bool,
     /// For the two things a response settles about a recompaction.
     recompact: Arc<crate::recompact::Recompact>,
     /// This request's place among all requests, by arrival.
@@ -3034,6 +3251,8 @@ pub(crate) struct Recorder {
     /// This request was recompacted on a *predicted* lapse, so the provider's
     /// answer can be held against the prediction.
     predicted_cold: bool,
+    /// Each round's own usage, round 0 first, where the relay kept it.
+    pub(crate) round_usage: Vec<Value>,
     /// Counts this request among those under way for as long as it is.
     _under_way: kompressor_core::runtime::Entered,
 }
@@ -3092,6 +3311,7 @@ impl Recorder {
             total_ms: None,
             error: None,
             keep_warm: false,
+            output_shaping: prepared.output_shaping.map(|arm| arm.as_str().to_string()),
         };
         Recorder {
             _under_way: state.core.runtime().enter(event.stream),
@@ -3103,11 +3323,13 @@ impl Recorder {
             prefix: prepared.prefix,
             keep_warm: None,
             stop_reason: None,
+            compressed: false,
             recompact: state.recompact.clone(),
             ticket: prepared.ticket,
             predicted_cold: prepared
                 .recompacted
                 .is_some_and(|(kind, _)| kind == crate::recompact::Cold::Predicted),
+            round_usage: Vec::new(),
         }
     }
 
@@ -3135,6 +3357,21 @@ impl Recorder {
         let schedule = match self.stop_reason.as_deref() {
             Some("tool_use") => plan.schedule,
             Some("end_turn") => match plan.background {
+                Some(schedule)
+                    if plan.background_prior
+                        && !plan.state.keepwarm.background_wait(
+                            plan.ping.conversation,
+                            plan.ping.messages,
+                            schedule.covers_until(started),
+                        ) =>
+                {
+                    tracing::debug!(
+                        request_id = %plan.ping.request_id,
+                        "keep-warm not armed: this conversation's background waits \
+                         have not come back"
+                    );
+                    return;
+                }
                 Some(schedule) => schedule,
                 None => return,
             },
@@ -3252,6 +3489,12 @@ impl Recorder {
             // wrote nothing" would have the next turn recompacted again.
             let cache_read = self.event.cache_read_tokens.filter(|_| !predates);
             self.prefixes.record(prefix, cache_read, prompt, rounds);
+            if let Some(prompt) = prompt {
+                self.prefixes.record_prompt(prefix, prompt, rounds);
+            }
+            if self.compressed {
+                self.prefixes.record_compressed(prefix);
+            }
             // The request that opened the conversation: what the provider
             // holds of it now is what another conversation opening with the
             // same bytes can keep alive, and so no evidence about this one.
@@ -3276,7 +3519,41 @@ impl Recorder {
             }
         }
         self.arm_keep_warm(started);
+        // Only where the loop took a round: otherwise the one round is the
+        // row itself.
+        if rounds > 0 && !self.round_usage.is_empty() {
+            self.core.stats().send(Event::RetrieveRounds(
+                kompressor_stats::RetrieveRoundsEvent {
+                    time_ms: self.event.time_ms,
+                    tenant: self.event.tenant.clone(),
+                    request_id: self.event.request_id.clone(),
+                    rounds: self
+                        .round_usage
+                        .iter()
+                        .enumerate()
+                        .map(|(round, usage)| round_usage(round as u32, usage))
+                        .collect(),
+                },
+            ));
+        }
         self.core.stats().send(Event::ProxyRequest(self.event));
+    }
+}
+
+/// One round's usage in the columns `proxy_requests` uses for the sum.
+fn round_usage(round: u32, usage: &Value) -> kompressor_stats::RoundUsage {
+    kompressor_stats::RoundUsage {
+        round,
+        input_tokens: billed(usage, &["prompt_tokens", "input_tokens"]),
+        cache_read_tokens: billed(usage, &["cache_read_input_tokens"]).or_else(|| {
+            usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
+                .and_then(Value::as_u64)
+                .map(|tokens| tokens as u32)
+        }),
+        cache_write_tokens: billed(usage, &["cache_creation_input_tokens"]),
+        output_tokens: billed(usage, &["completion_tokens", "output_tokens"]),
     }
 }
 

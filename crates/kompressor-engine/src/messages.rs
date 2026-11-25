@@ -750,6 +750,9 @@ pub struct CompressStats {
     ///   two maps reconcile against `skipped_messages` without double counting.
     /// * `below_min_chars` — shorter than `min_compress_chars`; the engine
     ///   never looked at it.
+    /// * `above_max_bytes` — longer than `max_compress_bytes`; the engine
+    ///   never looked at it either, so no one payload can spend the request's
+    ///   compress deadline.
     /// * `declined:<type>` — the compressors ran on content detected as
     ///   `<type>` and none of them shrank it. This is the key that answers the
     ///   diff question.
@@ -814,6 +817,12 @@ pub struct CompressStats {
     /// one.
     #[serde(skip_serializing)]
     pub read_decisions: Vec<(u64, ReadDecision)>,
+    /// Messages the net-cost gate decided for the first time on this run, by
+    /// [`read_key`], with the inputs it decided them against. The caller pins
+    /// them and hands them back on every later run — see [`crate::gate`].
+    /// Empty without a gate.
+    #[serde(skip_serializing)]
+    pub gate_pins: Vec<(u64, crate::gate::GatePin)>,
     pub protected_ref_reasons: BTreeSet<String>,
     pub protected_ref_messages: u32,
     pub router_version: &'static str,
@@ -850,6 +859,11 @@ fn decline_reason(content: &MessageContent, role: &str, opts: &EngineOptions) ->
     };
     if chars_len(text) < opts.min_compress_chars {
         return "below_min_chars".to_string();
+    }
+    // Before detection, which would read the whole of a payload the bound
+    // exists to leave unread.
+    if opts.above_max_bytes(text) {
+        return "above_max_bytes".to_string();
     }
     format!(
         "declined:{}",
@@ -933,8 +947,32 @@ fn protection_for(
         // instructions.
         return Some(format!("role:{}", message.role.trim().to_ascii_lowercase()));
     }
+    // What a retrieve call handed back is the original the model asked for by
+    // name. Compressing it again would elide the very bytes it fetched, under a
+    // new handle, and invite the same fetch on the next turn.
+    if message
+        .meta
+        .tool_name
+        .as_deref()
+        .is_some_and(|name| name.ends_with(RETRIEVE_TOOL))
+    {
+        return Some("retrieve_result".to_string());
+    }
+    // A short failure is the message the agent is about to act on, so no size
+    // gate below gets to decide it is worth compressing.
+    if message.meta.tool_error
+        && opts.protect_tool_error_chars > 0
+        && message.content.text_len() <= opts.protect_tool_error_chars
+    {
+        return Some("tool_error".to_string());
+    }
     None
 }
+
+/// The retrieve tool's name. An MCP client sees it prefixed with its server's
+/// name (`mcp__optscale_kompressor__optscale_kompressor_retrieve`), so a tool
+/// result is matched on the suffix.
+pub const RETRIEVE_TOOL: &str = "optscale_kompressor_retrieve";
 
 /// The largest fragment a second read of it keeps inline. See `read_again`
 /// in [`compress_messages`].
@@ -968,6 +1006,17 @@ pub fn compress_messages(
             .collect()
     } else {
         Vec::new()
+    };
+    // The net-cost gate's pins are found by the same key, taken at the same
+    // moment: before anything is rewritten.
+    let gate_keys: Vec<u64> = match (&opts.elision_gate, ledger.is_some()) {
+        (None, _) => Vec::new(),
+        (Some(_), true) => read_keys.clone(),
+        (Some(_), false) => messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| read_key(index, message))
+            .collect(),
     };
     let mut decisions: BTreeMap<usize, ReadDecision> = BTreeMap::new();
     if let Some(ledger) = ledger {
@@ -1158,6 +1207,36 @@ pub fn compress_messages(
         } else {
             opts
         };
+        // Under the net-cost gate a message is decided against the inputs it
+        // was first decided against, whatever the conversation has grown to
+        // since: that is what keeps its bytes the same on every later turn.
+        // One seen for the first time is decided against today's, and they
+        // are reported for the caller to pin if the gate was consulted.
+        let gated_opts;
+        let mut gate_pin = None;
+        let opts_here: &EngineOptions = match (&opts_here.elision_gate, gate_keys.get(index)) {
+            (Some(gate), Some(key)) => {
+                let pinned = gate.pinned.get(key).copied();
+                let pin = pinned.unwrap_or(gate.current);
+                if pinned.is_none() {
+                    gate_pin = Some((*key, pin));
+                }
+                if pin == gate.current {
+                    opts_here
+                } else {
+                    gated_opts = EngineOptions {
+                        elision_gate: Some(crate::gate::ElisionGate {
+                            current: pin,
+                            ..gate.clone()
+                        }),
+                        ..opts_here.clone()
+                    };
+                    &gated_opts
+                }
+            }
+            _ => opts_here,
+        };
+        let consulted_before = refs.gate_consulted();
 
         if !compressed_here {
             let ctx_index = index;
@@ -1230,6 +1309,11 @@ pub fn compress_messages(
                 MessageContent::Opaque => {}
             }
         }
+        if let Some(pin) = gate_pin
+            && refs.gate_consulted() != consulted_before
+        {
+            stats.gate_pins.push(pin);
+        }
 
         // Last, on what the message actually ships: the pointer has to name
         // bytes an earlier message emitted, not bytes it arrived with.
@@ -1258,6 +1342,7 @@ pub fn compress_messages(
         if opts.enable_cross_turn_dedup
             && !seen.is_empty()
             && let Some(text) = foldable
+            && !opts.above_max_bytes(text)
             && let Some(folded) = seen.fold(text, opts)
         {
             *text = folded;
@@ -1679,6 +1764,79 @@ mod tests {
         compress_messages(messages, opts, &req, &mut refs)
     }
 
+    fn tool_result(text: String, tool_name: &str, tool_error: bool) -> Message {
+        Message {
+            role: "tool".into(),
+            content: MessageContent::Text(text),
+            meta: MessageMeta {
+                tool_name: Some(tool_name.into()),
+                tool_error,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A short failure reaches the model whole, however low the size gate is
+    /// set; the same text without the flag, or past the limit, compresses.
+    #[test]
+    fn a_short_tool_error_is_never_compressed() {
+        let opts = EngineOptions {
+            min_compress_chars: 1,
+            ..EngineOptions::default()
+        };
+        let payload = log_payload(30);
+        assert!(payload.chars().count() <= opts.protect_tool_error_chars);
+        let mut messages = vec![
+            tool_result(payload.clone(), "Bash", true),
+            tool_result(payload.clone(), "Bash", false),
+        ];
+        let stats = run(&mut messages, &opts, RequestOptions::default());
+        assert_eq!(messages[0].content, MessageContent::Text(payload.clone()));
+        assert_ne!(messages[1].content, MessageContent::Text(payload.clone()));
+        assert_eq!(stats.protected_by_reason.get("tool_error"), Some(&1));
+        assert_eq!(
+            stats.skipped_by_reason.get("protected:tool_error"),
+            Some(&1)
+        );
+
+        // past the limit it is an ordinary payload
+        let long = log_payload(400);
+        assert!(long.chars().count() > opts.protect_tool_error_chars);
+        let mut messages = vec![tool_result(long.clone(), "Bash", true)];
+        run(&mut messages, &opts, RequestOptions::default());
+        assert_ne!(messages[0].content, MessageContent::Text(long));
+
+        // and 0 turns the protection off
+        let off = EngineOptions {
+            protect_tool_error_chars: 0,
+            ..opts
+        };
+        let mut messages = vec![tool_result(payload.clone(), "Bash", true)];
+        run(&mut messages, &off, RequestOptions::default());
+        assert_ne!(messages[0].content, MessageContent::Text(payload));
+    }
+
+    /// What the retrieve tool handed back is never compressed again, under
+    /// its own name or the prefixed one an MCP client gives it.
+    #[test]
+    fn retrieve_tool_output_is_excluded_from_compression() {
+        let opts = EngineOptions::default();
+        let payload = log_payload(400);
+        for name in [
+            "optscale_kompressor_retrieve",
+            "mcp__optscale_kompressor__optscale_kompressor_retrieve",
+        ] {
+            let mut messages = vec![
+                tool_result(payload.clone(), name, false),
+                tool_result(payload.clone(), "Bash", false),
+            ];
+            let stats = run(&mut messages, &opts, RequestOptions::default());
+            assert_eq!(messages[0].content, MessageContent::Text(payload.clone()));
+            assert_ne!(messages[1].content, MessageContent::Text(payload.clone()));
+            assert_eq!(stats.protected_by_reason.get("retrieve_result"), Some(&1));
+        }
+    }
+
     #[test]
     fn the_models_own_turns_are_never_compressed() {
         let opts = EngineOptions::default();
@@ -1784,6 +1942,86 @@ mod tests {
                 "message one must not change because {extra} more messages followed it"
             );
         }
+    }
+
+    fn gate_at(prefix_tokens: u32, pinned: BTreeMap<u64, crate::gate::GatePin>) -> EngineOptions {
+        EngineOptions {
+            elision_gate: Some(crate::gate::ElisionGate {
+                model: std::sync::Arc::new(crate::gate::NetCostModel::default()),
+                current: crate::gate::GatePin {
+                    prefix_tokens,
+                    write_ppm: 1_250_000,
+                    read_ppm: 50_000,
+                },
+                pinned: std::sync::Arc::new(pinned),
+            }),
+            ..EngineOptions::default()
+        }
+    }
+
+    #[test]
+    fn a_message_compresses_the_same_however_much_follows_it_under_the_net_cost_gate() {
+        // The same property with the gate on, where it is no longer free: the
+        // gate reads the prompt size, which grows with every message that
+        // follows. Turn one decides against a small prompt and pins it; every
+        // later turn arrives with a far larger one and must replay the pin.
+        let payload = log_payload(200);
+        let compress_with = |extra: usize, opts: &EngineOptions| {
+            let mut messages = vec![
+                Message::text("user", "the opening turn".to_string()),
+                Message::text("tool", payload.clone()),
+            ];
+            for i in 0..extra {
+                messages.push(Message::text("tool", log_payload(120 + i)));
+            }
+            let stats = run(&mut messages, opts, RequestOptions::default());
+            let MessageContent::Text(text) = &messages[1].content else {
+                panic!("text in, text out");
+            };
+            (text.clone(), stats.gate_pins)
+        };
+
+        let (alone, pins) = compress_with(0, &gate_at(2_000, BTreeMap::new()));
+        assert!(alone.len() < payload.len(), "turn one has to compress");
+        assert_eq!(
+            pins.len(),
+            1,
+            "and the gate's inputs are reported for pinning"
+        );
+        let pinned: BTreeMap<u64, crate::gate::GatePin> = pins.into_iter().collect();
+
+        for (extra, prefix_tokens) in [(1, 50_000), (5, 400_000), (20, 10_000_000)] {
+            let (text, new_pins) = compress_with(extra, &gate_at(prefix_tokens, pinned.clone()));
+            assert_eq!(
+                text, alone,
+                "message one must not change because {extra} more messages followed it"
+            );
+            assert!(
+                !new_pins.iter().any(|(key, _)| pinned.contains_key(key)),
+                "a pinned message is never re-pinned"
+            );
+        }
+        // Non-vacuous: without its pin, the largest prompt ships it whole.
+        let (unpinned, _) = compress_with(20, &gate_at(10_000_000, BTreeMap::new()));
+        assert_eq!(unpinned, payload, "the pin is what holds the decision");
+    }
+
+    #[test]
+    fn the_net_cost_gate_ships_whole_what_the_fixed_gate_would_not_and_counts_it() {
+        let payload = log_payload(200);
+        let mut messages = vec![Message::text("tool", payload.clone())];
+        let stats = run(
+            &mut messages,
+            &gate_at(10_000_000, BTreeMap::new()),
+            RequestOptions::default(),
+        );
+        assert_eq!(messages[0].content, MessageContent::Text(payload));
+        assert_eq!(stats.compressed_messages, 0);
+        assert_eq!(
+            stats.gate_pins.len(),
+            1,
+            "a refusal is a decision too, and pinned"
+        );
     }
 
     /// A Claude Code background-task notification: the header repeats on every
@@ -3989,5 +4227,40 @@ mod skip_reason_tests {
             gated.skipped_by_reason.keys().collect::<Vec<_>>(),
             ["below_min_saving"]
         );
+    }
+
+    #[test]
+    fn a_payload_over_the_byte_bound_is_skipped_unread_and_says_why() {
+        // Repeated lines: the fixture compresses to almost nothing without
+        // the bound, so a skip under it can only be the bound.
+        let log: String = (0..400).map(|i| format!("INFO tick {}\n", i % 3)).collect();
+        let other: String = (0..400).map(|i| format!("WARN tock {}\n", i % 4)).collect();
+        let run = |max_compress_bytes| {
+            let mut refs = RefCollector::new(1 << 20);
+            let mut messages = vec![msg("tool", &log), msg("tool", &other)];
+            let opts = EngineOptions {
+                max_compress_bytes,
+                ..opts()
+            };
+            let stats =
+                compress_messages(&mut messages, &opts, &RequestOptions::default(), &mut refs);
+            (stats, messages)
+        };
+        let (unbounded, _) = run(0);
+        assert_eq!(
+            unbounded.compressed_messages, 2,
+            "the fixture must compress"
+        );
+
+        let (bounded, messages) = run(log.len().min(other.len()) - 1);
+        assert_eq!(bounded.compressed_messages, 0);
+        assert_eq!(bounded.skipped_by_reason.get("above_max_bytes"), Some(&2));
+        // Untouched, the cross-message fold included.
+        for (message, text) in messages.iter().zip([&log, &other]) {
+            assert!(matches!(&message.content, MessageContent::Text(sent) if sent == text));
+        }
+
+        // At the bound exactly, it is still compressed.
+        assert_eq!(run(log.len().max(other.len())).0.compressed_messages, 2);
     }
 }

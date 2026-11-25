@@ -359,6 +359,26 @@ enum BenchAction {
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
     },
+    /// Price a conversation corpus under the fixed elision gate and the
+    /// net-cost one: removal value minus expected fetch cost, per provider.
+    Price {
+        /// Conversation corpus (`scripts/bench/extract-conversations.py`).
+        #[arg(long)]
+        conversations: PathBuf,
+        /// Configuration whose `[engine]` and `[proxy.net_cost_gate]` the
+        /// replay runs under.
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+        /// The fixed arm's `min_elision_saving_chars`.
+        #[arg(long, default_value_t = 4000)]
+        fixed_chars: usize,
+        /// Tokens billed outside the messages (system prompt, tool schemas),
+        /// which a corpus does not record and every fetch re-reads.
+        #[arg(long, default_value_t = 0)]
+        outside_tokens: u32,
+        #[arg(long)]
+        json: bool,
+    },
     /// Build a corpus from what real runs elided, so floors track real traffic.
     Extract {
         /// Run dumps to walk, or `kompressor-refs.db` files directly.
@@ -543,6 +563,19 @@ fn run(cli: Cli) -> CliResult {
                 save,
                 compare,
                 check_determinism,
+                json,
+            }),
+            BenchAction::Price {
+                conversations,
+                config,
+                fixed_chars,
+                outside_tokens,
+                json,
+            } => bench::price_corpus(bench::PriceArgs {
+                conversations,
+                config,
+                fixed_chars,
+                outside_tokens,
                 json,
             }),
             BenchAction::Extract {

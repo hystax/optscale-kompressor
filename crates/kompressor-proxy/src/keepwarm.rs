@@ -49,6 +49,14 @@
 //! `max_tokens` must exceed the budget there, and changing `thinking` changes
 //! the cache key, so no cheap ping exists. Nor below [`MIN_PREFIX_TOKENS`].
 //!
+//! Two settings, both off, change that. `cache_keep_warm_one_hour` gives a
+//! one-hour request that stopped on `tool_use` a single ping
+//! `cache_keep_warm_one_hour_delay` (55 minutes) after it started, which
+//! keeps its entry another hour for the price of one read.
+//! `cache_keep_warm_background_prior` stops pinging a background wait in a
+//! conversation whose earlier background waits did not come back; the rule is
+//! `Prior`'s.
+//!
 //! # When it stops
 //!
 //! At the client's next request in the conversation, which cancels the timer
@@ -105,6 +113,95 @@ pub struct KeepWarm {
     /// [`cache_keep_warm_max_conversations`](kompressor_core::config::ProxyConfig::cache_keep_warm_max_conversations)
     /// were already being kept warm.
     refused: std::sync::atomic::AtomicU64,
+    /// How each conversation's background waits have ended, for
+    /// `proxy.cache_keep_warm_background_prior`. Empty while that is off.
+    priors: Mutex<Priors>,
+}
+
+/// How a conversation's background waits have ended: `back`, the client's
+/// next request came before the wait's pings ran out, or within one interval
+/// of the last (when the next would have been due), so its cache was still
+/// alive; `gone`, it came later. One interval rather than the provider's five
+/// minutes, so the score depends on the schedule alone; the interval is the
+/// shorter, so a wait scored `back` was always one the pings bridged.
+///
+/// The rule (`proxy.cache_keep_warm_background_prior`): a background wait is
+/// not pinged when at least [`Prior::MIN_SCORED`] earlier ones have been
+/// scored and the Laplace-smoothed share that came back,
+/// `(back + 1) / (back + gone + 2)`, is below [`Prior::THRESHOLD`], a third.
+/// So two waits that did not come back, and none that did, hold the third
+/// back (1/4); one that came back beside them does not (2/5); a conversation
+/// with nothing scored yet — its first background wait among them — is
+/// pinged as it always was. The smoothing is what keeps one observation from
+/// deciding: a single wait that did not come back leaves the share at 1/3,
+/// not 0, and [`Prior::MIN_SCORED`] says so outright.
+///
+/// A wait is scored at the conversation's next request, so one whose client
+/// never returns is never scored — and needs no score, since nothing in that
+/// conversation is armed again. A wait held back is still scored, against the
+/// cache its pings would have kept, so a conversation whose waits start
+/// coming back is pinged again. Only waits that may be dead ends count, as
+/// only they are held back: a wake due at a known time brings the client back
+/// when it fires.
+///
+/// Replayed over 20 days of interactive Claude Code traffic it held nothing
+/// back (`scripts/harbor/keepwarm-replay.py`): no conversation had a second
+/// background wait after one that did not come back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Prior {
+    pub(crate) back: u32,
+    pub(crate) gone: u32,
+}
+
+impl Prior {
+    /// Waits scored before the share decides anything.
+    pub(crate) const MIN_SCORED: u32 = 2;
+    /// The share of waits that came back, as a fraction, below which the
+    /// next is held back.
+    pub(crate) const THRESHOLD: (u64, u64) = (1, 3);
+
+    /// Whether the next background wait goes unpinged.
+    pub(crate) fn holds_back(self) -> bool {
+        let scored = u64::from(self.back) + u64::from(self.gone);
+        let (num, den) = Self::THRESHOLD;
+        scored >= u64::from(Self::MIN_SCORED)
+            && (u64::from(self.back) + 1) * den < (scored + 2) * num
+    }
+
+    fn score(&mut self, came_back: bool) {
+        if came_back {
+            self.back = self.back.saturating_add(1);
+        } else {
+            self.gone = self.gone.saturating_add(1);
+        }
+    }
+}
+
+/// Every conversation's [`Prior`], with the wait each still has to score.
+///
+/// At most [`crate::prefixcache::REMEMBER`] conversations, the prefix
+/// tracker's own bound: a conversation it has forgotten is a new one to the
+/// proxy, and here too, the least recently armed going first.
+#[derive(Default)]
+struct Priors {
+    conversations: HashMap<u64, PriorEntry>,
+    clock: u64,
+}
+
+struct PriorEntry {
+    prior: Prior,
+    /// The background wait to score at the conversation's next request.
+    pending: Option<Pending>,
+    touched: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Pending {
+    /// When the wait outlasts its schedule: [`Schedule::covers_until`].
+    until: Instant,
+    /// Messages in the request that waited, which the next must reach to be
+    /// this conversation coming back: see [`KeepWarm::cancel`].
+    messages: usize,
 }
 
 struct Armed {
@@ -129,6 +226,9 @@ pub(crate) struct Ping {
     /// Messages in the request this pings, which a later request must reach
     /// to be this conversation coming back.
     pub(crate) messages: usize,
+    /// Every cache marker in the request asks for an hour. Such a ping exists
+    /// only under `proxy.cache_keep_warm_one_hour`, and goes out once.
+    pub(crate) one_hour: bool,
 }
 
 impl Ping {
@@ -149,6 +249,7 @@ impl Ping {
         model: Option<String>,
         upstream: &str,
         conversation: u64,
+        one_hour_ping: bool,
     ) -> Option<Ping> {
         let messages = sent
             .get("messages")
@@ -163,7 +264,11 @@ impl Ping {
         // the upgrade armed pings for every Claude Code conversation that asks
         // for an hour itself: over one week of interactive use, 306 of 592
         // pings went to one-hour conversations and none bridged a gap.
-        if crate::drift::every_marker_one_hour(sent) {
+        //
+        // `proxy.cache_keep_warm_one_hour` keeps one ping for them, near the
+        // hour: `one_hour_ping` asks for it, and the ping says it is one.
+        let one_hour = crate::drift::every_marker_one_hour(sent);
+        if one_hour && !one_hour_ping {
             return None;
         }
         body.insert("max_tokens".to_string(), json!(1));
@@ -193,6 +298,7 @@ impl Ping {
             upstream: upstream.to_string(),
             conversation,
             messages,
+            one_hour,
         })
     }
 }
@@ -313,10 +419,18 @@ impl Wait {
     /// after a final answer — and so needs no tighter cap than its due time;
     /// `background` (at most `max`) for any other wait, which may be one.
     pub(crate) fn cap(&self, background: u32, max: u32) -> u32 {
-        match self {
-            Wait::Wake(Some(_)) => max,
-            _ => background.min(max),
+        if self.may_be_a_dead_end() {
+            background.min(max)
+        } else {
+            max
         }
+    }
+
+    /// Whether the client may never come back from this wait: anything but a
+    /// wake due at a known time. These are the waits the background cap and
+    /// the [`Prior`] apply to.
+    pub(crate) fn may_be_a_dead_end(&self) -> bool {
+        !matches!(self, Wait::Wake(Some(_)))
     }
 }
 
@@ -570,6 +684,18 @@ pub(crate) struct Schedule {
     pub(crate) max_pings: u32,
 }
 
+impl Schedule {
+    /// When a wait that started at `cached_at` has outlasted this schedule:
+    /// one interval after its last ping, when another would have been due.
+    /// A client back by then found its cache alive. See [`Prior`].
+    pub(crate) fn covers_until(&self, cached_at: Instant) -> Instant {
+        cached_at
+            + self
+                .interval
+                .saturating_mul(self.max_pings.saturating_add(1))
+    }
+}
+
 /// What one ping found.
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
@@ -595,6 +721,7 @@ impl KeepWarm {
     /// attempt's pings and armed its own; the earlier attempt came back 1,174 s
     /// later to an expired entry and wrote 14,314 tokens again.
     pub fn cancel(&self, conversation: u64, messages: Option<usize>) {
+        self.score_pending(conversation, messages, Instant::now());
         if let Ok(mut armed) = self.armed.lock()
             && armed.get(&conversation).is_some_and(|previous| {
                 messages.is_none_or(|messages| messages >= previous.messages)
@@ -603,6 +730,80 @@ impl KeepWarm {
         {
             previous.task.abort();
         }
+    }
+
+    /// Score the background wait `conversation` has pending, if a request
+    /// with `messages` messages arriving at `now` is that conversation coming
+    /// back (as in [`Self::cancel`]).
+    fn score_pending(&self, conversation: u64, messages: Option<usize>, now: Instant) {
+        let Ok(mut priors) = self.priors.lock() else {
+            return;
+        };
+        if let Some(entry) = priors.conversations.get_mut(&conversation)
+            && let Some(pending) = entry.pending
+            && messages.is_none_or(|messages| messages >= pending.messages)
+        {
+            entry.prior.score(now <= pending.until);
+            entry.pending = None;
+        }
+    }
+
+    /// Whether a background wait in `conversation`, after a request of
+    /// `messages` messages, is to be pinged under
+    /// `proxy.cache_keep_warm_background_prior`; see [`Prior`]. Pinged or
+    /// not, the wait is recorded, to be scored at the conversation's next
+    /// request against `until`, [`Schedule::covers_until`].
+    pub(crate) fn background_wait(
+        &self,
+        conversation: u64,
+        messages: usize,
+        until: Instant,
+    ) -> bool {
+        let Ok(mut priors) = self.priors.lock() else {
+            return true;
+        };
+        priors.clock += 1;
+        let touched = priors.clock;
+        if !priors.conversations.contains_key(&conversation)
+            && priors.conversations.len() >= crate::prefixcache::REMEMBER
+            && let Some(oldest) = priors
+                .conversations
+                .iter()
+                .min_by_key(|(_, entry)| entry.touched)
+                .map(|(conversation, _)| *conversation)
+        {
+            priors.conversations.remove(&oldest);
+        }
+        let entry = priors
+            .conversations
+            .entry(conversation)
+            .or_insert(PriorEntry {
+                prior: Prior::default(),
+                pending: None,
+                touched,
+            });
+        entry.touched = touched;
+        entry.pending = Some(Pending { until, messages });
+        !entry.prior.holds_back()
+    }
+
+    /// What `conversation`'s background waits have scored.
+    #[cfg(test)]
+    fn background_prior(&self, conversation: u64) -> Option<(u32, u32)> {
+        let priors = self.priors.lock().ok()?;
+        priors
+            .conversations
+            .get(&conversation)
+            .map(|entry| (entry.prior.back, entry.prior.gone))
+    }
+
+    /// How many conversations have a background prior.
+    #[cfg(test)]
+    fn priors_held(&self) -> usize {
+        self.priors
+            .lock()
+            .map(|priors| priors.conversations.len())
+            .unwrap_or(0)
     }
 
     /// How many waits were not kept warm because the deployment was already
@@ -785,6 +986,8 @@ async fn send(state: &ProxyState, ping: &Ping, sent: u32) -> Outcome {
         total_ms: None,
         error: None,
         keep_warm: true,
+        // A ping is the proxy's, in no arm of anything.
+        output_shaping: None,
     };
     let outcome = match result {
         Err(error) => {
@@ -878,6 +1081,7 @@ mod tests {
             None,
             "up",
             7,
+            false,
         )
     }
 
@@ -1288,6 +1492,130 @@ mod tests {
         ]));
         assert!(!background_task_running(&body));
         assert!(!background_task_running(&json!({})));
+    }
+
+    #[test]
+    fn the_prior_holds_back_only_below_a_third_after_two_scored() {
+        let prior = |back, gone| Prior { back, gone }.holds_back();
+        assert!(!prior(0, 0), "nothing scored: pinged as before");
+        assert!(!prior(0, 1), "one wait does not decide (1/3 is not below)");
+        assert!(prior(0, 2), "two gone, none back: 1/4");
+        assert!(!prior(1, 2), "one back beside them: 2/5");
+        assert!(!prior(1, 3), "2/6 is a third, not below it");
+        assert!(prior(1, 4), "2/7");
+        assert!(!prior(5, 5));
+        assert!(prior(0, u32::MAX), "no overflow at the extreme");
+        assert!(!prior(u32::MAX, u32::MAX));
+    }
+
+    #[test]
+    fn a_background_wait_is_scored_at_the_conversation_next_request() {
+        let keepwarm = KeepWarm::default();
+        let t0 = Instant::now();
+        let until = t0 + Duration::from_secs(1_350);
+        // The first wait is armed, with nothing scored.
+        assert!(keepwarm.background_wait(7, 10, until));
+        assert_eq!(keepwarm.background_prior(7), Some((0, 0)));
+        // A shorter request is another conversation that opened the same way.
+        keepwarm.score_pending(7, Some(3), t0 + Duration::from_secs(60));
+        assert_eq!(keepwarm.background_prior(7), Some((0, 0)));
+        // Back while the cache lived.
+        keepwarm.score_pending(7, Some(12), t0 + Duration::from_secs(1_300));
+        assert_eq!(keepwarm.background_prior(7), Some((1, 0)));
+        // Scored once: a later request has nothing pending.
+        keepwarm.score_pending(7, Some(14), t0 + Duration::from_secs(9_000));
+        assert_eq!(keepwarm.background_prior(7), Some((1, 0)));
+        // Back after it lapsed.
+        assert!(keepwarm.background_wait(7, 14, until));
+        keepwarm.score_pending(7, None, until + Duration::from_secs(1));
+        assert_eq!(keepwarm.background_prior(7), Some((1, 1)));
+    }
+
+    #[test]
+    fn waits_that_never_come_back_stop_being_pinged_and_one_that_does_restarts_it() {
+        let keepwarm = KeepWarm::default();
+        let t0 = Instant::now();
+        let gone = |at: u64| t0 + Duration::from_secs(at);
+        let arm = |at: u64| keepwarm.background_wait(1, 1, gone(at) + Duration::from_secs(1_350));
+        assert!(arm(0), "the first background wait is pinged");
+        keepwarm.score_pending(1, None, gone(5_000));
+        assert!(
+            arm(5_000),
+            "one wait that did not come back does not decide"
+        );
+        keepwarm.score_pending(1, None, gone(10_000));
+        assert!(!arm(10_000), "two did, and none came back");
+        // Held back, but scored all the same: this one came back in time.
+        keepwarm.score_pending(1, None, gone(10_100));
+        assert_eq!(keepwarm.background_prior(1), Some((1, 2)));
+        assert!(arm(10_200), "2/5 is not below a third");
+    }
+
+    #[test]
+    fn the_priors_are_bounded_by_the_tracker() {
+        let keepwarm = KeepWarm::default();
+        let until = Instant::now();
+        for conversation in 0..crate::prefixcache::REMEMBER as u64 + 10 {
+            keepwarm.background_wait(conversation, 1, until);
+        }
+        assert_eq!(keepwarm.priors_held(), crate::prefixcache::REMEMBER);
+        assert_eq!(keepwarm.background_prior(0), None, "the oldest went first");
+        assert!(
+            keepwarm
+                .background_prior(crate::prefixcache::REMEMBER as u64 + 9)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_background_schedule_covers_one_interval_past_its_last_ping() {
+        let t0 = Instant::now();
+        let schedule = Schedule {
+            interval: Duration::from_secs(270),
+            max_pings: 4,
+        };
+        assert_eq!(schedule.covers_until(t0), t0 + Duration::from_secs(1_350));
+    }
+
+    #[test]
+    fn only_a_wake_due_at_a_known_time_is_no_dead_end() {
+        assert!(Wait::Task.may_be_a_dead_end());
+        assert!(Wait::Watch(Some(Duration::from_secs(600))).may_be_a_dead_end());
+        assert!(Wait::Wake(None).may_be_a_dead_end());
+        assert!(!Wait::Wake(Some(Duration::from_secs(600))).may_be_a_dead_end());
+    }
+
+    #[test]
+    fn a_one_hour_request_has_a_ping_only_when_one_is_asked_for() {
+        let mut body = sent();
+        body["system"][0]["cache_control"]["ttl"] = json!("1h");
+        assert!(ping_for(&body).is_none(), "Tier 1: no ping");
+        let ping = Ping::for_request(
+            &body,
+            "http://up/v1/messages",
+            &HeaderMap::new(),
+            "req",
+            "t",
+            None,
+            "up",
+            7,
+            true,
+        )
+        .expect("a ping near the hour");
+        assert!(ping.one_hour);
+        let ping = Ping::for_request(
+            &sent(),
+            "http://up/v1/messages",
+            &HeaderMap::new(),
+            "req",
+            "t",
+            None,
+            "up",
+            7,
+            true,
+        )
+        .expect("a five-minute request is pinged as ever");
+        assert!(!ping.one_hour);
     }
 
     #[test]

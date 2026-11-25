@@ -697,3 +697,167 @@ async fn a_streamed_end_turn_with_a_background_task_running_is_kept_warm() {
     tokio::time::sleep(INTERVAL * 3).await;
     assert_eq!(pings(&harness).await.len(), 1);
 }
+
+/// The background conversation `turns` turns later: the job still running,
+/// the agent having ended its turn each time and been prompted again.
+fn background_turn(turns: usize) -> Value {
+    let mut body = with_background_task(false);
+    let messages = body["messages"].as_array_mut().unwrap();
+    for turn in 0..turns {
+        messages.push(json!({"role": "assistant", "content": [
+            {"type": "text", "text": format!("Waiting on the job ({turn}).")}]}));
+        messages.push(json!({"role": "user", "content": "Any news?"}));
+    }
+    body
+}
+
+async fn keeping_background_warm_with_prior(prior: bool) -> Harness {
+    Harness::with(|config| {
+        config.proxy.cache_keep_warm = true;
+        config.proxy.cache_keep_warm_interval = INTERVAL;
+        config.proxy.cache_keep_warm_max_pings = 5;
+        config.proxy.cache_keep_warm_background_pings = 2;
+        config.proxy.cache_keep_warm_background_prior = prior;
+    })
+    .await
+}
+
+/// Three background waits, each followed by a request long after its two
+/// pings (and the interval past them) ran out: the client was not back in
+/// time for any of them.
+async fn waits_that_never_come_back(harness: &Harness) {
+    answering(harness, "end_turn", 4000).await;
+    for turn in 0..3 {
+        harness.post("/v1/messages", &background_turn(turn)).await;
+        tokio::time::sleep(INTERVAL * 4).await;
+    }
+}
+
+#[tokio::test]
+async fn without_the_prior_every_background_wait_is_pinged() {
+    let harness = keeping_background_warm_with_prior(false).await;
+    waits_that_never_come_back(&harness).await;
+    assert_eq!(
+        pings(&harness).await.len(),
+        6,
+        "two pings for each of three"
+    );
+}
+
+#[tokio::test]
+async fn the_prior_stops_pinging_background_waits_that_never_come_back() {
+    let harness = keeping_background_warm_with_prior(true).await;
+    waits_that_never_come_back(&harness).await;
+    assert_eq!(
+        pings(&harness).await.len(),
+        4,
+        "the first two waits as before; the third, after two that did not come \
+         back, not at all"
+    );
+    assert_eq!(harness.state.keepwarm().armed(), 0);
+}
+
+#[tokio::test]
+async fn the_prior_keeps_pinging_background_waits_that_come_back() {
+    let harness = keeping_background_warm_with_prior(true).await;
+    answering(&harness, "end_turn", 4000).await;
+    for turn in 0..4 {
+        harness.post("/v1/messages", &background_turn(turn)).await;
+        // Back after the first ping, well before the second interval is out.
+        tokio::time::sleep(INTERVAL + INTERVAL / 2).await;
+    }
+    assert_eq!(pings(&harness).await.len(), 4, "one ping for every wait");
+}
+
+async fn pinging_near_the_hour(delay: Duration) -> Harness {
+    Harness::with(|config| {
+        config.proxy.cache_keep_warm = true;
+        config.proxy.cache_keep_warm_interval = INTERVAL;
+        config.proxy.cache_keep_warm_one_hour = true;
+        config.proxy.cache_keep_warm_one_hour_delay = delay;
+    })
+    .await
+}
+
+/// `body` with every marker asking for an hour.
+fn for_an_hour(mut body: Value) -> Value {
+    body["system"][0]["cache_control"]["ttl"] = json!("1h");
+    let last = body["messages"].as_array().unwrap().len() - 1;
+    if body["messages"][last]["content"].is_array() {
+        body["messages"][last]["content"][0]["cache_control"] =
+            json!({"type": "ephemeral", "ttl": "1h"});
+    }
+    body
+}
+
+/// Stands in for the 55 minutes: well past the five-minute interval here.
+const HOUR_DELAY: Duration = Duration::from_millis(450);
+
+#[tokio::test]
+async fn a_one_hour_request_gets_one_ping_near_the_hour_when_asked() {
+    let harness = pinging_near_the_hour(HOUR_DELAY).await;
+    answering(&harness, "tool_use", 4000).await;
+    harness
+        .post("/v1/messages", &for_an_hour(conversation(1)))
+        .await;
+    tokio::time::sleep(HOUR_DELAY / 2).await;
+    assert!(
+        pings(&harness).await.is_empty(),
+        "nothing at the five-minute interval"
+    );
+    tokio::time::sleep(HOUR_DELAY * 2).await;
+    let sent = harness.upstream_json().await;
+    let pings = pings(&harness).await;
+    assert_eq!(pings.len(), 1, "one ping, at the configured delay");
+    let mut expected = sent[0].clone();
+    expected["max_tokens"] = json!(1);
+    expected["stream"] = json!(false);
+    assert_eq!(pings[0], expected, "the one-hour request, made cheap");
+    assert_eq!(harness.state.keepwarm().armed(), 0);
+}
+
+#[tokio::test]
+async fn the_clients_next_request_before_the_hour_ping_means_no_ping() {
+    let harness = pinging_near_the_hour(HOUR_DELAY).await;
+    answering(&harness, "tool_use", 4000).await;
+    harness
+        .post("/v1/messages", &for_an_hour(conversation(1)))
+        .await;
+    tokio::time::sleep(HOUR_DELAY / 3).await;
+    harness.server.reset().await;
+    answering(&harness, "end_turn", 4000).await;
+    harness
+        .post("/v1/messages", &for_an_hour(conversation(2)))
+        .await;
+    tokio::time::sleep(HOUR_DELAY * 2).await;
+    assert!(pings(&harness).await.is_empty());
+    assert_eq!(harness.state.keepwarm().armed(), 0);
+}
+
+#[tokio::test]
+async fn a_one_hour_background_wait_gets_no_hour_ping() {
+    let harness = pinging_near_the_hour(HOUR_DELAY).await;
+    answering(&harness, "end_turn", 4000).await;
+    let mut body = with_background_task(false);
+    body["system"][0]["cache_control"]["ttl"] = json!("1h");
+    harness.post("/v1/messages", &body).await;
+    tokio::time::sleep(HOUR_DELAY * 2).await;
+    assert!(pings(&harness).await.is_empty(), "after a tool_use only");
+}
+
+/// Markers `cache_ttl` upgraded are one-hour markers too.
+#[tokio::test]
+async fn an_upgraded_one_hour_request_gets_the_hour_ping_too() {
+    let harness = Harness::with(|config| {
+        config.proxy.cache_keep_warm = true;
+        config.proxy.cache_keep_warm_interval = INTERVAL;
+        config.proxy.cache_ttl = kompressor_core::config::CacheTtl::OneHour;
+        config.proxy.cache_keep_warm_one_hour = true;
+        config.proxy.cache_keep_warm_one_hour_delay = HOUR_DELAY;
+    })
+    .await;
+    answering(&harness, "tool_use", 4000).await;
+    harness.post("/v1/messages", &conversation(1)).await;
+    tokio::time::sleep(HOUR_DELAY * 2).await;
+    assert_eq!(pings(&harness).await.len(), 1);
+}

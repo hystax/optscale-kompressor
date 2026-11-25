@@ -67,12 +67,16 @@ pub mod bodycodec;
 mod cachettl;
 pub mod drift;
 pub mod failopen;
+pub mod guard;
 mod handler;
 pub mod headers;
 pub mod intercept;
 pub mod keepwarm;
 pub mod mode;
+mod netgate;
 mod nonstream;
+pub mod outputshape;
+pub mod persist;
 mod piggyback;
 pub mod prefixcache;
 mod reasoning;
@@ -96,6 +100,7 @@ use axum::Router;
 use kompressor_core::AppCore;
 
 pub use crate::failopen::{FailOpen, Stage};
+pub use crate::guard::{Guard, Guards};
 pub use crate::mode::ProxyMode;
 pub use crate::tool::RETRIEVE_TOOL_NAME;
 
@@ -105,6 +110,8 @@ pub struct ProxyState {
     pub(crate) core: Arc<AppCore>,
     pub(crate) client: reqwest::Client,
     pub(crate) failopen: Arc<FailOpen>,
+    /// Trips of the stability guards (`proxy.guard_*`), beside `failopen`.
+    pub(crate) guards: Arc<Guards>,
     /// What the provider last reported about each frozen prefix, so the engine
     /// can be told when a freeze is protecting a cache that is already gone.
     /// Shared across requests, which is the whole point: one request's usage is
@@ -129,9 +136,24 @@ pub struct ProxyState {
     /// Whether each conversation's tool schemas are compacted, decided when
     /// it is first seen, for `proxy.tools_compact`.
     pub(crate) tool_policies: Arc<toolcompact::ToolPolicies>,
+    /// Each conversation's arm of `proxy.output_shaping`, decided when it is
+    /// first seen.
+    pub(crate) output_shaping: Arc<outputshape::OutputShaping>,
     /// Set by [`ProxyState::fail_next_encode_for_test`]. Never set otherwise.
     pub(crate) encode_fault: Arc<std::sync::atomic::AtomicBool>,
+    /// Held while the state file is written, so a timed save and the
+    /// shutdown save never write one temporary file together.
+    pub(crate) saving: Arc<std::sync::Mutex<()>>,
+    /// What reading `proxy.state_path` at start came to.
+    pub(crate) loaded: Arc<persist::Loaded>,
+    /// Set by [`ProxyState::corrupt_next_rewrite_for_test`]. Never set
+    /// otherwise.
+    pub(crate) rewrite_fault: Arc<std::sync::Mutex<Option<RewriteFault>>>,
 }
+
+/// A change made to the next rewritten body, standing in for a rewrite that
+/// went wrong. See [`ProxyState::corrupt_next_rewrite_for_test`].
+pub(crate) type RewriteFault = Box<dyn FnOnce(&mut serde_json::Value) + Send>;
 
 impl ProxyState {
     /// Build the state.
@@ -148,11 +170,20 @@ impl ProxyState {
         let prefixes = Arc::new(prefixcache::PrefixTracker::new(ttl));
         let keepwarm = Arc::new(keepwarm::KeepWarm::default());
         let recompact = Arc::new(recompact::Recompact::default());
-        // All of it lives in this process alone, which is what a restart
-        // costs: the Maintenance page asks for the count.
-        let held = (prefixes.clone(), keepwarm.clone(), recompact.clone());
+        let failopen = Arc::new(FailOpen::default());
+        let guards = Arc::new(Guards::default());
+        // All of it lives in this process, which is what a restart costs
+        // unless `proxy.state_path` keeps it (`persist`): the Maintenance page
+        // asks for the count.
+        let held = (
+            prefixes.clone(),
+            keepwarm.clone(),
+            recompact.clone(),
+            failopen.clone(),
+            guards.clone(),
+        );
         core.runtime().holding(move || {
-            let (prefixes, keepwarm, recompact) = &held;
+            let (prefixes, keepwarm, recompact, failopen, guards) = &held;
             let (conversations, frozen, one_hour) = prefixes.held();
             kompressor_core::runtime::Held {
                 conversations,
@@ -162,12 +193,16 @@ impl ProxyState {
                 recompacted: recompact.tracked(),
                 predicting: recompact.predicting(),
                 wrong_predictions: recompact.wrong_predictions(),
+                guard_trips: guards.total(),
+                guard_enforced: guards.enforced(),
+                failopen_after_compressed: failopen.count(Stage::AfterCompressed),
             }
         });
-        ProxyState {
+        let mut state = ProxyState {
             core,
             client,
-            failopen: Arc::new(FailOpen::default()),
+            failopen,
+            guards,
             prefixes,
             keepwarm,
             retention: Arc::new(retention::Rejections::default()),
@@ -175,13 +210,54 @@ impl ProxyState {
             stabilizer: Arc::new(stabilize::Stabilizer::default()),
             recompact,
             tool_policies: Arc::new(toolcompact::ToolPolicies::default()),
+            output_shaping: Arc::new(outputshape::OutputShaping::default()),
             encode_fault: Arc::default(),
-        }
+            rewrite_fault: Arc::default(),
+            saving: Arc::default(),
+            loaded: Arc::new(persist::Loaded::Off),
+        };
+        // Before the state serves anything, so no request can be decided
+        // against a tracker that is about to be replaced. Never fails: a file
+        // that cannot be used is logged and left alone.
+        state.loaded = Arc::new(persist::load(&state));
+        state
+    }
+
+    /// Write what this proxy remembers about each conversation to
+    /// `proxy.state_path`, atomically. `Ok(None)` when no path is set.
+    ///
+    /// Blocking file IO: call it off the async runtime. `serve` calls it on
+    /// a timer and once more after the listeners have drained.
+    pub fn save_state(&self) -> Result<Option<std::path::PathBuf>, persist::SaveError> {
+        persist::save(self)
+    }
+
+    /// What reading the state file at start came to.
+    pub fn loaded(&self) -> &persist::Loaded {
+        &self.loaded
+    }
+
+    /// The pinned tool orders and beta tokens. Exposed on the same terms as
+    /// `prefixes`.
+    pub fn stabilizer(&self) -> Arc<stabilize::Stabilizer> {
+        self.stabilizer.clone()
+    }
+
+    /// The tool-compaction decisions. Exposed on the same terms as
+    /// `prefixes`.
+    pub fn tool_policies(&self) -> Arc<toolcompact::ToolPolicies> {
+        self.tool_policies.clone()
     }
 
     /// Per-stage fail-open counts, for `/metrics` and for tests.
     pub fn failopen(&self) -> Arc<FailOpen> {
         self.failopen.clone()
+    }
+
+    /// Stability guard trips, for tests and the Maintenance page. Exposed on
+    /// the same terms as `failopen`.
+    pub fn guards(&self) -> Arc<Guards> {
+        self.guards.clone()
     }
 
     /// What the proxy remembers about each conversation's cached prefix.
@@ -218,6 +294,25 @@ impl ProxyState {
     pub fn fail_next_encode_for_test(&self) {
         self.encode_fault
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Apply `fault` to the next body this proxy rewrites, after every
+    /// rewrite and before the stability guards look at it, as a rewrite with
+    /// a defect would.
+    ///
+    /// For tests, on the terms of [`Self::fail_next_encode_for_test`]: no
+    /// rewrite this proxy makes is known to break what the guards check, and
+    /// what happens when one does is a path that has to hold. A body the
+    /// proxy forwards unchanged is left alone and the fault waits. Nothing in
+    /// the proxy calls it.
+    #[doc(hidden)]
+    pub fn corrupt_next_rewrite_for_test(
+        &self,
+        fault: impl FnOnce(&mut serde_json::Value) + Send + 'static,
+    ) {
+        if let Ok(mut slot) = self.rewrite_fault.lock() {
+            *slot = Some(Box::new(fault));
+        }
     }
 
     /// The keep-warm timers. Exposed on the same terms as `prefixes`.

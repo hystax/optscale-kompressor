@@ -63,6 +63,14 @@ pub struct Held {
     pub predicting: bool,
     /// Predictions the provider's answer contradicted, since start.
     pub wrong_predictions: u64,
+    /// Requests a stability guard (`proxy.guard_*`) tripped on, since start:
+    /// the rewrite introduced a fault the provider refuses.
+    pub guard_trips: u64,
+    /// Of those, the ones under `enforce` that sent the client's original.
+    pub guard_enforced: u64,
+    /// Requests that went out uncompressed after an earlier turn of their
+    /// conversation went out compressed, since start.
+    pub failopen_after_compressed: u64,
 }
 
 /// Whoever holds the state [`Held`] counts, asked each time it is wanted.

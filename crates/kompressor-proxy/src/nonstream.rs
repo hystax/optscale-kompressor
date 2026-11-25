@@ -37,6 +37,9 @@ pub(crate) struct Relayed {
     pub(crate) injected_tokens: u32,
     /// The usage the client was shown, which is the summed usage.
     pub(crate) usage: Option<Value>,
+    /// Each round's own usage, round 0 first, for the rounds whose response
+    /// was read: what `retrieve_round_usage` is filed from.
+    pub(crate) round_usage: Vec<Value>,
 }
 
 /// Forward the request and, where the model asks for it, fetch fragments back.
@@ -44,11 +47,33 @@ pub(crate) struct Relayed {
 /// `retriever` is `None` when the loop must not run at all — client-side
 /// execution, a family with no walker, or a request that carries no handle.
 pub(crate) async fn run(
+    outbound: Outbound,
+    family: Option<ApiFamily>,
+    retriever: Option<&Retriever>,
+    budget: Budget,
+    failopen: &FailOpen,
+) -> Result<Relayed, reqwest::Error> {
+    let mut per_round = Vec::new();
+    let mut relayed = run_rounds(
+        outbound,
+        family,
+        retriever,
+        budget,
+        failopen,
+        &mut per_round,
+    )
+    .await?;
+    relayed.round_usage = per_round;
+    Ok(relayed)
+}
+
+async fn run_rounds(
     mut outbound: Outbound,
     family: Option<ApiFamily>,
     retriever: Option<&Retriever>,
     mut budget: Budget,
     failopen: &FailOpen,
+    per_round: &mut Vec<Value>,
 ) -> Result<Relayed, reqwest::Error> {
     let mut rounds = 0u32;
     let mut injected = 0u32;
@@ -120,6 +145,9 @@ pub(crate) async fn run(
             // a success we cannot read is still a success; relay it
             return Ok(finish(status, headers, body, rounds, injected, None));
         };
+        // This round's own figure, before it is folded into the sum: the
+        // sum cannot say which round read what.
+        per_round.push(turn::usage_of(&parsed).cloned().unwrap_or(Value::Null));
 
         // Client-side execution and requests carrying no handle still come
         // through here, so that what the provider billed is recorded either
@@ -210,6 +238,12 @@ pub(crate) async fn run(
             round_tokens = round_tokens.saturating_add(tokens);
             results.push((call.clone(), payload));
         }
+        // `proxy.retrieve_attach_siblings`: what is left of the allowance may
+        // carry the rest of each asked-for output, so the next round need not.
+        if !spent && let Some(submission) = outbound.json() {
+            let attached = retriever.attach_siblings(submission, &mut results, left);
+            round_tokens = round_tokens.saturating_add(attached.tokens);
+        }
 
         let mut next = outbound.json().cloned().unwrap_or(Value::Null);
         if !turn::append_round(family, &mut next, &parsed, &results) || !outbound.set_json(next) {
@@ -229,6 +263,9 @@ pub(crate) async fn run(
                 "retrieve_round_failed",
                 "kompressor: could not build the next retrieval round",
             ));
+        }
+        if let Some(submission) = outbound.json() {
+            retriever.capture_round(rounds + 1, submission);
         }
 
         if let Some(usage) = turn::usage_of(&parsed) {
@@ -276,6 +313,7 @@ fn loop_error(rounds: u32, injected: u32, code: &str, message: &str) -> Relayed 
         rounds,
         injected_tokens: injected,
         usage: None,
+        round_usage: Vec::new(),
     }
 }
 
@@ -324,5 +362,6 @@ fn finish(
         rounds,
         injected_tokens: injected,
         usage,
+        round_usage: Vec::new(),
     }
 }

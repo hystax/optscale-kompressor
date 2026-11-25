@@ -45,6 +45,7 @@ pub mod crusher;
 pub mod detect;
 pub mod diff;
 pub mod echo;
+pub mod gate;
 pub mod gutter;
 pub mod listing;
 pub mod logs;
@@ -62,6 +63,7 @@ pub mod search;
 pub mod tabular;
 pub mod text;
 pub mod tokens;
+pub mod traces;
 pub mod types;
 
 pub use options::{EngineOptions, EngineOptionsPatch, TokenGuard};

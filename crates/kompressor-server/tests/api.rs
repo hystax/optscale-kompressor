@@ -1513,6 +1513,7 @@ fn proxied_turn(
         total_ms: (!keep_warm).then_some(900.0),
         error: None,
         keep_warm,
+        output_shaping: None,
     })
 }
 
@@ -1597,6 +1598,130 @@ async fn a_cache_query_it_cannot_honour_is_refused() {
     let (status, body) = harness.get("/v1/stats/cache").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(text(&body["error"]["message"]).contains("disabled"));
+}
+
+// ---------------------------------------------------------------------------
+// the three gate measurements
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_gate_measurements_answer_with_a_number_and_the_query_behind_it() {
+    let harness = Harness::with_stats();
+    let (status, empty) = harness.get("/v1/stats/restarts").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(empty["available"], true);
+    assert!(text(&empty["query"]).contains("process_starts"));
+    let tenant = text(&empty["tenant"]);
+
+    const MIN: i64 = 60_000;
+    let start = now_ms() - 30 * MIN;
+    let mut turn_with_rounds = proxied_turn(start + MIN, &tenant, 40_000, 0, false);
+    let request_id = match &mut turn_with_rounds {
+        kompressor_stats::Event::ProxyRequest(row) => {
+            row.retrieve_rounds = 1;
+            row.request_id.clone()
+        }
+        _ => unreachable!(),
+    };
+    for event in [
+        kompressor_stats::Event::ProcessStart(kompressor_stats::ProcessStartEvent {
+            time_ms: start,
+            version: "test".into(),
+            pid: None,
+            surfaces: "proxy".into(),
+        }),
+        proxied_turn(start - MIN, &tenant, 0, 40_000, false),
+        turn_with_rounds,
+        kompressor_stats::Event::RetrieveRounds(kompressor_stats::RetrieveRoundsEvent {
+            time_ms: start + MIN,
+            tenant: tenant.clone(),
+            request_id: request_id.clone(),
+            rounds: [(0, 20_000), (1, 20_000)]
+                .into_iter()
+                .map(|(round, read)| kompressor_stats::RoundUsage {
+                    round,
+                    input_tokens: Some(8),
+                    cache_read_tokens: Some(read),
+                    cache_write_tokens: Some(0),
+                    output_tokens: Some(10),
+                })
+                .collect(),
+        }),
+        kompressor_stats::Event::Elisions(kompressor_stats::ElisionsEvent {
+            time_ms: start + MIN,
+            tenant: tenant.clone(),
+            request_id: request_id.clone(),
+            refs: vec![
+                kompressor_stats::Elided {
+                    reference: "k_aaaaaaaaaaaa".into(),
+                    kind: "log".into(),
+                    bytes: 2_000,
+                },
+                kompressor_stats::Elided {
+                    reference: "k_bbbbbbbbbbbb".into(),
+                    kind: "log".into(),
+                    bytes: 2_000,
+                },
+            ],
+        }),
+        kompressor_stats::Event::Retrieval(kompressor_stats::RetrievalEvent {
+            context: None,
+            time_ms: start + MIN,
+            tenant: tenant.clone(),
+            request_id: Some(request_id.clone()),
+            surface: kompressor_stats::Surface::Proxy,
+            reference: "k_aaaaaaaaaaaa".into(),
+            found: true,
+            expired: false,
+            ranged: false,
+            fragment_bytes: 2_000,
+            fragment_chars: 2_000,
+            fragment_tokens: 500,
+            returned_chars: 2_000,
+            returned_tokens: 500,
+            withheld: false,
+            range_status: None,
+        }),
+    ] {
+        harness.sink.send(event);
+    }
+    harness.sink.flush().expect("the batch commits");
+
+    let (status, restarts) = harness.get("/v1/stats/restarts?window=2h").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(restarts["starts"][0]["conversations_across"], 1);
+    assert_eq!(restarts["totals"]["read_after"], 40_000);
+    assert_eq!(restarts["totals"]["read_share"], 1.0);
+
+    let (status, rounds) = harness.get("/v2/stats/retrieve-rounds?window=2h").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rounds["totals"]["extra_rounds_measured"], 1);
+    assert_eq!(rounds["totals"]["cache_read_per_extra_round"], 20_000.0);
+    assert!(text(&rounds["query"]).contains("retrieve_round_usage"));
+
+    let (status, fetch) = harness.get("/v1/stats/fetch-probability?window=2h").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        (fetch["elisions"].as_u64(), fetch["fetched"].as_u64()),
+        (Some(2), Some(1))
+    );
+    assert_eq!(fetch["probability"], 0.5);
+    assert!(text(&fetch["query"]).contains("elisions"));
+
+    // An experiment nothing was recorded under sees none of it.
+    let (_, other) = harness
+        .get("/v1/stats/fetch-probability?window=2h&experiment_id=t9")
+        .await;
+    assert_eq!(other["elisions"], 0);
+    assert_eq!(other["experiment_id"], "t9");
+
+    for query in ["window=2w", "from=5", "colour=red"] {
+        let (status, _) = harness.get(&format!("/v1/stats/restarts?{query}")).await;
+        assert!(status.is_client_error(), "{query} answered {status}");
+    }
+    let harness = Harness::memory();
+    let (status, _) = harness.get("/v1/stats/retrieve-rounds").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "statistics are off");
 }
 
 #[tokio::test]
@@ -2777,7 +2902,25 @@ async fn the_analysis_json_keeps_its_contract() {
         .await;
     assert_eq!(status, StatusCode::OK, "{compare}");
     has_keys(&compare, &scope, "compare");
-    has_keys(&compare, &["current", "baseline", "changes"], "compare");
+    has_keys(
+        &compare,
+        &["current", "baseline", "changes", "output_shaping"],
+        "compare",
+    );
+    has_keys(
+        &compare["output_shaping"],
+        &[
+            "arms",
+            "output_per_turn_change",
+            "turns_per_conversation_change",
+        ],
+        "output shaping",
+    );
+    assert_eq!(
+        compare["output_shaping"]["arms"],
+        serde_json::json!([]),
+        "no row here is in the experiment"
+    );
     for side in ["current", "baseline"] {
         has_keys(
             &compare[side],

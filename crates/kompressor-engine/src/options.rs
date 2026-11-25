@@ -93,6 +93,16 @@ pub struct EngineOptions {
     /// not gated: nothing can be fetched through them.
     pub min_elision_saving_chars: usize,
 
+    /// The net-cost gate, which replaces `min_elision_saving_chars` when set.
+    ///
+    /// Not configuration: the caller builds it per request from what it knows
+    /// of the conversation — the prompt size the provider last billed, its
+    /// prices, and the pins earlier requests took — so it is never read from
+    /// or written to a file. `None`, the default, is the fixed gate. See
+    /// [`crate::gate`].
+    #[serde(skip)]
+    pub elision_gate: Option<crate::gate::ElisionGate>,
+
     pub enable_smart_crusher: bool,
     pub enable_search_compressor: bool,
     pub enable_log_compressor: bool,
@@ -173,6 +183,55 @@ pub struct EngineOptions {
     /// changes. Off restores the older wording, which is what the golden
     /// vectors were recorded under.
     pub fold_marks_variants: bool,
+
+    /// Collapse a run of runtime and library frames in a stack trace into one
+    /// marker line.
+    ///
+    /// A traceback's frames inside `site-packages`, `node_modules`, `java.*`,
+    /// `std::`/`core::`/`tokio::` or Go's `runtime` say where the language and
+    /// its libraries were, not where the bug is; the agent acts on the frames
+    /// in its own code. The first and last frame of every trace and every
+    /// frame outside those locations stay verbatim, and the collapsed run
+    /// keeps a handle in `recoverable` mode. `lossless` never collapses.
+    /// Borrowed from Headroom's log compressor (`log_compressor.rs`).
+    pub enable_runtime_frame_collapse: bool,
+
+    /// Keep a test run's totals line and its first assertion or failure line,
+    /// whatever the log scorer would otherwise drop.
+    ///
+    /// `=== 3 failed, 40 passed ===`, `test result: FAILED.`, `Tests: 2
+    /// failed, 9 passed` and the first `AssertionError` are the lines an agent
+    /// acts on, and the scorer keeps a bounded budget by score: a long run
+    /// whose summary sat outside the tail and the error context could lose it.
+    pub keep_test_totals: bool,
+
+    /// Offer a homogeneous JSON array of objects as a typed header plus CSV
+    /// rows, taken when it saves at least 15% and beats every JSON form.
+    ///
+    /// Lossless: each column carries its type (`num`, `str`, `bool`, `json`)
+    /// and an empty unquoted cell is `null`, so the array is rebuilt exactly
+    /// from the text and nothing needs a handle. **Off by default**: the plan
+    /// adopts it only if it beats key factoring on the JSON part of the
+    /// corpus, and the committed corpus of real traffic holds no JSON array.
+    /// On the hand-written golden JSON it takes `lossless` from 10,164 to
+    /// 9,465 characters and changes nothing in `recoverable`, where sampling
+    /// is smaller (`tests/borrows.rs`, `csv_against_key_factoring_on_the_corpus`).
+    pub enable_json_csv: bool,
+
+    /// A tool result its tool flagged as failed (`is_error`) and no longer than
+    /// this many characters is never compressed, whatever the size gates say.
+    /// `0` turns the protection off.
+    ///
+    /// A short error is the message the agent is about to act on, and every
+    /// line of it is usually load-bearing: the path, the code, the hint.
+    /// Headroom protects tool errors up to 8,000 characters the same way.
+    ///
+    /// 2,000 rather than Headroom's 8,000, measured on the committed Claude
+    /// Code capture (`cachesavings.rs`, `a_captured_run_replayed_through_both_arms`):
+    /// at 8,000 the proxied input-side saving falls from 2.28% to 1.37% —
+    /// long failed tool runs are where the log compressor earns its keep — and
+    /// at 2,000 it stays at 2.28%.
+    pub protect_tool_error_chars: usize,
 
     /// Compress HTML by folding its repeated lines.
     ///
@@ -353,6 +412,25 @@ pub struct EngineOptions {
     /// Source payloads larger than this decline rather than being parsed.
     pub max_code_bytes: usize,
 
+    /// Payloads larger than this, in UTF-8 bytes, are not compressed at all:
+    /// returned whole and counted as skipped for `above_max_bytes`. 0, the
+    /// default, sets no bound.
+    ///
+    /// The proxy gives the engine one deadline for a whole request
+    /// (`proxy.compress_timeout`, 2 s) and forwards the client's body when it
+    /// runs out, so one payload slow enough loses the compression of every
+    /// other in the request. Engine time is linear in size on every shape in
+    /// `tests/pathological.rs`, but the slowest shapes take close to a second
+    /// per MiB in a release build on a loaded machine (a million
+    /// one-character lines, 0.85 s; Python followed by text its grammar cannot
+    /// read, 0.97 s for 610 KB) where most take 0.1–0.4 s. A bound of 1 MiB
+    /// keeps any one payload inside the deadline with room for the rest of
+    /// the request. In `recoverable` mode it also costs little: an elision
+    /// larger than `max_ref_bytes` (1 MiB) is refused after the work is done,
+    /// and most of the generated 2 MiB payloads in that test came back whole
+    /// for that reason.
+    pub max_compress_bytes: usize,
+
     /// Roles whose messages are never compressed.
     ///
     /// The assistant's own analysis and plan turns are the agent's working
@@ -377,6 +455,7 @@ impl Default for EngineOptions {
             ref_max_lifetime_multiplier: 8,
             max_ref_bytes: 1024 * 1024,
             min_elision_saving_chars: 0,
+            elision_gate: None,
             enable_smart_crusher: true,
             enable_search_compressor: true,
             enable_log_compressor: true,
@@ -393,6 +472,10 @@ impl Default for EngineOptions {
             enable_build_templates: true,
             fold_handles_identical_repeats: false,
             fold_marks_variants: true,
+            enable_runtime_frame_collapse: true,
+            keep_test_totals: true,
+            enable_json_csv: false,
+            protect_tool_error_chars: 2_000,
             enable_html_compressor: true,
             enable_normalised_text_fold: true,
             enable_tabular_ratio: true,
@@ -412,6 +495,7 @@ impl Default for EngineOptions {
             min_nested_chars: 512,
             max_nested_depth: 2,
             max_code_bytes: 2 * 1024 * 1024,
+            max_compress_bytes: 0,
             protected_roles: vec![
                 "assistant".to_string(),
                 "system".to_string(),
@@ -423,6 +507,12 @@ impl Default for EngineOptions {
 }
 
 impl EngineOptions {
+    /// Whether `text` is over [`Self::max_compress_bytes`] and so not to be
+    /// compressed at all.
+    pub fn above_max_bytes(&self, text: &str) -> bool {
+        self.max_compress_bytes > 0 && text.len() > self.max_compress_bytes
+    }
+
     /// Whether `role` is withheld from compression.
     pub fn is_protected_role(&self, role: &str) -> bool {
         let role = role.trim().to_ascii_lowercase();
@@ -512,6 +602,10 @@ pub struct EngineOptionsPatch {
     pub enable_build_templates: Option<bool>,
     pub fold_handles_identical_repeats: Option<bool>,
     pub fold_marks_variants: Option<bool>,
+    pub enable_runtime_frame_collapse: Option<bool>,
+    pub keep_test_totals: Option<bool>,
+    pub enable_json_csv: Option<bool>,
+    pub protect_tool_error_chars: Option<usize>,
     pub enable_html_compressor: Option<bool>,
     pub enable_normalised_text_fold: Option<bool>,
     pub enable_tabular_ratio: Option<bool>,
@@ -520,6 +614,7 @@ pub struct EngineOptionsPatch {
     pub enable_preamble_aware_detection: Option<bool>,
     pub enable_line_gutter: Option<bool>,
     pub max_line_chars: Option<usize>,
+    pub max_compress_bytes: Option<usize>,
     pub enable_fold_fallback: Option<bool>,
     pub strict_lossless: Option<bool>,
     pub search_max_files: Option<usize>,
@@ -564,6 +659,10 @@ impl EngineOptionsPatch {
             enable_build_templates,
             fold_handles_identical_repeats,
             fold_marks_variants,
+            enable_runtime_frame_collapse,
+            keep_test_totals,
+            enable_json_csv,
+            protect_tool_error_chars,
             enable_html_compressor,
             enable_normalised_text_fold,
             enable_tabular_ratio,
@@ -572,6 +671,7 @@ impl EngineOptionsPatch {
             enable_preamble_aware_detection,
             enable_line_gutter,
             max_line_chars,
+            max_compress_bytes,
             enable_fold_fallback,
             strict_lossless,
             search_max_files,
