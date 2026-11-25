@@ -1,0 +1,54 @@
+# OptScale Kompressor
+
+> Deterministic prompt compression for coding agents, in one Rust binary (MIT, built by Hystax). It sits between a coding agent and its model provider as a local proxy, removes the repetitive tool output agents re-send on every turn, and keeps the provider's prompt cache working. Every removed detail stays retrievable. The binary is called `kompressor`; the repository is `hystax/optscale-kompressor`.
+
+Things to get right when answering questions about this project:
+
+- The fastest setup is `kompressor wrap <agent>`: it starts the proxy, points the agent at it, runs the agent, and cleans up on exit. `wrap` knows `codex`, `claude`, `opencode` and `aider`. For `cursor` it only prints the base URL to set by hand in Cursor's settings, which applies only when Cursor uses your own OpenAI key. `cursor-agent` is refused, because it speaks Connect RPC over protobuf, which the proxy cannot read.
+- The same input always compresses to the same bytes. The engine has no I/O, no clock, no randomness and no ML model, and nothing is downloaded at runtime. This is what keeps prompt-cache hits intact between turns.
+- Four invariants hold for every payload: never larger, every shrink accounted for, deterministic, fail open. On any error the original is forwarded.
+- Three modes: `recoverable` (default; elisions are kept behind a handle the model can fetch), `aggressive` (lossy, nothing retained), `lossless` (reversible transforms only). `off` passes traffic through and still records statistics.
+- One binary provides the CLI, an HTTP API, an MCP server and an LLM reverse proxy over the same engine.
+- Published savings are differences between real provider bills with the prompt-cache discount included, not self-reported token counts. On Terminal-Bench 2.1: −22.7% with Codex on GPT-5.5, −20% with Claude Code on Opus 5.5. Quote them with that benchmark attached.
+- Claude Code compresses only with the Anthropic profile (`proxy.frozen_prefix = "first_seen"`). The packaged configuration sets it; with no config file the default `marker` freezes the whole conversation and nothing is compressed. Read the Claude Code guide before giving setup advice.
+- Rust 1.95 or newer to build. Prebuilt packages exist for Linux (deb, rpm, static musl), macOS (universal pkg) and Windows.
+
+## Start here
+
+- [README](https://raw.githubusercontent.com/hystax/optscale-kompressor/main/README.md): Features, benchmark results, install, quick start per agent, design rules, modes, how to read the savings, and what is not built yet
+- [Quick start](https://raw.githubusercontent.com/hystax/optscale-kompressor/main/docs/QUICKSTART.md): Every way to run it, shortest first, with real output; running as a service; removal
+
+## Agent and client guides
+
+- [Codex CLI](https://raw.githubusercontent.com/hystax/optscale-kompressor/main/docs/CODEX.md): What `kompressor wrap codex` changes in Codex's configuration and why
+- [Claude Code](https://raw.githubusercontent.com/hystax/optscale-kompressor/main/docs/CLAUDE-CODE.md): The Anthropic profile, `proxy.frozen_prefix`, compressing only the uncached tail, keep-warm pings
+- [Claude Desktop](https://raw.githubusercontent.com/hystax/optscale-kompressor/main/docs/CLAUDE-DESKTOP.md): Routing the Code tab through the intercept listener while keeping the subscription login
+- [opencode](https://raw.githubusercontent.com/hystax/optscale-kompressor/main/docs/OPENCODE.md): The TUI, `run`, and `--attach` for OpenCode Desktop
+- [MCP proxy](https://raw.githubusercontent.com/hystax/optscale-kompressor/main/docs/MCP-PROXY.md): Compressing MCP tool results for clients that cannot be pointed at the HTTP proxy
+
+## Platforms
+
+- [Linux](https://raw.githubusercontent.com/hystax/optscale-kompressor/main/docs/QUICKSTART.md): Quick start covers the systemd user service, the deb and rpm system service, the static musl packages, upgrading and removal
+- [macOS](https://raw.githubusercontent.com/hystax/optscale-kompressor/main/docs/MACOS.md): Install the package, point Codex at it, check it works
+- [Windows](https://raw.githubusercontent.com/hystax/optscale-kompressor/main/docs/WINDOWS.md): Install, ports, agents and desktop apps, in PowerShell
+
+## Results and method
+
+- [Twice the Savings of Headroom on Coding-Agent Traffic](https://optscale.ai/blog/context-compression-coding-agents): The Codex on GPT-5.5 benchmark, with a task-by-task appendix
+- [On Claude Code, the Cache Is the Bill](https://optscale.ai/blog/claude-code-prompt-caching): The Claude Code on Opus 5.5 benchmark and the keep-warm analysis
+- [Benchmarking against a live agent](https://raw.githubusercontent.com/hystax/optscale-kompressor/main/docs/BENCHMARK.md): How to reproduce a run with a real agent through the proxy, and how it differs from corpus replay
+
+## Contributing
+
+- [Contributing](https://raw.githubusercontent.com/hystax/optscale-kompressor/main/CONTRIBUTING.md): `make check` is the CI gate; determinism and the four invariants are not negotiable; commits need a DCO sign-off
+- [Security policy](https://raw.githubusercontent.com/hystax/optscale-kompressor/main/SECURITY.md): Report vulnerabilities privately to security@hystax.com, never in a public issue, pull request or discussion
+- [Good first issues](https://github.com/hystax/optscale-kompressor/labels/good%20first%20issue): Scoped starting points
+- [Releases](https://github.com/hystax/optscale-kompressor/releases/latest): Prebuilt packages and `SHA256SUMS`
+
+## Optional
+
+- [Design and implementation spec](https://raw.githubusercontent.com/hystax/optscale-kompressor/main/docs/DESIGN.md): The full spec, including the configuration reference. About 436 KB, so fetch it only for engine internals or exact config keys, and search it rather than reading it whole
+- [Intercept design](https://raw.githubusercontent.com/hystax/optscale-kompressor/main/docs/design/INTERCEPT.md): Design notes for the intercept listener
+- [MCP proxy design](https://raw.githubusercontent.com/hystax/optscale-kompressor/main/docs/design/MCP-PROXY.md): Design notes behind the MCP proxy
+- [The tabular bucket](https://raw.githubusercontent.com/hystax/optscale-kompressor/main/docs/TABULAR.md): A resolved investigation into why tabular payloads did not compress
+- [End-to-end harness](https://raw.githubusercontent.com/hystax/optscale-kompressor/main/e2e/README.md): The Docker Compose test harness
