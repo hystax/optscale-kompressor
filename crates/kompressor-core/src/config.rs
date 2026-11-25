@@ -1827,12 +1827,15 @@ impl Default for CursorMcpHooksConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct CursorShellHooksConfig {
     pub enabled: bool,
-    /// Rewrite only when the Cursor CLI's `approvalMode` is `unrestricted`
-    /// (run everything). Whether an allow-list still sees every executable
-    /// inside the rewritten form is not yet measured, so a rewrite is not
-    /// allowed to stand between a command and an approval decision until it
-    /// is.
-    pub only_when_unrestricted: bool,
+    /// Rewrite only when the Cursor CLI would run the rewritten command:
+    /// its `approvalMode` is `unrestricted`, or its allow-list
+    /// (`~/.cursor/cli-config.json`, a workspace's `.cursor/cli.json`)
+    /// approves this binary as the rewrite names it — `Shell(kompressor)`, or
+    /// `Shell(<absolute path>)` when `PATH` does not find it. Without that,
+    /// every rewritten command would be refused, including the ones the user
+    /// approved. The desktop's approval settings cannot be read, so in the
+    /// editor this has to be switched off for the rewrite to run.
+    pub only_when_approved: bool,
     /// Commands never rewritten, matched on the first word (two for `git`).
     pub skip: Vec<String>,
     /// Captured output above this is printed uncompressed rather than read
@@ -1844,7 +1847,7 @@ impl Default for CursorShellHooksConfig {
     fn default() -> Self {
         CursorShellHooksConfig {
             enabled: false,
-            only_when_unrestricted: true,
+            only_when_approved: true,
             skip: [
                 "cd",
                 "pwd",
@@ -2122,11 +2125,11 @@ impl Config {
                 cursor.shell.enabled =
                     parse_bool_setting("hooks.cursor.shell.enabled", value, cursor.shell.enabled)
             }
-            "shell__only_when_unrestricted" => {
-                cursor.shell.only_when_unrestricted = parse_bool_setting(
-                    "hooks.cursor.shell.only_when_unrestricted",
+            "shell__only_when_approved" => {
+                cursor.shell.only_when_approved = parse_bool_setting(
+                    "hooks.cursor.shell.only_when_approved",
                     value,
-                    cursor.shell.only_when_unrestricted,
+                    cursor.shell.only_when_approved,
                 )
             }
             "shell__skip" => cursor.shell.skip = list(value),

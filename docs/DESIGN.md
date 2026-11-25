@@ -2486,7 +2486,7 @@ skip_tools = []                     # tool names (after `MCP:`) forwarded untouc
 
 [hooks.cursor.shell]
 enabled = false                     # rewrite shell commands so their output is compressed
-only_when_unrestricted = true       # only when the CLI's approvalMode is "unrestricted"
+only_when_approved = true           # only when the CLI would run the rewrite: unrestricted, or kompressor allow-listed
 skip = ["cd", "pwd", "echo", "export", "mkdir", "touch", "rm", "mv", "cp", "chmod", "which", "git add", "git commit", "git checkout", "git switch", "git push"]
 max_capture_bytes = 67108864        # larger captured output is printed uncompressed
 ```
@@ -2661,9 +2661,12 @@ money. `kompressor stats by-tool` and the dashboard's Cursor page read them.
 What it cannot reach: built-in Read, Grep, List and Fetch output (no hook can
 change it); MCP results over Cursor's ~40 KB spill threshold (the hook is
 handed an empty string — front those servers); keep-warm and every
-prefix-cache feature. Shell rewriting is off by default and, until it is
-measured that Cursor's allow-list still sees executables inside the brace
-group, rewrites only under `approvalMode: unrestricted`.
+prefix-cache feature. Shell rewriting is off by default. Cursor's allow-list
+judges the rewritten command word by word, so an unapproved executable inside
+the brace group is still refused (measured on CLI 2026.11.22); the rewrite
+names this binary as an allow-list can match it — bare when `PATH` finds it,
+otherwise its absolute path unquoted — and is offered only when the CLI would
+run it: `approvalMode: unrestricted`, or `kompressor` on the allow-list.
 
 **A wrapped agent that pins its whole prompt compresses nothing.** Claude Code
 puts a `cache_control` breakpoint on its final message, so every wrapped session

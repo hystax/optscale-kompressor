@@ -9,7 +9,8 @@ measurement (Gate A), Tier 6's A/B on Cursor's own accounting (Gate B), and the
 live acceptance criteria of the other tiers. Those cost plan usage and are run
 by hand. Until they are, the defaults stay where the plan puts a feature
 awaiting its gate: MCP compression on once installed, shell rewriting **off**
-and, when switched on, limited to `approvalMode: unrestricted` (Q1 is open),
+and, when switched on, offered only when the CLI would approve the rewrite
+(Q1, answered in §12.6),
 and no saving claimed anywhere. §13.12 lists what was built against each tier.
 
 The mechanisms were exercised against a real Cursor CLI and desktop app on
@@ -527,10 +528,11 @@ run. A rewriting hook can turn a command the user would have been asked about
 into one they are not. This design must never do that, which rules out any
 form that hides `C` from the parser — `kompressor run -- C` and
 `sh -c 'C'` in particular. In the brace form `C`'s own executables remain
-visible to the allow-list; that an executable *inside* the group that is not
-allow-listed is still rejected is **[unverified]** and is the one approval
-test left (§12.5, Q1). Until it is run, the rewrite is enabled only where the
-session already runs everything (`--force`, an unrestricted approval mode).
+visible to the allow-list, and an executable *inside* the group that is not
+allow-listed is still rejected **[spike]** (§12.6, Q1). The allow-list also
+judges this binary's own word literally, so the rewrite names it as an entry
+can match — bare, or by its unquoted absolute path — and is offered only when
+the CLI's settings would approve it.
 
 **What the model sees** **[spike]**. The tool call in the transcript keeps the
 command the model wrote, in both its arguments and its result; asked what it
@@ -1102,13 +1104,86 @@ hooks. §13 assigns each to the tier whose entry gate it is.
 
 | # | Question | Experiment | Blocks |
 |---|---|---|---|
-| Q1 | In the brace form, is an executable inside the group that is not allow-listed still rejected? What does the desktop approval prompt show for a rewritten command? | The brace form around a command that is not on the allow-list, with `kompressor` on it; and one rewritten command in the desktop under ask-every-time. | the shell rewrite outside run-everything sessions (Tier 5) |
+| Q1 | **Answered for the CLI (§12.6): yes, still rejected.** Open: what the desktop approval prompt shows for a rewritten command. | The brace form around a command that is not on the allow-list, with `kompressor` on it; and one rewritten command in the desktop under ask-every-time. | the shell rewrite outside run-everything sessions (Tier 5) |
 | Q2 | Desktop: is the replacement applied to a *successful* MCP result, and is the spill threshold the CLI's? | The fixture's 200-line and 3,000-line calls with the replacement on. | closing Tier 4 on the desktop; low risk |
 | Q3 | Do the hooks fire on macOS, on the current CLI build, and from the user-level file in the desktop app? | The same recording hooks; one shell command and one MCP call each. | Tier 0 |
 | Q4 | A restrictive sandbox policy: can `hook emit` reach the store, and is `$TMPDIR` writable? | A policy denying writes outside the workspace. | §8's fallback being tested rather than assumed (Tier 5) |
 | Q5 | What share of a real session's tool output is Shell, MCP, Read, Grep — and how much of it is under 40 KB? | Shadow mode over a week of real use. | **whether Tiers 4 and 5 are built at all** (Tier 3) |
 | Q6 | The size cap on `additional_context`. | Growing strings until one is dropped. | the length of the guidance (Tier 4) |
 | Q7 | Which construct sank the first-draft form — the assignment, `\|\|`, or `(exit)`? | One session, one construct per command. | nothing; only if `\|\| cat` is wanted back |
+
+### 12.6 Q1, answered (2026-11-25, CLI 2026.11.22-e9042b2)
+
+Sessions under `-p` with **no `--force`**, the allow-list set per run in the
+workspace's `.cursor/cli.json` (which this build merges with the global file),
+shell compression on through `wrap cursor-agent`:
+
+| Allow-list | Command | Bare | Rewritten |
+|---|---|---|---|
+| `Shell(seq)` | `seq 1 3` | ran | — |
+| `Shell(seq)` | `uname -a` | refused | — |
+| `seq`, `kompressor`; binary on `PATH` | `seq 1 20000` | — | **ran**, 109 KB → 84 chars with a handle |
+| `seq`, `Shell(/abs/kompressor)`; not on `PATH` | `seq 1 20000` | — | **ran**, compressed |
+| `seq` and both `kompressor` entries | `uname -a` | — | **refused** |
+| same | `seq 1 3 && uname -a` | — | **refused** |
+| `seq` only | `seq 1 20000` | — | refused |
+
+The first rewrite form, with the binary as a quoted absolute path, was refused
+even with `Shell(seq)` and `Shell(kompressor)` allow-listed. Varying one piece
+at a time with a fixed-reply hook isolated it: the allow-list matches the
+command word **literally** — `Shell(kompressor)` only a bare `kompressor`,
+`Shell(/abs/path)` only that path unquoted, neither a quoted path. The quoted
+capture file, `"$?"`, `--config` and the other flags all passed. Hence
+`shell::program_word`, `hooks.cursor.shell.only_when_approved` (rewrite only
+when the CLI's settings would run the result), and `--allow-list` adding both
+entries.
+
+A full e2e round on the same build then added two findings. A workspace's
+`.cursor/cli.json` **replaces** the global `permissions.allow` rather than
+adding to it — the CLI's config merge recurses into objects and replaces
+arrays — so with `Shell(kompressor)` global and `Shell(seq)` alone in the
+project file, the rewritten `seq` was refused; the hook now merges the files
+the same way before deciding. And without `--force`, MCP tool calls need
+approval too (`User rejected MCP: …`), retrieval included; `--allow-list`
+therefore also adds `Mcp(*:optscale_kompressor_retrieve)` (`Mcp(server:tool)`,
+globs, matched against the provider id). With both, a session with no
+`--force` compressed the MCP result and the shell output, retrieved through
+the tool, answered correctly, and uninstall restored the allow-list exactly.
+
+Also found: a refused rewrite leaves its empty capture file behind (the hook
+makes it before approval), now swept after a day; and the refusal shows the
+model the rewritten command. What the desktop's approval prompt shows is still
+not recorded.
+
+### 12.7 Corner cases, three rounds (2026-11-25, CLI 2026.11.22-e9042b2)
+
+Run on a VPS through `wrap cursor-agent` and `hook install`, each round's
+findings fixed before the next.
+
+| Case | Result |
+|---|---|
+| `cd`, `export` across rewritten commands; quotes, `$HOME`, a quoted heredoc, a pipe, a failing `ls` | all as bare: state carried, exit 2 kept, text intact |
+| a command over 30 s (`sleep 35; seq 1 20000`) | returned inline, compressed |
+| a 26 KB JSON array, then a lookup by id | answered; the retrieval had returned the **whole** 27 KB fragment — fixed, see below |
+| an MCP result with an image item; an `isError` result | image kept; the error result untouched |
+| MCP results of 39,000 and 45,000 bytes | the first compressed; the second spilled by Cursor before the hook — **not counted** in compressing mode, fixed |
+| store unwritable; a 1 ms deadline; installed hooks whose binary cannot run | the model got the original result each time, answered correctly |
+| user and project installs at once | every hook ran twice: results recorded twice, a losing rewrite's capture file left — `install` now refuses, `status` warns |
+| a rival `preToolUse` rewriter in the workspace beside a user install | **the workspace hook's reply won**; ours was discarded — `install` now checks the other files Cursor reads too |
+| two sessions at once on one store | both correct, no lock errors, shared content-addressed handles |
+| `--sandbox enabled` | not available on that host (AppArmor); the CLI exits 1 — `wrap` no longer blames the hooks |
+
+Fixes, in the order found: `grep` over a fragment that is a JSON array
+matches elements, not the single line it is stored as (44 characters back
+instead of 27,010; in `kompressor-core`, so every surface has it); spilled MCP
+results are counted while compressing; `wrap` tells hooks that never ran from
+hooks that ran and recorded nothing, and says nothing after an agent that
+failed to start; `install` refuses a second install Cursor would also read
+and a rival shell rewriter in any of those files, and `status` reports both.
+
+Open: whether `structuredContent`, which repeats a retrieved fragment, reaches
+the model — the retrieval of a 27 KB fragment came back as 63,892 characters
+in Cursor's tool record.
 
 ## 13. Implementation plan
 
@@ -1626,7 +1701,7 @@ diff in a fixture rather than as a silent `{}`.
 | 2 | `hook install / uninstall / status cursor` with byte-for-byte restore; `Wiring::Hooks`; `wrap cursor-agent` with `--plugin-dir`; `wrap cursor` re-pointed | AC-2.1–2.6, 2.8, 2.9 | AC-2.7 (SIGKILL) by inspection: only `run/` is written; AC-2.10 **[live]** |
 | 3 | `stats by-tool`, the Cursor dashboard page: the instruments Gate A reads | — | the whole tier **[live]** |
 | 4 | MCP compression mirroring the result's shape; refusals for `{}`, `isError`, empty text, our own tools, `skip_tools`; `session_guidance()` | AC-4.1–4.8 | AC-4.9–4.11 **[live]**; Q6 (the `additional_context` cap) open — the guidance is ~3 KB |
-| 5 | tokenizer and classifier (`hook/shell.rs`), the brace-form rewrite, `hook emit`, lossless fallback, `only_when_unrestricted` (step 5.6, taken because Q1 is open), `--allow-list` | AC-5.1, 5.3 (40 commands × sh, bash, dash; zsh where installed), 5.4–5.9 | AC-5.2 needs the Tier 3 corpus; AC-5.10–5.12 **[live]** |
+| 5 | tokenizer and classifier (`hook/shell.rs`), the brace-form rewrite, `hook emit`, lossless fallback, `only_when_approved` (step 5.6, taken because Q1 is open), `--allow-list` | AC-5.1, 5.3 (40 commands × sh, bash, dash; zsh where installed), 5.4–5.9 | AC-5.2 needs the Tier 3 corpus; AC-5.10–5.12 **[live]** |
 | 6 | — | — | the whole tier **[live]** |
 | 7 | `Surface::Hook` and the v20 rebuild (keys and ids preserved, `foreign_keys` off around the ladder); `stop` usage as a `proxy_requests` row; dashboard page; DESIGN, README, QUICKSTART, docs/CURSOR.md | AC-7.1 on a copy of a real 400 MB v17 `stats.db` (`db check` ok, every row kept its surface); AC-7.2 in `tests/cursor.rs`; AC-7.3 data half | AC-7.3 page rendered by eye; AC-7.6 waits on the live tiers; 7.6 is separate work |
 

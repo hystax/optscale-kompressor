@@ -396,6 +396,9 @@ fn apply(fragment: &str, range: &RetrieveRange) -> String {
             if pattern.is_empty() {
                 return String::new();
             }
+            if let Some(matches) = grep_json_array(fragment, pattern, *context) {
+                return matches;
+            }
             let lines: Vec<&str> = fragment.lines().collect();
             let mut keep = vec![false; lines.len()];
             for (index, line) in lines.iter().enumerate() {
@@ -427,12 +430,109 @@ fn apply(fragment: &str, range: &RetrieveRange) -> String {
     }
 }
 
+/// `grep` over a fragment that is a JSON array: by element, not by line.
+///
+/// The items an array elision removes are retained as one compact JSON
+/// array — a single line — so a line grep that matched anything returned all
+/// of it. Measured through Cursor: `grep "\"id\":517,"` over 279 omitted
+/// records handed back the whole 27,010-character fragment, more than the
+/// compression had saved. Here each element is matched on its compact
+/// serialisation (the form the fragment is stored in, so a pattern copied
+/// from the marker or the visible items matches), and the matching elements,
+/// with `context` neighbours on each side, come back one per line.
+///
+/// `None` when the fragment is not a JSON array, for the line grep to handle.
+fn grep_json_array(fragment: &str, pattern: &str, context: usize) -> Option<String> {
+    if !fragment.trim_start().starts_with('[') {
+        return None;
+    }
+    let serde_json::Value::Array(items) = serde_json::from_str(fragment).ok()? else {
+        return None;
+    };
+    let rendered: Vec<String> = items
+        .iter()
+        .map(|item| serde_json::to_string(item).unwrap_or_default())
+        .collect();
+    let mut keep = vec![false; rendered.len()];
+    for (index, item) in rendered.iter().enumerate() {
+        if item.contains(pattern) {
+            let low = index.saturating_sub(context);
+            let high = index
+                .saturating_add(context)
+                .min(rendered.len().saturating_sub(1));
+            for slot in keep.iter_mut().take(high + 1).skip(low) {
+                *slot = true;
+            }
+        }
+    }
+    Some(
+        rendered
+            .into_iter()
+            .zip(keep)
+            .filter(|(_, keep)| *keep)
+            .map(|(item, _)| item)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
 fn cap(text: String, max_chars: usize) -> (String, bool) {
     if text.chars().count() <= max_chars {
         return (text, false);
     }
     let kept: String = text.chars().take(max_chars).collect();
     (kept, true)
+}
+
+#[cfg(test)]
+mod json_grep_tests {
+    use super::{RetrieveRange, slice};
+
+    #[test]
+    fn grep_over_a_json_array_returns_the_matching_elements_not_the_whole_line() {
+        let rows: Vec<serde_json::Value> = (0..600)
+            .map(|i| serde_json::json!({"id": i, "name": format!("item-{i}"), "ok": i % 3 == 0}))
+            .collect();
+        let fragment = serde_json::to_string(&rows).unwrap();
+        assert_eq!(fragment.lines().count(), 1, "stored as one line");
+        let got = slice(
+            &fragment,
+            Some(&RetrieveRange::Grep {
+                pattern: "\"id\":517,".into(),
+                context: 0,
+            }),
+            32_768,
+        );
+        let content = got.content.unwrap();
+        assert_eq!(content, r#"{"id":517,"name":"item-517","ok":false}"#);
+
+        let got = slice(
+            &fragment,
+            Some(&RetrieveRange::Grep {
+                pattern: "\"id\":517,".into(),
+                context: 1,
+            }),
+            32_768,
+        );
+        assert_eq!(
+            got.content.unwrap().lines().count(),
+            3,
+            "one neighbour each side"
+        );
+    }
+
+    #[test]
+    fn a_fragment_that_is_not_a_json_array_is_grepped_by_line_as_before() {
+        let got = slice(
+            "alpha\n[not json\nbeta alpha",
+            Some(&RetrieveRange::Grep {
+                pattern: "alpha".into(),
+                context: 0,
+            }),
+            1000,
+        );
+        assert_eq!(got.content.unwrap(), "alpha\nbeta alpha");
+    }
 }
 
 #[cfg(test)]

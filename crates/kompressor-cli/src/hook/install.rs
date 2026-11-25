@@ -110,6 +110,9 @@ struct Sidecar {
     config_written: bool,
     /// The CLI configuration `Shell(kompressor)` was added to, if it was.
     allow_list: Option<PathBuf>,
+    /// The entries added to it, removed again on uninstall.
+    #[serde(default)]
+    allow_entries: Vec<String>,
     shadow: bool,
 }
 
@@ -344,7 +347,26 @@ pub fn install(args: InstallArgs) -> CliResult {
         .cloned()
         .unwrap_or_default();
     if !args.force {
-        let rival: Vec<String> = existing_hooks
+        // Our own hooks in another file Cursor reads: both sets would run on
+        // every event. Measured on CLI 2026.11.22 with a user and a project
+        // install at once — each MCP result was recorded twice, and the
+        // losing shell rewrite left its capture file behind.
+        let elsewhere: Vec<String> = other_hook_files(&hooks_path)
+            .into_iter()
+            .filter(|path| hook_entries_in(path).iter().any(|(_, e)| is_ours(e)))
+            .map(|path| path.display().to_string())
+            .collect();
+        if !elsewhere.is_empty() {
+            return Err(CliError::Usage(format!(
+                "Kompressor's hooks are already installed in {}. Cursor runs every hooks file \
+                 it finds, so both sets would answer each event and every result would be \
+                 counted twice; nothing was written. Uninstall that one first \
+                 (`kompressor hook uninstall cursor`, with --project for a workspace), or \
+                 pass --force.",
+                elsewhere.join(", ")
+            )));
+        }
+        let mut rival: Vec<String> = existing_hooks
             .get("preToolUse")
             .and_then(Value::as_array)
             .into_iter()
@@ -357,6 +379,16 @@ pub fn install(args: InstallArgs) -> CliResult {
                     .to_string()
             })
             .collect();
+        // The other files Cursor reads count as well: a rewriter in the
+        // workspace or the enterprise file collides just the same.
+        for path in other_hook_files(&hooks_path) {
+            for (event, entry) in hook_entries_in(&path) {
+                if event == "preToolUse" && !is_ours(&entry) && matches_shell(&entry) {
+                    let command = entry.get("command").and_then(Value::as_str).unwrap_or("?");
+                    rival.push(format!("{command} (in {})", path.display()));
+                }
+            }
+        }
         if !rival.is_empty() {
             return Err(CliError::Usage(format!(
                 "{} already has a preToolUse hook on Shell: {}. Two hooks rewriting one \
@@ -442,6 +474,7 @@ pub fn install(args: InstallArgs) -> CliResult {
         config: config_path.clone(),
         config_written: needs_copy,
         allow_list: None,
+        allow_entries: Vec::new(),
         shadow: args.shadow,
     };
 
@@ -479,8 +512,15 @@ pub fn install(args: InstallArgs) -> CliResult {
         && let Some(home) = super::cursor::cursor_home()
     {
         let cli = home.join("cli-config.json");
-        if add_allow(&cli)? {
+        let added = add_allow(&cli, &allow_entries(&exe))?;
+        if !added.is_empty() {
+            eprintln!(
+                "  allow-list: added {} to {}",
+                added.join(", "),
+                cli.display()
+            );
             sidecar.allow_list = Some(cli);
+            sidecar.allow_entries = added;
         }
     }
 
@@ -507,14 +547,16 @@ pub fn install(args: InstallArgs) -> CliResult {
         eprintln!("  configuration: {}", config.display());
     }
     if config.hooks.cursor.shell.enabled
-        && config.hooks.cursor.shell.only_when_unrestricted
-        && sidecar.allow_list.is_none()
-        && !super::cursor::runs_everything()
+        && config.hooks.cursor.shell.only_when_approved
+        && !shell_would_run(&exe)
     {
         eprintln!(
-            "  shell output: the rewrite runs only with the CLI's approvalMode set to \
-             unrestricted. With an allow-list, add Shell(kompressor) to it, or rerun with \
-             --allow-list to have that added."
+            "  shell output: idle until the Cursor CLI would run the rewritten command. Its \
+             allow-list judges the command word literally: add {} to it, or rerun with \
+             --allow-list to have them added (or set approvalMode to unrestricted). A \
+             workspace .cursor/cli.json that sets permissions.allow replaces the global \
+             list, so the entries belong there too.",
+            allow_entries(&exe).join(", ")
         );
     }
     eprintln!("  `kompressor hook status cursor` shows when a hook last ran.");
@@ -547,8 +589,42 @@ fn load_sidecar(path: &Path) -> Result<Option<Sidecar>, CliError> {
     }
 }
 
-/// Add `Shell(kompressor)` to the CLI's allow-list. True when it was added.
-fn add_allow(path: &Path) -> Result<bool, CliError> {
+/// Whether the CLI, from this directory, would approve a rewrite naming this
+/// binary as a hook started with this process's `PATH` would name it.
+fn shell_would_run(exe: &Path) -> bool {
+    let path = std::env::var_os("PATH");
+    let here: Vec<PathBuf> = std::env::current_dir().into_iter().collect();
+    super::shell::program_word(exe, path.as_deref())
+        .is_some_and(|word| super::cursor::cli_approves(&word, &here))
+}
+
+/// The allow-list entries that approve this binary as a rewrite names it.
+///
+/// Cursor matches the command word literally (`shell::program_word`): the
+/// bare name when `PATH` finds this binary, the unquoted absolute path
+/// otherwise. Which of the two a hook writes depends on the `PATH` Cursor
+/// gives it, which the desktop and the CLI need not share, so both are added.
+///
+/// And the retrieval tool, `Mcp(*:optscale_kompressor_retrieve)`: under an
+/// allow-list every MCP tool call needs approval too, and a refused retrieval
+/// leaves the model a marker it cannot resolve. `*` because the server is
+/// `optscale_kompressor` when installed and `plugin-kompressor-…` under
+/// `wrap`. It reads back fragments and nothing else.
+fn allow_entries(exe: &Path) -> Vec<String> {
+    let mut entries = vec![
+        ALLOW_ENTRY.to_string(),
+        "Mcp(*:optscale_kompressor_retrieve)".to_string(),
+    ];
+    if let Some(word) = super::shell::program_word(exe, None)
+        && !word.starts_with('\'')
+    {
+        entries.push(format!("Shell({word})"));
+    }
+    entries
+}
+
+/// Add `entries` to the CLI's allow-list; the ones that were not there yet.
+fn add_allow(path: &Path, entries: &[String]) -> Result<Vec<String>, CliError> {
     let text = read_text(path)?;
     let mut doc = parse_object(path, text.as_deref())?;
     let permissions = doc
@@ -559,19 +635,25 @@ fn add_allow(path: &Path) -> Result<bool, CliError> {
         .map(|p| p.entry("allow").or_insert_with(|| json!([])))
         .and_then(Value::as_array_mut)
     else {
-        return Ok(false);
+        return Ok(Vec::new());
     };
-    if allow.iter().any(|v| v == ALLOW_ENTRY) {
-        return Ok(false);
+    let added: Vec<String> = entries
+        .iter()
+        .filter(|entry| !allow.iter().any(|v| v == entry.as_str()))
+        .cloned()
+        .collect();
+    if added.is_empty() {
+        return Ok(added);
     }
-    allow.push(json!(ALLOW_ENTRY));
+    allow.extend(added.iter().map(|entry| json!(entry)));
     write_file(path, &render(&doc))?;
-    Ok(true)
+    Ok(added)
 }
 
 const ALLOW_ENTRY: &str = "Shell(kompressor)";
 
-fn remove_allow(path: &Path) {
+/// Remove exactly the entries an install added.
+fn remove_allow(path: &Path, entries: &[String]) {
     let Ok(Some(text)) = read_text(path) else {
         return;
     };
@@ -584,7 +666,7 @@ fn remove_allow(path: &Path) {
         .and_then(Value::as_array_mut)
     {
         let before = allow.len();
-        allow.retain(|v| v != ALLOW_ENTRY);
+        allow.retain(|v| !entries.iter().any(|entry| v == entry.as_str()));
         if allow.len() != before {
             let _ = write_file(path, &render(&doc));
         }
@@ -638,7 +720,13 @@ fn remove(scope: &Scope, quiet: bool) -> CliResult {
         }
     }
     if let Some(cli) = &sidecar.allow_list {
-        remove_allow(cli);
+        // A record from before the entries were listed added the one.
+        let entries = if sidecar.allow_entries.is_empty() {
+            vec![ALLOW_ENTRY.to_string()]
+        } else {
+            sidecar.allow_entries.clone()
+        };
+        remove_allow(cli, &entries);
     }
     if sidecar.config_written
         && let Some(config) = &sidecar.config
@@ -688,9 +776,62 @@ fn remove_entry(doc: &mut Map<String, Value>, owned: &Owned) -> bool {
     }
 }
 
-/// Whether hooks of ours are registered at user level, by an install or by
-/// hand: a `wrap` session would then get every hook twice.
+/// The other hooks files Cursor reads besides `own`: the user's, the
+/// current workspace's and the enterprise one, whichever of them `own` is not.
+fn other_hook_files(own: &Path) -> Vec<PathBuf> {
+    // The same file named two ways — `~/.cursor/hooks.json` is also the
+    // workspace file when the workspace is the home directory. Compared by
+    // directory, because the file itself may not exist yet.
+    let same = |a: &Path, b: &Path| {
+        let dir = |p: &Path| p.parent().and_then(|d| std::fs::canonicalize(d).ok());
+        a == b || (a.file_name() == b.file_name() && dir(a).is_some() && dir(a) == dir(b))
+    };
+    let mut files = Vec::new();
+    if let Some(home) = super::cursor::cursor_home() {
+        files.push(home.join("hooks.json"));
+    }
+    if let Ok(here) = std::env::current_dir() {
+        files.push(here.join(".cursor").join("hooks.json"));
+    }
+    files.push(PathBuf::from("/etc/cursor/hooks.json"));
+    let mut out: Vec<PathBuf> = Vec::new();
+    for file in files {
+        if !same(&file, own) && !out.iter().any(|seen| same(seen, &file)) {
+            out.push(file);
+        }
+    }
+    out
+}
+
+/// Every hook entry in a hooks file, with its event. Empty when the file is
+/// absent or unreadable.
+fn hook_entries_in(path: &Path) -> Vec<(String, Value)> {
+    read_text(path)
+        .ok()
+        .flatten()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|doc| doc.get("hooks").and_then(Value::as_object).cloned())
+        .map(|hooks| {
+            hooks
+                .into_iter()
+                .filter_map(|(event, list)| Some((event, list.as_array()?.clone())))
+                .flat_map(|(event, list)| list.into_iter().map(move |e| (event.clone(), e)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether hooks of ours are registered where a session started here would
+/// read them — at user level or in this workspace, by an install or by hand:
+/// a `wrap` session would then get every hook twice.
 pub fn installed_for_user() -> bool {
+    if let Ok(here) = std::env::current_dir()
+        && hook_entries_in(&here.join(".cursor").join("hooks.json"))
+            .iter()
+            .any(|(_, e)| is_ours(e))
+    {
+        return true;
+    }
     let Ok(scope) = scope(false) else {
         return false;
     };
@@ -766,6 +907,16 @@ pub fn status(project: bool, config: Option<&Path>) -> CliResult {
         }
     }
 
+    let own_file = scope.cursor_dir.join("hooks.json");
+    for path in other_hook_files(&own_file) {
+        if hook_entries_in(&path).iter().any(|(_, e)| is_ours(e)) {
+            println!(
+                "  ALSO HERE     {}: Kompressor's hooks are installed there too, so each \
+                 event runs both and every result is counted twice",
+                path.display()
+            );
+        }
+    }
     // What else answers the same events. The last reply wins (design/CURSOR.md, "Hooks").
     let mut sources = vec![
         scope.cursor_dir.join("hooks.json"),
@@ -822,8 +973,11 @@ pub fn status(project: bool, config: Option<&Path>) -> CliResult {
                 if hooks.mcp.enabled { "on" } else { "off" },
                 if !hooks.shell.enabled {
                     "off (hooks.cursor.shell.enabled)"
-                } else if hooks.shell.only_when_unrestricted && !super::cursor::runs_everything() {
-                    "on, but idle: the CLI's approvalMode is not unrestricted"
+                } else if hooks.shell.only_when_approved
+                    && !super::exe().is_some_and(|exe| shell_would_run(&exe))
+                {
+                    "on, but idle: the CLI would refuse the rewrite (add Shell(kompressor) to \
+                     its allow-list, or `hook install cursor --allow-list`)"
                 } else {
                     "on"
                 }

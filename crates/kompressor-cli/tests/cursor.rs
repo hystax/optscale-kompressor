@@ -185,7 +185,7 @@ fn switched_off_it_answers_nothing_and_records_nothing() {
 #[test]
 fn shadow_mode_measures_every_tool_and_changes_nothing() {
     let home = Home::new();
-    home.config("[hooks.cursor]\nshadow = true\n[hooks.cursor.shell]\nenabled = true\nonly_when_unrestricted = false\n");
+    home.config("[hooks.cursor]\nshadow = true\n[hooks.cursor.shell]\nenabled = true\nonly_when_approved = false\n");
     let mut post = 0;
     for (name, input) in all_fixtures() {
         let (reply, _, _) = home.hook(&input);
@@ -398,15 +398,77 @@ fn the_shell_rewrite_is_off_by_default() {
     assert!(rewritten(&home, "seq 1 30", "t2").is_some());
 }
 
+/// Q1, measured on CLI 2026.11.22: the allow-list judges the rewritten
+/// command's words literally, so the rewrite is offered under an allow-list
+/// only when that list approves this binary as the rewrite names it.
+#[cfg(unix)]
+#[test]
+fn under_an_allow_list_the_rewrite_waits_for_this_binary_to_be_approved() {
+    let home = Home::new();
+    home.config("[hooks.cursor.shell]\nenabled = true\n");
+    let exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_kompressor")).unwrap();
+    let entry = format!("Shell({})", exe.display());
+    let cli = home.path().join(".cursor/cli-config.json");
+    std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+    let global = |allow: &[&str], deny: &[&str]| {
+        std::fs::write(
+            &cli,
+            json!({"approvalMode": "allowlist", "permissions": {"allow": allow, "deny": deny}})
+                .to_string(),
+        )
+        .unwrap();
+    };
+    global(&["Shell(seq)"], &[]);
+    assert_eq!(rewritten(&home, "seq 1 30", "a1"), None, "would be refused");
+
+    global(&["Shell(seq)", &entry], &[]);
+    let command = rewritten(&home, "seq 1 30", "a2").expect("approved, so rewritten");
+    assert!(
+        command.contains(&format!("; {} hook emit", exe.display())),
+        "named unquoted, as the entry matches it: {command}"
+    );
+
+    global(&["Shell(seq)", &entry], &[&entry]);
+    assert_eq!(rewritten(&home, "seq 1 30", "a3"), None, "deny wins");
+
+    // A workspace's .cursor/cli.json counts as well — and replaces the
+    // global allow-list rather than adding to it, as the CLI's merge does.
+    global(&["Shell(seq)", &entry], &[]);
+    let replaced = home.path().join("replaced");
+    std::fs::create_dir_all(replaced.join(".cursor")).unwrap();
+    std::fs::write(
+        replaced.join(".cursor/cli.json"),
+        json!({"permissions": {"allow": ["Shell(seq)"]}}).to_string(),
+    )
+    .unwrap();
+    let mut event: Value = serde_json::from_slice(&fixture("preToolUse-Shell")).unwrap();
+    event["tool_use_id"] = json!("a5");
+    event["workspace_roots"] = json!([replaced.display().to_string()]);
+    let (reply, _, _) = home.hook(&serde_json::to_vec(&event).unwrap());
+    assert_eq!(reply, json!({}), "the project list replaced the global one");
+
+    global(&["Shell(seq)"], &[]);
+    let workspace = home.path().join("proj");
+    std::fs::create_dir_all(workspace.join(".cursor")).unwrap();
+    std::fs::write(
+        workspace.join(".cursor/cli.json"),
+        json!({"permissions": {"allow": [&entry]}}).to_string(),
+    )
+    .unwrap();
+    let mut event: Value = serde_json::from_slice(&fixture("preToolUse-Shell")).unwrap();
+    event["tool_use_id"] = json!("a4");
+    event["workspace_roots"] = json!([workspace.display().to_string()]);
+    let (reply, _, _) = home.hook(&serde_json::to_vec(&event).unwrap());
+    assert!(reply["updated_input"]["command"].is_string(), "{reply}");
+}
+
 /// AC-5.3: with compression disabled, a rewritten command prints exactly what
 /// the bare one prints and exits with its status, in every shell present.
 #[cfg(unix)]
 #[test]
 fn a_rewritten_command_is_equivalent_to_the_bare_one() {
     let home = Home::new();
-    home.config(
-        "[hooks.cursor.shell]\nenabled = true\nonly_when_unrestricted = false\nskip = []\n",
-    );
+    home.config("[hooks.cursor.shell]\nenabled = true\nonly_when_approved = false\nskip = []\n");
     let work = home.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
     std::fs::write(work.join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
@@ -455,7 +517,7 @@ fn a_rewritten_command_is_equivalent_to_the_bare_one() {
     assert!(commands.len() >= 40);
     // Compression off: `emit` prints the capture unchanged.
     home.config(
-        "[hooks.cursor]\nenabled = true\n[hooks.cursor.shell]\nenabled = true\nonly_when_unrestricted = false\nskip = []\n",
+        "[hooks.cursor]\nenabled = true\n[hooks.cursor.shell]\nenabled = true\nonly_when_approved = false\nskip = []\n",
     );
     let off = home.path().join("off.toml");
     std::fs::write(&off, "[hooks.cursor]\nenabled = false\n").unwrap();
@@ -508,9 +570,7 @@ fn a_rewritten_command_is_equivalent_to_the_bare_one() {
 #[test]
 fn shell_state_survives_the_brace_group() {
     let home = Home::new();
-    home.config(
-        "[hooks.cursor.shell]\nenabled = true\nonly_when_unrestricted = false\nskip = []\n",
-    );
+    home.config("[hooks.cursor.shell]\nenabled = true\nonly_when_approved = false\nskip = []\n");
     let target = home.path().join("elsewhere");
     std::fs::create_dir_all(&target).unwrap();
     for (n, shell) in shells()
@@ -1031,4 +1091,94 @@ fn shadow_rows_claim_nothing_over_the_spill_threshold() {
         .unwrap();
     assert_eq!(shell.shadow_would_remove, 0);
     assert_eq!(shell.kept_inline, 1);
+}
+
+/// A result Cursor spilled to a file is counted per tool in compressing mode
+/// too: that count is the list of servers worth fronting, and it is read in
+/// compressing mode, not only in shadow. Found on the VPS: a 45 KB result
+/// left no trace.
+#[test]
+fn a_spilled_result_is_counted_while_compressing() {
+    let home = Home::new();
+    let (reply, _, _) = home.hook(&fixture("postToolUse-MCP-spilled"));
+    assert_eq!(reply, json!({}));
+    assert_eq!(
+        home.rows("tool = 'MCP:big_text' AND json_extract(skipped_by_reason, '$.spilled') = 1"),
+        1
+    );
+    let reader = kompressor_stats::StatsReader::open(home.path().join("stats.db")).unwrap();
+    let row = reader.by_tool(0, i64::MAX).unwrap().remove(0);
+    assert_eq!((row.spilled, row.tokens_removed), (1, 0));
+}
+
+/// Two installs Cursor would both read — the user's and a workspace's —
+/// run every hook twice and count every result twice. Measured on the VPS;
+/// install now refuses the second, names the first, and status warns.
+#[test]
+fn a_second_install_cursor_would_also_read_is_refused() {
+    let home = Home::new();
+    let workspace = home.path().join("proj");
+    std::fs::create_dir_all(&workspace).unwrap();
+    assert!(install(&home, &[]).status.success());
+    let out = home
+        .cmd()
+        .current_dir(&workspace)
+        .args(["hook", "install", "cursor", "--project", "--config"])
+        .arg(home.config_path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("already installed in"), "{stderr}");
+    assert!(
+        !workspace.join(".cursor/hooks.json").exists(),
+        "nothing written"
+    );
+
+    // With --force it goes in, and status says what that costs.
+    let out = home
+        .cmd()
+        .current_dir(&workspace)
+        .args([
+            "hook",
+            "install",
+            "cursor",
+            "--project",
+            "--force",
+            "--config",
+        ])
+        .arg(home.config_path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let status = home
+        .cmd()
+        .current_dir(&workspace)
+        .args(["hook", "status", "cursor", "--project"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&status.stdout).contains("ALSO HERE"));
+}
+
+/// A rival shell rewriter in the workspace collides with a user install just
+/// as one in the user's own file does.
+#[test]
+fn a_rival_rewriter_in_the_workspace_file_is_caught_too() {
+    let home = Home::new();
+    let workspace = home.path().join("proj");
+    std::fs::create_dir_all(workspace.join(".cursor")).unwrap();
+    std::fs::write(
+        workspace.join(".cursor/hooks.json"),
+        r#"{"version":1,"hooks":{"preToolUse":[{"command":"rtk rewrite","matcher":"^Shell$"}]}}"#,
+    )
+    .unwrap();
+    let out = home
+        .cmd()
+        .current_dir(&workspace)
+        .args(["hook", "install", "cursor", "--config"])
+        .arg(home.config_path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("rtk rewrite (in"));
 }

@@ -142,13 +142,25 @@ Shell output is off by default. To turn it on, add to the configuration:
 enabled = true
 ```
 
-It then rewrites commands only when the CLI's `approvalMode` is `unrestricted`
-(run everything). With an allow-list, either add `Shell(kompressor)` to it —
-`kompressor hook install cursor --allow-list` does that — and set
-`only_when_unrestricted = false`, accepting that Cursor judges approval on the
-rewritten command ([Shell output](#shell-output)); or leave shell compression
-off. The desktop's approval mode cannot be read from outside, so in the editor
-the rewrite needs `only_when_unrestricted = false` too.
+It then rewrites a command only when the Cursor CLI would run the rewritten
+one: its `approvalMode` is `unrestricted` (run everything), or its allow-list
+approves `kompressor`. With an allow-list, add the entries — this adds
+`Shell(kompressor)`, `Shell(<absolute path of the binary>)` and
+`Mcp(*:optscale_kompressor_retrieve)` (so the model may read back what was
+removed) to `~/.cursor/cli-config.json`:
+
+```bash
+kompressor hook install cursor --allow-list
+```
+
+The rewrite does not let anything through that you had not approved: an
+unapproved command inside it is still refused ([Shell output](#shell-output)).
+A workspace `.cursor/cli.json` that sets `permissions.allow` **replaces** the
+global allow-list for that workspace (the CLI merges objects, not lists), so
+there the entries have to be in that file too; the hook reads both the same
+way and stays idle when the merged list lacks them.
+The desktop's approval settings cannot be read from outside, so in the editor
+set `only_when_approved = false` for the rewrite to run.
 
 ### 7. Turn it off, or remove it
 
@@ -204,7 +216,7 @@ Options:
 | `--config PATH` | the configuration the hooks run under |
 | `--print` | print the entries as JSON and write nothing — for `/etc/cursor/hooks.json` on managed machines |
 | `--force` | install beside another tool's `preToolUse` hook on `Shell` (RTK, lean-ctx). Without it, install refuses: two hooks rewriting one command overwrite each other |
-| `--allow-list` | add `Shell(kompressor)` to the CLI's allow-list in `~/.cursor/cli-config.json` |
+| `--allow-list` | add `Shell(kompressor)`, `Shell(<absolute path>)` and `Mcp(*:optscale_kompressor_retrieve)` to the CLI's allow-list in `~/.cursor/cli-config.json`; uninstall removes exactly what it added |
 
 Remove it again, exactly:
 
@@ -245,7 +257,7 @@ skip_tools = []
 
 [hooks.cursor.shell]
 enabled = false
-only_when_unrestricted = true
+only_when_approved = true
 skip = ["cd", "pwd", "echo", "export", "mkdir", "touch", "rm", "mv", "cp", "chmod", "which", "git add", "git commit", "git checkout", "git switch", "git push"]
 max_capture_bytes = 67108864
 ```
@@ -270,13 +282,26 @@ the output unchanged. The model's transcript keeps the command it wrote. The
 rewritten text shows up in one place: the header of a long command's terminal
 file, which Cursor moves to the background after 30 seconds.
 
-It is **off by default**, and with it on it rewrites only when the CLI's
-`approvalMode` is `unrestricted` (run everything). Cursor judges approval on
-the *rewritten* command, and whether its allow-list still sees an executable
-inside the brace group has not been measured yet. Until it is, a rewrite never
-stands between a command and an approval decision. The editor's approval
-setting is not readable from outside, so in the editor the rewrite stays idle
-unless you set `only_when_unrestricted = false` yourself.
+It is **off by default**. Cursor judges approval on the *rewritten* command,
+literally, word by word. Measured on CLI 2026.11.22 without `--force`:
+
+| Allow-list | Command | Rewritten, it |
+|---|---|---|
+| `Shell(seq)`, `Shell(kompressor)` | `seq 1 20000` | ran, compressed |
+| `Shell(seq)`, `Shell(kompressor)` | `uname -a`, `seq 1 3 && uname -a` | was refused, as without the rewrite |
+| `Shell(seq)` | `seq 1 20000` | was refused: `kompressor` itself is not approved |
+
+So the rewrite never approves anything you had not, but it needs `kompressor`
+approved, or every rewritten command is refused. The entry has to match the
+binary as the rewrite names it: `Shell(kompressor)` matches the bare name,
+used when `PATH` finds this binary; `Shell(/path/to/kompressor)` matches the
+unquoted absolute path, used otherwise. Neither matches a quoted path. With
+`only_when_approved = true`, the default, the hook rewrites only when the
+CLI's settings (`~/.cursor/cli-config.json`, the workspace's
+`.cursor/cli.json`) would run the result. The editor's approval settings are
+not readable from outside, so there the rewrite needs
+`only_when_approved = false`. A refused rewrite shows the model the rewritten
+command in the refusal.
 
 Left alone, always: commands that run `kompressor`; background jobs (`&`,
 `nohup`); anything that wants a terminal (`vim`, `less`, `ssh host`, a REPL,
@@ -315,10 +340,12 @@ the desktop reports for each turn.
 
 | Symptom | Cause |
 |---|---|
+| `install` refuses: *already installed in …* | Cursor reads the user's and the workspace's hooks files both; two installs would run every hook twice and count every result twice. Uninstall one |
+| A shell rewriter from another tool (RTK, lean-ctx) | Only one rewrite of a command survives — measured: a workspace hook's reply beat a user-level one. `install` refuses beside one in any hooks file Cursor reads; `--force` installs anyway, and then shell compression depends on which file wins |
 | `hook status` says *last call: never* | Cursor is not running the hooks: a managed account, or (reported on macOS CLI 2026.11.05) the CLI not loading `~/.cursor/hooks.json`. Try `--project`. |
 | MCP results never get smaller | They are under `min_compress_chars`, over Cursor's ~40 KB spill threshold (`stats by-tool` counts them as *spilled*), or from a tool on `skip_tools` |
-| Shell output never gets smaller | `[hooks.cursor.shell] enabled` is false, or the CLI's `approvalMode` is not `unrestricted` |
-| A command is rejected after install | The CLI's allow-list judges the rewritten command: add `Shell(kompressor)`, or `--allow-list` |
+| Shell output never gets smaller | `[hooks.cursor.shell] enabled` is false, or the CLI would refuse the rewrite: add `kompressor` to its allow-list (`--allow-list`). `hook status cursor` says which |
+| Every shell command is refused | `only_when_approved = false` under an allow-list without a `kompressor` entry: add it, or set the option back to true |
 | The model cannot retrieve | The `optscale_kompressor` server is disabled or unapproved; it can run `kompressor retrieve`, which the session-start context names |
 
 Every failure in the hook changes nothing: it answers `{}`, and Cursor ignores

@@ -401,6 +401,39 @@ fn memory_store(config: &Config) -> Config {
     config
 }
 
+/// How old an empty capture file must be before it is taken for an orphan.
+///
+/// The hook makes the file before Cursor decides whether to run the command,
+/// so a refused command leaves it behind, empty — measured under an
+/// allow-list on CLI 2026.11.22. A command that is still running and has
+/// printed nothing has an empty file too, so only files older than any
+/// command a session would wait on are removed.
+const ORPHAN_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// Remove empty capture files older than [`ORPHAN_AGE`]. Best-effort.
+fn sweep_captures(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with("kompressor-cursor-") && name.ends_with(".out")) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age > ORPHAN_AGE);
+        if meta.is_file() && meta.len() == 0 && old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// A capture file for one shell call: under the temporary directory, owner
 /// only, unique per tool call. Made by the hook itself, before it returns a
 /// rewrite, so a temporary directory that cannot be written is found here —
@@ -408,6 +441,7 @@ fn memory_store(config: &Config) -> Config {
 /// would fail and the command would not run at all.
 pub fn create_capture(tool_use_id: Option<&str>) -> Option<PathBuf> {
     let dir = std::env::temp_dir();
+    sweep_captures(&dir);
     let id: String = tool_use_id
         .unwrap_or("")
         .chars()

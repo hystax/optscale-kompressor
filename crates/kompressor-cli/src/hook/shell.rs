@@ -661,17 +661,75 @@ pub struct EmitArgs<'a> {
     pub model: Option<&'a str>,
 }
 
-/// The rewritten command, or `None` when a path cannot be quoted safely.
+/// How this binary is named at the head of a command Cursor will judge.
 ///
-/// `command` is embedded verbatim: no quoting pass that could change what it
-/// means. The newline before `}` lets it end in a heredoc or a comment.
+/// Cursor's allow-list compares the command word **as written**, measured on
+/// CLI 2026.11.22: `Shell(kompressor)` matches a bare `kompressor` and nothing
+/// else; `Shell(/opt/bin/kompressor)` matches that path unquoted and *not*
+/// `'/opt/bin/kompressor'`. Every other piece of the rewrite — the quoted
+/// capture file, `"$?"`, the flags — passed. The first form shipped quoted the
+/// absolute path, and every rewritten command was refused, approved or not.
+///
+/// So, in order: the bare name when `path` resolves `kompressor` to this very
+/// binary (`Shell(kompressor)` then approves it); the absolute path unquoted
+/// when it holds nothing a shell would split or expand (`Shell(<path>)`
+/// approves that); quoted as a last resort, which runs where everything is
+/// approved and is refused under an allow-list. `None` when not even quoting
+/// is safe.
+pub fn program_word(exe: &Path, path: Option<&std::ffi::OsStr>) -> Option<String> {
+    let canonical = |p: &Path| std::fs::canonicalize(p).ok();
+    if let Some(path) = path
+        && let Some(this) = canonical(exe)
+    {
+        let found = std::env::split_paths(path)
+            .map(|dir| {
+                dir.join(if cfg!(windows) {
+                    "kompressor.exe"
+                } else {
+                    "kompressor"
+                })
+            })
+            .find(|candidate| candidate.is_file());
+        if found.and_then(|f| canonical(&f)).is_some_and(|f| f == this) {
+            return Some("kompressor".to_string());
+        }
+    }
+    let text = exe.to_str()?;
+    if !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+".contains(c))
+    {
+        return Some(text.to_string());
+    }
+    quote(exe)
+}
+
+/// The rewritten command with this binary named as [`program_word`] would
+/// name it with no `PATH` to search, or `None` when a path cannot be quoted
+/// safely.
+#[cfg(test)]
 pub fn rewrite(
     command: &str,
     binary: &Path,
     capture: &Path,
     emit: &EmitArgs<'_>,
 ) -> Option<String> {
-    let bin = quote(binary)?;
+    rewrite_with(command, &program_word(binary, None)?, capture, emit)
+}
+
+/// The rewritten command, `program` being this binary's command word (see
+/// [`program_word`]), or `None` when a path cannot be quoted safely.
+///
+/// `command` is embedded verbatim: no quoting pass that could change what it
+/// means. The newline before `}` lets it end in a heredoc or a comment.
+pub fn rewrite_with(
+    command: &str,
+    program: &str,
+    capture: &Path,
+    emit: &EmitArgs<'_>,
+) -> Option<String> {
+    let bin = program;
     let file = quote(capture)?;
     let mut tail = format!("{bin} hook emit");
     if let Some(config) = emit.config {
@@ -838,7 +896,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             rewritten,
-            "{\nseq 1 30\n} > '/tmp/kompressor-x.out' 2>&1; '/usr/bin/kompressor' hook emit \
+            "{\nseq 1 30\n} > '/tmp/kompressor-x.out' 2>&1; /usr/bin/kompressor hook emit \
              --status \"$?\" '/tmp/kompressor-x.out'"
         );
     }
@@ -894,6 +952,47 @@ mod tests {
         )
         .unwrap();
         assert!(!rewritten.contains("--request"));
+    }
+
+    /// The command word is what Cursor's allow-list judges, literally.
+    #[test]
+    fn the_program_is_named_as_an_allow_list_can_match_it() {
+        // No PATH, a plain path: unquoted, so `Shell(<path>)` matches it.
+        assert_eq!(
+            program_word(Path::new("/opt/kz-1.2/bin/kompressor"), None).as_deref(),
+            Some("/opt/kz-1.2/bin/kompressor")
+        );
+        // A path a shell would split: quoted, the last resort.
+        assert_eq!(
+            program_word(Path::new("/opt/my tools/kompressor"), None).as_deref(),
+            Some("'/opt/my tools/kompressor'")
+        );
+        assert_eq!(program_word(Path::new("/opt/it's/kompressor"), None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_bare_name_is_used_only_when_path_finds_this_very_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let exe = real.join("kompressor");
+        std::fs::write(&exe, "").unwrap();
+        // PATH holds a symlink to it: the same binary, so the bare name.
+        let linked = dir.path().join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(&exe, linked.join("kompressor")).unwrap();
+        let path = std::env::join_paths([&linked]).unwrap();
+        assert_eq!(
+            program_word(&exe, Some(&path)).as_deref(),
+            Some("kompressor")
+        );
+        // PATH finds a different kompressor first: never the bare name.
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("kompressor"), "x").unwrap();
+        let path = std::env::join_paths([&other, &linked]).unwrap();
+        assert_eq!(program_word(&exe, Some(&path)).as_deref(), exe.to_str());
     }
 
     /// AC-5.5: a heredoc, a comment and a continuation at the end.

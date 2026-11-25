@@ -122,8 +122,10 @@ pub fn handle(
 
 /// The command a model runs to resolve a handle without the tool server.
 pub fn retrieve_command(config_path: Option<&Path>) -> String {
+    // Named as an allow-list can match it, like the rewrite's tail.
+    let path = std::env::var_os("PATH");
     let binary = super::exe()
-        .and_then(|exe| super::shell::quote(&exe))
+        .and_then(|exe| super::shell::program_word(&exe, path.as_deref()))
         .unwrap_or_else(|| "kompressor".to_string());
     match config_path.and_then(super::shell::quote) {
         Some(config) => format!("{binary} retrieve --config {config}"),
@@ -275,7 +277,14 @@ fn compress_mcp(event: &Event, config: &Config, tool: &str) -> Value {
             .map(|&i| items[i]["text"].as_str().unwrap_or_default().to_string())
             .collect(),
         McpResult::Text(text) => vec![text.clone()],
-        McpResult::Spilled | McpResult::Untouchable => return nothing(),
+        // Counted in compressing mode too, not only in shadow: the per-tool
+        // count of spilled results is the list of servers worth fronting,
+        // and it is in compressing mode that someone reads it.
+        McpResult::Spilled => {
+            unmeasured(event, config, tool, 0, "spilled");
+            return nothing();
+        }
+        McpResult::Untouchable => return nothing(),
     };
     if texts
         .iter()
@@ -468,9 +477,6 @@ fn pre_tool_use(event: &Event, config: &Config, config_path: Option<&Path>) -> V
     let Some(command) = input.get("command").and_then(Value::as_str) else {
         return nothing();
     };
-    if shell.only_when_unrestricted && !runs_everything() {
-        return nothing();
-    }
     if let Err(reason) = super::shell::classify(command, &shell.skip) {
         tracing::debug!(reason = reason.as_str(), "shell command left alone");
         return nothing();
@@ -478,6 +484,13 @@ fn pre_tool_use(event: &Event, config: &Config, config_path: Option<&Path>) -> V
     let Some(binary) = super::exe() else {
         return nothing();
     };
+    let path = std::env::var_os("PATH");
+    let Some(program) = super::shell::program_word(&binary, path.as_deref()) else {
+        return nothing();
+    };
+    if shell.only_when_approved && !cli_approves(&program, &workspace_roots(event)) {
+        return nothing();
+    }
     let Some(capture) = super::create_capture(event.tool_use_id.as_deref()) else {
         note("the temporary directory is not writable; the command runs unchanged");
         return nothing();
@@ -488,7 +501,7 @@ fn pre_tool_use(event: &Event, config: &Config, config_path: Option<&Path>) -> V
         conversation: event.conversation_id.as_deref(),
         model: event.model.as_deref(),
     };
-    match super::shell::rewrite(command, &binary, &capture, &emit) {
+    match super::shell::rewrite_with(command, &program, &capture, &emit) {
         Some(rewritten) => json!({ "updated_input": { "command": rewritten } }),
         None => {
             let _ = std::fs::remove_file(&capture);
@@ -497,27 +510,80 @@ fn pre_tool_use(event: &Event, config: &Config, config_path: Option<&Path>) -> V
     }
 }
 
-/// Whether the Cursor CLI is set to run every command without asking
-/// (`approvalMode: "unrestricted"` in `~/.cursor/cli-config.json`).
+/// The workspace roots an event names.
+fn workspace_roots(event: &Event) -> Vec<std::path::PathBuf> {
+    event
+        .raw
+        .get("workspace_roots")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(std::path::PathBuf::from)
+        .collect()
+}
+
+/// Whether the Cursor CLI would run a rewritten command without refusing it.
 ///
-/// Approval is evaluated on the rewritten command (design/CURSOR.md, Shell
-/// output). Until it is
-/// measured that an executable inside the brace group which is not on the
-/// allow-list is still refused, a rewrite is kept out of sessions where an
-/// approval decision is being made at all.
-pub fn runs_everything() -> bool {
-    let Some(dir) = cursor_home() else {
-        return false;
+/// Approval is judged on the rewritten command, and measured on CLI
+/// 2026.11.22 (design/CURSOR.md, Q1): an executable inside the brace group
+/// that is not on the allow-list is still refused, so the rewrite never
+/// approves anything the user had not — but this binary has to be approved
+/// too, or *every* rewritten command is refused, including the ones the user
+/// did approve. So a rewrite is offered only when the CLI runs everything
+/// (`approvalMode: "unrestricted"`), or when its allow-list — the user's
+/// `~/.cursor/cli-config.json`, merged with each workspace's
+/// `.cursor/cli.json` — approves `program` as the rewrite writes it, and no
+/// deny entry names it.
+pub fn cli_approves(program: &str, workspaces: &[std::path::PathBuf]) -> bool {
+    let read = |path: std::path::PathBuf| -> Option<Value> {
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
     };
-    std::fs::read_to_string(dir.join("cli-config.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|v| {
-            v.get("approvalMode")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .is_some_and(|mode| mode == "unrestricted")
+    let mut settings = cursor_home()
+        .and_then(|home| read(home.join("cli-config.json")))
+        .unwrap_or_else(|| json!({}));
+    for project in workspaces
+        .iter()
+        .filter_map(|root| read(root.join(".cursor").join("cli.json")))
+    {
+        merge_like_cursor(&mut settings, project);
+    }
+    let entry = format!("Shell({program})");
+    let listed = |key: &str| {
+        settings
+            .get("permissions")
+            .and_then(|p| p.get(key))
+            .and_then(Value::as_array)
+            .is_some_and(|list| list.iter().any(|v| v.as_str() == Some(entry.as_str())))
+    };
+    if listed("deny") {
+        return false;
+    }
+    settings.get("approvalMode").and_then(Value::as_str) == Some("unrestricted") || listed("allow")
+}
+
+/// Lay a workspace's `.cursor/cli.json` over the user's settings the way the
+/// CLI does (its `g()` in 2026.11.22): objects merge key by key, and anything
+/// else — an array included — *replaces* what was there. So a project that
+/// sets `permissions.allow` replaces the user's whole allow-list rather than
+/// adding to it. Measured: with `Shell(kompressor)` allow-listed globally and
+/// `Shell(seq)` alone in the project file, the rewritten `seq` was refused.
+fn merge_like_cursor(base: &mut Value, over: Value) {
+    match (base, over) {
+        (Value::Object(base), Value::Object(over)) => {
+            for (key, value) in over {
+                match base.get_mut(&key) {
+                    Some(existing) if existing.is_object() && value.is_object() => {
+                        merge_like_cursor(existing, value)
+                    }
+                    _ => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, over) => *base = over,
+    }
 }
 
 /// `~/.cursor`.
@@ -789,7 +855,7 @@ mod tests {
             json!({})
         );
         config.hooks.cursor.shell.enabled = true;
-        config.hooks.cursor.shell.only_when_unrestricted = false;
+        config.hooks.cursor.shell.only_when_approved = false;
         let reply = handle(&event(payload), &config, None, false);
         if cfg!(windows) {
             assert_eq!(reply, json!({}));

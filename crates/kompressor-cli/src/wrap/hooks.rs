@@ -72,8 +72,9 @@ pub fn run(
     let started_ms = super::now_ms();
     let plugin = if crate::hook::install::installed_for_user() {
         say!(
-            "kompressor: Cursor hooks are already installed in ~/.cursor (`kompressor hook status \
-             cursor`), and the CLI reads those too; not adding a second set for this session"
+            "kompressor: Cursor hooks are already installed (in ~/.cursor or this workspace; \
+             `kompressor hook status cursor`), and the CLI reads those too; not adding a \
+             second set for this session"
         );
         None
     } else {
@@ -105,8 +106,11 @@ pub fn run(
     if let Some(plugin) = &plugin {
         plugin.release();
     }
-    report(&config, started_ms, plugin.is_some());
-    super::exit_of(status?)
+    let status = status?;
+    // An agent that failed to start (a sandbox the system cannot provide,
+    // say) has said why itself; a line about hooks would only mislead.
+    report(&config, started_ms, plugin.is_some() && status.success());
+    super::exit_of(status)
 }
 
 /// This session's plugin directory and pinned configuration.
@@ -149,6 +153,14 @@ pub fn write_session_plugin(paths: &Paths, config: &Config) -> Result<SessionPlu
     })
 }
 
+/// Whether any hook ran since `started_ms`, from the mark each one leaves.
+fn hooks_ran_since(started_ms: i64) -> bool {
+    std::fs::read_to_string(crate::hook::last_call_file("cursor"))
+        .ok()
+        .and_then(|text| text.split_whitespace().next()?.parse::<i64>().ok())
+        .is_some_and(|ms| ms >= started_ms)
+}
+
 /// One line about what the session's hooks did, from `stats.db`.
 fn report(config: &Config, started_ms: i64, offered: bool) {
     if !config.stats.enabled || !config.stats.path.exists() {
@@ -162,10 +174,21 @@ fn report(config: &Config, started_ms: i64, offered: bool) {
     };
     if rows == 0 {
         if offered {
-            say!(
-                "kompressor: no tool result reached the hooks this session. If tools ran, \
-                 Cursor did not call them: `kompressor hook status cursor`"
-            );
+            // Whether Cursor called the hooks at all is a different failure
+            // from hooks that ran and could record nothing — an unwritable
+            // store, a deadline too short — and the two want different fixes.
+            if hooks_ran_since(started_ms) {
+                say!(
+                    "kompressor: the hooks ran but recorded nothing: every result was too small \
+                     or not text, or the store or the deadline failed (Cursor's hook log has \
+                     the line). `kompressor hook status cursor` checks the store"
+                );
+            } else {
+                say!(
+                    "kompressor: no tool result reached the hooks this session. If tools ran, \
+                     Cursor did not call them: `kompressor hook status cursor`"
+                );
+            }
         }
         return;
     }

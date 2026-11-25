@@ -48,11 +48,21 @@ venv/
 .pytest_cache/
 *.egg-info/
 
-# Claude Desktop compression check: per-run state. The planted token must stay
-# unseen by the session under test, and start-ms only scopes one run's stats.
-# Experiment directories from prepare.py live outside the checkout (/tmp).
-/scripts/claude-desktop-experiment/kd-check/.check/expected-token.txt
-/scripts/claude-desktop-experiment/kd-check/.check/start-ms
+# Cursor hook mode, installed into a checkout. `kompressor hook install cursor
+# --project` writes hooks.json and mcp.json into the workspace's .cursor/, and
+# a test of the allow-list writes cli.json there; all three name this machine's
+# binary, configuration and home directory by absolute path, so they are local
+# by construction. The workspace can be any directory below the root, hence
+# `**/`. Not the whole of .cursor/ — rules and other files a team shares
+# belong there too.
+**/.cursor/hooks.json
+**/.cursor/mcp.json
+**/.cursor/cli.json
+
+# Claude Code: personal permissions, and the worktrees it creates for isolated
+# sessions — each a full checkout of this repository.
+.claude/settings.local.json
+.claude/worktrees/
 
 # Agent tooling state. Serena writes a per-project symbol cache and config here
 # the first time it activates on the repo; its own .gitignore covers only
