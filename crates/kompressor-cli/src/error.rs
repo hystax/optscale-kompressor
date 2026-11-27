@@ -22,6 +22,9 @@ pub enum CliError {
     /// `make test` failed. Nothing is printed for it — the agent already said
     /// whatever it had to say.
     AgentExit(i32),
+    /// The command already reported what it found and ends with this code:
+    /// `doctor`'s 1 for warnings and 2 for failures. Nothing more is printed.
+    Quiet(i32),
 }
 
 impl CliError {
@@ -31,6 +34,7 @@ impl CliError {
             CliError::Runtime(_) => 1,
             CliError::Usage(_) => 2,
             CliError::Regressed => 3,
+            CliError::Quiet(code) => *code,
             // Kept inside what a shell can report; 0 would turn a failure into
             // success.
             CliError::AgentExit(code) => match code & 0xff {
@@ -54,6 +58,7 @@ impl fmt::Display for CliError {
             // it on stderr would bury the table it refers to.
             CliError::Regressed => f.write_str("benchmark comparison regressed"),
             CliError::AgentExit(code) => write!(f, "the agent exited with status {code}"),
+            CliError::Quiet(code) => write!(f, "exit status {code}"),
         }
     }
 }

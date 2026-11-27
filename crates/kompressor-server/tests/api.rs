@@ -2349,7 +2349,7 @@ async fn the_advisor_gives_a_verdict_per_setting_and_says_what_is_on() {
         for row in advice {
             assert_eq!(row["enabled"], false, "{}", row["setting"]);
         }
-        assert_eq!(of("tool deferral")["built"], false);
+        assert_eq!(of("tools_defer")["built"], true);
         assert_eq!(report["effects"]["recompactions_observed"], 0);
     }
 

@@ -88,7 +88,7 @@ fn with_too_little_traffic_nothing_is_recommended_either_way() {
         assert!(!advice.why.is_empty(), "{} says why", advice.setting);
         assert_eq!(advice.value, None);
     }
-    assert!(!advice(&report, "tool deferral").built);
+    assert!(advice(&report, "tools_defer").built);
 }
 
 #[test]
@@ -358,7 +358,7 @@ fn a_model_that_re_sends_reasoning_is_named_and_one_that_does_not_is_not() {
 }
 
 #[test]
-fn long_undeferred_tool_lists_make_the_case_for_building_deferral() {
+fn long_undeferred_tool_lists_make_the_case_for_turning_deferral_on() {
     let (dir, conn) = database();
     warm_conversation(&conn, "a", 0, 120, |turn| PrefixObservation {
         tools_count: if turn % 4 == 0 { 30 } else { 6 },
@@ -367,10 +367,10 @@ fn long_undeferred_tool_lists_make_the_case_for_building_deferral() {
     });
     drop(conn);
     let report = report(&dir);
-    let deferral = advice(&report, "tool deferral");
-    assert!(!deferral.built);
+    let deferral = advice(&report, "tools_defer");
+    assert!(deferral.built);
     assert_eq!(deferral.verdict, Verdict::TurnOn, "{}", deferral.why);
-    assert!(deferral.why.contains("not built"));
+    assert!(deferral.why.contains("tools_defer = true"));
     assert!(deferral.measure.unwrap() > 0.2);
 }
 

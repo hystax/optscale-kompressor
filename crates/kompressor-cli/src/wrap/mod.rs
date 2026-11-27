@@ -274,6 +274,14 @@ async fn run(args: WrapArgs, agent: Option<&'static Agent>, config: Config) -> C
     }
 
     if args.print {
+        // A manual entry's names are labels for a settings page, not
+        // variables: printing them as `export` lines would be a shell error.
+        if matches!(agent.map(|a| a.wiring), Some(agents::Wiring::Manual { .. })) {
+            for (label, value) in &env {
+                println!("{label}: {value}");
+            }
+            return Ok(());
+        }
         for (name, value) in &env {
             println!("export {name}={}", shell_quote(value));
         }
@@ -1056,9 +1064,8 @@ async fn manual(
     say!();
     say!("  If that holds, in {title}:");
     say!("      {where_}");
-    for (name, value) in env {
-        say!("      Base URL:  {value}");
-        let _ = name;
+    for (label, value) in env {
+        say!("      {label}:  {value}");
     }
     say!();
     say!("kompressor: holding the proxy. Ctrl-C releases it.");

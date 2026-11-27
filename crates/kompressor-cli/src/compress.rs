@@ -105,7 +105,8 @@ pub fn compress(args: CompressArgs) -> CliResult {
     if !refs.is_empty() {
         let retained = match config.refs.backend {
             kompressor_core::config::RefsBackend::Memory => false,
-            kompressor_core::config::RefsBackend::Sqlite => {
+            kompressor_core::config::RefsBackend::Sqlite
+            | kompressor_core::config::RefsBackend::Redis => {
                 kompressor_core::build_ref_store(&config).is_ok_and(|store| {
                     kompressor_core::AppCore::new(
                         config.clone(),

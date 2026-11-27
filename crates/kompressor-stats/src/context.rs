@@ -163,6 +163,12 @@ pub struct PrefixObservation {
     /// definitions. Zero when the conversation is not compacted.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub tools_compacted_bytes: u32,
+    /// Tool definitions `proxy.tools_defer` marked `defer_loading` on this
+    /// request, and their size: what was kept out of the rendered prompt.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tools_proxy_deferred: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tools_proxy_deferred_bytes: u32,
     /// Bytes of earlier-turn reasoning `proxy.reasoning_elide_models` took
     /// out of this request.
     #[serde(default, skip_serializing_if = "is_zero")]

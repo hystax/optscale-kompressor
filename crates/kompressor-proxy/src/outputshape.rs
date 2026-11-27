@@ -2,7 +2,9 @@
 //!
 //! Output is about a sixth of the bill on Anthropic and nothing else in this
 //! proxy touches it. `proxy.output_shaping` appends one fixed instruction —
-//! answer concisely, do not restate — to the request's `system` prompt. It
+//! answer concisely, do not restate — to the request's `system` prompt
+//! (Anthropic), `instructions` (OpenAI Responses) or leading system message
+//! (OpenAI Chat); see [`append_instruction_for`]. It
 //! changes what the model does, which nothing else here does, so it is built
 //! as an experiment: off by default, and with a share of conversations held out
 //! so `/v1/stats/analysis/compare` can set treated against untreated over the
@@ -278,6 +280,132 @@ pub fn append_instruction(body: &mut Value, text: &str) -> bool {
     }
 }
 
+/// Append `text` where `family` puts the instructions that precede the
+/// conversation. Returns whether the body changed.
+///
+/// - Anthropic Messages: [`append_instruction`].
+/// - OpenAI Responses: the tail of `instructions`, which renders before
+///   `input` and which Codex re-sends verbatim every turn; created when absent.
+/// - OpenAI Chat: the first message, when it is `system` or `developer`
+///   (string content gets a blank line and the text, part-list content a new
+///   text part); otherwise a `system` message inserted at the front. The
+///   decision is made on a conversation's first request, so every turn of a
+///   treated conversation has the same first message.
+pub fn append_instruction_for(
+    body: &mut Value,
+    family: kompressor_wire::ApiFamily,
+    text: &str,
+) -> bool {
+    use kompressor_wire::ApiFamily;
+    match family {
+        ApiFamily::OpenAiResponses => append_to_instructions(body, text),
+        ApiFamily::OpenAiChat => append_to_chat(body, text),
+        ApiFamily::AnthropicMessages => append_instruction(body, text),
+        ApiFamily::GeminiGenerateContent => {
+            let key = if body.get("systemInstruction").is_none()
+                && body.get("system_instruction").is_some()
+            {
+                "system_instruction"
+            } else {
+                "systemInstruction"
+            };
+            append_part(body, key, text)
+        }
+        ApiFamily::BedrockConverse => append_converse_system(body, text),
+    }
+}
+
+/// Gemini: one more text part at the end of `systemInstruction`.
+fn append_part(body: &mut Value, key: &str, text: &str) -> bool {
+    let Some(object) = body.as_object_mut() else {
+        return false;
+    };
+    let instruction = object
+        .entry(key.to_string())
+        .or_insert_with(|| json!({"parts": []}));
+    let Some(instruction) = instruction.as_object_mut() else {
+        return false;
+    };
+    match instruction
+        .entry("parts".to_string())
+        .or_insert_with(|| json!([]))
+    {
+        Value::Array(parts) => {
+            parts.push(json!({"text": text}));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Bedrock Converse: one more `{"text"}` block at the end of `system`, after
+/// any `cachePoint`, so no cached byte moves.
+fn append_converse_system(body: &mut Value, text: &str) -> bool {
+    let Some(object) = body.as_object_mut() else {
+        return false;
+    };
+    match object
+        .entry("system".to_string())
+        .or_insert_with(|| json!([]))
+    {
+        Value::Array(blocks) => {
+            blocks.push(json!({"text": text}));
+            true
+        }
+        _ => false,
+    }
+}
+
+fn append_to_instructions(body: &mut Value, text: &str) -> bool {
+    let Some(object) = body.as_object_mut() else {
+        return false;
+    };
+    match object.get_mut("instructions") {
+        None | Some(Value::Null) => {
+            object.insert("instructions".to_string(), Value::String(text.to_string()));
+            true
+        }
+        Some(Value::String(instructions)) => {
+            if !instructions.is_empty() {
+                instructions.push_str("\n\n");
+            }
+            instructions.push_str(text);
+            true
+        }
+        Some(_) => false,
+    }
+}
+
+fn append_to_chat(body: &mut Value, text: &str) -> bool {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let leads = messages.first().is_some_and(|first| {
+        matches!(
+            first.get("role").and_then(Value::as_str),
+            Some("system" | "developer")
+        )
+    });
+    if !leads {
+        messages.insert(0, json!({"role": "system", "content": text}));
+        return true;
+    }
+    match messages[0].get_mut("content") {
+        Some(Value::String(content)) => {
+            if !content.is_empty() {
+                content.push_str("\n\n");
+            }
+            content.push_str(text);
+            true
+        }
+        Some(Value::Array(parts)) => {
+            parts.push(json!({"type": "text", "text": text}));
+            true
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,5 +526,144 @@ mod tests {
         assert_eq!(none["system"], json!([{"type": "text", "text": TEXT}]));
         let mut odd = json!({"system": 3});
         assert!(!append_instruction(&mut odd, TEXT));
+    }
+
+    use kompressor_wire::ApiFamily;
+
+    #[test]
+    fn responses_instructions_are_extended_or_created() {
+        let mut body = json!({"instructions": "You are Codex.", "input": []});
+        assert!(append_instruction_for(
+            &mut body,
+            ApiFamily::OpenAiResponses,
+            TEXT
+        ));
+        assert_eq!(body["instructions"], "You are Codex.\n\nBe concise.");
+        let mut bare = json!({"input": []});
+        assert!(append_instruction_for(
+            &mut bare,
+            ApiFamily::OpenAiResponses,
+            TEXT
+        ));
+        assert_eq!(bare["instructions"], TEXT);
+        let mut odd = json!({"instructions": [1]});
+        assert!(!append_instruction_for(
+            &mut odd,
+            ApiFamily::OpenAiResponses,
+            TEXT
+        ));
+    }
+
+    #[test]
+    fn chat_extends_a_leading_system_or_developer_message() {
+        let mut string = json!({"messages": [
+            {"role": "developer", "content": "Rules."},
+            {"role": "user", "content": "hi"}
+        ]});
+        assert!(append_instruction_for(
+            &mut string,
+            ApiFamily::OpenAiChat,
+            TEXT
+        ));
+        assert_eq!(string["messages"][0]["content"], "Rules.\n\nBe concise.");
+        assert_eq!(string["messages"].as_array().unwrap().len(), 2);
+
+        let mut parts = json!({"messages": [
+            {"role": "system", "content": [{"type": "text", "text": "Rules."}]},
+            {"role": "user", "content": "hi"}
+        ]});
+        assert!(append_instruction_for(
+            &mut parts,
+            ApiFamily::OpenAiChat,
+            TEXT
+        ));
+        assert_eq!(
+            parts["messages"][0]["content"],
+            json!([{"type": "text", "text": "Rules."}, {"type": "text", "text": TEXT}])
+        );
+    }
+
+    #[test]
+    fn chat_without_a_leading_system_message_gets_one() {
+        let mut body = json!({"messages": [{"role": "user", "content": "hi"}]});
+        assert!(append_instruction_for(
+            &mut body,
+            ApiFamily::OpenAiChat,
+            TEXT
+        ));
+        assert_eq!(
+            body["messages"],
+            json!([{"role": "system", "content": TEXT}, {"role": "user", "content": "hi"}])
+        );
+        let mut none = json!({"model": "x"});
+        assert!(!append_instruction_for(
+            &mut none,
+            ApiFamily::OpenAiChat,
+            TEXT
+        ));
+    }
+
+    #[test]
+    fn gemini_snake_case_instructions_are_extended_without_a_duplicate_field() {
+        let mut body = json!({"system_instruction": {"parts": [{"text": "Rules."}]}});
+        assert!(append_instruction_for(
+            &mut body,
+            ApiFamily::GeminiGenerateContent,
+            TEXT
+        ));
+        assert!(body.get("systemInstruction").is_none());
+        assert_eq!(
+            body["system_instruction"]["parts"],
+            json!([{"text": "Rules."}, {"text": TEXT}])
+        );
+    }
+
+    #[test]
+    fn gemini_and_converse_get_a_system_part_of_their_own_shape() {
+        let mut gemini =
+            json!({"systemInstruction": {"parts": [{"text": "Rules."}]}, "contents": []});
+        assert!(append_instruction_for(
+            &mut gemini,
+            ApiFamily::GeminiGenerateContent,
+            TEXT
+        ));
+        assert_eq!(
+            gemini["systemInstruction"]["parts"],
+            json!([{"text": "Rules."}, {"text": TEXT}])
+        );
+        let mut bare = json!({"contents": []});
+        assert!(append_instruction_for(
+            &mut bare,
+            ApiFamily::GeminiGenerateContent,
+            TEXT
+        ));
+        assert_eq!(
+            bare["systemInstruction"],
+            json!({"parts": [{"text": TEXT}]})
+        );
+
+        let mut converse =
+            json!({"system": [{"text": "Rules."}, {"cachePoint": {"type": "default"}}]});
+        assert!(append_instruction_for(
+            &mut converse,
+            ApiFamily::BedrockConverse,
+            TEXT
+        ));
+        assert_eq!(
+            converse["system"][2],
+            json!({"text": TEXT}),
+            "after the cache point"
+        );
+    }
+
+    #[test]
+    fn anthropic_is_unchanged_by_the_family_dispatch() {
+        let mut body = json!({"system": "You are an agent.", "messages": []});
+        assert!(append_instruction_for(
+            &mut body,
+            ApiFamily::AnthropicMessages,
+            TEXT
+        ));
+        assert_eq!(body["system"], "You are an agent.\n\nBe concise.");
     }
 }

@@ -29,6 +29,7 @@
 //!
 //! - [`SqliteRefStore`] — the production default; one WAL file.
 //! - [`MemoryRefStore`] — the test default, and what `--ephemeral` runs.
+//! - [`RedisRefStore`] — shared by several proxies behind one load balancer.
 //! - [`CachedRefStore`] — a write-through cache to wrap either, covering the
 //!   retrieval that lands while a write is still in flight.
 //!
@@ -47,6 +48,7 @@ pub mod browse;
 pub mod cache;
 pub mod clock;
 pub mod memory;
+pub mod redis;
 pub mod sqlite;
 pub mod types;
 
@@ -57,6 +59,7 @@ pub use browse::{
 pub use cache::CachedRefStore;
 pub use clock::{Clock, ManualClock};
 pub use memory::MemoryRefStore;
+pub use redis::{RedisOptions, RedisRefStore};
 pub use sqlite::{SqliteOptions, SqliteRefStore};
 pub use types::{
     DEFAULT_LIFETIME_MULTIPLIER, DEFAULT_MAX_LIFETIME_SECONDS, DEFAULT_TTL_SECONDS, Lookup,
@@ -113,6 +116,19 @@ mod tests {
             }
         }
 
+        fn redis(now: u64, _max_bytes: Option<u64>) -> Fixture {
+            let clock = ManualClock::at(now);
+            let fake = redis::fake::FakeRedis::start(None);
+            let mut options = RedisOptions::new(&fake.url).expect("a fake url");
+            options.clock = clock.clock();
+            let store = RedisRefStore::open(options).expect("the fake answers");
+            Fixture {
+                store: Box::new(store),
+                clock,
+                _dir: None,
+            }
+        }
+
         fn store(&self) -> &dyn RefStore {
             self.store.as_ref()
         }
@@ -135,9 +151,45 @@ mod tests {
                 fn sqlite() {
                     super::$body(super::Fixture::sqlite as super::Make);
                 }
+
+                #[test]
+                fn redis() {
+                    super::$body(super::Fixture::redis as super::Make);
+                }
             }
         )+};
     }
+
+    /// The guarantees only the local backends make: a byte cap of their own,
+    /// and browsing. Redis leaves the cap to `maxmemory` and is not browsed.
+    macro_rules! against_local_backends {
+        ($($body:ident),+ $(,)?) => {$(
+            mod $body {
+                #[test]
+                fn memory() {
+                    super::$body(super::Fixture::memory as super::Make);
+                }
+
+                #[test]
+                fn sqlite() {
+                    super::$body(super::Fixture::sqlite as super::Make);
+                }
+            }
+        )+};
+    }
+
+    against_local_backends!(
+        the_byte_cap_evicts_the_least_recently_accessed_first,
+        browsing_lists_only_the_callers_tenant_newest_first,
+        browsing_hides_expired_rows_unless_asked_and_never_touches,
+        browsing_filters_by_search_kind_request_and_handle,
+        browsing_pages_and_orders_deterministically,
+        a_browse_preview_is_cut_on_a_character_boundary,
+        a_search_preview_is_a_window_around_the_first_match,
+        inspecting_an_expired_row_neither_deletes_nor_touches_it,
+        removing_deletes_only_the_named_tenants_rows,
+        a_census_lists_the_tenants_bookkeeping_newest_first_without_touching,
+    );
 
     against_every_backend!(
         a_stored_fragment_round_trips_by_its_handle,
@@ -156,18 +208,8 @@ mod tests {
         touch_many_extends_several_at_once_and_reports_how_many_it_found,
         touching_does_not_resurrect_an_expired_entry,
         purge_expired_removes_exactly_the_dead_rows_and_returns_the_count,
-        the_byte_cap_evicts_the_least_recently_accessed_first,
         stats_reports_live_rows_and_bytes,
         an_empty_batch_is_accepted_and_changes_nothing,
-        browsing_lists_only_the_callers_tenant_newest_first,
-        browsing_hides_expired_rows_unless_asked_and_never_touches,
-        browsing_filters_by_search_kind_request_and_handle,
-        browsing_pages_and_orders_deterministically,
-        a_browse_preview_is_cut_on_a_character_boundary,
-        a_search_preview_is_a_window_around_the_first_match,
-        inspecting_an_expired_row_neither_deletes_nor_touches_it,
-        removing_deletes_only_the_named_tenants_rows,
-        a_census_lists_the_tenants_bookkeeping_newest_first_without_touching,
     );
 
     fn meta() -> PutMeta {

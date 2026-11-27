@@ -1,0 +1,68 @@
+# The configuration the Headroom-port checks run under
+# (docs/design/HEADROOM-PORT.md): a second kompressor, so the features that
+# change what goes upstream can be on here without moving a byte of what the
+# main suite asserts against `kompressor.toml`.
+#
+# Two instances run it, `kompressor-next` and `kompressor-peer`, sharing one
+# Redis: a handle minted on one must resolve on the other.
+[server]
+listen = "0.0.0.0:8817"
+
+[engine]
+mode = "recoverable"
+max_ref_bytes = 4194304
+
+[refs]
+backend = "redis"
+redis_url = "redis://redis:6379/0"
+redis_prefix = "kompressor-e2e"
+
+[stats]
+enabled = true
+path = "/data/stats.db"
+
+[log]
+level = "warn"
+
+[proxy]
+allow_insecure_upstream = true
+# Tier 2: every conversation is in the experiment; 30% are held out.
+output_shaping = true
+output_shaping_holdout_pct = 30
+output_shaping_text = "E2E-SHAPED: answer concisely."
+# The cloud checks are about what reaches the provider, not about pings.
+cache_keep_warm = false
+
+# Tier 1: deferral, on the first-party mount only.
+[proxy.providers.anthropic]
+tools_defer = true
+
+[[proxy.upstreams]]
+name = "anthropic"
+path_prefix = "/v1/messages"
+base_url = "http://provider:8080"
+api_family = "anthropic"
+
+[[proxy.upstreams]]
+name = "openai"
+path_prefix = "/v1"
+base_url = "http://provider:8080"
+api_family = "openai"
+
+# Tier 5: the cloud transports, all on the mock.
+[[proxy.upstreams]]
+name = "gemini"
+path_prefix = "/v1beta"
+base_url = "http://provider:8080"
+
+[[proxy.upstreams]]
+name = "vertex"
+path_prefix = "/vertex"
+strip_prefix = true
+base_url = "http://provider:8080"
+
+[[proxy.upstreams]]
+name = "bedrock"
+path_prefix = "/model"
+base_url = "http://provider:8080"
+aws_sigv4 = { region = "us-west-2", service = "bedrock" }

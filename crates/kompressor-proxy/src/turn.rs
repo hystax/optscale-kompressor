@@ -173,6 +173,8 @@ pub(crate) fn strip_retrieve_calls(family: ApiFamily, response: &mut Value) -> b
                 }
             }
         }
+        // No retrieve tool is offered on these families.
+        ApiFamily::GeminiGenerateContent | ApiFamily::BedrockConverse => {}
     }
     changed
 }
@@ -246,6 +248,9 @@ pub fn tool_calls(family: ApiFamily, response: &Value) -> Vec<ModelToolCall> {
                     .collect()
             })
             .unwrap_or_default(),
+        // Not read: the retrieve loop does not run on these families, so a
+        // call in their response is always the client's.
+        ApiFamily::GeminiGenerateContent | ApiFamily::BedrockConverse => Vec::new(),
     }
 }
 
@@ -336,12 +341,16 @@ pub fn append_round(
             messages.push(json!({"role": "user", "content": blocks}));
             true
         }
+        ApiFamily::GeminiGenerateContent | ApiFamily::BedrockConverse => false,
     }
 }
 
 /// The usage object of a complete response.
 pub fn usage_of(response: &Value) -> Option<&Value> {
-    response.get("usage").filter(|usage| usage.is_object())
+    response
+        .get("usage")
+        .or_else(|| response.get("usageMetadata"))
+        .filter(|usage| usage.is_object())
 }
 
 /// Add every number in `add` into `acc`, recursively.

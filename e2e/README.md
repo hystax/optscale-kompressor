@@ -4,10 +4,10 @@
 make e2e
 ```
 
-Three containers on an `internal: true` network — a mock provider, a
-`kompressor` built from this working tree, and a driver that exercises them and
-asserts. The run needs no credentials, no provider and no internet; only the
-image build reaches crates.io.
+Containers on an `internal: true` network — a mock provider, a `kompressor`
+built from this working tree, two more on the Headroom-port configuration with
+the Redis they share, and a driver that exercises them and asserts. The run needs no credentials, no provider and no internet; only the
+image build reaches crates.io and pulls `redis:7-alpine`.
 
 ## What it checks that nothing else does
 
@@ -29,6 +29,7 @@ So the mock provider records every request body, and the driver reads them back:
 | **The retrieve loop** | For OpenAI Chat, OpenAI Responses and Anthropic Messages, buffered and streamed. The client gets one answer, never sees `optscale_kompressor_retrieve`, and the provider saw a second round carrying the fragment. |
 | **A stream the provider does not label** | The mock answers streamed Responses with **no `Content-Type`**, which is what chatgpt.com does. The relay has to recognise it anyway, or the whole response takes the buffered path and the retrieve loop cannot intercept anything. |
 | **Keep-warm** | With keep-warm on for Anthropic at a 2 s interval (`kompressor.toml`), the provider receives pings — the forwarded request with only `max_tokens: 1` and `stream: false` changed, each with its own `.keepwarmN` request id — after a `tool_use` stop up to the cap, and after an `end_turn` while a background task runs up to the lower background cap; none after an ordinary `end_turn` or once the task is reported, and none after the client's next request. The mock answers as a cached conversation only to requests carrying `KEEPWARM:`, so no other check can arm a timer. |
+| **The Headroom port** | Against two more kompressors (`kompressor-next`, `kompressor-peer`) running [`kompressor-next.toml`](kompressor-next.toml) over a shared Redis, so features that change what goes upstream never touch the checks above. Tool deferral (core tools resident, the rest `defer_loading`, the search tool added, byte-identical next turn); output shaping split into treated and held-out arms on Chat and Responses; Gemini `functionResponse` compressed with `?key=` and `x-goog-api-key` intact; Claude on Vertex through the retrieve loop with the mount stripped; Claude on Bedrock re-signed on every round, checked by the mock's **own** SigV4 verifier; a Bedrock event-stream relayed byte for byte; Converse compressed; a handle minted on one instance resolved on the other; the Python client end to end. `kompressor doctor` is both instances' healthcheck, so the runner only starts once it reports every check passing. See [design/HEADROOM-PORT.md](../docs/design/HEADROOM-PORT.md). |
 | **Compression efficiency** | Every corpus payload, classified by `/v1/detect`, compressed in all three modes, reported per type and gated on `runner/floors.json`. |
 
 The streamed retrieve loop is the case worth having: a server-side loop that
@@ -70,6 +71,7 @@ e2e/
   Dockerfile.kompressor   multi-stage: build from this tree, run on slim
   Dockerfile.harness      python:3.12-slim, standard library only
   kompressor.toml         the configuration under test
+  kompressor-next.toml    the Headroom-port configuration (Redis, deferral, shaping, cloud mounts)
   provider/               the mock upstream, and its request recorder
   runner/                 the driver, and the floors it gates on
 ```

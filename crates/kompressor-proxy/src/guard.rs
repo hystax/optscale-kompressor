@@ -177,6 +177,38 @@ fn signed_reasoning(body: &Value, family: ApiFamily) -> Vec<String> {
             }
         }
         ApiFamily::OpenAiChat => {}
+        // A Gemini part with a `thoughtSignature`: verified against its bytes.
+        ApiFamily::GeminiGenerateContent => {
+            for content in array(body, "contents") {
+                for part in content
+                    .get("parts")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if part.get("thoughtSignature").is_some()
+                        || part.get("thought_signature").is_some()
+                    {
+                        found.push(part.to_string());
+                    }
+                }
+            }
+        }
+        // Converse `reasoningContent` carries a signature as Anthropic's does.
+        ApiFamily::BedrockConverse => {
+            for message in array(body, "messages") {
+                for block in message
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if block.get("reasoningContent").is_some() {
+                        found.push(block.to_string());
+                    }
+                }
+            }
+        }
     }
     found
 }

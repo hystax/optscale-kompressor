@@ -16,6 +16,10 @@ services:
       dockerfile: Dockerfile.harness
     command: ["python3", "/app/provider/mock_provider.py"]
     networks: [kompressor-e2e]
+    environment:
+      # What the mock's SigV4 verifier checks the proxy's signatures against.
+      E2E_AWS_ACCESS_KEY_ID: AKIDE2EEXAMPLE
+      E2E_AWS_SECRET_ACCESS_KEY: e2e/secret+key
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/_health',timeout=2)"]
       interval: 2s
@@ -47,6 +51,58 @@ services:
       timeout: 5s
       retries: 30
 
+  # The Headroom-port checks (docs/design/HEADROOM-PORT.md) run against a
+  # second configuration, kompressor-next.toml, so features that change what
+  # goes upstream are on there and the main suite's assertions are untouched.
+  # Two instances share one Redis fragment store.
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    networks: [kompressor-e2e]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  kompressor-next: &next
+    build:
+      context: ..
+      dockerfile: e2e/Dockerfile.kompressor
+    command:
+      - serve
+      - --api
+      - --proxy
+      - --mcp
+      - --listen
+      - 0.0.0.0:8817
+      - --config
+      - /etc/kompressor/next.toml
+    networks: [kompressor-e2e]
+    volumes:
+      - ./kompressor-next.toml:/etc/kompressor/next.toml:ro
+    environment:
+      # The proxy re-signs Bedrock requests with these (`aws_sigv4`).
+      AWS_ACCESS_KEY_ID: AKIDE2EEXAMPLE
+      AWS_SECRET_ACCESS_KEY: e2e/secret+key
+    depends_on:
+      provider:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    tmpfs:
+      - /data
+    # `kompressor doctor` is the healthcheck: the stack is healthy only when
+    # every check passes (exit 0) — the listener answers as kompressor, the
+    # upstreams parse, Redis answers PING, the stats store can be created.
+    healthcheck:
+      test: ["CMD", "/kompressor", "doctor", "--config", "/etc/kompressor/next.toml"]
+      interval: 2s
+      timeout: 10s
+      retries: 30
+
+  kompressor-peer: *next
+
   runner:
     build:
       context: .
@@ -58,13 +114,22 @@ services:
         condition: service_started
       provider:
         condition: service_healthy
+      kompressor-next:
+        condition: service_healthy
+      kompressor-peer:
+        condition: service_healthy
     environment:
       KOMPRESSOR_API: http://kompressor:8817
       KOMPRESSOR_PROXY: http://kompressor:8817
+      KOMPRESSOR_NEXT: http://kompressor-next:8817
+      KOMPRESSOR_PEER: http://kompressor-peer:8817
+      REDIS: redis:6379
       PROVIDER: http://provider:8080
       CORPUS: /corpus/corpus.jsonl.gz
     volumes:
       - ../fixtures:/corpus:ro
+      # The thin Python client, exercised against kompressor-next.
+      - ../clients/python:/clients/python:ro
 
 networks:
   kompressor-e2e:

@@ -389,7 +389,7 @@ impl StatsReader {
             entry.tools_compacted_requests += u64::from(seen.tools_compacted_bytes > 0);
             *tools_seen.entry(key).or_default() += u64::from(seen.tools_count);
             entry.tool_search_requests += u64::from(seen.tool_search);
-            if seen.tools_deferred > 0 || seen.tool_search {
+            if seen.tools_deferred > 0 || seen.tool_search || seen.tools_proxy_deferred > 0 {
                 entry.deferring_requests += 1;
             } else if seen.tools_count >= MANY_TOOLS {
                 entry.undeferred_requests += 1;

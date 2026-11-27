@@ -15,6 +15,7 @@ mod backup;
 mod bench;
 mod compress;
 mod db;
+mod doctor;
 mod error;
 mod explain;
 mod highlight;
@@ -62,6 +63,9 @@ enum Command {
     Bench(BenchCmd),
     /// Load a configuration, validate it, and print it with secrets removed.
     CheckConfig(CheckConfigCmd),
+    /// Check this setup: config, proxy listener, stores, agents, base-URL
+    /// variables. Exit 0 healthy, 1 warnings, 2 failures.
+    Doctor(DoctorCmd),
     /// Write every database to one .tar.gz, without stopping the service.
     Backup(BackupCmd),
     /// Put the databases in a backup back. The service must be stopped.
@@ -580,6 +584,18 @@ struct BackupCmd {
 }
 
 #[derive(Args)]
+struct DoctorCmd {
+    /// Configuration file, found the way every other command finds it when
+    /// omitted.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// One JSON object: `{version, exit_code, checks: [{check, status,
+    /// detail, remedy}]}`.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
 struct CheckConfigCmd {
     /// Configuration file. Without one the built-in defaults are validated,
     /// which is a working single-tenant deployment.
@@ -591,7 +607,7 @@ fn main() {
     let cli = Cli::parse();
     if let Err(error) = run(cli) {
         // The agent's own failure is not ours to announce.
-        if !matches!(error, CliError::AgentExit(_)) {
+        if !matches!(error, CliError::AgentExit(_) | CliError::Quiet(_)) {
             eprintln!("kompressor: {error}");
         }
         std::process::exit(error.code());
@@ -751,6 +767,7 @@ fn run(cli: Cli) -> CliResult {
             agent: HookStatusAgent::Cursor { project, config },
         }) => hook::install::status(project, config.as_deref()),
         Command::CheckConfig(args) => check_config(args.config.as_deref()),
+        Command::Doctor(args) => doctor::run(args.config.as_deref(), args.json),
         Command::Backup(args) => backup::run(
             args.config.as_deref(),
             args.out.as_deref(),

@@ -495,6 +495,7 @@ async fn respond(
                     any(&|p| p.prompt_cache_key == PromptCacheKey::Conversation),
                 ),
                 ("tools_compact", any(&|p| p.tools_compact)),
+                ("tools_defer", any(&|p| p.tools_defer)),
                 (
                     "cold_recompact",
                     any(&|p| p.cold_recompact != ColdRecompact::Off),
@@ -507,7 +508,6 @@ async fn respond(
                     "reasoning_elide_models",
                     any(&|p| !p.reasoning_elide_models.is_empty()),
                 ),
-                ("tool deferral", false),
             ] {
                 report.mark_enabled(setting, enabled);
             }

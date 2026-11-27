@@ -233,6 +233,11 @@ pub enum StoreError {
         source: rusqlite::Error,
     },
 
+    /// The Redis server refused a command, or could not be reached. The
+    /// message never carries a fragment or a password.
+    #[error("redis: {0}")]
+    Redis(String),
+
     /// A stored row cannot be turned back into a [`RefRecord`].
     ///
     /// `detail` is a fixed string and the fragment is never attached: a row is

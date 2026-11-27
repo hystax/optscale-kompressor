@@ -84,11 +84,13 @@ pub mod recompact;
 mod retention;
 pub mod retrieve;
 pub mod route;
+pub mod sigv4;
 pub mod sse;
 pub mod stabilize;
 mod stream;
 pub mod tool;
 pub mod toolcompact;
+pub mod tooldefer;
 pub mod turn;
 mod upstream;
 pub mod websocket;
@@ -139,6 +141,9 @@ pub struct ProxyState {
     /// Each conversation's arm of `proxy.output_shaping`, decided when it is
     /// first seen.
     pub(crate) output_shaping: Arc<outputshape::OutputShaping>,
+    /// Whether each conversation's tools are deferred under
+    /// `proxy.tools_defer`, decided when it is first seen.
+    pub(crate) defer_policies: Arc<toolcompact::ToolPolicies>,
     /// Set by [`ProxyState::fail_next_encode_for_test`]. Never set otherwise.
     pub(crate) encode_fault: Arc<std::sync::atomic::AtomicBool>,
     /// Held while the state file is written, so a timed save and the
@@ -211,6 +216,7 @@ impl ProxyState {
             recompact,
             tool_policies: Arc::new(toolcompact::ToolPolicies::default()),
             output_shaping: Arc::new(outputshape::OutputShaping::default()),
+            defer_policies: Arc::new(toolcompact::ToolPolicies::default()),
             encode_fault: Arc::default(),
             rewrite_fault: Arc::default(),
             saving: Arc::default(),

@@ -145,9 +145,9 @@ pub enum Wiring {
     ///
     /// No entry uses it since the Cursor editor moved to hook mode — its
     /// base-URL override is called from Cursor's servers and never reaches a
-    /// local proxy. The path is kept for the next GUI tool that does call a
-    /// local URL.
-    #[allow(dead_code)]
+    /// local proxy. Cline and Continue, which do call a local URL, use it.
+    /// For a manual entry the names in [`Agent::env`] are labels printed
+    /// beside each URL, never variables that are set.
     Manual { where_: &'static str },
     /// This proxy cannot compress the tool, and an entry that says so is worth
     /// more than no entry at all.
@@ -353,6 +353,93 @@ pub const AGENTS: &[Agent] = &[
         ),
     },
     Agent {
+        name: "copilot",
+        binary: "copilot",
+        about: "GitHub Copilot CLI with your own provider key (BYOK: Anthropic by default)",
+        // Copilot CLI's bring-your-own-key mode reads a provider type, a base
+        // URL and a key. Anthropic takes the bare host; a user on an OpenAI key
+        // sets COPILOT_PROVIDER_TYPE=openai and wraps with
+        // `--env COPILOT_PROVIDER_BASE_URL=v1`, which the note says.
+        env: &[("COPILOT_PROVIDER_BASE_URL", Endpoint::Root)],
+        providers: &[Provider::Anthropic, Provider::OpenAi],
+        fixed_env: &[("COPILOT_PROVIDER_TYPE", "anthropic")],
+        config: None,
+        mcp: None,
+        wiring: Wiring::Launch,
+        note: Some(
+            "Only Copilot CLI's bring-your-own-key mode is reached: set \
+             COPILOT_PROVIDER_API_KEY (or ANTHROPIC_API_KEY). A session signed in with a \
+             Copilot subscription talks to GitHub's own API and is not compressed. For an \
+             OpenAI key: COPILOT_PROVIDER_TYPE=openai kompressor wrap copilot \
+             --env COPILOT_PROVIDER_BASE_URL=v1.",
+        ),
+    },
+    Agent {
+        name: "goose",
+        binary: "goose",
+        about: "Block's goose (Anthropic or OpenAI provider)",
+        // goose reads a host per provider and appends its own path:
+        // `OPENAI_BASE_PATH` defaults to `v1/chat/completions`, Anthropic's
+        // client appends `/v1/messages`. Both want the bare origin.
+        env: &[
+            ("ANTHROPIC_HOST", Endpoint::Root),
+            ("OPENAI_HOST", Endpoint::Root),
+        ],
+        providers: &[Provider::Anthropic, Provider::OpenAi],
+        fixed_env: &[],
+        config: None,
+        mcp: None,
+        wiring: Wiring::Launch,
+        note: Some(
+            "goose reads the provider from its own config (`goose configure`); the anthropic \
+             and openai providers are reached. A custom OPENAI_BASE_PATH must still end in \
+             v1/chat/completions or v1/responses for the request to be compressed.",
+        ),
+    },
+    Agent {
+        name: "cline",
+        binary: "cline",
+        about: "Cline (VS Code extension) — prints the base URLs to paste and holds the proxy up",
+        // Labels, not variables: a manual entry sets nothing.
+        env: &[
+            ("Anthropic Base URL", Endpoint::Root),
+            ("OpenAI Compatible Base URL", Endpoint::V1),
+        ],
+        providers: &[Provider::Anthropic, Provider::OpenAi],
+        fixed_env: &[],
+        config: None,
+        mcp: None,
+        wiring: Wiring::Manual {
+            where_: "Cline › settings (gear) › API Provider › “Use custom base URL”",
+        },
+        note: Some(
+            "Cline calls the provider from the VS Code extension host on this machine, so a \
+             local base URL is reached. Pick the Anthropic provider, or OpenAI Compatible, \
+             and paste the matching URL below.",
+        ),
+    },
+    Agent {
+        name: "continue",
+        binary: "cn",
+        about: "Continue (VS Code / JetBrains) — prints the apiBase to put in config.yaml",
+        env: &[
+            ("apiBase for provider: anthropic", Endpoint::Root),
+            ("apiBase for provider: openai", Endpoint::V1),
+        ],
+        providers: &[Provider::Anthropic, Provider::OpenAi],
+        fixed_env: &[],
+        config: None,
+        mcp: None,
+        wiring: Wiring::Manual {
+            where_: "~/.continue/config.yaml › models › each model › apiBase",
+        },
+        note: Some(
+            "Continue reads a per-model apiBase from ~/.continue/config.yaml; the file is not \
+             edited here. Add apiBase to each anthropic or openai model, reload the window, \
+             and remove it when you are done.",
+        ),
+    },
+    Agent {
         name: "aider",
         binary: "aider",
         about: "aider (OpenAI Chat or Anthropic Messages, by model)",
@@ -487,10 +574,15 @@ mod tests {
     }
 
     #[test]
-    fn only_claude_carries_a_fixed_variable() {
+    fn only_claude_and_copilot_carry_a_fixed_variable() {
         // `fixed_env` is for a variable a tool needs *because* it is proxied,
-        // not a convenient place to set defaults. One entry needs one today.
-        for agent in AGENTS.iter().filter(|a| a.name != "claude") {
+        // not a convenient place to set defaults. Claude Code needs tool
+        // search kept on; Copilot CLI's BYOK base URL means nothing without a
+        // provider type beside it.
+        for agent in AGENTS
+            .iter()
+            .filter(|a| a.name != "claude" && a.name != "copilot")
+        {
             assert!(
                 agent.fixed_env.is_empty(),
                 "{} sets a fixed variable with no reason recorded",
@@ -546,7 +638,11 @@ mod tests {
         // The new enum defaults nothing: an entry that forgot to say how it is
         // wired would not compile, but one that said `Manual` by accident would
         // silently stop launching. This is the guard for the second.
-        for agent in AGENTS.iter().filter(|a| !a.name.starts_with("cursor")) {
+        const MANUAL: [&str; 2] = ["cline", "continue"];
+        for agent in AGENTS
+            .iter()
+            .filter(|a| !a.name.starts_with("cursor") && !MANUAL.contains(&a.name))
+        {
             assert_eq!(
                 agent.wiring,
                 Wiring::Launch,
@@ -606,10 +702,12 @@ mod tests {
             );
             // A config-file agent sets no variable by design, so the count can
             // only be checked where variables are the mechanism.
+            // At most one variable per provider: Copilot CLI sets one URL and
+            // mounts both, because which provider it is depends on a type the
+            // user may switch.
             if agent.config.is_none() {
-                assert_eq!(
-                    agent.env.len(),
-                    agent.providers.len(),
+                assert!(
+                    !agent.env.is_empty() && agent.env.len() <= agent.providers.len(),
                     "{}: every base URL needs a provider behind it",
                     agent.name
                 );
@@ -724,7 +822,9 @@ mod tests {
     /// the tool you are naming*, because nothing else will.
     #[test]
     fn an_agents_binary_is_its_name_unless_it_is_listed_otherwise() {
-        const RENAMED: &[(&str, &str)] = &[];
+        // Continue's CLI is `cn`; the entry is manual and never launched, but
+        // the name is still the one a user would look for.
+        const RENAMED: &[(&str, &str)] = &[("continue", "cn")];
         for agent in AGENTS {
             let expected = RENAMED
                 .iter()
@@ -763,6 +863,9 @@ mod tests {
         assert_eq!(names.len(), count, "duplicate agent name");
         assert!(Agent::find("claude").is_some());
         assert!(Agent::find("opencode").is_some());
+        for name in ["copilot", "goose", "cline", "continue"] {
+            assert!(Agent::find(name).is_some(), "{name}");
+        }
         assert!(Agent::find("nope").is_none());
     }
 }

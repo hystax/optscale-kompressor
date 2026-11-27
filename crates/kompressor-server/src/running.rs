@@ -14,7 +14,7 @@ use serde_json::Value;
 
 /// The proxy settings that are off, or at a conservative value, unless a
 /// deployment chose otherwise: the ones worth seeing at a glance.
-const OPT_IN: [&str; 17] = [
+const OPT_IN: [&str; 18] = [
     "compress",
     "retrieve_tool",
     "frozen_prefix",
@@ -25,6 +25,7 @@ const OPT_IN: [&str; 17] = [
     "tools_order",
     "sticky_beta",
     "tools_compact",
+    "tools_defer",
     "output_shaping",
     "output_shaping_holdout_pct",
     "cold_recompact",

@@ -218,6 +218,12 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     // After `decoded` is taken, so a renamed model reads as a rewritten body and
     // is re-encoded rather than forwarded as the bytes that arrived.
     let body = model_for_upstream(body, family, route.origin());
+    let platform = kompressor_wire::platform(&route.path);
+    // A Bedrock stream comes back as AWS event-stream frames, which the
+    // retrieve loop does not read: a call to the tool would reach a client
+    // that never declared it.
+    let retrieve_allowed = !(platform == kompressor_wire::Platform::Bedrock
+        && kompressor_wire::streams_by_path(&route.path));
     let identity = resolve_identity(&state, &parts.headers);
     let mode = resolve_mode(
         &state,
@@ -241,8 +247,16 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         body,
         &request_id,
         upstream.name.as_str(),
+        route.origin(),
+        retrieve_allowed,
     )
     .await;
+    // The cloud platforms name the model and ask for a stream in the path,
+    // not the body.
+    prepared.stream |= kompressor_wire::streams_by_path(&route.path);
+    if prepared.model.is_none() && family.is_some() {
+        prepared.model = kompressor_wire::model_in_path(&route.path);
+    }
     // After every rewrite, so it rides on whatever goes out, compressed or
     // not, and before the capture, so the capture shows it.
     let retention = ask_for_retention(
@@ -385,6 +399,9 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
             outbound = outbound.with_json(json);
         }
         outbound = outbound.with_retention(retention).with_started(started);
+        if let Some(signer) = aws_signer(upstream, &parts.headers) {
+            outbound = outbound.with_signer(signer);
+        }
         if !prepared.stream {
             outbound = outbound.with_timeout(proxy.upstream_read_timeout);
         }
@@ -471,6 +488,29 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         )
         .await
     }
+}
+
+/// The SigV4 signer for an upstream configured with `aws_sigv4`, unless the
+/// client authenticates with a bearer key (which covers no body and is
+/// forwarded) or the proxy has no AWS credentials, in which case the client's
+/// own headers go out and the provider decides.
+fn aws_signer(upstream: &Upstream, client: &HeaderMap) -> Option<crate::sigv4::Signer> {
+    let config = upstream.aws_sigv4.as_ref()?;
+    if crate::sigv4::uses_bearer(client) {
+        return None;
+    }
+    let Some(credentials) = crate::sigv4::Credentials::from_env() else {
+        tracing::warn!(
+            upstream = %upstream.name,
+            "aws_sigv4 is set but AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY are not; forwarding the client's signature"
+        );
+        return None;
+    };
+    Some(crate::sigv4::Signer {
+        region: config.region.clone(),
+        service: config.service.clone(),
+        credentials,
+    })
 }
 
 /// The client's original goes out instead of the rewrite, so nothing was
@@ -580,6 +620,7 @@ fn guard_the_rewrite(
     prepared.injected = false;
     prepared.strip_usage = false;
     prepared.tools_compacted_bytes = 0;
+    prepared.tools_deferred = Default::default();
     prepared.reasoning_elided_bytes = 0;
     forget_the_rewrite(state, prepared);
 }
@@ -673,7 +714,13 @@ fn keep_warm_for(
     identity: &Identity,
     upstream: &str,
 ) -> Option<KeepWarmPlan> {
-    if family != Some(ApiFamily::AnthropicMessages) {
+    // The provider's own API only: a ping copies this request's headers, and
+    // on Vertex or Bedrock those carry a token or signature for another body.
+    if family != Some(ApiFamily::AnthropicMessages)
+        || url.parse::<http::Uri>().is_ok_and(|uri| {
+            kompressor_wire::platform(uri.path()) != kompressor_wire::Platform::Direct
+        })
+    {
         return None;
     }
     let proxy = &state.core.config_for(Some("anthropic")).proxy;
@@ -810,6 +857,8 @@ struct Prepared {
     ticket: u64,
     /// Bytes `proxy.tools_compact` took out of the tool definitions.
     tools_compacted_bytes: usize,
+    /// What `proxy.tools_defer` kept out of the rendered prompt.
+    tools_deferred: crate::tooldefer::Deferred,
     /// Bytes it would take out, where it is not applied.
     tools_compactable_bytes: usize,
     /// Bytes of earlier-turn reasoning taken out of the conversation.
@@ -834,6 +883,7 @@ impl Prepared {
             reservation: None,
             ticket: 0,
             tools_compacted_bytes: 0,
+            tools_deferred: Default::default(),
             tools_compactable_bytes: 0,
             reasoning_elided_bytes: 0,
             output_shaping: None,
@@ -911,12 +961,14 @@ fn passthrough_with_stable_tools(
     body: Bytes,
     stream: bool,
     model: Option<String>,
+    retrieve_allowed: bool,
 ) -> Prepared {
-    let wants_tool = offers_retrieve_tool(
-        proxy,
-        engine_mode,
-        tool::carries_handle(&String::from_utf8_lossy(&body)),
-    );
+    let wants_tool = retrieve_allowed
+        && offers_retrieve_tool(
+            proxy,
+            engine_mode,
+            tool::carries_handle(&String::from_utf8_lossy(&body)),
+        );
     if !wants_tool {
         return Prepared::passthrough(body, stream, model);
     }
@@ -950,6 +1002,7 @@ fn passthrough_with_stable_tools(
         reservation: None,
         ticket: 0,
         tools_compacted_bytes: 0,
+        tools_deferred: Default::default(),
         tools_compactable_bytes: 0,
         reasoning_elided_bytes: 0,
         output_shaping: None,
@@ -1303,15 +1356,93 @@ fn compact_tool_schemas(state: &ProxyState, identified: &Identified, prepared: &
     }
 }
 
-/// Append the output-shaping instruction to a treated conversation's system
-/// prompt, under `proxy.output_shaping`. See [`crate::outputshape`].
+/// Keep the tools a conversation does not use every turn out of the rendered
+/// prompt, under `proxy.tools_defer`. See [`crate::tooldefer`].
 ///
-/// Asked of every Anthropic conversation, on or off, for the reason
-/// `compact_tool_schemas` is: the answer is fixed by the first request.
-fn shape_output(state: &ProxyState, identified: &Identified, prepared: &mut Prepared) {
+/// Asked of every Anthropic conversation, on or off, so the answer is on
+/// record from its first request. Applied only on the first-party API: the
+/// `anthropic` mount or a host of `api.anthropic.com`. Gateways, Bedrock and
+/// Vertex refuse the tool-search shape or gate it behind another beta.
+fn defer_tool_schemas(
+    state: &ProxyState,
+    identified: &Identified,
+    provider: &str,
+    origin: &str,
+    prepared: &mut Prepared,
+) {
     if identified.family != ApiFamily::AnthropicMessages {
         return;
     }
+    let config = state.core.config_for(Some(identified.family.provider()));
+    let proxy = &config.proxy;
+    if !state.defer_policies.compacting(
+        identified.fingerprint,
+        identified.messages,
+        proxy.tools_defer && first_party_anthropic(provider, origin),
+    ) {
+        return;
+    }
+    let mut parsed = None;
+    let value = match prepared.json.as_mut() {
+        Some(value) => value,
+        None => match serde_json::from_slice::<Value>(&prepared.body) {
+            Ok(value) => parsed.insert(value),
+            Err(_) => return,
+        },
+    };
+    let mut changed = false;
+    if let Some(Value::Array(tools)) = value.get_mut("tools")
+        && let Some(deferred) = crate::tooldefer::defer_tools(
+            tools,
+            &proxy.tools_defer_keep,
+            proxy.tools_defer_min_tools,
+        )
+    {
+        prepared.tools_deferred = deferred;
+        changed = true;
+    }
+    // On every request of a deferred conversation, deferred this time or not:
+    // a side request replaying the transcript with fewer tools is the case.
+    let repaired = crate::tooldefer::repair_history(value);
+    if repaired > 0 {
+        tracing::debug!(
+            repaired,
+            "replaced tool-search blocks this request cannot resolve"
+        );
+    }
+    if (changed || repaired > 0)
+        && let Ok(out) = serde_json::to_vec(value)
+    {
+        prepared.body = Bytes::from(out);
+    }
+}
+
+/// Whether a request goes to Anthropic's own API rather than a gateway or a
+/// cloud platform: the `anthropic` mount, or the host itself, and never a
+/// Google or AWS host whatever the mount is called.
+fn first_party_anthropic(provider: &str, origin: &str) -> bool {
+    let host = origin
+        .split("://")
+        .nth(1)
+        .unwrap_or(origin)
+        .split([':', '/'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if host.ends_with("googleapis.com") || host.ends_with("amazonaws.com") {
+        return false;
+    }
+    provider == "anthropic" || host == "api.anthropic.com"
+}
+
+/// Append the output-shaping instruction to a treated conversation's system
+/// prompt, under `proxy.output_shaping`. See [`crate::outputshape`].
+///
+/// Asked of every conversation, on or off and in every family, for the
+/// reason `compact_tool_schemas` is: the answer is fixed by the first request.
+/// Where the text goes is the family's: see
+/// [`crate::outputshape::append_instruction_for`].
+fn shape_output(state: &ProxyState, identified: &Identified, prepared: &mut Prepared) {
     let proxy = &state
         .core
         .config_for(Some(identified.family.provider()))
@@ -1338,7 +1469,7 @@ fn shape_output(state: &ProxyState, identified: &Identified, prepared: &mut Prep
             Err(_) => return,
         },
     };
-    if crate::outputshape::append_instruction(value, &text)
+    if crate::outputshape::append_instruction_for(value, identified.family, &text)
         && let Ok(out) = serde_json::to_vec(value)
     {
         prepared.body = Bytes::from(out);
@@ -1442,6 +1573,8 @@ fn observe_prefix(
     observation.quiet_read_bytes = clamp(identified.reads.matured);
     observation.tools_compacted_bytes =
         u32::try_from(prepared.tools_compacted_bytes).unwrap_or(u32::MAX);
+    observation.tools_proxy_deferred = prepared.tools_deferred.tools;
+    observation.tools_proxy_deferred_bytes = prepared.tools_deferred.bytes;
     if let Some((kind, held)) = prepared.recompacted {
         observation.recompacted = Some(kind.as_str().to_string());
         observation.ledger_reads = u32::try_from(held).unwrap_or(u32::MAX);
@@ -1535,6 +1668,8 @@ async fn prepare(
     body: Bytes,
     request_id: &str,
     provider: &str,
+    origin: &str,
+    retrieve_allowed: bool,
 ) -> Prepared {
     let identified = prefix_identity(state, identity, family, &body, provider, request_headers);
     let fingerprint = identified.as_ref().map(|found| found.fingerprint);
@@ -1578,6 +1713,7 @@ async fn prepare(
         fingerprint,
         long_ttl,
         cold,
+        retrieve_allowed,
     )
     .await;
     // Whatever the settings: `predicted_cold` reads it when the setting is
@@ -1633,6 +1769,9 @@ async fn prepare(
         // Asked of every conversation, on or off: the answer is fixed by the
         // first request, and has to be on record before the setting changes.
         compact_tool_schemas(state, identified, &mut prepared);
+        // After compaction, which then sees every schema, and before pinning,
+        // which then orders the list that is sent.
+        defer_tool_schemas(state, identified, provider, origin, &mut prepared);
         // Before the observation, which then describes the system prompt
         // that is sent.
         shape_output(state, identified, &mut prepared);
@@ -1697,6 +1836,9 @@ async fn prepare_inner(
     long_ttl: bool,
     // This request finds the provider's cache gone; see `cold_turn`.
     cold: Option<crate::recompact::Cold>,
+    // Whether the retrieve tool may be offered on this transport at all: not
+    // where the answer comes back in a framing the loop cannot read.
+    retrieve_allowed: bool,
 ) -> Prepared {
     // This provider's settings: `proxy.providers` applied over the defaults.
     let config = state.core.config_for(family.map(ApiFamily::provider));
@@ -1823,7 +1965,15 @@ async fn prepare_inner(
             request_id,
             "tool_choice forbids the retrieve tool; forwarding as it arrived"
         );
-        return passthrough_with_stable_tools(proxy, options.mode, family, body, stream, model);
+        return passthrough_with_stable_tools(
+            proxy,
+            options.mode,
+            family,
+            body,
+            stream,
+            model,
+            retrieve_allowed,
+        );
     }
 
     let before = compressible_tokens(&walk);
@@ -1832,7 +1982,15 @@ async fn prepare_inner(
             tokens = before,
             "below proxy.min_tokens; forwarding as it arrived"
         );
-        return passthrough_with_stable_tools(proxy, options.mode, family, body, stream, model);
+        return passthrough_with_stable_tools(
+            proxy,
+            options.mode,
+            family,
+            body,
+            stream,
+            model,
+            retrieve_allowed,
+        );
     }
 
     // Is the freeze protecting a cache that still exists? Fingerprinted over
@@ -2014,7 +2172,15 @@ async fn prepare_inner(
     )
     .await;
     let Some((messages, saved, read_decisions)) = compressed else {
-        return passthrough_with_stable_tools(proxy, options.mode, family, body, stream, model);
+        return passthrough_with_stable_tools(
+            proxy,
+            options.mode,
+            family,
+            body,
+            stream,
+            model,
+            retrieve_allowed,
+        );
     };
     walk.messages = messages;
 
@@ -2027,7 +2193,15 @@ async fn prepare_inner(
             .failopen
             .record(Stage::Discarded, &"compression did not shrink the prompt");
         record_discard(state, identity, request_id);
-        return passthrough_with_stable_tools(proxy, options.mode, family, body, stream, model);
+        return passthrough_with_stable_tools(
+            proxy,
+            options.mode,
+            family,
+            body,
+            stream,
+            model,
+            retrieve_allowed,
+        );
     }
 
     let carries_handle = tool::carries_handle(&String::from_utf8_lossy(&body))
@@ -2036,7 +2210,7 @@ async fn prepare_inner(
             .iter()
             .filter_map(|origin| walk.current_text(origin))
             .any(tool::carries_handle);
-    let wants_tool = offers_retrieve_tool(proxy, options.mode, carries_handle);
+    let wants_tool = retrieve_allowed && offers_retrieve_tool(proxy, options.mode, carries_handle);
     let mut injected = false;
     if wants_tool {
         match tool::inject(&mut value, family) {
@@ -2076,6 +2250,7 @@ async fn prepare_inner(
                     body,
                     stream,
                     model,
+                    retrieve_allowed,
                 );
             }
             tracing::info!(
@@ -2113,6 +2288,7 @@ async fn prepare_inner(
                 reservation: None,
                 ticket: 0,
                 tools_compacted_bytes: 0,
+                tools_deferred: Default::default(),
                 tools_compactable_bytes: 0,
                 reasoning_elided_bytes: 0,
                 output_shaping: None,
@@ -3087,7 +3263,12 @@ async fn stream_response(
 
     // An error, or a response that is not an event stream after all, is a whole
     // body: relaying it as one is both simpler and what the client expects.
-    if !status.is_success() || !is_event_stream(upstream.headers(), prepared.stream) {
+    // AWS event-stream framing (Bedrock's streaming actions) is the exception:
+    // binary, never SSE, and piped through below as it arrives.
+    let aws_frames = is_aws_event_stream(upstream.headers());
+    if !status.is_success()
+        || (!aws_frames && !is_event_stream(upstream.headers(), prepared.stream))
+    {
         let body = upstream.bytes().await.unwrap_or_default();
         recorder.finish(Some(status.as_u16()), 0, 0, None, started, None);
         let mut response = Response::new(Body::from(body));
@@ -3099,7 +3280,10 @@ async fn stream_response(
     // A family we do not walk has no turn to intercept, so its stream skips the
     // machine entirely and is piped through. Buffering it to look for a tool
     // call we could not have injected would hold every token back until the
-    // provider finished the answer.
+    // provider finished the answer. Bedrock's event-stream frames take the
+    // same road: the retrieve tool is never offered on them, and usage is in
+    // binary frames this proxy does not decode.
+    let family = family.filter(|_| !aws_frames);
     let Some(family) = family else {
         recorder.finish(Some(status.as_u16()), 0, 0, None, started, None);
         let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
@@ -3188,6 +3372,15 @@ fn is_event_stream(headers: &HeaderMap, asked_for_stream: bool) -> bool {
         Some(value) => value.contains("event-stream"),
         None => asked_for_stream,
     }
+}
+
+/// Whether the response is AWS's binary event-stream framing
+/// (`application/vnd.amazon.eventstream`), as Bedrock's streaming actions send.
+fn is_aws_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("vnd.amazon.eventstream"))
 }
 
 /// Say when the provider refused a request, at a level the default log keeps.
@@ -3405,17 +3598,46 @@ impl Recorder {
         self.event.upstream_ms = (waited > 0).then(|| waited as f64 / 1000.0);
         self.event.error = error;
         if let Some(usage) = usage {
-            self.event.prompt_tokens = billed(usage, &["prompt_tokens", "input_tokens"]);
-            self.event.completion_tokens = billed(usage, &["completion_tokens", "output_tokens"]);
-            self.event.cache_read_tokens =
-                billed(usage, &["cache_read_input_tokens"]).or_else(|| {
-                    usage
-                        .pointer("/prompt_tokens_details/cached_tokens")
-                        .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
-                        .and_then(Value::as_u64)
-                        .map(|tokens| tokens as u32)
-                });
-            self.event.cache_write_tokens = billed(usage, &["cache_creation_input_tokens"]);
+            // Gemini (`usageMetadata`) and Bedrock Converse spell the same
+            // numbers in camelCase. Gemini's prompt count includes the cached
+            // part, as OpenAI's does.
+            self.event.prompt_tokens = billed(
+                usage,
+                &[
+                    "prompt_tokens",
+                    "input_tokens",
+                    "promptTokenCount",
+                    "inputTokens",
+                ],
+            );
+            self.event.completion_tokens = billed(
+                usage,
+                &[
+                    "completion_tokens",
+                    "output_tokens",
+                    "candidatesTokenCount",
+                    "outputTokens",
+                ],
+            );
+            self.event.cache_read_tokens = billed(
+                usage,
+                &[
+                    "cache_read_input_tokens",
+                    "cachedContentTokenCount",
+                    "cacheReadInputTokens",
+                ],
+            )
+            .or_else(|| {
+                usage
+                    .pointer("/prompt_tokens_details/cached_tokens")
+                    .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
+                    .and_then(Value::as_u64)
+                    .map(|tokens| tokens as u32)
+            });
+            self.event.cache_write_tokens = billed(
+                usage,
+                &["cache_creation_input_tokens", "cacheWriteInputTokens"],
+            );
             // The TTL split, which prices the write: 1.25x input for five-minute
             // entries, 2x for one-hour ones.
             self.event.cache_write_1h_tokens = usage

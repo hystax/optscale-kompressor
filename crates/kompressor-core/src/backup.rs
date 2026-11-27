@@ -642,6 +642,10 @@ fn restore_targets(config: &Config) -> [(&'static str, Result<PathBuf, &'static 
                 RefsBackend::Memory => {
                     Err("the ref store is in memory (refs.backend = \"memory\")")
                 }
+                RefsBackend::Redis => Err(
+                    "the ref store is in Redis (refs.backend = \"redis\"); back it up with \
+                     the server's own RDB/AOF",
+                ),
             },
             kompressor_store::sqlite::latest_version(),
         ),
@@ -994,6 +998,12 @@ pub fn write_archive(config: &Config, output: &Path) -> Result<Manifest, CoreErr
         RefsBackend::Memory => record(Err(Skipped {
             name: "refs.db".to_string(),
             reason: "the ref store is in memory (refs.backend = \"memory\")".to_string(),
+        })),
+        RefsBackend::Redis => record(Err(Skipped {
+            name: "refs.db".to_string(),
+            reason: "the ref store is in Redis (refs.backend = \"redis\"); back it up with \
+                     the server's own RDB/AOF"
+                .to_string(),
         })),
     }
     if manifest.databases.is_empty() {

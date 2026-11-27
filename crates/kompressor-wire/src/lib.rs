@@ -45,6 +45,8 @@
 #![forbid(unsafe_code)]
 
 pub mod anthropic;
+pub mod bedrock;
+pub mod gemini;
 pub mod openai_chat;
 pub mod openai_responses;
 pub mod path;
@@ -63,8 +65,14 @@ pub enum ApiFamily {
     OpenAiChat,
     /// OpenAI Responses: `POST /v1/responses`.
     OpenAiResponses,
-    /// Anthropic Messages: `POST /v1/messages`.
+    /// Anthropic Messages: `POST /v1/messages`, and the same body on Vertex
+    /// AI (`…/publishers/anthropic/models/{m}:rawPredict`) and on Bedrock
+    /// (`/model/{id}/invoke`). See [`platform`].
     AnthropicMessages,
+    /// Gemini `generateContent`, on Google AI or Vertex AI.
+    GeminiGenerateContent,
+    /// AWS Bedrock Converse: `POST /model/{id}/converse`.
+    BedrockConverse,
 }
 
 impl ApiFamily {
@@ -74,6 +82,8 @@ impl ApiFamily {
         match self {
             ApiFamily::AnthropicMessages => "anthropic",
             ApiFamily::OpenAiChat | ApiFamily::OpenAiResponses => "openai",
+            ApiFamily::GeminiGenerateContent => "gemini",
+            ApiFamily::BedrockConverse => "bedrock",
         }
     }
 
@@ -83,6 +93,8 @@ impl ApiFamily {
             ApiFamily::OpenAiChat => "openai_chat",
             ApiFamily::OpenAiResponses => "openai_responses",
             ApiFamily::AnthropicMessages => "anthropic_messages",
+            ApiFamily::GeminiGenerateContent => "gemini_generate_content",
+            ApiFamily::BedrockConverse => "bedrock_converse",
         }
     }
 }
@@ -121,7 +133,147 @@ pub fn detect_family(path: &str) -> Option<ApiFamily> {
     if path.ends_with("/v1/messages") || path == "/messages" {
         return Some(ApiFamily::AnthropicMessages);
     }
-    None
+    match platform(path) {
+        Platform::Vertex | Platform::GoogleAi => {
+            let action = path.rsplit_once(':').map(|(_, action)| action)?;
+            match action {
+                "rawPredict" | "streamRawPredict"
+                    if path.contains("/publishers/anthropic/models/") =>
+                {
+                    Some(ApiFamily::AnthropicMessages)
+                }
+                "generateContent" | "streamGenerateContent" => {
+                    Some(ApiFamily::GeminiGenerateContent)
+                }
+                _ => None,
+            }
+        }
+        Platform::Bedrock => match path.rsplit('/').next()? {
+            "invoke" | "invoke-with-response-stream" => Some(ApiFamily::AnthropicMessages),
+            "converse" | "converse-stream" => Some(ApiFamily::BedrockConverse),
+            _ => None,
+        },
+        Platform::Direct => None,
+    }
+}
+
+/// Which cloud's transport a path belongs to. The body may be one this crate
+/// already knows — Claude on Vertex and on Bedrock `invoke` is an Anthropic
+/// Messages body — but the transport decides the rest: where the model is
+/// named, how a stream is framed and how the request is signed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Platform {
+    /// The provider's own API, or a gateway speaking it.
+    Direct,
+    /// Vertex AI: `…/projects/{p}/locations/{l}/publishers/{pub}/models/{m}:{action}`.
+    Vertex,
+    /// Google AI (`generativelanguage.googleapis.com`): `…/models/{m}:{action}`.
+    GoogleAi,
+    /// AWS Bedrock runtime: `/model/{modelId}/{action}`.
+    Bedrock,
+}
+
+impl Platform {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Platform::Direct => "direct",
+            Platform::Vertex => "vertex",
+            Platform::GoogleAi => "google_ai",
+            Platform::Bedrock => "bedrock",
+        }
+    }
+}
+
+/// The platform a path is on. Matched on whole segments, under any mount
+/// prefix, like [`detect_family`].
+pub fn platform(path: &str) -> Platform {
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let path = path.trim_end_matches('/');
+    let segments: Vec<&str> = path.split('/').collect();
+    if path.contains("/projects/")
+        && path.contains("/locations/")
+        && path.contains("/publishers/")
+        && path.contains("/models/")
+        && path
+            .rsplit('/')
+            .next()
+            .is_some_and(|last| last.contains(':'))
+    {
+        return Platform::Vertex;
+    }
+    if let Some(at) = segments.iter().rposition(|s| *s == "model")
+        && segments.len() == at + 3
+        && !segments[at + 1].is_empty()
+    {
+        return Platform::Bedrock;
+    }
+    if let Some(at) = segments.iter().rposition(|s| *s == "models")
+        && segments.len() == at + 2
+        && segments[at + 1].contains(':')
+    {
+        return Platform::GoogleAi;
+    }
+    Platform::Direct
+}
+
+/// The model a path names, for the platforms that name it there rather than
+/// in the body: `gemini-2.5-pro`, `claude-sonnet-4-5@20250929`,
+/// `anthropic.claude-sonnet-4-5-20250929-v1:0`. `None` on the direct APIs.
+pub fn model_in_path(path: &str) -> Option<String> {
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let path = path.trim_end_matches('/');
+    match platform(path) {
+        Platform::Direct => None,
+        Platform::Vertex | Platform::GoogleAi => {
+            let tail = path.rsplit_once("/models/")?.1;
+            let model = tail.rsplit_once(':').map_or(tail, |(model, _)| model);
+            (!model.is_empty()).then(|| model.to_string())
+        }
+        Platform::Bedrock => {
+            let mut segments = path.rsplit('/');
+            segments.next()?;
+            let model = segments.next()?;
+            Some(percent_decode(model))
+        }
+    }
+}
+
+/// Whether the path itself asks for a stream: the cloud platforms put it in
+/// the action rather than in a `stream` field of the body.
+pub fn streams_by_path(path: &str) -> bool {
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let path = path.trim_end_matches('/');
+    match platform(path) {
+        Platform::Direct => false,
+        Platform::Vertex | Platform::GoogleAi => path
+            .rsplit_once(':')
+            .is_some_and(|(_, action)| action.starts_with("stream")),
+        Platform::Bedrock => {
+            path.ends_with("/invoke-with-response-stream") || path.ends_with("/converse-stream")
+        }
+    }
+}
+
+/// `%3A` and friends in a Bedrock model id (an inference-profile ARN).
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Some(byte) = text
+                .get(i + 1..i + 3)
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+        {
+            out.push(byte);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// One text slot's origin in the request body.
@@ -256,6 +408,8 @@ pub fn walker_for(family: ApiFamily) -> Box<dyn Walker> {
         ApiFamily::OpenAiChat => Box::new(openai_chat::OpenAiChatWalker),
         ApiFamily::OpenAiResponses => Box::new(openai_responses::OpenAiResponsesWalker),
         ApiFamily::AnthropicMessages => Box::new(anthropic::AnthropicMessagesWalker),
+        ApiFamily::GeminiGenerateContent => Box::new(gemini::GeminiWalker),
+        ApiFamily::BedrockConverse => Box::new(bedrock::BedrockConverseWalker),
     }
 }
 
@@ -568,11 +722,78 @@ mod tests {
     }
 
     #[test]
+    fn the_cloud_platforms_paths_are_recognised() {
+        let vertex_claude = "/v1/projects/p/locations/us-east5/publishers/anthropic/models/claude-sonnet-4-5@20250929:streamRawPredict";
+        assert_eq!(
+            detect_family(vertex_claude),
+            Some(ApiFamily::AnthropicMessages)
+        );
+        assert_eq!(platform(vertex_claude), Platform::Vertex);
+        assert_eq!(
+            model_in_path(vertex_claude).as_deref(),
+            Some("claude-sonnet-4-5@20250929")
+        );
+        assert!(streams_by_path(vertex_claude));
+
+        let vertex_gemini = "/vertex/v1/projects/p/locations/global/publishers/google/models/gemini-2.5-pro:generateContent";
+        assert_eq!(
+            detect_family(vertex_gemini),
+            Some(ApiFamily::GeminiGenerateContent)
+        );
+        assert!(!streams_by_path(vertex_gemini));
+
+        let google = "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse";
+        assert_eq!(
+            detect_family(google),
+            Some(ApiFamily::GeminiGenerateContent)
+        );
+        assert_eq!(platform(google), Platform::GoogleAi);
+        assert_eq!(model_in_path(google).as_deref(), Some("gemini-2.5-flash"));
+        assert!(streams_by_path(google));
+
+        let invoke =
+            "/model/anthropic.claude-sonnet-4-5-20250929-v1%3A0/invoke-with-response-stream";
+        assert_eq!(detect_family(invoke), Some(ApiFamily::AnthropicMessages));
+        assert_eq!(platform(invoke), Platform::Bedrock);
+        assert_eq!(
+            model_in_path(invoke).as_deref(),
+            Some("anthropic.claude-sonnet-4-5-20250929-v1:0")
+        );
+        assert!(streams_by_path(invoke));
+
+        let converse = "/bedrock/model/amazon.nova-pro-v1:0/converse";
+        assert_eq!(detect_family(converse), Some(ApiFamily::BedrockConverse));
+        assert!(!streams_by_path(converse));
+        assert!(streams_by_path("/model/m/converse-stream"));
+
+        assert_eq!(platform("/v1/messages"), Platform::Direct);
+        assert_eq!(model_in_path("/v1/chat/completions"), None);
+    }
+
+    #[test]
+    fn the_cloud_platforms_neighbours_are_not_families() {
+        for path in [
+            "/v1beta/models/gemini-2.5-pro:countTokens",
+            "/v1beta/models/text-embedding-004:embedContent",
+            "/v1beta/models/gemini-2.5-pro:batchGenerateContent",
+            "/v1/projects/p/locations/l/publishers/anthropic/models/claude:countTokens",
+            "/v1/projects/p/locations/l/publishers/meta/models/llama:rawPredict",
+            "/model/m/apply-guardrail",
+            "/model/m",
+            "/v1beta/models",
+        ] {
+            assert_eq!(detect_family(path), None, "{path}");
+        }
+    }
+
+    #[test]
     fn walker_for_returns_the_walker_that_speaks_that_family() {
         for family in [
             ApiFamily::OpenAiChat,
             ApiFamily::OpenAiResponses,
             ApiFamily::AnthropicMessages,
+            ApiFamily::GeminiGenerateContent,
+            ApiFamily::BedrockConverse,
         ] {
             assert_eq!(walker_for(family).family(), family);
         }

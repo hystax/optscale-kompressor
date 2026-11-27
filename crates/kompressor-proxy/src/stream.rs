@@ -210,6 +210,7 @@ fn observe_terminal(family: ApiFamily, frame: &SseFrame, terminal: &mut Option<b
         && !data.contains("stop")
         && !data.contains("response.")
         && !data.contains("finish_reason")
+        && !data.contains("finishReason")
     {
         return;
     }
@@ -245,6 +246,18 @@ fn observe_terminal(family: ApiFamily, frame: &SseFrame, terminal: &mut Option<b
                         .iter()
                         .any(|choice| choice.get("finish_reason").is_some_and(|r| !r.is_null()))
                 }),
+            // Gemini ends a candidate with a `finishReason` in its last chunk.
+            ApiFamily::GeminiGenerateContent => value
+                .as_ref()
+                .and_then(|v| v.get("candidates"))
+                .and_then(Value::as_array)
+                .is_some_and(|candidates| {
+                    candidates
+                        .iter()
+                        .any(|c| c.get("finishReason").is_some_and(|r| !r.is_null()))
+                }),
+            // Converse streams are AWS event-stream frames, never SSE.
+            ApiFamily::BedrockConverse => false,
         };
         if complete {
             *terminal = Some(true);
@@ -354,7 +367,9 @@ impl StreamRelay {
     async fn recovery_error(&self, tx: &Sender<ClientChunk>, code: &str) {
         let message = "kompressor: could not complete the retrieval loop";
         let error = match self.family {
-            ApiFamily::OpenAiChat => format!(
+            ApiFamily::OpenAiChat
+            | ApiFamily::GeminiGenerateContent
+            | ApiFamily::BedrockConverse => format!(
                 "data: {}\n\n",
                 json!({"error": {
                     "type": "kompressor_retrieve_loop", "code": code, "message": message
@@ -1433,6 +1448,9 @@ fn scrub(family: ApiFamily, frame: &SseFrame, others_remain: bool) -> Option<Byt
             delta["stop_reason"] = Value::String("end_turn".to_string());
             Some(reframe(frame, &value))
         }
+        // No retrieve tool is offered on these families, so no call of ours
+        // can be in the stream.
+        ApiFamily::GeminiGenerateContent | ApiFamily::BedrockConverse => None,
     }
 }
 
@@ -1812,6 +1830,8 @@ impl StreamTurn {
             ApiFamily::OpenAiChat => self.observe_chat(value),
             ApiFamily::OpenAiResponses => self.observe_responses(value),
             ApiFamily::AnthropicMessages => self.observe_anthropic(value),
+            // No retrieve tool is offered here; nothing to decide.
+            ApiFamily::GeminiGenerateContent | ApiFamily::BedrockConverse => Signal::None,
         };
         (signal, self.touched.take())
     }
@@ -2188,6 +2208,8 @@ impl StreamTurn {
                 }
                 json!({"content": blocks})
             }
+            // The retrieve loop never runs on these families.
+            ApiFamily::GeminiGenerateContent | ApiFamily::BedrockConverse => json!({}),
         }
     }
 }
@@ -2268,6 +2290,15 @@ fn usage_pointer(family: ApiFamily, value: &Value) -> Option<&'static str> {
                 .map(|_| "/usage"),
             _ => None,
         },
+        // Cumulative on every chunk; the caller keeps the maximum.
+        ApiFamily::GeminiGenerateContent => value
+            .get("usageMetadata")
+            .filter(|usage| usage.is_object())
+            .map(|_| "/usageMetadata"),
+        ApiFamily::BedrockConverse => value
+            .get("usage")
+            .filter(|usage| usage.is_object())
+            .map(|_| "/usage"),
     }
 }
 

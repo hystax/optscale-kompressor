@@ -312,6 +312,13 @@ fixture whole, and a run where opencode still cut one is VOID.
 
 ## Known limits
 
+- **A long tool catalogue.** opencode sends every tool schema on every request
+  (about 135 with a few MCP servers). On the `anthropic` provider,
+  `[proxy] tools_defer = true` keeps all but the core tools out of the prompt
+  behind Anthropic's tool search; opencode's Anthropic SDK round-trips the
+  search blocks. Off by default because the model then has to search for a
+  tool before its first use. See the README's opt-in settings table.
+
 - **Retrieval tools as MCP.** `wrap claude` hands Claude Code the retrieve tool
   as an MCP server for the session. opencode gets the in-band tool the proxy
   injects into every request, which covers HTTP turns; a WebSocket turn (an

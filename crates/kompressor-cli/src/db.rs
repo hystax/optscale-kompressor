@@ -46,6 +46,7 @@ fn databases(config: &Config) -> Vec<Database> {
             match config.refs.backend {
                 RefsBackend::Sqlite => on_disk(&config.refs.path),
                 RefsBackend::Memory => Err("the ref store is in memory".to_string()),
+                RefsBackend::Redis => Err("the ref store is in Redis".to_string()),
             },
         ),
     ]

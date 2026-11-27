@@ -428,6 +428,8 @@ pub enum RefsBackend {
     #[default]
     Sqlite,
     Memory,
+    /// A Redis server shared by several proxies; see [`RefsConfig::redis_url`].
+    Redis,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -454,6 +456,18 @@ pub struct RefsConfig {
     /// that tenant's fragments, and with `auth.mode = "none"` anyone who can
     /// reach the listener can.
     pub browse: bool,
+    /// `redis://[user[:password]@]host[:port][/db]`, read when `backend =
+    /// "redis"`. `rediss://` is refused. The password is redacted by
+    /// `check-config`.
+    pub redis_url: String,
+    /// Prepended to every key, so deployments can share a server.
+    pub redis_prefix: String,
+    /// Pool acquisition, connect, read and write timeout for each Redis call.
+    #[serde(with = "humantime_serde")]
+    pub redis_timeout: Duration,
+    /// Maximum Redis connections, including idle and connecting ones.
+    /// Zero is treated as one.
+    pub redis_pool: usize,
 }
 
 impl Default for RefsConfig {
@@ -466,6 +480,10 @@ impl Default for RefsConfig {
             purge_interval: Duration::from_secs(60),
             max_bytes: 1024 * 1024 * 1024,
             browse: false,
+            redis_url: "redis://127.0.0.1:6379/0".to_string(),
+            redis_prefix: "kompressor".to_string(),
+            redis_timeout: Duration::from_secs(2),
+            redis_pool: 8,
         }
     }
 }
@@ -1001,8 +1019,31 @@ pub struct ProxyConfig {
     /// 2% of the tool block; it exists for clients whose tools come from a
     /// schema generator.
     pub tools_compact: bool,
-    /// Append [`Self::output_shaping_text`] to the `system` prompt of
-    /// Anthropic Messages requests, as an experiment. **Off by default.**
+    /// Mark the tools a conversation does not use every turn `defer_loading`
+    /// and add Anthropic's tool-search tool, so their schemas are not
+    /// rendered into the prompt until the model searches for one. **Off by
+    /// default.**
+    ///
+    /// Anthropic Messages to the first-party API only (gateways, Bedrock and
+    /// Vertex refuse or gate the shape). Decided on a conversation's first
+    /// request and held for its life, like [`Self::tools_compact`]; never
+    /// applied when the client already defers, or to fewer than
+    /// [`Self::tools_defer_min_tools`] tools. The tools named in
+    /// [`Self::tools_defer_keep`] stay in the prompt. It changes what the
+    /// model sees: a deferred tool takes one search before its first use.
+    pub tools_defer: bool,
+    /// The fewest tools a request must carry for `tools_defer` to act.
+    pub tools_defer_min_tools: usize,
+    /// Tools `tools_defer` never defers, compared lower-cased with leading
+    /// underscores dropped: the ones an agent calls every turn, which would
+    /// otherwise cost a search round each.
+    pub tools_defer_keep: Vec<String>,
+    /// Append [`Self::output_shaping_text`] to the instructions ahead of the
+    /// conversation, as an experiment. **Off by default.** Anthropic Messages:
+    /// the last `system` block. OpenAI Responses: the tail of `instructions`.
+    /// OpenAI Chat: the leading `system`/`developer` message, or a `system`
+    /// message put in front when there is none. Not applied on the websocket
+    /// relay.
     ///
     /// The only setting that changes what the model is asked rather than how
     /// the request is carried. It goes after every `system` block, with no
@@ -1465,7 +1506,7 @@ pub struct ProxyConfig {
 /// The providers [`ProxyConfig::providers`] may name: the API family a request
 /// arrives as, not the upstream it is sent to, so a mount renamed or split in
 /// two still gets its provider's settings.
-pub const PROVIDERS: &[&str] = &["anthropic", "openai"];
+pub const PROVIDERS: &[&str] = &["anthropic", "openai", "gemini", "bedrock"];
 
 /// What one provider's traffic does differently from the deployment default.
 ///
@@ -1513,6 +1554,8 @@ pub struct ProviderOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools_compact: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools_defer: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cold_recompact: Option<ColdRecompact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub superseded_reads: Option<bool>,
@@ -1557,6 +1600,7 @@ impl ProviderOverrides {
             tools_order,
             sticky_beta,
             tools_compact,
+            tools_defer,
             cold_recompact,
             superseded_reads,
             matured_reads,
@@ -1612,6 +1656,29 @@ impl ProviderOverrides {
     }
 }
 
+/// The tools `proxy.tools_defer` keeps in the prompt unless configured
+/// otherwise: the file, shell and planning tools coding agents call every
+/// turn, as Claude Code, opencode and Codex spell them, and Claude Code's own
+/// `ToolSearch`, which loads tools nothing else can reach.
+pub const DEFAULT_TOOLS_DEFER_KEEP: [&str; 16] = [
+    "bash",
+    "read",
+    "write",
+    "edit",
+    "multiedit",
+    "apply_patch",
+    "glob",
+    "grep",
+    "ls",
+    "task",
+    "todowrite",
+    "todoread",
+    "webfetch",
+    "notebookedit",
+    "skill",
+    "toolsearch",
+];
+
 /// What `proxy.output_shaping` asks for unless configured otherwise: shorter
 /// prose, and nothing taken from the work itself. It names what to leave out
 /// rather than a length, so code, commands and tool calls are not squeezed.
@@ -1641,6 +1708,12 @@ impl Default for ProxyConfig {
             sticky_beta: false,
             reasoning_elide_models: Vec::new(),
             tools_compact: false,
+            tools_defer: false,
+            tools_defer_min_tools: 12,
+            tools_defer_keep: DEFAULT_TOOLS_DEFER_KEEP
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
             output_shaping: false,
             output_shaping_holdout_pct: 50,
             output_shaping_text: DEFAULT_OUTPUT_SHAPING_TEXT.to_string(),
@@ -1728,6 +1801,33 @@ pub struct Upstream {
     /// behaves exactly as it did before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription: Option<SubscriptionUpstream>,
+    /// Sign this mount's requests with AWS Signature Version 4, over the body
+    /// that is sent. For a Bedrock runtime upstream: a client's own signature
+    /// covers its uncompressed body and the proxy's host, and cannot survive
+    /// either. Credentials are `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+    /// and `AWS_SESSION_TOKEN` from the proxy's environment; a client sending
+    /// a Bedrock API key (`Authorization: Bearer`) is forwarded unsigned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_sigv4: Option<AwsSigV4>,
+}
+
+/// AWS signing for an upstream: see [`Upstream::aws_sigv4`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AwsSigV4 {
+    /// `us-east-1`, as in `bedrock-runtime.us-east-1.amazonaws.com`.
+    pub region: String,
+    /// The signing name: `bedrock` for the Bedrock runtime.
+    pub service: String,
+}
+
+impl Default for AwsSigV4 {
+    fn default() -> Self {
+        AwsSigV4 {
+            region: String::new(),
+            service: "bedrock".to_string(),
+        }
+    }
 }
 
 /// The base URL and prefix an upstream uses for subscription callers.
@@ -1756,6 +1856,7 @@ impl Default for Upstream {
             forward_auth: true,
             headers: BTreeMap::new(),
             subscription: None,
+            aws_sigv4: None,
         }
     }
 }
@@ -2263,10 +2364,24 @@ impl Config {
                 "backend" => match value.to_ascii_lowercase().as_str() {
                     "memory" => self.refs.backend = RefsBackend::Memory,
                     "sqlite" => self.refs.backend = RefsBackend::Sqlite,
+                    "redis" => self.refs.backend = RefsBackend::Redis,
                     _ => self.refused_env.push(format!(
-                        "refs.backend cannot be {value:?}: expected sqlite or memory"
+                        "refs.backend cannot be {value:?}: expected sqlite, memory or redis"
                     )),
                 },
+                "redis_url" => self.refs.redis_url = value.to_string(),
+                "redis_prefix" => self.refs.redis_prefix = value.to_string(),
+                "redis_timeout" => match parse_duration(value) {
+                    Some(timeout) => self.refs.redis_timeout = timeout,
+                    None => self.refused_env.push(format!(
+                        "refs.redis_timeout cannot be {value:?}: not a duration"
+                    )),
+                },
+                "redis_pool" => {
+                    if let Ok(pool) = value.parse() {
+                        self.refs.redis_pool = pool;
+                    }
+                }
                 "browse" => {
                     self.refs.browse = parse_bool_setting("refs.browse", value, self.refs.browse)
                 }
@@ -2564,6 +2679,23 @@ impl Config {
                 self.proxy.tools_compact =
                     parse_bool_setting("proxy.tools_compact", value, self.proxy.tools_compact);
             }
+            "tools_defer" => {
+                self.proxy.tools_defer =
+                    parse_bool_setting("proxy.tools_defer", value, self.proxy.tools_defer);
+            }
+            "tools_defer_min_tools" => {
+                if let Ok(v) = value.parse() {
+                    self.proxy.tools_defer_min_tools = v;
+                }
+            }
+            "tools_defer_keep" => {
+                self.proxy.tools_defer_keep = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .collect();
+            }
             "output_shaping" => {
                 self.proxy.output_shaping =
                     parse_bool_setting("proxy.output_shaping", value, self.proxy.output_shaping);
@@ -2809,6 +2941,14 @@ impl Config {
                     self.proxy.allow_insecure_upstream,
                 )?;
             }
+            if let Some(sigv4) = &upstream.aws_sigv4
+                && (sigv4.region.trim().is_empty() || sigv4.service.trim().is_empty())
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "upstream {:?}: aws_sigv4 needs a region and a service",
+                    upstream.name
+                )));
+            }
             if !matches!(
                 upstream.api_family.to_ascii_lowercase().as_str(),
                 "auto" | "openai" | "anthropic" | "passthrough"
@@ -2818,6 +2958,23 @@ impl Config {
                     upstream.name, upstream.api_family
                 )));
             }
+        }
+        if self.refs.backend == RefsBackend::Redis {
+            kompressor_store::redis::parse_url(&self.refs.redis_url)
+                .map_err(|e| ConfigError::Invalid(format!("refs.redis_url: {e}")))?;
+            if self.refs.redis_prefix.is_empty() || self.refs.redis_timeout.is_zero() {
+                return Err(ConfigError::Invalid(
+                    "refs.redis_prefix must not be empty and refs.redis_timeout must be above zero"
+                        .into(),
+                ));
+            }
+        }
+        // A deferral needs at least one tool left in the prompt beside the
+        // search tool, and one deferred: below two there is nothing to choose.
+        if self.proxy.tools_defer_min_tools < 2 {
+            return Err(ConfigError::Invalid(
+                "proxy.tools_defer_min_tools must be at least 2".into(),
+            ));
         }
         // Checked whether or not the feature is on, so turning it on for one
         // provider later cannot meet an interval nobody looked at.
@@ -2901,6 +3058,14 @@ impl Config {
         }
         if !copy.maintenance.s3.secret_access_key.is_empty() {
             copy.maintenance.s3.secret_access_key = "<redacted>".to_string();
+        }
+        // `redis://user:password@host`: the password goes, the rest stays so
+        // the address can still be read.
+        if let Some((scheme, rest)) = copy.refs.redis_url.split_once("://")
+            && let Some((auth, host)) = rest.rsplit_once('@')
+        {
+            let user = auth.split_once(':').map_or("", |(user, _)| user);
+            copy.refs.redis_url = format!("{scheme}://{user}:<redacted>@{host}");
         }
         for upstream in &mut copy.proxy.upstreams {
             for value in upstream.headers.values_mut() {
@@ -3146,11 +3311,11 @@ mod tests {
                 "1".into(),
             ),
             (
-                "KOMPRESSOR__PROXY__PROVIDERS__GEMINI__CACHE_TTL".into(),
+                "KOMPRESSOR__PROXY__PROVIDERS__MISTRAL__CACHE_TTL".into(),
                 "1h".into(),
             ),
         ]);
-        assert!(!config.proxy.providers.contains_key("gemini"));
+        assert!(!config.proxy.providers.contains_key("mistral"));
         let anthropic = config
             .for_provider("anthropic")
             .unwrap_or_else(|| config.clone());
@@ -3359,6 +3524,32 @@ mod tests {
         let listed: Config =
             toml::from_str("[proxy]\nreasoning_elide_models = [\"glm-4.6\"]\n").unwrap();
         assert_eq!(listed.proxy.reasoning_elide_models, ["glm-4.6"]);
+        assert!(!config.proxy.tools_defer);
+        assert_eq!(config.proxy.tools_defer_min_tools, 12);
+        config.apply_env(&[
+            ("KOMPRESSOR__PROXY__TOOLS_DEFER".into(), "true".into()),
+            (
+                "KOMPRESSOR__PROXY__TOOLS_DEFER_MIN_TOOLS".into(),
+                "20".into(),
+            ),
+            (
+                "KOMPRESSOR__PROXY__TOOLS_DEFER_KEEP".into(),
+                "Bash, Read".into(),
+            ),
+        ]);
+        assert!(config.proxy.tools_defer);
+        assert_eq!(config.proxy.tools_defer_min_tools, 20);
+        assert_eq!(config.proxy.tools_defer_keep, ["Bash", "Read"]);
+        let deferring: Config =
+            toml::from_str("[proxy.providers.anthropic]\ntools_defer = true\n").unwrap();
+        assert!(!deferring.proxy.tools_defer);
+        assert!(
+            deferring
+                .for_provider("anthropic")
+                .unwrap()
+                .proxy
+                .tools_defer
+        );
         assert!(!config.proxy.tools_compact);
         config.apply_env(&[("KOMPRESSOR__PROXY__TOOLS_COMPACT".into(), "true".into())]);
         assert!(config.proxy.tools_compact);
@@ -4126,6 +4317,37 @@ mod tests {
         assert_eq!(config.auth.mode, AuthMode::None);
     }
 
+    #[test]
+    fn password_only_redis_credentials_are_redacted() {
+        let mut config = Config::default();
+        config.refs.redis_url = "redis://secret-password@cache/0".into();
+        assert!(!config.redacted_toml().contains("secret-password"));
+    }
+
+    #[test]
+    fn a_redis_store_is_validated_at_load_and_its_password_redacted() {
+        let ok: Config = toml::from_str(
+            "[refs]\nbackend = \"redis\"\nredis_url = \"redis://app:s3cret@cache:6380/2\"\n",
+        )
+        .unwrap();
+        ok.validate().expect("a redis:// url is accepted");
+        let rendered = ok.redacted_toml();
+        assert!(!rendered.contains("s3cret"), "{rendered}");
+        assert!(rendered.contains("redis://app:<redacted>@cache:6380/2"));
+
+        for url in ["rediss://cache:6380", "http://cache", "redis://cache/x"] {
+            let mut bad = ok.clone();
+            bad.refs.redis_url = url.into();
+            let error = bad.validate().unwrap_err().to_string();
+            assert!(error.contains("refs.redis_url"), "{url}: {error}");
+        }
+        // Not read unless the backend is redis.
+        let mut sqlite = ok.clone();
+        sqlite.refs.backend = RefsBackend::Sqlite;
+        sqlite.refs.redis_url = "nonsense".into();
+        sqlite.validate().expect("ignored for sqlite");
+    }
+
     /// The same for the fragment store: a misspelt `memory` kept SQLite, and
     /// fragments the operator wanted held in memory were written to disk.
     #[test]
@@ -4138,6 +4360,7 @@ mod tests {
         assert_eq!(env("memory").refs.backend, RefsBackend::Memory);
         assert_eq!(env("Memory").refs.backend, RefsBackend::Memory);
         assert_eq!(env("sqlite").refs.backend, RefsBackend::Sqlite);
+        assert_eq!(env("redis").refs.backend, RefsBackend::Redis);
         assert!(env("sqlite").validate().is_ok());
         let error = env("ephemeral").validate().unwrap_err().to_string();
         assert!(

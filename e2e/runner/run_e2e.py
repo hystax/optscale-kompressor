@@ -1290,6 +1290,318 @@ def efficiency(floors: dict) -> None:
         check(pct >= floor, f"{kind} @ {mode} >= {floor:.2f}%", f"measured {pct:.2f}%")
 
 
+
+# --------------------------------------------------------------------------
+# The Headroom port (docs/design/HEADROOM-PORT.md), against kompressor-next
+# and kompressor-peer, which run `kompressor-next.toml` over a shared Redis.
+
+NEXT = os.environ.get("KOMPRESSOR_NEXT", "")
+PEER = os.environ.get("KOMPRESSOR_PEER", "")
+REDIS = os.environ.get("REDIS", "")
+SEARCH_TOOL = "tool_search_tool_regex_20251119"
+EVENTSTREAM_BYTES = bytes(range(256)) * 16
+
+
+def sent_to(fragment: str) -> list[dict]:
+    """Recorded requests whose path contains `fragment`, oldest first."""
+    return [r for r in recorded() if fragment in r["path"]]
+
+
+def tool(name: str) -> dict:
+    return {"name": name, "description": f"The {name} tool. " * 20,
+            "input_schema": {"type": "object", "properties": {"x": {"type": "string"}}}}
+
+
+def tools_are_deferred_from_the_first_turn() -> None:
+    print("\n[tier 1] tool-schema deferral")
+    reset_provider()
+    catalogue = [tool("Bash"), tool("Read"), tool("Edit")] + [
+        tool(f"mcp__e2e__tool_{i}") for i in range(15)
+    ]
+    opening = {"role": "user", "content": "E2E-DEFER: where is the bug?"}
+    turns = [
+        [opening],
+        [opening, {"role": "assistant", "content": "looking"}, {"role": "user", "content": "go on"}],
+    ]
+    for messages in turns:
+        status, _, body = post(f"{NEXT}/v1/messages", {
+            "model": "claude-opus-5-5", "max_tokens": 256, "tools": catalogue, "messages": messages})
+        check(status == 200, "[defer] the turn is relayed", f"{status} {body[:200]!r}")
+    sent = [json.loads(r["body"]) for r in sent_to("/v1/messages")]
+    if not check(len(sent) == 2, "[defer] both turns reached the provider", str(len(sent))):
+        return
+    tools = sent[0]["tools"]
+    names = [t.get("name") for t in tools]
+    deferred = [t["name"] for t in tools if t.get("defer_loading") is True]
+    check(len(deferred) == 15 and all(n.startswith("mcp__e2e__") for n in deferred),
+          "[defer] every non-core tool is deferred", str(deferred))
+    check(all("defer_loading" not in t for t in tools[:3]), "[defer] the core tools stay in the prompt")
+    check(any(t.get("type") == SEARCH_TOOL for t in tools), "[defer] the tool-search tool is added", str(names))
+    check("optscale_kompressor_retrieve" in names and not any(
+        t.get("name") == "optscale_kompressor_retrieve" and t.get("defer_loading") for t in tools),
+        "[defer] the retrieve tool stays resident", str(names))
+    check(json.dumps(sent[1]["tools"]) == json.dumps(tools),
+          "[defer] the next turn sends byte-identical tools")
+
+
+def output_shaping_reaches_openai() -> None:
+    print("\n[tier 2] output shaping on OpenAI Chat and Responses")
+    reset_provider()
+    for i in range(16):
+        post(f"{NEXT}/v1/chat/completions", {"model": "gpt-5.5", "messages": [
+            {"role": "system", "content": "You are E2E."},
+            {"role": "user", "content": f"E2E-SHAPE chat task {i}"}]})
+        post(f"{NEXT}/v1/responses", {"model": "gpt-5.5", "instructions": "You are E2E.",
+                                      "input": f"E2E-SHAPE responses task {i}"})
+    chats = [json.loads(r["body"]) for r in sent_to("/v1/chat/completions")]
+    treated = [c for c in chats if "E2E-SHAPED" in c["messages"][0]["content"]]
+    held = [c for c in chats if c["messages"][0]["content"] == "You are E2E."]
+    check(treated and held and len(treated) + len(held) == len(chats) == 16,
+          "[shaping] chat conversations split into a treated and a held-out arm",
+          f"treated {len(treated)}, held {len(held)}, of {len(chats)}")
+    if treated:
+        check(treated[0]["messages"][0]["content"] == "You are E2E.\n\nE2E-SHAPED: answer concisely.",
+              "[shaping] the text is appended to the system message", treated[0]["messages"][0]["content"])
+    responses = [json.loads(r["body"]) for r in sent_to("/v1/responses")]
+    shaped = [r for r in responses if r["instructions"].endswith("E2E-SHAPED: answer concisely.")]
+    check(0 < len(shaped) < len(responses) == 16,
+          "[shaping] Responses instructions are shaped for the treated arm only",
+          f"{len(shaped)} of {len(responses)}")
+    # A treated chat conversation's next turn carries the same text.
+    if treated:
+        task = treated[0]["messages"][1]["content"]
+        reset_provider()
+        post(f"{NEXT}/v1/chat/completions", {"model": "gpt-5.5", "messages": [
+            {"role": "system", "content": "You are E2E."},
+            {"role": "user", "content": task},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "and then?"}]})
+        again = json.loads(sent_to("/v1/chat/completions")[0]["body"])
+        check(again["messages"][0]["content"] == treated[0]["messages"][0]["content"],
+              "[shaping] a treated conversation's next turn carries the same bytes")
+
+
+def gemini_body(output: str) -> dict:
+    return {
+        "systemInstruction": {"parts": [{"text": "You are Gemini CLI."}]},
+        "contents": [
+            {"role": "user", "parts": [{"text": "why does the worker stall?"}]},
+            {"role": "model", "parts": [{"functionCall": {"name": "run_shell_command",
+                                                           "args": {"command": "tail worker.log"}}}]},
+            {"role": "user", "parts": [{"functionResponse": {"name": "run_shell_command",
+                                                              "response": {"output": output}}}]},
+        ],
+    }
+
+
+def gemini_is_compressed() -> None:
+    print("\n[tier 5] Gemini generateContent")
+    reset_provider()
+    log = log_payload(tag="gemini")
+    status, _, body = post(
+        f"{NEXT}/v1beta/models/gemini-2.5-pro:generateContent?key=AIza-e2e",
+        gemini_body(log), {"x-goog-api-key": "AIza-e2e"})
+    check(status == 200 and b"candidates" in body, "[gemini] the answer is relayed", f"{status} {body[:200]!r}")
+    sent = sent_to(":generateContent")
+    if not check(len(sent) == 1, "[gemini] one request reached the provider", str(len(sent))):
+        return
+    check(sent[0]["path"].endswith("?key=AIza-e2e"), "[gemini] the ?key= rides through", sent[0]["path"])
+    check(sent[0]["headers"].get("x-goog-api-key") == "AIza-e2e", "[gemini] and so does x-goog-api-key")
+    body = json.loads(sent[0]["body"])
+    output = body["contents"][2]["parts"][0]["functionResponse"]["response"]["output"]
+    check(len(output) < len(log) / 2, "[gemini] the functionResponse output is compressed",
+          f"{len(log)} -> {len(output)}")
+    check("tools" not in body, "[gemini] no retrieve tool is offered on a family whose answer is not read")
+    check(body["systemInstruction"]["parts"][0]["text"] == "You are Gemini CLI.",
+          "[gemini] the system instruction's own text is untouched")
+
+    status, headers, streamed = post(
+        f"{NEXT}/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse", gemini_body(log_payload(tag="gemini-stream")))
+    check(status == 200 and b"finishReason" in streamed and b'"do"' in streamed,
+          "[gemini] a stream is relayed to its last chunk", f"{status} {streamed[:200]!r}")
+
+
+def anthropic_cloud_body(log: str, version: str) -> dict:
+    # The log is pasted as text rather than carried in a tool_result: the mock
+    # reads any tool_result as the second round of a retrieve loop, and this
+    # body is the first.
+    return {
+        "anthropic_version": version, "max_tokens": 512,
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "check this log"},
+                                         {"type": "text", "text": log}]},
+        ],
+    }
+
+
+def claude_on_vertex_runs_the_retrieve_loop() -> None:
+    print("\n[tier 5] Claude on Vertex AI")
+    reset_provider()
+    path = "/vertex/v1/projects/p/locations/us-east5/publishers/anthropic/models/claude-sonnet-4-5@20250929:rawPredict"
+    status, _, body = post(f"{NEXT}{path}", anthropic_cloud_body(log_payload(tag="vertex"), "vertex-2023-10-16"),
+                           {"authorization": "Bearer ya29.e2e"})
+    text = body.decode("utf-8", "replace")
+    check(status == 200 and '"done"' in text, "[vertex] the client gets one answer", f"{status} {text[:300]}")
+    check("optscale_kompressor_retrieve" not in text, "[vertex] and never sees our tool")
+    sent = sent_to(":rawPredict")
+    check(all(r["path"].startswith("/v1/projects/") for r in sent),
+          "[vertex] the mount prefix is stripped", str([r["path"] for r in sent]))
+    check(len(sent) == 2 and "tool_result" in sent[1]["body"] and "optscale_kompressor_retrieve" in sent[1]["body"],
+          "[vertex] the provider saw a second round carrying the fragment", str(len(sent)))
+    check(all(r["headers"].get("authorization") == "Bearer ya29.e2e" for r in sent),
+          "[vertex] the OAuth token is forwarded on every round")
+
+
+def bedrock_is_signed_and_streamed() -> None:
+    print("\n[tier 5] Claude on Bedrock, and Converse")
+    reset_provider()
+    log = log_payload(tag="bedrock")
+    status, _, body = post(
+        f"{NEXT}/model/anthropic.claude-sonnet-4-5-20250929-v1:0/invoke",
+        anthropic_cloud_body(log, "bedrock-2023-05-31"),
+        {"authorization": "AWS4-HMAC-SHA256 Credential=CLIENT/20000101/x/y/aws4_request, "
+                          "SignedHeaders=host, Signature=" + "0" * 64,
+         "x-amz-date": "20000101T000000Z"})
+    text = body.decode("utf-8", "replace")
+    check(status == 200 and '"done"' in text,
+          "[bedrock] the provider's own SigV4 check accepts every round the proxy signed",
+          f"{status} {text[:300]}")
+    sent = sent_to("/invoke")
+    check(len(sent) == 2, "[bedrock] the retrieve loop ran (two signed rounds)", str(len(sent)))
+    if sent:
+        check(sent[0]["headers"]["authorization"].startswith("AWS4-HMAC-SHA256 Credential=AKIDE2EEXAMPLE/"),
+              "[bedrock] the client's signature was replaced", sent[0]["headers"]["authorization"][:60])
+        first = json.loads(sent[0]["body"])
+        result = first["messages"][0]["content"][1]["text"]
+        check(len(result) < len(log) / 2, "[bedrock] and the signed body is the compressed one",
+              f"{len(log)} -> {len(result)}")
+
+    reset_provider()
+    status, headers, streamed = post(
+        f"{NEXT}/model/anthropic.claude-sonnet-4-5-20250929-v1:0/invoke-with-response-stream",
+        anthropic_cloud_body(log_payload(tag="bedrock-stream"), "bedrock-2023-05-31"),
+        {"authorization": "Bearer ABSKe2eapikey"})
+    check(status == 200 and streamed == EVENTSTREAM_BYTES,
+          "[bedrock] an event-stream is relayed byte for byte", f"{status} {len(streamed)} bytes")
+    sent = sent_to("/invoke-with-response-stream")
+    if sent:
+        check(sent[0]["headers"].get("authorization") == "Bearer ABSKe2eapikey",
+              "[bedrock] a Bedrock API key is forwarded, not replaced")
+        check("tools" not in json.loads(sent[0]["body"]),
+              "[bedrock] no retrieve tool on a stream the proxy cannot read")
+
+    reset_provider()
+    converse_log = log_payload(tag="converse")
+    status, _, body = post(f"{NEXT}/model/amazon.nova-pro-v1:0/converse", {
+        "system": [{"text": "You are an agent."}],
+        "messages": [
+            {"role": "user", "content": [{"text": "check the log"}]},
+            {"role": "assistant", "content": [{"toolUse": {"toolUseId": "t1", "name": "bash", "input": {}}}]},
+            {"role": "user", "content": [{"toolResult": {"toolUseId": "t1", "content": [{"text": converse_log}]}}]},
+        ]})
+    check(status == 200 and b"stopReason" in body, "[converse] signed and answered", f"{status} {body[:200]!r}")
+    sent = sent_to("/converse")
+    if sent:
+        text = json.loads(sent[0]["body"])["messages"][2]["content"][0]["toolResult"]["content"][0]["text"]
+        check(len(text) < len(converse_log) / 2, "[converse] the toolResult text is compressed",
+              f"{len(converse_log)} -> {len(text)}")
+
+
+def redis_scan(pattern: str) -> list[str]:
+    """Every key matching `pattern`, over a raw RESP socket (no client library)."""
+    import socket
+    host, port = REDIS.split(":")
+    keys: list[str] = []
+    with socket.create_connection((host, int(port)), timeout=5) as sock:
+        reader = sock.makefile("rb")
+
+        def command(*args: str):
+            out = f"*{len(args)}\r\n" + "".join(f"${len(a.encode())}\r\n{a}\r\n" for a in args)
+            sock.sendall(out.encode())
+            return read()
+
+        def read():
+            line = reader.readline().rstrip(b"\r\n")
+            kind, rest = line[:1], line[1:]
+            if kind == b"*":
+                return [read() for _ in range(int(rest))]
+            if kind == b"$":
+                n = int(rest)
+                return None if n < 0 else reader.read(n + 2)[:-2].decode()
+            return rest.decode()
+
+        cursor = "0"
+        while True:
+            cursor, batch = command("SCAN", cursor, "MATCH", pattern, "COUNT", "500")
+            keys.extend(batch)
+            if cursor == "0":
+                return keys
+
+
+def a_handle_minted_on_one_proxy_resolves_on_another() -> None:
+    print("\n[tier 4] Redis fragment store, shared by two instances")
+    status, _, body = post(f"{NEXT}/v1/compress/raw", {"content": log_payload(tag="redis")})
+    found = HANDLE.search(json.loads(body).get("content", "")) if status == 200 else None
+    if not check(found is not None, "[redis] kompressor-next mints a handle", f"{status} {body[:200]!r}"):
+        return
+    handle = found.group(1)
+    status, _, body = post(f"{PEER}/v1/retrieve", {"ref": handle})
+    got = json.loads(body)
+    check(status == 200 and got.get("found") is True and "processing batch" in (got.get("content") or ""),
+          "[redis] kompressor-peer resolves it", f"{status} {str(got)[:200]}")
+    keys = redis_scan("kompressor-e2e:r:*")
+    check(any(k.endswith(handle.removeprefix("k_")) or handle in k for k in keys),
+          "[redis] the fragment is a key under the configured prefix", str(keys[:5]))
+
+
+def the_python_client_works_against_the_server() -> None:
+    print("\n[tier 6] the thin Python client")
+    sys.path.insert(0, "/clients/python")
+    try:
+        from kompressor_client import Kompressor, KompressorError
+    except ImportError as error:
+        check(False, "[client] the package imports", repr(error))
+        return
+    client = Kompressor(NEXT)
+    check(client.health(), "[client] health() sees the server")
+    messages = [{"role": "user", "content": "why?"},
+                {"role": "tool", "tool_call_id": "c1", "content": log_payload(tag="client")}]
+    out = client.compress(messages, model="gpt-5.5")
+    check(len(out["messages"][1]["content"]) < len(messages[1]["content"]) / 2 and "stats" in out,
+          "[client] compress() returns the conversation compressed, with stats")
+    raw = client.compress_raw(log_payload(tag="client-raw"))
+    found = HANDLE.search(raw["content"])
+    if check(found is not None, "[client] compress_raw() returns a handle"):
+        got = Kompressor(PEER).retrieve(found.group(1), range={"lines": {"start": 1, "end": 3}})
+        check(got.get("found") is True, "[client] retrieve() on the peer finds it", str(got)[:200])
+    check(client.detect(log_payload(lines=200))["strategy"] == "log", "[client] detect() classifies")
+    miss = client.retrieve("k_AAAAAAAAAAAA")
+    check(miss.get("found") is False and miss.get("hint"), "[client] a miss is an answer, not an exception")
+    try:
+        client.compress([], options={"no_such_knob": 1})
+        check(False, "[client] a refused request raises KompressorError")
+    except KompressorError as error:
+        check(400 <= error.status < 500, "[client] a refused request raises KompressorError with its status",
+              f"{error.status} {error}")
+    dead = Kompressor("http://kompressor-next:1", timeout=2)
+    check(dead.compress_or_passthrough(messages) is messages, "[client] fail-open returns the input")
+
+
+def headroom_port() -> None:
+    if not NEXT:
+        notes.append("KOMPRESSOR_NEXT is unset: the Headroom-port checks did not run")
+        return
+    wait_for(f"{NEXT}/readyz")
+    wait_for(f"{PEER}/readyz")
+    print("\n[tier 3] kompressor doctor is both instances' healthcheck; the runner started, so it passed")
+    tools_are_deferred_from_the_first_turn()
+    output_shaping_reaches_openai()
+    gemini_is_compressed()
+    claude_on_vertex_runs_the_retrieve_loop()
+    bedrock_is_signed_and_streamed()
+    a_handle_minted_on_one_proxy_resolves_on_another()
+    the_python_client_works_against_the_server()
+
 def main() -> int:
     print("kompressor end-to-end suite")
     wait_for(f"{PROVIDER}/_health")
@@ -1318,6 +1630,7 @@ def main() -> int:
     declines_are_honest()
     keep_warm()
     efficiency(floors)
+    headroom_port()
 
     for note in notes:
         print(f"\n  \033[33mnote\033[0m {note}")

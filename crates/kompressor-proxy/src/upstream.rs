@@ -49,6 +49,9 @@ pub(crate) struct Outbound {
     /// so a refusal of either can be answered by sending without it. See
     /// [`crate::retention`].
     retention: Option<retention::Guard>,
+    /// Signs every send for the body it carries, when the upstream is
+    /// configured for AWS SigV4. See [`crate::sigv4`].
+    signer: Option<crate::sigv4::Signer>,
 }
 
 impl Outbound {
@@ -82,6 +85,7 @@ impl Outbound {
             timing: Arc::new(Mutex::new(ProxyTiming::default())),
             started: Instant::now(),
             retention: None,
+            signer: None,
         }
     }
 
@@ -96,6 +100,12 @@ impl Outbound {
     /// The body carries a `prompt_cache_retention` the proxy added.
     pub(crate) fn with_retention(mut self, guard: Option<retention::Guard>) -> Outbound {
         self.retention = guard;
+        self
+    }
+
+    /// Sign each send with AWS SigV4.
+    pub(crate) fn with_signer(mut self, signer: crate::sigv4::Signer) -> Outbound {
+        self.signer = Some(signer);
         self
     }
 
@@ -205,10 +215,14 @@ impl Outbound {
     }
 
     async fn send_body(&self, body: Bytes) -> reqwest::Result<reqwest::Response> {
+        let mut headers = self.headers.clone();
+        if let Some(signer) = &self.signer {
+            signer.sign(self.method.as_str(), &self.url, &mut headers, &body);
+        }
         let mut request = self
             .client
             .request(self.method.clone(), &self.url)
-            .headers(self.headers.clone())
+            .headers(headers)
             .body(body);
         if let Some(timeout) = self.timeout {
             request = request.timeout(timeout);

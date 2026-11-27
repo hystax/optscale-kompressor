@@ -93,6 +93,15 @@ pub enum Injection {
     Unsupported,
 }
 
+/// Whether the retrieve tool can be offered on this family at all: only where
+/// the proxy reads the response and can answer the call itself.
+pub fn offers_tool(family: ApiFamily) -> bool {
+    matches!(
+        family,
+        ApiFamily::OpenAiChat | ApiFamily::OpenAiResponses | ApiFamily::AnthropicMessages
+    )
+}
+
 /// The tool definition in a family's own shape.
 pub fn definition(family: ApiFamily) -> Value {
     match family {
@@ -117,6 +126,18 @@ pub fn definition(family: ApiFamily) -> Value {
             "description": DESCRIPTION,
             "input_schema": parameters(),
         }),
+        // Never injected (see `offers_tool`); the shapes are each wire's own
+        // so a client that declares the tool is still recognised.
+        ApiFamily::GeminiGenerateContent => json!({
+            "name": RETRIEVE_TOOL_NAME,
+            "description": DESCRIPTION,
+            "parameters": parameters(),
+        }),
+        ApiFamily::BedrockConverse => json!({"toolSpec": {
+            "name": RETRIEVE_TOOL_NAME,
+            "description": DESCRIPTION,
+            "inputSchema": {"json": parameters()},
+        }}),
     }
 }
 
@@ -212,6 +233,12 @@ pub fn client_declares_tool(body: &Value, family: ApiFamily) -> bool {
 /// cannot ask for anything back, and a marker the model cannot resolve is worse
 /// than no compression.
 pub fn inject(body: &mut Value, family: ApiFamily) -> Injection {
+    // Gemini and Converse are relayed without a parsed retrieve loop, so a
+    // call to the tool would reach a client that never declared it. Handles
+    // in their requests resolve through the MCP tools instead.
+    if !offers_tool(family) {
+        return Injection::NotNeeded;
+    }
     if client_declares_tool(body, family) {
         return Injection::ClientOwnsTool;
     }
@@ -287,9 +314,12 @@ pub fn tool_name(tool: &Value, family: ApiFamily) -> Option<&str> {
             .and_then(|f| f.get("name"))
             .or_else(|| tool.get("name"))
             .and_then(Value::as_str),
-        ApiFamily::OpenAiResponses | ApiFamily::AnthropicMessages => {
-            tool.get("name").and_then(Value::as_str)
+        ApiFamily::OpenAiResponses | ApiFamily::AnthropicMessages | ApiFamily::BedrockConverse => {
+            tool.get("name")
+                .or_else(|| tool.pointer("/toolSpec/name"))
+                .and_then(Value::as_str)
         }
+        ApiFamily::GeminiGenerateContent => tool.get("name").and_then(Value::as_str),
     }
 }
 

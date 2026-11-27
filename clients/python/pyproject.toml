@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kompressor-client"
+version = "0.1.0"
+description = "Thin, dependency-free client for the OptScale Kompressor HTTP API"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = []
+
+[tool.setuptools]
+packages = ["kompressor_client"]

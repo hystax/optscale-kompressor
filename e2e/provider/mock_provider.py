@@ -23,7 +23,10 @@ Standard library only, deliberately: the image needs no wheels, no index and no
 network, which is most of what makes the suite hermetic.
 """
 
+import hashlib
+import hmac
 import json
+import os
 import re
 import sys
 import threading
@@ -52,9 +55,16 @@ def _record(path: str, headers, body: bytes) -> None:
         )
 
 
+# The example handle in the retrieve tool's own description. Every request
+# carrying the tool carries it, so it is never a handle the proxy minted.
+EXAMPLE_HANDLE = b"k_AbC123dEf456"
+
+
 def _first_handle(body: bytes) -> str | None:
-    found = HANDLE.search(body)
-    return found.group(1).decode() if found else None
+    for found in HANDLE.finditer(body):
+        if found.group(1) != EXAMPLE_HANDLE:
+            return found.group(1).decode()
+    return None
 
 
 def _already_answered(body: bytes) -> bool:
@@ -353,6 +363,111 @@ def _anthropic_stream(handle: str | None) -> bytes:
     return "".join(f"event: {name}\ndata: {data}\n\n" for name, data in frames).encode()
 
 
+# ---------------------------------------------------------------- cloud wires
+#
+# Gemini, Claude on Vertex, Claude on Bedrock and Bedrock Converse. The SigV4
+# verifier below is written from the AWS specification independently of the
+# proxy's Rust signer, so a signature both agree on is one AWS would accept.
+
+AWS_ACCESS_KEY_ID = os.environ.get("E2E_AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_ACCESS_KEY = os.environ.get("E2E_AWS_SECRET_ACCESS_KEY", "")
+
+# Bytes in the shape of an AWS event-stream body. Not decoded by anyone: the
+# proxy must relay them untouched, which the runner checks byte for byte.
+EVENTSTREAM_BYTES = bytes(range(256)) * 16
+
+
+def _uri_encode(text: str, keep_slash: bool) -> str:
+    out = []
+    for byte in text.encode():
+        char = chr(byte)
+        if char.isascii() and (char.isalnum() or char in "-_.~"):
+            out.append(char)
+        elif char == "/" and keep_slash:
+            out.append(char)
+        else:
+            out.append(f"%{byte:02X}")
+    return "".join(out)
+
+
+def _sigv4_problem(method: str, raw_path: str, headers, body: bytes) -> str | None:
+    """Why this request's SigV4 signature is wrong, or None when it is right."""
+    auth = headers.get("authorization") or ""
+    match = re.match(
+        r"AWS4-HMAC-SHA256 Credential=([^/]+)/(\d{8})/([^/]+)/([^/]+)/aws4_request, "
+        r"SignedHeaders=([^,]+), Signature=([0-9a-f]{64})$",
+        auth,
+    )
+    if not match:
+        return f"not a SigV4 authorization: {auth[:40]!r}"
+    key_id, date, region, service, signed, signature = match.groups()
+    if key_id != AWS_ACCESS_KEY_ID:
+        return f"unknown access key {key_id}"
+    payload = hashlib.sha256(body).hexdigest()
+    if headers.get("x-amz-content-sha256") != payload:
+        return "x-amz-content-sha256 is not the hash of the body received"
+    amz_date = headers.get("x-amz-date") or ""
+    if not amz_date.startswith(date):
+        return "x-amz-date disagrees with the credential scope"
+    path, _, query = raw_path.partition("?")
+    pairs = sorted(
+        (_uri_encode(k, False), _uri_encode(v, False))
+        for k, _, v in (p.partition("=") for p in query.split("&") if p)
+    )
+    names = signed.split(";")
+    canonical_headers = "".join(
+        f"{name}:{' '.join((headers.get(name) or '').split())}\n" for name in names
+    )
+    canonical = "\n".join([
+        method,
+        _uri_encode(path, True),
+        "&".join(f"{k}={v}" for k, v in pairs),
+        canonical_headers,
+        signed,
+        payload,
+    ])
+    scope = f"{date}/{region}/{service}/aws4_request"
+    to_sign = "\n".join([
+        "AWS4-HMAC-SHA256", amz_date, scope, hashlib.sha256(canonical.encode()).hexdigest()
+    ])
+    key = ("AWS4" + AWS_SECRET_ACCESS_KEY).encode()
+    for part in (date, region, service, "aws4_request"):
+        key = hmac.new(key, part.encode(), hashlib.sha256).digest()
+    expected = hmac.new(key, to_sign.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        return "signature mismatch"
+    return None
+
+
+def _gemini_answer(text: str = "done") -> dict:
+    return {
+        "candidates": [{"content": {"role": "model", "parts": [{"text": text}]},
+                        "finishReason": "STOP", "index": 0}],
+        "usageMetadata": {"promptTokenCount": 1500, "cachedContentTokenCount": 900,
+                          "candidatesTokenCount": 7, "totalTokenCount": 1507},
+    }
+
+
+def _gemini_stream() -> bytes:
+    chunks = [
+        {"candidates": [{"content": {"role": "model", "parts": [{"text": "do"}]}, "index": 0}],
+         "usageMetadata": {"promptTokenCount": 1500, "candidatesTokenCount": 1}},
+        {"candidates": [{"content": {"role": "model", "parts": [{"text": "ne"}]},
+                         "finishReason": "STOP", "index": 0}],
+         "usageMetadata": {"promptTokenCount": 1500, "candidatesTokenCount": 2,
+                           "totalTokenCount": 1502}},
+    ]
+    return "".join(f"data: {json.dumps(c)}\r\n\r\n" for c in chunks).encode()
+
+
+def _converse_answer(text: str = "done") -> dict:
+    return {
+        "output": {"message": {"role": "assistant", "content": [{"text": text}]}},
+        "stopReason": "end_turn",
+        "usage": {"inputTokens": 1400, "outputTokens": 6, "totalTokens": 1406},
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -401,7 +516,31 @@ class Handler(BaseHTTPRequestHandler):
         handle = None if _already_answered(body) else _first_handle(body)
         streaming = b'"stream":true' in body.replace(b" ", b"")
 
-        if self.path.endswith("/messages"):
+        route = self.path.split("?", 1)[0]
+        # A request signed with SigV4 is verified before anything is answered:
+        # a wrong signature is AWS's 403, and the runner sees it as one.
+        if (self.headers.get("authorization") or "").startswith("AWS4-HMAC-SHA256"):
+            problem = _sigv4_problem("POST", self.path, self.headers, body)
+            if problem:
+                self._send(403, json.dumps({"message": problem}).encode(), "application/json")
+                return
+
+        if route.endswith(":generateContent"):
+            self._send(200, json.dumps(_gemini_answer()).encode(), "application/json")
+        elif route.endswith(":streamGenerateContent"):
+            self._send(200, _gemini_stream(), "text/event-stream")
+        elif route.endswith(":rawPredict") or route.endswith("/invoke"):
+            # Claude on Vertex or Bedrock: an Anthropic body and answer, with the
+            # retrieve loop scripted as for /v1/messages.
+            payload = _anthropic_tool_call(handle) if handle else _anthropic_answer()
+            self._send(200, json.dumps(payload).encode(), "application/json")
+        elif route.endswith(":streamRawPredict"):
+            self._send(200, _anthropic_stream(handle), "text/event-stream")
+        elif route.endswith("/invoke-with-response-stream"):
+            self._send(200, EVENTSTREAM_BYTES, "application/vnd.amazon.eventstream")
+        elif route.endswith("/converse"):
+            self._send(200, json.dumps(_converse_answer()).encode(), "application/json")
+        elif self.path.endswith("/messages"):
             keepwarm = _keepwarm_answer(body)
             if keepwarm is not None:
                 self._send(200, json.dumps(keepwarm).encode(), "application/json")

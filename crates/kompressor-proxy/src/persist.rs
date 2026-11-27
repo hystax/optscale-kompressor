@@ -141,6 +141,10 @@ struct StateFile {
     /// written before the experiment existed still loads.
     #[serde(default)]
     output_shaping: crate::outputshape::ShapingRecord,
+    /// Each conversation's `proxy.tools_defer` decision. Defaulted so a file
+    /// written before deferral existed still loads.
+    #[serde(default)]
+    tool_deferral: Vec<crate::toolcompact::PolicyRecord>,
 }
 
 /// What loading the state file came to.
@@ -226,6 +230,7 @@ pub(crate) fn load(state: &ProxyState) -> Loaded {
     state.stabilizer.restore(file.pinned, &clock);
     state.tool_policies.restore(file.tool_policies, &clock);
     state.output_shaping.restore(file.output_shaping, &clock);
+    state.defer_policies.restore(file.tool_deferral, &clock);
     tracing::info!(
         path = %path.display(),
         conversations,
@@ -266,6 +271,7 @@ pub(crate) fn save(state: &ProxyState) -> Result<Option<PathBuf>, SaveError> {
         pinned: state.stabilizer.snapshot(&clock),
         tool_policies: state.tool_policies.snapshot(&clock),
         output_shaping: state.output_shaping.snapshot(&clock),
+        tool_deferral: state.defer_policies.snapshot(&clock),
     };
     let bytes = serde_json::to_vec(&file)?;
     write_atomically(&path, &bytes).map_err(|source| SaveError::Io {

@@ -101,7 +101,17 @@ sync-check: ## Org invariants: crates carry `repository`, CI uses only allowed a
 	echo "sync-check: ok"
 
 .PHONY: check
-check: lint test bench bench-selftest docs-check ## Everything CI gates on (no docker; see `check-full`)
+check: lint test bench bench-selftest clients-test docs-check ## Everything CI gates on (no docker; see `check-full`)
+
+.PHONY: clients-test
+clients-test: ## The Python and TypeScript clients' tests, against in-process fakes
+	cd clients/python && python3 -m unittest discover -s tests
+	@# The TypeScript half needs tsc; without it the build is skipped and said so.
+	@if command -v npx >/dev/null 2>&1 && [ -d clients/typescript/node_modules/typescript ]; then \
+		cd clients/typescript && npm test; \
+	else \
+		echo "clients-test: TypeScript skipped (run \`npm install\` in clients/typescript)"; \
+	fi
 
 .PHONY: bench-selftest
 bench-selftest: ## The benchmark and replay scripts' own checks. No provider, no spend

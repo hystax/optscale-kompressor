@@ -244,3 +244,112 @@ async fn a_string_system_prompt_is_extended_in_place() {
         );
     }
 }
+
+/// OpenAI families: the same experiment, the instruction where each family
+/// puts the text ahead of the conversation.
+mod openai {
+    use super::*;
+
+    async fn answering_openai(harness: &Harness) {
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "x", "object": "chat.completion",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+            })))
+            .mount(&harness.server)
+            .await;
+    }
+
+    fn chat(task: usize, turns: usize) -> Value {
+        let mut messages = vec![
+            json!({"role": "system", "content": "You are a coding agent."}),
+            json!({"role": "user", "content": format!("Task {task}: fix the bug.")}),
+        ];
+        for turn in 0..turns {
+            messages.push(json!({"role": "assistant", "content": format!("step {turn}")}));
+            messages.push(json!({"role": "user", "content": format!("go on {turn}")}));
+        }
+        json!({"model": "gpt-5.5", "messages": messages})
+    }
+
+    fn responses(task: usize, turns: usize) -> Value {
+        let mut input = vec![json!({"role": "user", "content": format!("Task {task}: fix it.")})];
+        for turn in 0..turns {
+            input.push(json!({"role": "assistant", "content": format!("step {turn}")}));
+            input.push(json!({"role": "user", "content": format!("go on {turn}")}));
+        }
+        json!({"model": "gpt-5.5", "instructions": "You are Codex.", "input": input})
+    }
+
+    /// Open twenty conversations on `path` and return a treated and a held-out task.
+    async fn arms(
+        harness: &Harness,
+        path: &str,
+        body: fn(usize, usize) -> Value,
+    ) -> (usize, usize) {
+        for task in 0..20 {
+            harness.post(path, &body(task, 0)).await;
+        }
+        let rows = proxy_rows(&harness.events);
+        let pick = |want: &str| {
+            rows.iter()
+                .position(|row| arm(row) == Some(want))
+                .unwrap_or_else(|| panic!("no {want} conversation"))
+        };
+        (pick("treated"), pick("holdout"))
+    }
+
+    #[tokio::test]
+    async fn a_treated_chat_conversation_carries_the_text_in_its_system_message_every_turn() {
+        let harness = Harness::with(shaping).await;
+        answering_openai(&harness).await;
+        let (treated, held) = arms(&harness, "/v1/chat/completions", chat).await;
+        for turns in 1..3 {
+            harness
+                .post("/v1/chat/completions", &chat(treated, turns))
+                .await;
+        }
+        let sent = harness.upstream_json().await;
+        let expected = format!("You are a coding agent.\n\n{TEXT}");
+        assert_eq!(sent[treated]["messages"][0]["content"], expected.as_str());
+        for later in &sent[20..] {
+            assert_eq!(later["messages"][0]["content"], expected.as_str());
+        }
+        assert_eq!(
+            sent[held]["messages"][0]["content"], "You are a coding agent.",
+            "the holdout is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_treated_responses_conversation_carries_the_text_in_its_instructions() {
+        let harness = Harness::with(shaping).await;
+        answering_openai(&harness).await;
+        let (treated, held) = arms(&harness, "/v1/responses", responses).await;
+        harness.post("/v1/responses", &responses(treated, 1)).await;
+        let sent = harness.upstream_json().await;
+        let expected = format!("You are Codex.\n\n{TEXT}");
+        assert_eq!(sent[treated]["instructions"], expected.as_str());
+        assert_eq!(sent[20]["instructions"], expected.as_str());
+        assert_eq!(sent[held]["instructions"], "You are Codex.");
+    }
+
+    #[tokio::test]
+    async fn an_openai_conversation_first_seen_under_way_is_outside_the_experiment() {
+        let harness = Harness::with(shaping).await;
+        answering_openai(&harness).await;
+        let body = chat(3, 4);
+        harness.post("/v1/chat/completions", &body).await;
+        assert_eq!(
+            harness.upstream_json().await[0]["messages"],
+            body["messages"]
+        );
+        assert!(
+            proxy_rows(&harness.events)
+                .iter()
+                .all(|row| arm(row).is_none())
+        );
+    }
+}

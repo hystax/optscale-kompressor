@@ -1019,6 +1019,8 @@ pub(crate) fn observation(
         recompacted: None,
         ledger_reads: 0,
         tools_compacted_bytes: 0,
+        tools_proxy_deferred: 0,
+        tools_proxy_deferred_bytes: 0,
         reasoning_elided_bytes: 0,
         client_cache_key: incoming.client_cache_key,
         // Stamped by the caller, which measures them.

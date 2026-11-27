@@ -1043,6 +1043,23 @@ pub fn build_ref_store(config: &Config) -> Result<Arc<dyn RefStore>, crate::erro
         RefsBackend::Memory => Ok(Arc::new(
             MemoryRefStore::new().with_max_bytes(config.refs.max_bytes),
         )),
+        RefsBackend::Redis => {
+            use kompressor_store::redis::{RedisOptions, RedisRefStore};
+            let mut options = RedisOptions::new(&config.refs.redis_url).map_err(|e| {
+                crate::error::CoreError::Store(kompressor_store::StoreError::Redis(e))
+            })?;
+            options.prefix = config.refs.redis_prefix.clone();
+            options.timeout = config.refs.redis_timeout;
+            options.pool = config.refs.redis_pool;
+            let store = RedisRefStore::open(options)?;
+            // Shared with other proxies, so a retrieval racing its own write
+            // is served here rather than across the network.
+            Ok(Arc::new(
+                CachedRefStore::new(store)
+                    .with_capacity(config.refs.recent_cache_entries)
+                    .with_max_bytes(config.refs.recent_cache_bytes),
+            ))
+        }
         RefsBackend::Sqlite => {
             if let Some(parent) = config.refs.path.parent()
                 && !parent.as_os_str().is_empty()

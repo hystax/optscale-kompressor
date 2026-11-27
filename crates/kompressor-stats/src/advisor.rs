@@ -744,12 +744,11 @@ fn reasoning(prefix: &PrefixReport) -> Advice {
 
 fn deferral(prefix: &PrefixReport) -> Advice {
     let mut out = advice(
-        "tool deferral",
+        "tools_defer",
         "Defer tool definitions (Anthropic)",
         UNDEFERRED_SHARE,
         "of Anthropic requests with a long tool list and none deferred",
     );
-    out.built = false;
     let anthropic: Vec<_> = prefix
         .composition
         .iter()
@@ -783,8 +782,9 @@ fn deferral(prefix: &PrefixReport) -> Advice {
     if share >= UNDEFERRED_SHARE {
         out.verdict = Verdict::TurnOn;
         out.why = format!(
-            "{} of Anthropic requests carry a long tool list whole. Deferral is not built: \
-             this is the case for building it, after a probe of the live API.",
+            "{} of Anthropic requests carry a long tool list whole. `tools_defer = true` \
+             keeps all but the tools named in `tools_defer_keep` out of the prompt until the \
+             model searches for one (first-party Anthropic API only).",
             percent(share)
         );
     } else {
