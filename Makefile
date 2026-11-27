@@ -353,6 +353,25 @@ freebsd-pkg: freebsd-builder ## FreeBSD .pkg (binary, rc.d service, config), bui
 	docker run --rm -u "$$(id -u):$$(id -g)" -v "$(CURDIR):/src" \
 		kompressor-freebsd-builder ./scripts/build/freebsd.sh pkg
 
+.PHONY: linux-arm64-builder
+linux-arm64-builder:
+	docker build -f scripts/build/Dockerfile.linux-arm64 -t kompressor-linux-arm64-builder scripts/build
+
+# All four run scripts/build/linux-arm64.sh in the container. That script also
+# runs directly on a host with zig and cargo-zigbuild, x86_64 or arm64.
+LINUX_ARM64_RUN := docker run --rm -u "$$(id -u):$$(id -g)" -v "$(CURDIR):/src" \
+	kompressor-linux-arm64-builder ./scripts/build/linux-arm64.sh
+
+.PHONY: linux-arm64 linux-arm64-deb linux-arm64-rpm linux-arm64-all
+linux-arm64: linux-arm64-builder ## Linux arm64 (aarch64, glibc >= 2.28) binary built in a container
+	$(LINUX_ARM64_RUN) bin
+linux-arm64-deb: linux-arm64-builder ## Linux arm64 .deb, built in the same container
+	$(LINUX_ARM64_RUN) deb
+linux-arm64-rpm: linux-arm64-builder ## Linux arm64 .rpm, built in the same container
+	$(LINUX_ARM64_RUN) rpm
+linux-arm64-all: linux-arm64-builder ## Linux arm64 binary, .deb and .rpm from one build, into target/linux-arm64
+	$(LINUX_ARM64_RUN) all
+
 .PHONY: docker
 docker: ## Container image from the static binary
 	./scripts/build/docker.sh $(DOCKER_IMAGE) $(DOCKER_TAG) $(STATIC_TARGET)

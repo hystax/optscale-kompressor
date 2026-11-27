@@ -1,0 +1,51 @@
+# Builder image for the Linux arm64 (aarch64, glibc) binary, .deb and .rpm,
+# cross-built on any Linux host.
+#
+#   docker build -f scripts/build/Dockerfile.linux-arm64 -t kompressor-linux-arm64-builder scripts/build
+#   docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/src" kompressor-linux-arm64-builder
+#
+# Or `make linux-arm64` / `-deb` / `-rpm` / `-all`. The context is
+# scripts/build because nothing is copied in.
+#
+# zig is the cross compiler and linker. It ships glibc stubs for every version,
+# which is what lets the build pin the libc floor the packages declare (see
+# scripts/build/linux-arm64.sh). A gcc-aarch64-linux-gnu toolchain would link
+# against this image's glibc instead, and then the floor would be whatever
+# Debian release the image happens to be built on.
+FROM rust:1.95-bookworm
+
+# Pinned so an image rebuilt in six months produces the same artifact. Debian
+# ships zig 0.6, and cargo-zigbuild refuses anything below 0.9.
+ARG ZIG_VERSION=0.16.0
+ARG CARGO_ZIGBUILD_VERSION=0.23.4
+ARG CARGO_DEB_VERSION=3.6.2
+ARG CARGO_GENERATE_RPM_VERSION=0.21.0
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-venv binutils ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# zig via its Python distribution, as in Dockerfile.macos: the simplest way to
+# pin a version for whichever architecture the image is built on.
+RUN python3 -m venv /opt/zigenv \
+    && /opt/zigenv/bin/pip install --no-cache-dir "ziglang==${ZIG_VERSION}" \
+    && printf '#!/bin/sh\nexec /opt/zigenv/bin/python -m ziglang "$@"\n' > /usr/local/bin/zig \
+    && chmod 755 /usr/local/bin/zig \
+    && zig version
+
+RUN cargo install --locked "cargo-zigbuild@${CARGO_ZIGBUILD_VERSION}" \
+    && cargo install --locked "cargo-deb@${CARGO_DEB_VERSION}" \
+    && cargo install --locked "cargo-generate-rpm@${CARGO_GENERATE_RPM_VERSION}" \
+    && rm -rf /usr/local/cargo/registry \
+    && rustup target add aarch64-unknown-linux-gnu
+
+# Writable by any uid, so `-u` leaves host-owned files. A uid with no passwd
+# entry would otherwise get HOME=/.
+ENV CARGO_HOME=/tmp/cargo \
+    XDG_CACHE_HOME=/tmp/.cache \
+    HOME=/tmp \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN mkdir -p /tmp/cargo /tmp/.cache && chmod 1777 /tmp /tmp/cargo /tmp/.cache
+
+WORKDIR /src
+CMD ["./scripts/build/linux-arm64.sh", "bin"]
