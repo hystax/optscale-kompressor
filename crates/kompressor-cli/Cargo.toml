@@ -146,6 +146,23 @@ assets = [
     { source = "../../LICENSE", dest = "/usr/share/doc/kompressor/LICENSE", mode = "644", doc = true },
 ]
 
+# Linux arm64, the RPM side of [package.metadata.deb.variants.arm64]: see the
+# note there for why the binary is staged and the libc floor is written out.
+# `auto-req` would run ldd over an aarch64 binary on an x86_64 host and report
+# nothing, so it is off and glibc is named. `requires` is repeated in full
+# because a variant replaces the table rather than merging into it.
+[package.metadata.generate-rpm.variants.arm64]
+auto-req = "disabled"
+requires = { glibc = ">= 2.28", shadow-utils = "*", systemd = "*" }
+assets = [
+    { source = "../../target/arm64/kompressor", dest = "/usr/bin/kompressor", mode = "755" },
+    { source = "../../packaging/kompressor.toml", dest = "/etc/kompressor/config.toml", mode = "644", config = "noreplace" },
+    { source = "../../packaging/systemd/kompressor.service", dest = "/usr/lib/systemd/system/kompressor.service", mode = "644" },
+    { source = "../../README.md", dest = "/usr/share/doc/kompressor/README.md", mode = "644", doc = true },
+    { source = "../../docs/QUICKSTART.md", dest = "/usr/share/doc/kompressor/QUICKSTART.md", mode = "644", doc = true },
+    { source = "../../LICENSE", dest = "/usr/share/doc/kompressor/LICENSE", mode = "644", doc = true },
+]
+
 [package.metadata.deb.systemd-units]
 unit-scripts = "../../packaging/systemd"
 unit-name = "kompressor"
@@ -200,6 +217,31 @@ depends = "adduser"
 # only the first line differs from [package.metadata.deb] above.
 assets = [
     ["../../target/static/kompressor", "usr/bin/", "755"],
+    ["../../packaging/kompressor.toml", "etc/kompressor/config.toml", "644"],
+    ["../../README.md", "usr/share/doc/kompressor/README.md", "644"],
+    ["../../docs/QUICKSTART.md", "usr/share/doc/kompressor/QUICKSTART.md", "644"],
+    ["../../LICENSE", "usr/share/doc/kompressor/LICENSE", "644"],
+]
+
+# --- Linux arm64 (aarch64, glibc) ------------------------------------------
+# `make linux-arm64-deb`, or scripts/build/linux-arm64.sh deb. The binary is
+# cross-built and staged at target/arm64/kompressor first, for the same reason
+# as target/static above: cargo-deb would otherwise package whatever sits at
+# the unrewritten path, which on an x86_64 host is the x86_64 binary.
+#
+# `$auto` cannot work here: it runs dpkg-shlibdeps, which looks for the arm64
+# libc on the build host, does not find it, and silently produces *no* libc
+# dependency at all. So the dependency is stated. It is also exact rather than
+# a guess: the build pins glibc 2.28 through cargo-zigbuild, so GLIBC_2.28 is
+# the highest symbol version the binary can reference (Debian 10, Ubuntu
+# 20.04, RHEL 8 and everything newer). libm, libpthread and libdl, the other
+# NEEDED entries, all ship in libc6. Raise both numbers together, here and in
+# scripts/build/linux-arm64.sh, or not at all.
+[package.metadata.deb.variants.arm64]
+name = "kompressor"
+depends = "libc6 (>= 2.28), adduser"
+assets = [
+    ["../../target/arm64/kompressor", "usr/bin/", "755"],
     ["../../packaging/kompressor.toml", "etc/kompressor/config.toml", "644"],
     ["../../README.md", "usr/share/doc/kompressor/README.md", "644"],
     ["../../docs/QUICKSTART.md", "usr/share/doc/kompressor/QUICKSTART.md", "644"],

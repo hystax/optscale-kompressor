@@ -333,6 +333,9 @@ and check it against `SHA256SUMS` from the same page
 | Debian, Ubuntu | `kompressor_<version>-1_amd64.deb` | `sudo apt install ./kompressor_*-1_amd64.deb` |
 | RHEL, Fedora | `kompressor-<version>-1.x86_64.rpm` | `sudo dnf install ./kompressor-*-1.x86_64.rpm` |
 | Any Linux x86_64 | `kompressor-<version>-x86_64-linux-musl` (static) | `install -m 755 kompressor-*-x86_64-linux-musl ~/.local/bin/kompressor` |
+| Debian, Ubuntu on arm64 | `kompressor_<version>-1_arm64.deb` | `sudo apt install ./kompressor_*-1_arm64.deb` |
+| RHEL, Fedora on aarch64 | `kompressor-<version>-1.aarch64.rpm` | `sudo dnf install ./kompressor-*-1.aarch64.rpm` |
+| Any Linux arm64, glibc 2.28+ | `kompressor-<version>-aarch64-linux-gnu` | `install -m 755 kompressor-*-aarch64-linux-gnu ~/.local/bin/kompressor` |
 | macOS (Apple silicon and Intel) | `kompressor-<version>-universal2.pkg` | `sudo installer -pkg kompressor-*-universal2.pkg -target /` |
 | Windows x86_64 | `kompressor-<version>-x86_64-setup.exe` | run it; see [docs/WINDOWS.md](docs/WINDOWS.md) |
 

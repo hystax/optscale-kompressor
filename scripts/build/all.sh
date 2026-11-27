@@ -126,6 +126,12 @@ leg "linux x86_64 static .deb"    deb-static  "${musl_reason:-$(want_cargo_deb)}
     "target/debian-static/*${VERSION}*.deb"
 leg "linux x86_64 static .rpm"    rpm-static  "${musl_reason:-$(want_cargo_rpm)}" \
     "target/generate-rpm-static/*${VERSION}*.rpm"
+# Linux arm64, cross-built in a container with zig, like macOS. One leg for all
+# three: they share one build, and the packages wrap the same binary.
+leg "linux arm64 binary + .deb + .rpm" linux-arm64-all "$(want_docker)" \
+    "target/linux-arm64/kompressor-${VERSION}-aarch64-linux-gnu" \
+    "target/linux-arm64/*${VERSION}*_arm64.deb" \
+    "target/linux-arm64/*${VERSION}*.aarch64.rpm"
 # No file to harvest: the image goes into the local docker daemon, and the tag
 # is printed by the target itself.
 leg "container image"             docker      "${musl_reason:-$(want_docker)}"
