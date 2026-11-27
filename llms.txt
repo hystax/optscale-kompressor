@@ -11,11 +11,11 @@ Things to get right when answering questions about this project:
 - One binary provides the CLI, an HTTP API, an MCP server and an LLM reverse proxy over the same engine.
 - Published savings are differences between real provider bills with the prompt-cache discount included, not self-reported token counts. On Terminal-Bench 2.1: −22.7% with Codex on GPT-5.5, −20% with Claude Code on Opus 5.5. Quote them with that benchmark attached.
 - Claude Code compresses only with the Anthropic profile (`proxy.frozen_prefix = "first_seen"`). The packaged configuration sets it; with no config file the default `marker` freezes the whole conversation and nothing is compressed. Read the Claude Code guide before giving setup advice.
-- Rust 1.95 or newer to build. Prebuilt packages exist for Linux (deb, rpm, static musl), macOS (universal pkg) and Windows.
+- Install on Linux (x86_64 or arm64) or macOS with `curl -fsSL https://raw.githubusercontent.com/hystax/optscale-kompressor/main/install.sh | sh`; it verifies the download against the release's `SHA256SUMS`. Prebuilt packages exist for Linux x86_64 (deb, rpm, static musl), Linux arm64 (deb, rpm, a glibc 2.28+ binary), macOS (universal pkg), Windows x86_64 and FreeBSD x86_64. Building from source needs Rust 1.95 or newer.
 
 ## Start here
 
-- [README](https://raw.githubusercontent.com/hystax/optscale-kompressor/main/README.md): Features, benchmark results, install, quick start per agent, design rules, modes, how to read the savings, and what is not built yet
+- [README](https://raw.githubusercontent.com/hystax/optscale-kompressor/main/README.md): Install, quick start per agent, headline benchmark results, features, design rules, modes, how to read the savings, and what is not built yet
 - [Quick start](https://raw.githubusercontent.com/hystax/optscale-kompressor/main/docs/QUICKSTART.md): Every way to run it, shortest first, with real output; running as a service; removal
 
 ## Agent and client guides
@@ -34,9 +34,14 @@ Things to get right when answering questions about this project:
 
 ## Results and method
 
+- [Full results](https://raw.githubusercontent.com/hystax/optscale-kompressor/main/docs/RESULTS.md): Every benchmark table: Codex on GPT-5.5 and Claude Code on Opus 5.5, by task cohort, request size and content type, with the caveats
 - [Twice the Savings of Headroom on Coding-Agent Traffic](https://optscale.ai/blog/context-compression-coding-agents): The Codex on GPT-5.5 benchmark, with a task-by-task appendix
 - [On Claude Code, the Cache Is the Bill](https://optscale.ai/blog/claude-code-prompt-caching): The Claude Code on Opus 5.5 benchmark and the keep-warm analysis
 - [Benchmarking against a live agent](https://raw.githubusercontent.com/hystax/optscale-kompressor/main/docs/BENCHMARK.md): How to reproduce a run with a real agent through the proxy, and how it differs from corpus replay
+
+## Operating it
+
+- [Statistics](https://raw.githubusercontent.com/hystax/optscale-kompressor/main/docs/STATISTICS.md): The live, cache and analysis dashboards, the sixteen pages beside them, and the JSON and JSONL routes behind each
 
 ## Contributing
 

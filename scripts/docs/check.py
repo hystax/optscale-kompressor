@@ -33,7 +33,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 BIN = ROOT / "target" / "release" / "kompressor"
-DOCS = ["README.md", "docs/QUICKSTART.md", "docs/DESIGN.md"]
+DOCS = [
+    "README.md",
+    "docs/QUICKSTART.md",
+    "docs/DESIGN.md",
+    "docs/RESULTS.md",
+    "docs/STATISTICS.md",
+]
 
 
 def free_port() -> int:

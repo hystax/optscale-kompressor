@@ -8,323 +8,69 @@
 
 OptScale Kompressor sits between a coding agent and its model provider. It
 removes the repetitive tool output agents re-send on every turn, and on Claude
-Code it keeps the provider's prompt cache alive while tools run. Each feature has
-its own write-up and its own results:
+Code it keeps the provider's prompt cache alive while tools run.
 
-| Feature | Measured on | Bill vs no compression | Results |
-| --- | --- | --- | --- |
-| [Cache-safe compression of tool output](#feature-cache-safe-compression) | Codex on GPT-5.5 | **−22.7%**, about twice Headroom's savings | [Codex results](#results-codex) |
-| [On Claude Code, the cache is the bill](#feature-claude-code-cache) | Claude Code on Opus 5.5 | **−20%**, with 99% fewer tokens lost to cache expiry | [Claude Code results](#results-claude-code) |
+Install it (Linux and macOS; [other platforms](#install)):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hystax/optscale-kompressor/main/install.sh | sh
+```
+
+Then run your agent through it:
 
 ```bash
 kompressor wrap codex
 ```
 
 That starts the proxy, points Codex at it, runs Codex, and cleans up on exit.
-When the session ends it tells you what happened:
+`wrap` also knows `claude`, `opencode` and `aider`. When the session ends it
+tells you what happened:
 
 ```console
 kompressor: 26 request(s), 126 message(s) compressed, ~2029706 tokens saved (2015180 net of retrieval)
 ```
 
----
-
-## Features
-
-<a id="feature-cache-safe-compression"></a>
-### Cache-safe compression of tool output
-
-Every step a coding agent takes, it re-sends its entire working history to the
-model: every apt-get log, every compiler warning, every progress bar. On a long
-task the model re-reads the same build output dozens of times, and you pay for
-every read.
-
-We built OptScale Kompressor to stop that, for many teams and agents at once.
-The same input compresses to the same bytes every turn, so the prompt cache
-keeps working, and every removed detail stays one retrieval away.
-
-One rule decides everything else: **the same input compresses to the same bytes,
-every turn.** On agent traffic most input tokens are billed as prompt-cache reads,
-at roughly a tenth of the fresh price — measured at 93.0% of billed prompt on an
-89-task run. A compressor whose output shifts between turns breaks that cache and
-costs more than it saves.
-
-On Terminal-Bench 2.1 with Codex on GPT-5.5 it takes 22.7% off the real bill. How
-is it different from Headroom, the best-known open-source context compressor,
-which has grown into a platform? Kompressor is deliberately just a compressor,
-and it saves about twice as much.
-
-**Results:** [Codex on GPT-5.5](#results-codex) · **Write-up:**
-[Twice the Savings of Headroom on Coding-Agent Traffic](https://optscale.ai/blog/context-compression-coding-agents)
-
-<a id="feature-claude-code-cache"></a>
-### On Claude Code, the cache is the bill
-
-Claude Code marks its conversation with explicit cache breakpoints, so almost
-every request is a long cached prefix plus a short new tail: 92–95% of billed
-prompt tokens are cache reads. On Opus 5.5 a cache read costs $0.20 per million
-tokens and a five-minute cache write $5, 25 times more. A default cache entry
-lives five minutes, and a training run, a full build or a long simulation can
-keep the agent idle for longer. When it comes back, the whole prefix is written
-to the cache again at full price. So on Claude Code the question is less "how
-much can we remove?" and more "how much can we avoid paying twice?".
-
-Kompressor's Anthropic profile answers it in three parts:
-
-- **Compress only the uncached tail.** Messages inside the prefix the provider
-  has already cached stay byte-identical; only the new tail is compressed, the
-  first time it is sent. Elisions under 4,000 characters ship whole, and
-  function-body elision is off for this provider, because a retrieval round on
-  Claude Code re-sends a large prefix.
-- **Keep the cache alive while tools run.** While the agent runs a tool,
-  Kompressor re-sends the last request body every 4.5 minutes with
-  `max_tokens: 1`, so the provider reads the cached prefix and the entry's
-  five-minute clock restarts. Keep-warm stops at the agent's next request, after
-  11 pings (about 50 minutes), at the first failed ping, or if a ping reads no
-  cached tokens. After a conversation's first idle gap longer than five minutes,
-  Kompressor switches it to one-hour cache entries.
-- **Price every decision on the real bill:** per-model cache prices, the system
-  prompt and tool definitions it never compresses, and Anthropic's 20-block cache
-  lookback.
-
-**Results:** [Claude Code on Opus 5.5](#results-claude-code) · **Write-up:**
-[On Claude Code, the Cache Is the Bill](https://optscale.ai/blog/claude-code-prompt-caching) ·
-**Set-up:** [Quick start → Claude Code](#quick-start-claude-code)
-
----
-
-## Results
-
-Every figure below is the difference between real provider bills, with the
-prompt-cache discount included. Self-reported savings, which price removed tokens
-at the uncached list rate, are not used. Each feature has its own section:
-
-- [Codex on GPT-5.5](#results-codex): cache-safe compression of tool output
-- [Claude Code on Opus 5.5](#results-claude-code): the cache is the bill
-
-<a id="results-codex"></a>
-### Codex on GPT-5.5
-
-**Feature:** [Cache-safe compression of tool output](#feature-cache-safe-compression) ·
-**Full write-up, with the task-by-task appendix:**
-[Twice the Savings of Headroom on Coding-Agent Traffic](https://optscale.ai/blog/context-compression-coding-agents)
-
-**On Terminal-Bench 2.1.** 89 tasks, Codex CLI on GPT-5.5 ($5.00 / $0.50 / $30.00 per million uncached / cached / output tokens), Harbor with 3 concurrent trials. Four arms: no compression; Headroom 0.40 at its defaults, with its ML model; Headroom at its most aggressive setting (retrieval off, a 120-token size floor, at most 8 array items); OptScale Kompressor via OptScale AI. The table is one full run over the 87 tasks every arm completed. Trials that failed agent setup for external reasons are excluded. Cost and token savings are statistically significant; the solve-rate differences are not.
-
-
-| Per full run          | No compression | Headroom | Kompressor  |
-| --------------------- | -------------- | -------- | ----------- |
-| Cost                  | $107.89        | $99.04   | **$83.40**  |
-| Input tokens          | 96.1M          | 95.5M    | **72.2M**   |
-| Uncached input tokens | 6.68M          | 5.16M    | **4.46M**   |
-| Tasks solved          | 82.2%          | 81.6%    | 81.1%       |
-| Median trial time     | 4.8 min        | 5.3 min  | **4.5 min** |
-
-
-Headroom in that table is the default. Against the same baseline its most
-aggressive setting saved 11.6%.
-
-
-| Against no compression            | Cost       | Solved |
-| --------------------------------- | ---------- | ------ |
-| Kompressor                        | **−22.7%** | 81.1%  |
-| Headroom, most aggressive setting | −11.6%     | 85.1%  |
-| Headroom, default                 | −8.2%      | 81.6%  |
-
-
-Kompressor's saving is 2.0× Headroom's most aggressive setting and 2.8× its
-default. Head to head with the default, Kompressor is 15.8% cheaper, sends 24.4%
-fewer input tokens and 13.6% fewer uncached input tokens, and solves 0.5 points
-fewer tasks (81.1% vs 81.6%). It was cheaper on 54 of 87 tasks. The gap sits in
-long, log-heavy work — ML training, cross-compilation, statistical modelling. On
-short tasks neither tool has much to remove.
-
-**By task cohort.** Removed is the share of eligible tool output (at least 512
-characters) taken out. ML training, source builds and data pipelines produce 83%
-of the total saving. Compression is weakest where outputs are tiny, and where
-they are prose that should not be folded.
-
-
-| Task cohort                                     | Tool output per task | Removed | Bill vs no compression |
-| ----------------------------------------------- | -------------------- | ------- | ---------------------- |
-| ML training, sampling and evaluation (17 tasks) | 598K chars           | **81%** | −26%                   |
-| Reverse engineering and security (12)           | 310K chars           | **69%** | −5%                    |
-| Building software from source (10)              | 1,178K chars         | **64%** | −28%                   |
-| Service configuration and git (10)              | 262K chars           | **58%** | −14%                   |
-| Data pipelines and media (9)                    | 288K chars           | **55%** | −37%                   |
-| Text, documents and sequences (7)               | 120K chars           | **51%** | −23%                   |
-| Algorithms, maths and puzzles (22)              | 99K chars            | **48%** | −8%                    |
-
-
-**Smaller requests.** A cached token is still sent, and it still fills the
-context window. Byte sizes are estimated at 4.35 bytes of request JSON per token,
-measured on the no-compression runs.
-
-
-|                           | No compression          | Headroom         | Kompressor          |
-| ------------------------- | ----------------------- | ---------------- | ------------------- |
-| Prompt sent per run       | 96.1M tokens · ~418 MB  | 95.5M · ~415 MB  | **72.2M · ~314 MB** |
-| 90th-percentile request   | 106.9K tokens · ~465 KB | 110.5K · ~481 KB | **66.5K · ~289 KB** |
-| Requests over 100K tokens | 11.2%                   | 12.0%            | **3.2%**            |
-| Requests over 200K tokens | 1.9%                    | 0.6%             | **0.13%**           |
-
-
-Without compression, 1.9% of requests passed 200K of GPT-5.5's 258K window, and
-two trials compacted their context. With Kompressor, 0.13% did, and one trial
-compacted. On the heavy tasks, `mcmc-sampling-stan` peaked at 60K tokens instead
-of 165K, and `caffe-cifar-10` at 68K instead of 152K. Where a provider does not
-cache, the 25% cut in prompt traffic goes straight to the bill.
-
-**Replayed on the same traffic.** The same 6,255 tool outputs (34.2M characters)
-through three engines at default settings: optscale-kompressor 0.13, Headroom
-0.40 with its ML model off, and Headroom 0.40 with Magika detection plus its
-ModernBERT model.
-
-
-| Content type                 | Share    | Kompressor | Headroom, ML on | Headroom, ML off |
-| ---------------------------- | -------- | ---------- | --------------- | ---------------- |
-| Listings and dumps           | 27.8%    | **81.8%**  | 22.6%           | 7.0%             |
-| Plain text                   | 25.3%    | **41.0%**  | 20.6%           | 5.2%             |
-| Build output and logs        | 19.3%    | **75.4%**  | 17.1%           | 4.2%             |
-| Source code                  | 13.8%    | **35.0%**  | 31.9%           | 0.0%             |
-| Search results               | 11.1%    | **82.7%**  | 25.5%           | 25.4%            |
-| Diffs, config, HTML, JSON    | 2.7%     | **40.9%**  | 19.8%           | 12.5%            |
-| **All eligible tool output** | **100%** | **62.8%**  | 22.6%           | 7.3%             |
-| Time per KB                  |          | **0.2 ms** | 87 ms           | 1.5 ms           |
-
-
-Kompressor removes 2.8× as much as Headroom with its ML model on, and 8.6× as
-much as Headroom without it, in about 1/440 of the time the model needs. Every
-removed detail stays retrievable.
-
-<a id="results-claude-code"></a>
-### Claude Code on Opus 5.5
-
-**Feature:** [On Claude Code, the cache is the bill](#feature-claude-code-cache) ·
-**Full write-up:**
-[On Claude Code, the Cache Is the Bill](https://optscale.ai/blog/claude-code-prompt-caching)
-
-**On Terminal-Bench 2.1.** 89 tasks, Claude Code on Opus 5.5 ($4.00 / $0.20 / $5.00 / $8.00 / $20.00 per million uncached input / cache read / five-minute cache write / one-hour cache write / output tokens). Two arms: no compression, and OptScale Kompressor with the Anthropic profile. The metric is what Anthropic charges: every API request, including keep-warm pings and Claude Code's calls to other models. Harbor's own cost sees only the requests in the agent's trajectory; without compression it reported $32.00 against $35.35 billed. Trials that failed agent setup are excluded.
-
-
-| Per 89-task run                    | No compression | Kompressor         |
-| ---------------------------------- | -------------- | ------------------ |
-| Anthropic API bill                 | $35.35         | **$28.30 (−20%)**  |
-| Tasks solved                       | 89.9%          | 90.6%              |
-| Prompt tokens served from cache    | 92.0%          | **94.8%**          |
-| Cache writes                       | 2.78M tokens   | **1.67M (−40%)**   |
-| Prompt tokens lost to cache expiry | 927K           | **13K (−99%)**     |
-| Output tokens                      | 660K           | 596K               |
-| Agent steps                        | 1,104          | 1,080              |
-
-
-Individual Kompressor runs cost between $27.86 and $28.68 and solved 80–81 tasks.
-
-**Where the money went.** Cache writes account for most of the difference:
-$5.59 of $7.05. The extra spend on pings and one-hour entries comes to under a
-dollar, about a sixth of what the writes saved.
-
-
-| Per run                | No compression | Kompressor | Change     |
-| ---------------------- | -------------- | ---------- | ---------- |
-| Cache writes, 5-minute | $14.16         | $8.57      | **−$5.59** |
-| Cache writes, 1-hour   | —              | $0.14      | +$0.14     |
-| Cache reads            | $7.37          | $6.46      | −$0.91     |
-| Output                 | $13.60         | $12.31     | −$1.29     |
-| Uncached input         | $0.23          | $0.09      | −$0.14     |
-| Keep-warm pings        | —              | $0.73      | +$0.73     |
-| **Total**              | **$35.35**     | **$28.30** | **−$7.05** |
-
-
-**Keep-warm.** Each bridged gap would otherwise have ended in a full rewrite of
-the prefix, which is what the uncompressed agent paid: 927K tokens per run. Net
-of the pings, keep-warm saved about $3.9 per run, roughly 11% of the
-uncompressed bill, on its own. In most runs no turn lost its cache at all.
-
-
-| Keep-warm, per run                                   | Average | Range        |
-| ---------------------------------------------------- | ------- | ------------ |
-| Pings sent                                           | 93      | 73–112       |
-| Idle gaps over five minutes bridged                  | 28      | 22–35        |
-| Prefix tokens kept warm                              | 0.96M   | 0.78M–1.20M  |
-| Cost of the pings                                    | $0.73   | $0.46–0.89   |
-| Rewrites avoided, at $5 instead of $0.20 per million | ~$4.6   | ~$3.7–5.7    |
-
-
-**Reading it honestly.** Agents do not take the same path twice. Four tasks
-account for the whole net difference: `winning-avg-corewars`, `regex-chess`,
-`sam-cell-seg` and `crack-7z-hash`. On the first three, the uncompressed agent
-took a much longer path: 45–72 steps against 19–26. Kompressor was cheaper on 44
-of the 89 tasks. Splitting tasks by whether they wait on long-running tools
-separates the two effects:
-
-
-| Tasks                                                                | Count | Cost     | Median cost per step |
-| -------------------------------------------------------------------- | ----- | -------- | -------------------- |
-| With idle gaps over five minutes (training, builds, long simulations) | 14    | **−34%** | **−20%**             |
-| All others                                                           | 72    | −12%     | +2%                  |
-
-
-Where the cache would expire, keep-warm and the adaptive TTL make each step
-cheaper. On a typical short task a step costs what it did before, and the rest of
-that cohort's saving comes from shorter paths. The mechanism-level estimate,
-which we expect to hold up across repeated measurements, is about 11% from
-keeping the cache alive plus a few percent from compressing the tail.
-
-**What compression still does on Claude Code.**
-
-
-| Per run, average                              | Value                                   |
-| --------------------------------------------- | --------------------------------------- |
-| Tokens removed from the uncached tail         | 348K (4.7–8.0% of what the engine saw)  |
-| Messages protected inside the cached prefix   | ~1,800, about 2.2M tokens               |
-| Elisions with a retrieval handle              | 126                                     |
-| Retrievals the model made                     | 0–2 per run, every one a hit            |
-
-
-Removal is far below the 62.8% in the [Codex replay](#results-codex), by design:
-the engine only sees the uncached tail, skips elisions under 4,000 characters,
-and leaves code bodies alone on this provider. The model almost never needs to
-retrieve anything, so compression adds no retrieval cost of its own.
+Measured on Terminal-Bench 2.1, as the difference between real provider bills:
+
+| Agent | Bill vs no compression | Tasks solved | What does it |
+| --- | --- | --- | --- |
+| Codex on GPT-5.5 | **−22.7%**, about twice Headroom's savings | 81.1% vs 82.2% | [Cache-safe compression of tool output](#feature-cache-safe-compression) |
+| Claude Code on Opus 5.5 | **−20%**, with 99% fewer tokens lost to cache expiry | 90.6% vs 89.9% | [Keeping the prompt cache alive](#feature-claude-code-cache) |
+
+[Results](#results) · [Reading the savings honestly](#reading-the-savings-honestly) ·
+[Not built yet](#not-built-yet)
 
 ---
 
 ## Install
 
-Pre-built binaries for Linux (x86_64, arm64) and macOS (arm64, x86_64), with
-checksums, are on the [Releases page](https://github.com/hystax/optscale-kompressor/releases/latest).
-
-With Cargo (Rust 1.95 or newer):
-
 ```bash
-cargo install --locked --git https://github.com/hystax/optscale-kompressor kompressor-cli
+curl -fsSL https://raw.githubusercontent.com/hystax/optscale-kompressor/main/install.sh | sh
 ```
 
-From source:
+No Rust toolchain needed. [`install.sh`](install.sh) downloads the latest
+release, checks it against the release's `SHA256SUMS`, and stops on a mismatch:
+
+- **Linux x86_64 and arm64:** the binary goes to `~/.local/bin`, and the
+  packaged configuration to `~/.config/kompressor/config.toml` unless one is
+  already there. No root. The x86_64 binary is static; the arm64 one needs
+  glibc 2.28 or newer.
+- **macOS (Apple silicon and Intel):** the universal `.pkg` is installed with
+  `sudo installer`: the binary in `/usr/local/bin`, a user config, and a
+  LaunchAgent that serves the proxy. Details: [docs/MACOS.md](docs/MACOS.md).
+
+`KOMPRESSOR_VERSION=2.6.0` pins a release and `KOMPRESSOR_INSTALL_DIR` moves the
+Linux binary. Then check it runs:
 
 ```bash
-git clone https://github.com/hystax/optscale-kompressor
-cd optscale-kompressor
-make release
-./target/release/kompressor version
+kompressor version
 ```
-
-`make deb`, `make rpm`, `make static` (musl), `make docker`,
-`make macos-pkg-docker`, `make win` and `make win-installer` build packages; each
-says what it needs if a tool is missing. [docs/QUICKSTART.md](docs/QUICKSTART.md) covers running it as a service,
-[docs/MACOS.md](docs/MACOS.md) covers the macOS paths, and
-[docs/WINDOWS.md](docs/WINDOWS.md) the Windows ones, including Claude Desktop
-and the Codex app.
-
----
-
-## Quick start
 
 <a id="quick-start-install"></a>
-### Install a prebuilt package
+### Packages
 
-No Rust toolchain needed: download the package for your platform from the
-[latest release](https://github.com/hystax/optscale-kompressor/releases/latest)
+To install a system package instead, or on another platform, download it from
+the [latest release](https://github.com/hystax/optscale-kompressor/releases/latest)
 and check it against `SHA256SUMS` from the same page
 (`sha256sum --check --ignore-missing SHA256SUMS`).
 
@@ -338,6 +84,7 @@ and check it against `SHA256SUMS` from the same page
 | Any Linux arm64, glibc 2.28+ | `kompressor-<version>-aarch64-linux-gnu` | `install -m 755 kompressor-*-aarch64-linux-gnu ~/.local/bin/kompressor` |
 | macOS (Apple silicon and Intel) | `kompressor-<version>-universal2.pkg` | `sudo installer -pkg kompressor-*-universal2.pkg -target /` |
 | Windows x86_64 | `kompressor-<version>-x86_64-setup.exe` | run it; see [docs/WINDOWS.md](docs/WINDOWS.md) |
+| FreeBSD x86_64 | `kompressor-<version>-x86_64-freebsd.pkg` | `sudo pkg add ./kompressor-*-x86_64-freebsd.pkg` |
 
 Older glibc systems can use the `-static` `.deb` / `.rpm` builds instead. With
 the [GitHub CLI](https://cli.github.com) the download is one command, for
@@ -347,13 +94,35 @@ example:
 gh release download --repo hystax/optscale-kompressor -p 'kompressor_*-1_amd64.deb' -p SHA256SUMS
 ```
 
-Then check it runs:
+[docs/QUICKSTART.md](docs/QUICKSTART.md) covers running it as a service, and
+[docs/WINDOWS.md](docs/WINDOWS.md) the Windows paths, including Claude Desktop
+and the Codex app.
+
+### From source
+
+With Cargo (Rust 1.95 or newer):
 
 ```bash
-kompressor version
+cargo install --locked --git https://github.com/hystax/optscale-kompressor kompressor-cli
 ```
 
-To build from source instead, see [Install](#install).
+Or from a checkout:
+
+```bash
+git clone https://github.com/hystax/optscale-kompressor
+cd optscale-kompressor
+make release
+./target/release/kompressor version
+```
+
+`make deb`, `make rpm`, `make static` (musl), `make linux-arm64-all`,
+`make docker`, `make macos-pkg-docker`, `make win` and `make win-installer`
+build packages; each
+says what it needs if a tool is missing.
+
+---
+
+## Quick start
 
 ### Codex
 
@@ -369,7 +138,7 @@ If a session is killed, `kompressor unwrap codex` removes the leftover block.
 Details: [docs/CODEX.md](docs/CODEX.md).
 
 A subscription session opens a WebSocket, which the proxy relays and compresses —
-on by default since 0.14.0. Relayed turns report no provider usage, so their
+on by default. Relayed turns report no provider usage, so their
 savings are real but unmeasured; `KOMPRESSOR__PROXY__WEBSOCKET_RELAY=false` trades
 that coverage back for the numbers.
 
@@ -531,6 +300,126 @@ effective result with secrets removed.
 
 ---
 
+## Results
+
+Every figure is the difference between real provider bills, with the
+prompt-cache discount included. Self-reported savings, which price removed tokens
+at the uncached list rate, are not used. These are the headline tables; the
+method, the per-cohort and per-content-type breakdowns and the caveats are in
+[docs/RESULTS.md](docs/RESULTS.md).
+
+<a id="results-codex"></a>
+### Codex on GPT-5.5
+
+Terminal-Bench 2.1, Codex CLI on GPT-5.5, one full run over the 87 tasks every
+arm completed. Headroom is 0.40 at its defaults. Cost and token savings are
+statistically significant; the solve-rate differences are not.
+
+| Per full run          | No compression | Headroom | Kompressor  |
+| --------------------- | -------------- | -------- | ----------- |
+| Cost                  | $107.89        | $99.04   | **$83.40**  |
+| Input tokens          | 96.1M          | 95.5M    | **72.2M**   |
+| Uncached input tokens | 6.68M          | 5.16M    | **4.46M**   |
+| Tasks solved          | 82.2%          | 81.6%    | 81.1%       |
+| Median trial time     | 4.8 min        | 5.3 min  | **4.5 min** |
+
+That is −22.7% against no compression: 2.8× the saving of Headroom's default
+(−8.2%) and 2.0× that of its most aggressive setting (−11.6%). The gap sits in
+long, log-heavy work; on short tasks neither tool has much to remove.
+
+**Full results:** [docs/RESULTS.md → Codex on GPT-5.5](docs/RESULTS.md#results-codex)
+(by task cohort, request sizes, the same traffic replayed through both engines) ·
+**Write-up:** [Twice the Savings of Headroom on Coding-Agent Traffic](https://optscale.ai/blog/context-compression-coding-agents)
+
+<a id="results-claude-code"></a>
+### Claude Code on Opus 5.5
+
+Terminal-Bench 2.1, 89 tasks, Claude Code on Opus 5.5. The metric is what
+Anthropic charges, including keep-warm pings.
+
+| Per 89-task run                    | No compression | Kompressor         |
+| ---------------------------------- | -------------- | ------------------ |
+| Anthropic API bill                 | $35.35         | **$28.30 (−20%)**  |
+| Tasks solved                       | 89.9%          | 90.6%              |
+| Cache writes                       | 2.78M tokens   | **1.67M (−40%)**   |
+| Prompt tokens lost to cache expiry | 927K           | **13K (−99%)**     |
+
+Cache writes account for $5.59 of the $7.05 difference. Read the total with
+care: agents do not take the same path twice, and four tasks account for the
+whole net difference. The mechanism-level estimate, which we expect to hold up
+across repeated measurements, is about 11% from keeping the cache alive plus a
+few percent from compressing the tail.
+
+**Full results:** [docs/RESULTS.md → Claude Code on Opus 5.5](docs/RESULTS.md#results-claude-code)
+(where the money went, keep-warm, tasks with and without idle gaps) ·
+**Write-up:** [On Claude Code, the Cache Is the Bill](https://optscale.ai/blog/claude-code-prompt-caching)
+
+---
+
+## Features
+
+<a id="feature-cache-safe-compression"></a>
+### Cache-safe compression of tool output
+
+Every step a coding agent takes, it re-sends its entire working history to the
+model: every apt-get log, every compiler warning, every progress bar. On a long
+task the model re-reads the same build output dozens of times, and you pay for
+every read.
+
+We built OptScale Kompressor to stop that, for many teams and agents at once.
+The same input compresses to the same bytes every turn, so the prompt cache
+keeps working, and every removed detail stays one retrieval away.
+
+One rule decides everything else: **the same input compresses to the same bytes,
+every turn.** On agent traffic most input tokens are billed as prompt-cache reads,
+at roughly a tenth of the fresh price — measured at 93.0% of billed prompt on an
+89-task run. A compressor whose output shifts between turns breaks that cache and
+costs more than it saves.
+
+On Terminal-Bench 2.1 with Codex on GPT-5.5 it takes 22.7% off the real bill. How
+is it different from Headroom, the best-known open-source context compressor,
+which has grown into a platform? Kompressor is deliberately just a compressor,
+and it saves about twice as much.
+
+**Results:** [Codex on GPT-5.5](#results-codex) · **Write-up:**
+[Twice the Savings of Headroom on Coding-Agent Traffic](https://optscale.ai/blog/context-compression-coding-agents)
+
+<a id="feature-claude-code-cache"></a>
+### On Claude Code, the cache is the bill
+
+Claude Code marks its conversation with explicit cache breakpoints, so almost
+every request is a long cached prefix plus a short new tail: 92–95% of billed
+prompt tokens are cache reads. On Opus 5.5 a cache read costs $0.20 per million
+tokens and a five-minute cache write $5, 25 times more. A default cache entry
+lives five minutes, and a training run, a full build or a long simulation can
+keep the agent idle for longer. When it comes back, the whole prefix is written
+to the cache again at full price. So on Claude Code the question is less "how
+much can we remove?" and more "how much can we avoid paying twice?".
+
+Kompressor's Anthropic profile answers it in three parts:
+
+- **Compress only the uncached tail.** Messages inside the prefix the provider
+  has already cached stay byte-identical; only the new tail is compressed, the
+  first time it is sent. Elisions under 4,000 characters ship whole, and
+  function-body elision is off for this provider, because a retrieval round on
+  Claude Code re-sends a large prefix.
+- **Keep the cache alive while tools run.** While the agent runs a tool,
+  Kompressor re-sends the last request body every 4.5 minutes with
+  `max_tokens: 1`, so the provider reads the cached prefix and the entry's
+  five-minute clock restarts. Keep-warm stops at the agent's next request, after
+  11 pings (about 50 minutes), at the first failed ping, or if a ping reads no
+  cached tokens. After a conversation's first idle gap longer than five minutes,
+  Kompressor switches it to one-hour cache entries.
+- **Price every decision on the real bill:** per-model cache prices, the system
+  prompt and tool definitions it never compresses, and Anthropic's 20-block cache
+  lookback.
+
+**Results:** [Claude Code on Opus 5.5](#results-claude-code) · **Write-up:**
+[On Claude Code, the Cache Is the Bill](https://optscale.ai/blog/claude-code-prompt-caching) ·
+**Set-up:** [Quick start → Claude Code](#quick-start-claude-code)
+
+---
+
 ## Design rules
 
 **It never changes its mind.** The engine crate has no I/O, no clock and no
@@ -651,222 +540,17 @@ re-compresses the same growing history and credits the same bytes again.
 an undercount. [docs/BENCHMARK.md](docs/BENCHMARK.md) explains how to measure
 against a live agent.
 
-To watch it as it happens, set `server.stats_listen = "127.0.0.1:8818"` and open
-`http://127.0.0.1:8818/`: a dashboard of the last hour (or 5 minutes, or 7
-days) — throughput, tokens removed, net of retrieval, cache reads, upstream
-status and latency, savings by provider, model and content type, why messages
-were left alone, and the latest requests — refreshed every two seconds. The
-same data is JSON at `/v1/stats/live`. It shows the dropped-event count too.
+The live dashboard, the prompt-cache and analysis pages, sixteen more
+dashboards and the JSON route behind each one are described in
+[docs/STATISTICS.md](docs/STATISTICS.md). Set
+`server.stats_listen = "127.0.0.1:8818"` and open `http://127.0.0.1:8818/` to
+watch a session as it happens.
 
-`http://127.0.0.1:8818/cache` is the provider's prompt cache over the last six
-hours (or one, or 30 days): how much of the input was read from cache, what
-the cache saved against no cache at all, every turn that failed to read back
-the prefix the turn before left — put down to expiry when the conversation
-had idled past the cache lifetime, to a prefix change otherwise — the idle
-gaps before each turn, and what the keep-warm pings cost and bridged. Click a
-conversation for its turns one by one. The JSON is `/v1/stats/cache`.
+---
 
-`http://127.0.0.1:8818/analysis` analyzes a fixed date range: conversation
-compression credits and retrieval debits, provider usage, cache losses, latency,
-and errors, plus compression outcomes and skipped categories ranked by token
-volume. Open a conversation for its turn timeline, with links to cache details
-and retrieved fragments (when ref browsing is enabled). The JSON endpoint is
-`/v1/stats/analysis?from=<epoch-ms>&to=<epoch-ms>`; `to` is exclusive, ranges
-span at most 90 days, and `conversation=<fingerprint>` adds turn details.
-Both `/v1` and `/v2` routes serve HTML with `?format=html`. Cache deep links also
-accept the same `from`/`to` pair. Analysis uses retained raw events; daily
-archives cannot reconstruct turn history. Token reduction remains an estimate
-per request, not a monetary saving or a count of unique content.
+## Opt-in settings that edit the prefix
 
-Sixteen more pages sit beside those on the statistics listener, linked from each
-other and from every page's **Dashboards** link:
-
-- `/health`: one verdict for the last hour (or any window) — upstream incidents
-  (429, 5xx, no answer) and failure bursts, refused (4xx) and retried requests,
-  engine p95 and slots busy now, retrieval misses and budget-withheld asks, ref
-  store fill against its cap, and dropped statistics — each judged ok, warn or
-  bad against a fixed threshold and linked to the dashboard that explains it.
-  The Live page links to it.
-- `/trends`: weekly (or daily, or monthly) net tokens removed, prompt-cache
-  saving, input cost, conversations and errors for up to two years. It reads the
-  daily archive as well as raw rows, so it reaches past the raw-row retention,
-  and marks the period each build was first seen.
-- `/yield`: what each content type gave up, and what retrieval took back by
-  fragment kind (how many stored fragments were ever asked for, and how soon).
-  The engine records messages per type rather than tokens, so the per-type
-  saving is an estimate; runs made of a single type give the exact figure.
-- `/timeline`: one conversation drawn turn by turn — what the cache read, wrote
-  and charged fresh, each lost prefix, the pings, compressions and retrievals.
-- `/store`: what the ref store holds by kind, age and time to expiry, against
-  its byte cap, how many minted handles were ever asked for, and asks that came
-  too late (expired) or for nothing (missing).
-- `/keepwarm`: what the keep-warm pings cost against the rewrites they avoided,
-  by pause length and per conversation, with the pings sent after a
-  conversation's last turn and the TTL losses no ping covered.
-- `/cache-loss`: whether compression costs the prompt cache more than it
-  saves. Compared client turns are split into those whose engine run rewrote
-  messages, those it ran on and left alone, and those it never saw; the
-  prefix-change loss rate of the untouched turns is the baseline, losses on
-  compressed turns above it are the *excess* (the estimate), every loss on a
-  compressed turn the upper bound, and a loss after the freeze was lifted (the
-  run froze fewer messages than the conversation's previous one) the *likely*
-  case. TTL losses are left out. The excess cost is set against what the
-  removed tokens were worth at cache-read rates, the least they saved.
-- `/upstream`: status classes, 429s, 5xx and unanswered requests by upstream
-  and model, latency percentiles, incidents (three or more such failures within
-  a minute of each other) and the latest failures.
-- `/traffic`: what the proxy relays — model calls, keep-warm pings, WebSocket
-  upgrades and pass-through — and each row's outcome: expected (2xx, 304, 101,
-  redirects), client side (other 4xx, client disconnects) or upstream (429,
-  5xx, no answer, a broken stream). It shows the real error share (upstream
-  failures of model calls and pings) beside the naive one a status-class count
-  would report, by upstream, API family and status, with the error messages.
-- `/engine`: where compression time goes, by content type, prompt size, outcome
-  and surface, the slowest runs, the engine slots in use and dropped stats events.
-- `/quality`: how far the other pages can be trusted — the share of rows that
-  carry provider usage, a conversation, upstream timing and run context; engine
-  runs with an outcome and skip reasons; retrievals tied to a request; requests
-  filed with more than one run; dropped statistics, a window reaching past
-  retention, the archive's last day, and tables too busy to read whole.
-  Columns this build never writes (such as the uncompressed-prompt measurement)
-  are shown as information, not as failures.
-- `/models`: one row per API family and model, putting side by side what is
-  otherwise on four pages — what the provider billed and how much of it was
-  cache reads, what the engine removed and how long it took, what retrieval put
-  back, and how often the upstream failed. Where compression pays, and where it
-  only costs latency.
-- `/activity`: the window folded onto one week, a cell per weekday and hour in
-  your browser's zone, shaded by model calls, billed input, cache writes, engine
-  savings or keep-warm pings; the busiest hour and the busiest eight hours.
-- `/cohorts`: conversations grouped by how many client turns they ran (1, 2–4,
-  5–19, 20–99, 100–499, 500+), with each cohort's share of the cost, its cache
-  economics and its net compression saving, and how few conversations carry
-  half the bill.
-
-- `/prefix`: which part of the cacheable prefix moved between two turns of a
-  conversation, and on which side of the proxy. Each request is reduced to a
-  hash per segment — beta headers, the tool set, tool order, tool definitions,
-  the system prompt, earlier messages — over the body as the client sent it
-  and as it went upstream, and compared with the turn before. Every
-  prefix-change loss on the Cache page is put down to the earliest segment
-  that changed and to the client or the proxy, or listed as unexplained. The
-  page also shows what a request is made of per model (tools, system,
-  reasoning and the conversation the engine cannot see, in bytes), volatile
-  values in instructions and tool descriptions (dates, date-times, UUIDs,
-  JWT-shaped tokens), and how well a cache lapse can be predicted on the
-  request that finds it, per lifetime and margin. Observation only: no byte of
-  any request changes.
-
-- `/advisor`: which of the opt-in settings would pay on this traffic. One row
-  per setting — pinned tool order, kept beta tokens, an OpenAI cache key,
-  schema compaction, recompaction on a lapsed cache, the read decisions,
-  reasoning elision, and tool deferral, which is not built — with whether it
-  is on now, a verdict (turn on, not worth it, not enough data), the value to
-  set, the figure the verdict rests on beside the bar it was held against, a
-  ceiling on the saving, and the reason in a sentence. Under it, the figures
-  behind each row and what the settings that are on have actually done. The
-  bars are the design's proposals, printed with each verdict, not measured
-  optima; three of the figures (what compaction would remove, what a
-  recompaction would rewrite, whether a client names its own cache key) are
-  measured on every request without acting on them.
-
-### Statistics JSON API for automation
-
-Every dashboard is backed by a JSON route, and a client that sends no `Accept`
-header, `*/*` or `application/json` always gets JSON (`?format=json` forces it
-even for a browser). The same routes are served under `/v2`, and on the
-statistics listener (`server.stats_listen`) as well.
-
-| Route | Answers |
-|---|---|
-| `GET /v1/stats/live?window=1h&recent=25` | the live dashboard's snapshot: totals, rates, timeline, upstream, by provider/model/type, skips, retrievals, recent requests, process info |
-| `GET /v1/stats/cache?window=6h` or `?from=&to=` | the cache dashboard's report; `conversation=<16 hex>` adds that conversation's turns |
-| `GET /v1/stats/analysis?from=&to=` | the analysis overview (`report`, `stats_dropped`, `retention_days`); defaults to the last 24 h |
-| `GET /v1/stats/analysis/retrievals?from=&to=` | retrieval amplification |
-| `GET /v1/stats/analysis/latency?from=&to=` | latency and reliability |
-| `GET /v1/stats/analysis/compare?from=&to=` | historical comparison; `compare_from`/`compare_to`, `model`, `mode`, `surface`, `experiment_id`, `run_id` |
-| `GET /v1/stats/trends?window=26w&bucket=week` | per-period history from raw rows and the daily archive; `window` up to `104w`, `bucket` `day`, `week` or `month`, or `from=&to=` up to 730 days |
-| `GET /v1/stats/yield?window=24h` | tokens removed per content type (estimated by message share) and retrieval asks per fragment kind |
-| `GET /v1/stats/store-health?window=24h` | the ref store's census by kind, age and expiry, its size over time, minted versus asked handles, expired and missing asks |
-| `GET /v1/stats/keepwarm?window=24h&conversations=50` | keep-warm ping cost against avoided rewrites, by pause length and per conversation |
-| `GET /v1/stats/health?window=1h` | ok / warn / bad verdict with each judged check, its thresholds and the dashboard behind it, a request/failure timeline, recent incidents and failures |
-| `GET /v1/stats/cache-loss?window=24h&conversations=50` | prefix-change losses by what the engine did to the turn, baseline rate, excess / likely / upper-bound losses with their cost, removed tokens at cache-read rates, conversations and the latest suspect losses |
-| `GET /v1/stats/traffic?window=24h` | rows by class and outcome, real vs naive error share, noise share, by upstream / API family / status, grouped error messages, a timeline |
-| `GET /v1/stats/quality?window=24h` | coverage checks (ok / warn / bad, or info for columns not written), rows per table in the window, the oldest raw row, retention and the last archived day |
-| `GET /v1/stats/upstream?window=24h` | status mix, latency and failures by upstream and model, incidents, latest failures |
-| `GET /v1/stats/engine?window=24h` | engine time by content type, prompt size, outcome and surface, slowest runs, process slots |
-| `GET /v1/stats/models?window=24h` | per API family and model: client requests and pings, billed input split by how it was billed, engine runs, reduction and latency percentiles, retrieval rounds and tokens put back, net saving, upstream failures |
-| `GET /v1/stats/activity?window=7d` | requests, pings, pass-through, billed input, cache writes and engine savings per weekday and hour (UTC), the busiest cell and the busiest eight consecutive hours |
-| `GET /v1/stats/cohorts?window=7d` | conversations bucketed by client turns, each with its billed input, cost share, net saving and median length, and the share of conversations that carries half the cost |
-| `GET /v1/stats/prefix?window=24h` | compared requests and how many moved nothing; per prompt segment the turns the client changed it and the turns only the proxy did, with the prefix-change losses, tokens and cost put down to each; losses the observations cannot explain; request composition per model; volatile values in instructions; predicted-cold precision and recall per lifetime and margin |
-| `GET /v1/stats/advisor?window=24h` | one `advice` row per opt-in setting: `verdict` (`turn_on`, `not_worth_it`, `not_enough_data`), `value` to set, `enabled` now, `built`, the `measure` and `threshold` with what they are a share of, a `saving` ceiling in input-equivalent tokens, `why`, and the `facts` behind it; plus `effects`, what the settings that are on did in the window |
-| `GET /v1/stats/summary`, `histogram`, `by_type`, `retrievals`, `requests?request_id=`, `store` | the aggregate reports `kompressor stats` prints |
-
-`from`/`to` are epoch milliseconds (`to` exclusive, at most 90 days apart).
-Authenticate with `x-kompressor-key` (or `Authorization: Bearer`); a key reads
-only its own tenant, and a caller holding the cluster secret
-(`x-kompressor-secret`) may name any tenant with `?tenant=`. Unknown query
-parameters are refused with `422`, and every error uses the same
-`{"error":{"code","message"}}` envelope. With statistics off, the routes answer
-`404` saying so.
-
-```bash
-curl -s -H 'x-kompressor-key: sk-…' "http://127.0.0.1:8840/v1/stats/analysis/latency?from=$(( ($(date +%s) - 3600) * 1000 ))&to=$(( $(date +%s) * 1000 ))" | jq .total
-```
-
-Every dashboard has a **Download JSONL** button, and each of their JSON
-routes — `/v1/stats/live`, `/v1/stats/cache`, `/v1/stats/analysis` and its
-`retrievals`, `latency` and `compare` views, and the six dashboard routes above —
-also answers `?format=jsonl` with a JSON Lines attachment, under the same key
-and tenant rules as the JSON. The first line is `{"record":"summary",…}` with
-every field that is not a list; each list element follows on its own line,
-tagged with the list's dotted path, e.g. `{"record":"timeline",…}` or
-`{"record":"report.conversations",…}`:
-
-```bash
-curl -H 'x-kompressor-key: sk-…' 'http://127.0.0.1:8840/v1/stats/cache?window=24h&format=jsonl' > cache.jsonl
-```
-
-The Analysis page also includes retrieval amplification (negative-net requests,
-repeated reference asks, ranged/full retrieval volume, and budget refusals),
-historical comparison, and latency/reliability tabs. Their JSON endpoints are
-`/v1/stats/analysis/retrievals`, `/v1/stats/analysis/compare`, and
-`/v1/stats/analysis/latency`, each accepting `from`/`to` and the existing tenant
-credentials. They are also available under `/v2`.
-
-Comparison accepts `compare_from`/`compare_to` for the baseline (default: the
-preceding equal-length window) and exact `model`, `mode`, `surface`,
-`experiment_id`, and `run_id` filters applied to both periods. It reports totals,
-per-client/per-conversation values, absolute differences, and relative changes;
-zero denominators remain unavailable. To label a benchmark, set optional
-`stats.experiment_id` and `stats.run_id`. Otherwise each AppCore instance generates
-its own run ID. Events also carry the build version and a canonical fingerprint
-of an explicit allowlist of deployment compression/cache/retrieval settings,
-including provider policy overrides. Credentials and payloads are excluded.
-Actual compression mode is recorded separately; other per-request overrides
-are not separate configuration fingerprints.
-
-Schema v13 preserves daily experiment totals and conversation fingerprint sets
-before retention deletes raw events. Late arrivals are added once, and archived
-and raw totals can be combined. Archived comparisons require complete UTC days;
-partial archived days are explicitly omitted. Older legacy daily rollups lack
-experiment dimensions and are excluded from this comparison. Turn ordering,
-retrieval rankings, and latency percentiles still require retained raw events.
-
-New HTTP requests record upstream response-head wait for each attempt (including
-retries/failures), request-start-to-first-response-head time, and local retrieval
-answer/refusal execution time. Attempt detail is capped at 64 with the total
-count retained. This measures headers, not time to first token, and phases
-must not be added together. Latency reports exclude keep-warm pings, preserve
-missing sample counts, and show distributions, model/round/prompt-size/status
-breakdowns, slow requests, and error trends. Reports over more than 200,000 client
-rows explicitly use the newest 200,000. Detailed timing is unavailable for old
-rows and the WebSocket relay. Comparisons are observational and do not measure
-task-quality preservation or prove causation.
-
-### Opt-in settings that edit the prefix
-
-Everything above leaves the client's instructions, tools and headers as it
+By default Kompressor leaves the client's instructions, tools and headers as it
 sent them. These do not, each is off by default, and none has been measured on
 live traffic yet: turn one on for a client the `/prefix` page shows needs it.
 All are `[proxy]` keys, most also settable per provider;
